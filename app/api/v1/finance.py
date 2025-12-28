@@ -1,0 +1,1059 @@
+# app/api/v1/finance.py
+# encoding: utf-8
+"""
+财务管理（订单维度 / 去兼容版）
+
+✅ 新增：
+- BOS STS：GET /finance/bos-sts（兼容 /finance/orders/bos-sts）
+- BOS 代传：POST /finance/bos-upload（兼容 /finance/orders/bos-upload）
+- finalize：POST /finance/finalize（兼容 /finance/finalize-upload /finance/orders/finalize /finance/orders/finalize-upload）
+
+✅ 本次补齐：
+- /finance/orders 支持 created_date_start / created_date_end（按北京时间过滤 created_at，包含结束日）
+- /finance/orders 支持 first_register_date_start / first_register_date_end（按 dynamic_data 常见字段范围过滤，包含结束日）
+- 保留旧参数 created_date / first_register_date 兼容（单日）
+
+⚠️ 权限与范围：
+- 仅 finance/manager/super_admin 可用
+- 仅允许操作已完成订单
+- 仅允许操作 slot_key = related（备用图）
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import Optional, List, Dict, Any, Tuple
+
+import requests
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select, and_, or_, cast, String, delete
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from zoneinfo import ZoneInfo
+
+from app.api.deps import get_current_user_with_role
+from app.core.constants import (
+    ROLE_FINANCE,
+    ROLE_MANAGER,
+    ROLE_SUPER_ADMIN,
+    ROLE_SALES,
+)
+from app.core.db import get_db, engine
+from app.models.order import Order, OrderImage
+from app.models.order_info import OrderInfo
+from app.models.user import User
+from app.models.customer_group import CustomerGroup
+from app.models.image_file import ImageFile
+from app.schemas.order import OrderOut, OrderInfoOut
+from app.schemas.finance import (
+    FinanceOrderOut,
+    FinanceOrderListResponse,
+    FinanceOrderStatusUpdate,
+)
+from app.services.storage import StorageService
+from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
+
+router = APIRouter(prefix="/finance", tags=["finance"])
+
+BJ_TZ = ZoneInfo("Asia/Shanghai")
+storage = StorageService()
+
+# ✅ finance 只允许动备用图
+FINANCE_ALLOWED_SLOTS = {"related"}
+MULTI_SLOTS = {"related"}
+
+
+def _ensure_finance_access(role_name: Optional[str]) -> None:
+    if role_name == ROLE_SALES:
+        raise HTTPException(status_code=403, detail="Sales has no permission to access finance")
+    if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN):
+        raise HTTPException(status_code=403, detail="No permission")
+
+
+def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _user_display_name(u: Optional[User]) -> Optional[str]:
+    if not u:
+        return None
+    return getattr(u, "full_name", None) or getattr(u, "real_name", None) or getattr(u, "username", None)
+
+
+def _group_display_name(g) -> Optional[str]:
+    if not g:
+        return None
+    return (
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "channel_code", None)
+    )
+
+
+def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
+    if not info:
+        return None
+    return OrderInfoOut.from_orm(info)
+
+
+def _dialect_name() -> str:
+    try:
+        return str(getattr(engine, "dialect", None).name or "").lower()
+    except Exception:
+        return ""
+
+
+def _json_text(col, key: str):
+    """
+    返回 dynamic_data[key] 的“文本表达式”。
+
+    ✅ 关键修复：
+    - MySQL/MariaDB：优先用 JSON_UNQUOTE(JSON_EXTRACT())，避免 cast 后带双引号
+    - Postgres：优先走 json path 的 as_string / astext
+    - 其它：尽量用 json_extract + cast
+    """
+    d = _dialect_name()
+    k = (key or "").strip()
+    if not k:
+        return cast("", String)
+
+    if "postgres" in d:
+        try:
+            return col[k].as_string()
+        except Exception:
+            try:
+                return col[k].astext  # type: ignore
+            except Exception:
+                return cast(col, String)
+
+    if "mysql" in d or "mariadb" in d:
+        try:
+            return func.json_unquote(func.json_extract(col, f"$.{k}"))
+        except Exception:
+            return cast(func.json_extract(col, f"$.{k}"), String)
+
+    try:
+        return cast(func.json_extract(col, f"$.{k}"), String)
+    except Exception:
+        return cast(col, String)
+
+
+def _json_text_unquoted(col, key: str):
+    """
+    统一把字符串表达式“去引号+去空白”。
+    """
+    try:
+        expr = _json_text(col, key)
+        expr = func.trim(expr)
+        expr = func.replace(expr, '"', "")
+        return expr
+    except Exception:
+        return _json_text(col, key)
+
+
+def _digits8_expr(expr):
+    """
+    把日期字符串归一化为 YYYYMMDD 的前 8 位数字：
+    - 2025-11-13 -> 20251113
+    - 20251113 -> 20251113
+    - 2025-11-13T00:00:00 -> 20251113
+    """
+    e = func.replace(expr, "-", "")
+    e = func.replace(e, "/", "")
+    e = func.replace(e, ".", "")
+    e = func.replace(e, " ", "")
+    return func.substr(e, 1, 8)
+
+
+def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
+    v = (value or "").strip()
+    if not v:
+        return
+    expr = func.lower(_json_text(Order.dynamic_data, key))
+    clauses.append(expr.like(f"%{v.lower()}%"))
+
+
+def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
+    s = (ymd or "").strip()
+    if not s:
+        return None
+    try:
+        bj_start = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_end = bj_start + timedelta(days=1)
+        return bj_start.astimezone(timezone.utc), bj_end.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    start/end: YYYY-MM-DD（北京时间）
+    返回：[start_utc, end_utc_exclusive)，其中 end 为“包含 end 当天”
+    """
+    s0 = (start_ymd or "").strip()
+    e0 = (end_ymd or "").strip()
+    if not s0 or not e0:
+        return None
+    try:
+        bj_start = datetime.strptime(s0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_end_inclusive = datetime.strptime(e0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        if bj_end_inclusive < bj_start:
+            return None
+        bj_end_exclusive = bj_end_inclusive + timedelta(days=1)
+        return bj_start.astimezone(timezone.utc), bj_end_exclusive.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _parse_ymd(ymd: str) -> Optional[datetime]:
+    s = (ymd or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _add_json_date_range_any(
+    clauses: list,
+    *,
+    keys: List[str],
+    start_ymd: Optional[str],
+    end_ymd: Optional[str],
+    err_prefix: str,
+):
+    """
+    在 Order.dynamic_data 中按多个 key 任选其一命中区间。
+    ✅ 关键修复：把两端都归一化成 YYYYMMDD（8位数字）再比较，兼容：
+       - dl_register_date: 20251113
+       - register_date / first_register_date: 2025-11-13
+    注意：包含 end_ymd。
+    """
+    s = (start_ymd or "").strip()
+    e = (end_ymd or "").strip()
+    if not s and not e:
+        return
+    if not s or not e:
+        raise HTTPException(status_code=400, detail=f"{err_prefix}_start and {err_prefix}_end are required")
+
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        datetime.strptime(e, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{err_prefix}_* must be YYYY-MM-DD")
+
+    if e < s:
+        raise HTTPException(status_code=400, detail=f"{err_prefix}_end must be >= {err_prefix}_start")
+
+    s8 = s.replace("-", "")
+    e8 = e.replace("-", "")
+    if len(s8) != 8 or len(e8) != 8:
+        raise HTTPException(status_code=400, detail=f"{err_prefix}_* must be YYYY-MM-DD")
+
+    or_terms = []
+    for k in keys:
+        txt = _json_text_unquoted(Order.dynamic_data, k)
+        txt8 = _digits8_expr(txt)
+        or_terms.append(and_(txt8 >= s8, txt8 <= e8))
+
+    if or_terms:
+        clauses.append(or_(*or_terms))
+
+
+def _to_float(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+async def _load_finance_order_out(db: AsyncSession, order_id: int) -> OrderOut:
+    stmt = (
+        select(Order)
+        .where(Order.id == int(order_id))
+        .options(
+            selectinload(Order.creator),
+            selectinload(Order.salesperson),
+            selectinload(Order.customer_group),
+            selectinload(Order.channel_group),
+            selectinload(Order.order_info),
+            selectinload(Order.images).selectinload(OrderImage.image_file),
+        )
+    )
+    o = (await db.execute(stmt)).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be viewed in finance")
+
+    ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
+
+    info = getattr(o, "order_info", None)
+
+    return OrderOut(
+        id=o.id,
+        created_by=o.created_by,
+        salesperson_id=o.salesperson_id,
+        customer_group_id=o.customer_group_id,
+        channel_group_id=o.channel_group_id,
+        is_finished=bool(o.is_finished),
+        is_rebate=bool(getattr(o, "is_rebate", False)),
+        is_paid=bool(getattr(o, "is_paid", False)),
+        dynamic_data=o.dynamic_data or {},
+        image_urls=safe_image_urls(o, storage),
+        images=getattr(o, "images", None) or [],
+        created_at=getattr(o, "created_at", None),
+        updated_at=getattr(o, "updated_at", None),
+        customer_group_name=_group_display_name(getattr(o, "customer_group", None)),
+        channel_group_name=_group_display_name(getattr(o, "channel_group", None)),
+        salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
+        order_info=_order_info_out(info),
+    )
+
+
+@router.get("/orders", response_model=FinanceOrderListResponse)
+async def list_finance_orders(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+
+    order_id: Optional[int] = Query(None, description="精确订单ID"),
+
+    created_date: Optional[str] = Query(None, description="日期 YYYY-MM-DD（兼容旧参数：按北京时间过滤 created_at 单日）"),
+    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
+    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+
+    channel_group_id: Optional[int] = Query(None, description="渠道"),
+    customer_group_id: Optional[int] = Query(None, description="客户"),
+    market: Optional[str] = Query(None, description="市场（模糊）"),
+    owner_name: Optional[str] = Query(None, description="车主（模糊）"),
+    insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
+
+    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
+    first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
+    first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
+
+    is_paid: Optional[bool] = Query(None, description="是否回款"),
+    is_rebate: Optional[bool] = Query(None, description="是否返点"),
+
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    _current_user, role_name = user_role
+    _ensure_finance_access(role_name)
+
+    stmt = (
+        select(Order)
+        .where(Order.is_finished.is_(True))
+        .options(
+            selectinload(Order.salesperson),
+            selectinload(Order.customer_group),
+            selectinload(Order.channel_group),
+            selectinload(Order.order_info),
+        )
+    )
+    count_stmt = select(func.count(Order.id)).where(Order.is_finished.is_(True))
+
+    clauses: list = []
+
+    if order_id is not None:
+        clauses.append(Order.id == int(order_id))
+
+    if channel_group_id is not None:
+        clauses.append(Order.channel_group_id == int(channel_group_id))
+    if customer_group_id is not None:
+        clauses.append(Order.customer_group_id == int(customer_group_id))
+
+    # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
+    if created_date_start or created_date_end:
+        if not created_date_start or not created_date_end:
+            raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
+        rng = _parse_bj_date_span(created_date_start, created_date_end)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
+        start_utc, end_utc = rng
+        clauses.append(Order.created_at >= start_utc)
+        clauses.append(Order.created_at < end_utc)
+    elif created_date:
+        rng = _parse_bj_date_range(created_date)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
+        start_utc, end_utc = rng
+        clauses.append(Order.created_at >= start_utc)
+        clauses.append(Order.created_at < end_utc)
+
+    if is_paid is not None:
+        clauses.append(Order.is_paid.is_(bool(is_paid)))
+    if is_rebate is not None:
+        clauses.append(Order.is_rebate.is_(bool(is_rebate)))
+
+    if (market or "").strip():
+        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        count_stmt = count_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        mk = (market or "").strip().lower()
+        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
+
+    if (owner_name or "").strip():
+        _add_json_fuzzy(clauses, "id_name", owner_name)
+
+    # ✅ 初登日期：first_register_date 对应 dl_register_date（主字段）
+    if first_register_date_start or first_register_date_end:
+        _add_json_date_range_any(
+            clauses,
+            keys=["dl_register_date", "register_date", "first_register_date"],
+            start_ymd=first_register_date_start,
+            end_ymd=first_register_date_end,
+            err_prefix="first_register_date",
+        )
+    elif (first_register_date or "").strip():
+        # ✅ 兼容旧逻辑：模糊（例如传 "2025-01"），也兼容传 "202501"
+        v = (first_register_date or "").strip()
+        v2 = v.replace("-", "")
+        _add_json_fuzzy(clauses, "dl_register_date", v)
+        _add_json_fuzzy(clauses, "dl_register_date", v2)
+        _add_json_fuzzy(clauses, "register_date", v)
+        _add_json_fuzzy(clauses, "first_register_date", v)
+
+    if (insurance_expire_date or "").strip():
+        d = _parse_ymd(insurance_expire_date)
+        if not d:
+            raise HTTPException(status_code=400, detail="insurance_expire_date must be YYYY-MM-DD")
+        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        count_stmt = count_stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        clauses.append(OrderInfo.insurance_expire_date == d.date())
+
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+        count_stmt = count_stmt.where(and_(*clauses))
+
+    stmt = stmt.order_by(Order.id.desc()).offset((page - 1) * page_size).limit(page_size)
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    rows = (await db.execute(stmt)).scalars().all()
+
+    items: List[FinanceOrderOut] = []
+    for o in rows:
+        cg = getattr(o, "customer_group", None)
+        ch = getattr(o, "channel_group", None)
+        sp = getattr(o, "salesperson", None)
+        info = getattr(o, "order_info", None)
+
+        dd = getattr(o, "dynamic_data", None) or {}
+
+        plate_no = (dd.get("dl_plate_no") or dd.get("plate_no") or "") if isinstance(dd, dict) else ""
+        vin = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
+        engine_no = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
+        vehicle_model = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
+        id_number = (dd.get("id_number") or "") if isinstance(dd, dict) else ""
+        owner = (dd.get("id_name") or "") if isinstance(dd, dict) else ""
+
+        items.append(
+            FinanceOrderOut(
+                id=int(o.id),
+
+                col_01_date=_fmt_dt(getattr(o, "created_at", None)),
+                col_02_channel=_group_display_name(ch),
+                col_03_customer=_group_display_name(cg),
+                col_04_market=getattr(cg, "market", None) if cg else None,
+                col_05_owner=owner or None,
+                col_06_plate_no=plate_no or None,
+                col_07_insurance_expire_date=(
+                    info.insurance_expire_date.strftime("%Y-%m-%d") if info and getattr(info, "insurance_expire_date", None) else None
+                ),
+                col_08_vin=vin or None,
+                col_09_engine_no=engine_no or None,
+                col_10_vehicle_model=vehicle_model or None,
+                col_11_first_register_date=(dd.get("dl_register_date") if isinstance(dd, dict) else None),
+                col_12_id_number=id_number or None,
+                col_13_owner_phone=str(getattr(info, "owner_phone", None)) if info and getattr(info, "owner_phone", None) is not None else None,
+
+                col_14_commercial_amount=_to_float(getattr(info, "commercial_amount", None)) if info else None,
+                col_15_compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)) if info else None,
+                col_16_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)) if info else None,
+                col_17_noncar_amount=_to_float(getattr(info, "non_vehicle_amount", None)) if info else None,
+
+                col_18_ch_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)) if info else None,
+                col_19_ch_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)) if info else None,
+                col_20_ch_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)) if info else None,
+                col_21_ch_noncar_point=_to_float(getattr(info, "channel_non_vehicle_point", None)) if info else None,
+
+                col_22_cu_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)) if info else None,
+                col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
+                col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
+                col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
+
+                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
+
+                col_29_is_paid=bool(getattr(o, "is_paid", False)),
+                col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
+
+                customer_group_id=getattr(o, "customer_group_id", None),
+                channel_group_id=getattr(o, "channel_group_id", None),
+                salesperson_id=getattr(o, "salesperson_id", None),
+                salesperson_name=_user_display_name(sp),
+
+                dynamic_data=dd,
+                created_at=_fmt_dt(getattr(o, "created_at", None)),
+                updated_at=_fmt_dt(getattr(o, "updated_at", None)),
+            )
+        )
+
+    return FinanceOrderListResponse(total=int(total or 0), items=items)
+
+
+@router.get("/orders/{order_id:int}", response_model=OrderOut)
+async def get_finance_order_detail(
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    _current_user, role_name = user_role
+    _ensure_finance_access(role_name)
+    return await _load_finance_order_out(db, order_id)
+
+
+@router.patch("/orders/{order_id:int}/status")
+async def update_finance_order_status(
+    order_id: int,
+    payload: FinanceOrderStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    _current_user, role_name = user_role
+    _ensure_finance_access(role_name)
+
+    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
+
+    if payload.is_rebate is not None:
+        o.is_rebate = bool(payload.is_rebate)
+    if payload.is_paid is not None:
+        o.is_paid = bool(payload.is_paid)
+
+    await db.commit()
+    return {"ok": True}
+
+
+@router.post("/orders/{order_id:int}/return")
+async def return_finance_order_to_unfinished(
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    _current_user, role_name = user_role
+    _ensure_finance_access(role_name)
+
+    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Order is already unfinished")
+
+    o.is_finished = False
+    o.is_rebate = False
+    o.is_paid = False
+
+    await db.commit()
+    return {"ok": True}
+
+
+# ===========================
+# ✅ BOS STS + 代传 + finalize（finance 专用：仅 related）
+# ===========================
+class BosStsOut(BaseModel):
+    accessKeyId: str
+    secretAccessKey: str
+    sessionToken: str
+    expiration: str
+    bosHost: str
+
+
+@router.get("/bos-sts", response_model=BosStsOut)
+@router.get("/orders/bos-sts", response_model=BosStsOut)  # 兼容旧前端
+async def finance_get_bos_sts(
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role),
+):
+    _user, role_name = user_with_role
+    _ensure_finance_access(role_name)
+    _ = db
+
+    if not storage.enabled:
+        raise HTTPException(status_code=400, detail="BOS 未启用（BOS_ENABLED=false）")
+
+    cred = storage.assume_role(duration_seconds=900)
+    return BosStsOut(
+        accessKeyId=cred.access_key_id,
+        secretAccessKey=cred.secret_access_key,
+        sessionToken=cred.session_token,
+        expiration=cred.expiration,
+        bosHost=storage.vhost,
+    )
+
+
+def _utc_iso_z() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _uri_encode(s: str, encode_slash: bool = True) -> str:
+    from urllib.parse import quote
+    out = quote(str(s), safe="")
+    if not encode_slash:
+        out = out.replace("%2F", "/").replace("%2f", "/")
+    return out
+
+
+def _hmac_sha256_hex(key: str, msg: str) -> str:
+    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> str:
+    keys = sorted({str(h).strip().lower() for h in (headers_to_sign or [])})
+    lines: List[str] = []
+    for k in keys:
+        v = (headers.get(k) or "").strip()
+        if not v:
+            continue
+        lines.append(f"{_uri_encode(k)}:{_uri_encode(v)}")
+    return "\n".join(sorted(lines))
+
+
+def _bce_auth_v1(
+    *,
+    ak: str,
+    sk: str,
+    method: str,
+    path: str,
+    timestamp: str,
+    expire_seconds: int,
+    headers_to_sign: List[str],
+    headers: Dict[str, str],
+) -> str:
+    auth_prefix = f"bce-auth-v1/{ak}/{timestamp}/{expire_seconds}"
+    signing_key_hex = _hmac_sha256_hex(sk, auth_prefix)
+
+    canonical_uri = _uri_encode(path, encode_slash=False)
+    canonical_query = ""
+    canonical_hdrs = _canonical_headers(headers, headers_to_sign)
+    canonical_request = "\n".join([method.upper(), canonical_uri, canonical_query, canonical_hdrs])
+
+    signature = _hmac_sha256_hex(signing_key_hex, canonical_request)
+    signed_headers_str = ";".join(sorted({str(h).strip().lower() for h in (headers_to_sign or [])}))
+    return f"{auth_prefix}/{signed_headers_str}/{signature}"
+
+
+def _guess_ext(filename: str, content_type: str) -> str:
+    n = (filename or "").lower()
+    if n.endswith(".jpeg") or n.endswith(".jpg"):
+        return ".jpg"
+    if n.endswith(".png"):
+        return ".png"
+    if n.endswith(".webp"):
+        return ".webp"
+    if n.endswith(".bmp"):
+        return ".bmp"
+    if n.endswith(".heic"):
+        return ".heic"
+    ct = (content_type or "").lower()
+    if "jpeg" in ct or "jpg" in ct:
+        return ".jpg"
+    if "png" in ct:
+        return ".png"
+    if "bmp" in ct:
+        return ".bmp"
+    if "webp" in ct:
+        return ".webp"
+    return ".bin"
+
+
+async def _compute_md5_and_size(up: UploadFile) -> Tuple[str, int]:
+    md5 = hashlib.md5()
+    size = 0
+    while True:
+        chunk = await up.read(1024 * 1024)
+        if not chunk:
+            break
+        md5.update(chunk)
+        size += len(chunk)
+    await up.seek(0)
+    return md5.hexdigest(), size
+
+
+class BosProxyUploadOut(BaseModel):
+    slot_key: str
+    md5: str
+    storage_key: str
+    etag: Optional[str] = None
+    size: int = 0
+    content_type: Optional[str] = None
+    original_name: Optional[str] = None
+    url: str
+
+
+async def _ensure_order_finished_for_finance(db: AsyncSession, order_id: int) -> Order:
+    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
+    return o
+
+
+@router.post("/bos-upload", response_model=BosProxyUploadOut)
+@router.post("/orders/bos-upload", response_model=BosProxyUploadOut)  # 兼容旧前端
+async def finance_bos_upload_proxy(
+    order_id: int = Form(...),
+    slot_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role),
+):
+    _user, role_name = user_with_role
+    _ensure_finance_access(role_name)
+
+    if not storage.enabled:
+        raise HTTPException(status_code=400, detail="BOS 未启用（BOS_ENABLED=false）")
+
+    _ = await _ensure_order_finished_for_finance(db, int(order_id))
+
+    skey = (slot_key or "").strip()
+    if skey not in FINANCE_ALLOWED_SLOTS:
+        raise HTTPException(status_code=400, detail=f"非法 slot_key（finance 仅允许 related）: {slot_key}")
+
+    if not file:
+        raise HTTPException(status_code=400, detail="file 不能为空")
+
+    md5_hex, size = await _compute_md5_and_size(file)
+    content_type = (file.content_type or "application/octet-stream").strip()
+    original_name = (file.filename or "file").strip()
+
+    ext = _guess_ext(original_name, content_type)
+    storage_key = storage.build_key_by_md5(scene=skey, md5_hex=md5_hex, ext=ext).lstrip("/")
+
+    if not storage.validate_b1_key(scene=skey, storage_key=storage_key, md5_hex=md5_hex):
+        raise HTTPException(status_code=400, detail="storage_key 不符合B1规则或不属于该slot")
+
+    cred = storage.assume_role(duration_seconds=900)
+    bos_host = storage.vhost
+
+    sess = requests.Session()
+    sess.trust_env = False
+
+    def _signed_head() -> Tuple[bool, str]:
+        path = f"/{storage_key}"
+        url0 = f"https://{bos_host}{path}"
+        ts = _utc_iso_z()
+        headers_for_sign = {
+            "host": bos_host,
+            "x-bce-date": ts,
+            "x-bce-security-token": cred.session_token,
+        }
+        headers_to_sign = ["host", "x-bce-date", "x-bce-security-token"]
+        authorization = _bce_auth_v1(
+            ak=cred.access_key_id,
+            sk=cred.secret_access_key,
+            method="HEAD",
+            path=path,
+            timestamp=ts,
+            expire_seconds=1800,
+            headers_to_sign=headers_to_sign,
+            headers=headers_for_sign,
+        )
+        headers = {
+            "x-bce-date": ts,
+            "x-bce-security-token": cred.session_token,
+            "Authorization": authorization,
+        }
+        r = sess.request("HEAD", url0, headers=headers, timeout=(10, 60))
+        if r.status_code == 200:
+            return True, (r.headers.get("ETag") or "")
+        if r.status_code == 404:
+            return False, ""
+        rid = r.headers.get("x-bce-request-id") or ""
+        dbg = r.headers.get("x-bce-debug-id") or ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"BOS HEAD failed: status={r.status_code} request_id={rid} debug_id={dbg}",
+        )
+
+    def _signed_put() -> str:
+        path = f"/{storage_key}"
+        url0 = f"https://{bos_host}{path}"
+        ts = _utc_iso_z()
+        headers_for_sign = {
+            "host": bos_host,
+            "content-type": content_type,
+            "x-bce-date": ts,
+            "x-bce-security-token": cred.session_token,
+        }
+        headers_to_sign = ["host", "content-type", "x-bce-date", "x-bce-security-token"]
+        authorization = _bce_auth_v1(
+            ak=cred.access_key_id,
+            sk=cred.secret_access_key,
+            method="PUT",
+            path=path,
+            timestamp=ts,
+            expire_seconds=1800,
+            headers_to_sign=headers_to_sign,
+            headers=headers_for_sign,
+        )
+        headers = {
+            "x-bce-date": ts,
+            "x-bce-security-token": cred.session_token,
+            "Authorization": authorization,
+            "Content-Type": content_type,
+        }
+
+        r = sess.request("PUT", url0, headers=headers, data=file.file, timeout=(10, 180))
+        if 200 <= r.status_code < 300:
+            return (r.headers.get("ETag") or "")
+        rid = r.headers.get("x-bce-request-id") or ""
+        dbg = r.headers.get("x-bce-debug-id") or ""
+        body = ""
+        try:
+            body = r.text or ""
+        except Exception:
+            body = ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"BOS PUT failed: status={r.status_code} request_id={rid} debug_id={dbg} body={body[:300]}",
+        )
+
+    try:
+        exists, etag = _signed_head()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
+
+    if not exists:
+        try:
+            etag = _signed_put()
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+
+    url = storage.object_url_for_display(storage_key, expires_in=900)
+
+    return BosProxyUploadOut(
+        slot_key=skey,
+        md5=md5_hex,
+        storage_key=storage_key,
+        etag=etag or None,
+        size=int(size or 0),
+        content_type=content_type,
+        original_name=original_name,
+        url=url,
+    )
+
+
+async def _get_or_create_image_file(
+    db: AsyncSession,
+    *,
+    storage_key: str,
+    url: str,
+    size: int,
+    original_name: Optional[str],
+    content_type: Optional[str],
+    etag: Optional[str],
+    md5: str,
+) -> ImageFile:
+    storage_key = (storage_key or "").strip().lstrip("/")
+    md5 = (md5 or "").strip().lower()
+
+    obj = (await db.execute(select(ImageFile).where(ImageFile.storage_key == storage_key))).scalar_one_or_none()
+    if obj:
+        if url and not (obj.url or "").strip():
+            obj.url = url
+        if size and int(getattr(obj, "size", 0) or 0) <= 0:
+            obj.size = int(size)
+        if content_type and not getattr(obj, "content_type", None):
+            obj.content_type = content_type
+        if original_name and not getattr(obj, "original_name", None):
+            obj.original_name = original_name
+        if etag and not getattr(obj, "etag", None):
+            obj.etag = etag
+        if md5 and not getattr(obj, "md5", None):
+            obj.md5 = md5
+        await db.flush()
+        return obj
+
+    obj = ImageFile(
+        sha256=None,
+        md5=md5 or None,
+        storage_key=storage_key,
+        url=url or "",
+        size=int(size or 0),
+        original_name=original_name,
+        content_type=content_type,
+        etag=etag,
+    )
+    db.add(obj)
+
+    try:
+        async with db.begin_nested():
+            await db.flush()
+        return obj
+    except IntegrityError:
+        obj2 = (await db.execute(select(ImageFile).where(ImageFile.storage_key == storage_key))).scalar_one_or_none()
+        if obj2:
+            return obj2
+
+        if md5:
+            obj3 = (await db.execute(select(ImageFile).where(ImageFile.md5 == md5))).scalar_one_or_none()
+            if obj3:
+                if url and not (obj3.url or "").strip():
+                    obj3.url = url
+                if size and int(getattr(obj3, "size", 0) or 0) <= 0:
+                    obj3.size = int(size)
+                if content_type and not getattr(obj3, "content_type", None):
+                    obj3.content_type = content_type
+                if original_name and not getattr(obj3, "original_name", None):
+                    obj3.original_name = original_name
+                if etag and not getattr(obj3, "etag", None):
+                    obj3.etag = etag
+                await db.flush()
+                return obj3
+
+        raise
+
+
+class FinalizeImageIn(BaseModel):
+    slot_key: str
+    storage_key: str
+    md5: str = ""
+    size: int = 0
+    content_type: Optional[str] = None
+    etag: Optional[str] = None
+    original_name: Optional[str] = None
+    url: Optional[str] = None
+
+
+class FinanceFinalizeIn(BaseModel):
+    order_id: int
+    images: List[FinalizeImageIn] = Field(default_factory=list)
+    clear_slots: List[str] = Field(default_factory=list)
+
+
+class FinanceFinalizeOut(BaseModel):
+    ok: bool = True
+    order_id: int
+
+
+@router.post("/finalize", response_model=FinanceFinalizeOut)
+@router.post("/finalize-upload", response_model=FinanceFinalizeOut)          # 兼容旧前端
+@router.post("/orders/finalize", response_model=FinanceFinalizeOut)          # 兼容旧前端
+@router.post("/orders/finalize-upload", response_model=FinanceFinalizeOut)   # 兼容旧前端
+async def finance_finalize_images(
+    payload: FinanceFinalizeIn,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role),
+):
+    _user, role_name = user_with_role
+    _ensure_finance_access(role_name)
+
+    order_id = int(payload.order_id)
+    _ = await _ensure_order_finished_for_finance(db, order_id)
+
+    clear_slots = [str(x or "").strip() for x in (payload.clear_slots or [])]
+    clear_slots = [x for x in clear_slots if x]
+    for sk in clear_slots:
+        if sk not in FINANCE_ALLOWED_SLOTS:
+            raise HTTPException(status_code=400, detail=f"非法 clear_slots（finance 仅允许 related）: {sk}")
+
+    by_slot: Dict[str, List[FinalizeImageIn]] = {}
+    for im in payload.images or []:
+        sk = (im.slot_key or "").strip()
+        if sk not in FINANCE_ALLOWED_SLOTS:
+            raise HTTPException(status_code=400, detail=f"非法 slot_key（finance 仅允许 related）: {sk}")
+        by_slot.setdefault(sk, []).append(im)
+
+    normalized_images: List[FinalizeImageIn] = []
+    for sk, ims in by_slot.items():
+        if sk in MULTI_SLOTS:
+            normalized_images.extend(ims)
+        else:
+            normalized_images.append(ims[-1])
+
+    touched_slots = set(by_slot.keys()) | set(clear_slots)
+
+    for sk in touched_slots:
+        desired_sks: List[str] = []
+        if sk in by_slot:
+            for im in by_slot.get(sk, []) or []:
+                storage_key = (im.storage_key or "").strip().lstrip("/")
+                if storage_key:
+                    desired_sks.append(storage_key)
+
+            if sk not in MULTI_SLOTS and desired_sks:
+                desired_sks = [desired_sks[-1]]
+
+        del_stmt = delete(OrderImage).where(and_(OrderImage.order_id == order_id, OrderImage.slot_key == sk))
+        if desired_sks:
+            del_stmt = del_stmt.where(~OrderImage.storage_key.in_(desired_sks))
+        await db.execute(del_stmt)
+
+    for im in normalized_images:
+        slot_key = (im.slot_key or "").strip()
+        storage_key = (im.storage_key or "").strip().lstrip("/")
+        if not storage_key:
+            raise HTTPException(status_code=400, detail="storage_key 不能为空")
+
+        url = (im.url or "").strip()
+        if not url and getattr(storage, "enabled", False):
+            try:
+                url = storage.object_public_url(storage_key)
+            except Exception:
+                url = ""
+
+        imf = await _get_or_create_image_file(
+            db,
+            storage_key=storage_key,
+            url=url,
+            size=int(im.size or 0),
+            original_name=im.original_name,
+            content_type=im.content_type,
+            etag=im.etag,
+            md5=(im.md5 or "").strip(),
+        )
+
+        exists_stmt = select(OrderImage.id).where(
+            and_(
+                OrderImage.order_id == order_id,
+                OrderImage.slot_key == slot_key,
+                OrderImage.storage_key == storage_key,
+            )
+        )
+        exists_id = (await db.execute(exists_stmt)).scalar_one_or_none()
+        if exists_id:
+            continue
+
+        oi = OrderImage(
+            order_id=order_id,
+            slot_key=slot_key,
+            storage_key=storage_key,
+            image_url=url or "",
+            image_file_id=imf.id,
+        )
+        db.add(oi)
+
+    await db.commit()
+    return FinanceFinalizeOut(ok=True, order_id=order_id)
