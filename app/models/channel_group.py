@@ -13,6 +13,9 @@ class ChannelGroup(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
+    # ✅ 团队（用于隔离范围）
+    team_name = Column(String(32), nullable=True, index=True)
+
     # 渠道代码
     channel_code = Column(String(64), nullable=False, index=True)
 
@@ -43,6 +46,6 @@ class ChannelGroup(Base):
     )
 
     __table_args__ = (
-        # ✅ 永远唯一：同 code+name 只能存在一条（无论是否软删除）
-        UniqueConstraint("channel_code", "channel_name", name="uq_channel_group_code_name"),
+        # ✅ 团队内唯一：同 team + code + name 只能存在一条（无论是否软删除）
+        UniqueConstraint("team_name", "channel_code", "channel_name", name="uq_channel_group_team_code_name"),
     )

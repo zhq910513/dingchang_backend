@@ -73,6 +73,19 @@ ROLE_LABEL_MAP = {
     ROLE_MARKET: "市场账号",
 }
 
+# ------------------------
+# ✅ 团队（新增）
+# ------------------------
+TEAM_GANZHOU = "赣州团队"
+TEAM_NANCHANG = "南昌团队"
+TEAM_JIUJIANG = "九江团队"
+
+TEAM_NAMES = (
+    TEAM_GANZHOU,
+    TEAM_NANCHANG,
+    TEAM_JIUJIANG,
+)
+
 __all__ = [
     "ORDER_STATUS",
     "SETTLE_STATUS",
@@ -86,4 +99,8 @@ __all__ = [
     "ROLE_ALL",
     "ROLE_CHILD_CREATABLE_MAP",
     "ROLE_LABEL_MAP",
+    "TEAM_GANZHOU",
+    "TEAM_NANCHANG",
+    "TEAM_JIUJIANG",
+    "TEAM_NAMES",
 ]

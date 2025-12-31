@@ -3,14 +3,9 @@
 """
 客户 / 渠道 分组管理接口（共享数据版）
 
-规则（按当前需求落地）：
-1) 客户管理、渠道管理：共享（都能查看未删除数据）
-2) 财务账号：只能看，不能新增/删除/编辑/覆盖
-3) include_deleted：仅 super_admin 生效（其他角色传 true 也会被忽略）
-4) restore：仅 super_admin 可恢复（保留接口）
-5) ✅ 编辑：manager / super_admin / market
-6) ✅ 新增：若命中“同键已软删”，则执行“恢复并覆盖”（永远只保留一条）
-   - 若命中“同键未删除”，返回中文提示禁止重复创建
+⚠️ 本轮改造为【团队隔离版】：
+- super_admin：可查看全部；创建/编辑若要落到某团队，需传 team_name（query）
+- 非 super_admin：只能查看/操作自己 team_name 下的数据
 """
 
 from __future__ import annotations
@@ -29,11 +24,12 @@ from app.core.constants import (
     ROLE_MANAGER,
     ROLE_FINANCE,
     ROLE_MARKET,
+    TEAM_NAMES,
 )
 from app.core.db import get_db
-from app.models.user import User
-from app.models.customer_group import CustomerGroup
 from app.models.channel_group import ChannelGroup
+from app.models.customer_group import CustomerGroup
+from app.models.user import User
 from app.schemas.customer_channel import (
     CustomerGroupCreate,
     CustomerGroupUpdate,
@@ -51,6 +47,43 @@ router = APIRouter()
 
 def _now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
+def _clean_team_name(v: Optional[str]) -> Optional[str]:
+    s = (v or "").strip()
+    return s or None
+
+
+def _current_team_name_or_403(user: User, role_name: Optional[str]) -> str:
+    if role_name == ROLE_SUPER_ADMIN:
+        raise HTTPException(status_code=400, detail="super_admin must specify team_name explicitly")
+    tn = _clean_team_name(getattr(user, "team_name", None))
+    if not tn:
+        raise HTTPException(status_code=403, detail="当前账号未绑定团队（team_name）")
+    if tn not in TEAM_NAMES:
+        raise HTTPException(status_code=403, detail="当前账号团队非法（team_name）")
+    return tn
+
+
+def _resolve_team_name(
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_name: Optional[str],
+) -> Optional[str]:
+    """
+    - super_admin：可选 team_name；不传则表示“全局/未归属”（不建议，但保留）
+    - 其他角色：强制使用自身 team_name（忽略传入）
+    """
+    if role_name == ROLE_SUPER_ADMIN:
+        t = _clean_team_name(team_name)
+        if t is None:
+            return None
+        if t not in TEAM_NAMES:
+            raise HTTPException(status_code=400, detail=f"非法团队 team_name：{t}")
+        return t
+
+    return _current_team_name_or_403(current_user, role_name)
 
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:
@@ -137,22 +170,29 @@ customer_router = APIRouter(prefix="/customer-groups", tags=["customer-groups"])
 
 @customer_router.get("", response_model=CustomerGroupListResponse)
 async def list_customer_groups(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-    include_deleted: bool = Query(False, description="仅 super_admin 生效：是否包含已删除数据"),
-    customer_code: Optional[str] = Query(None, description="客户代码（模糊）"),
-    customer_name: Optional[str] = Query(None, description="客户名称（模糊）"),
-    market: Optional[str] = Query(None, description="市场（模糊）"),
-    created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        include_deleted: bool = Query(False, description="仅 super_admin 生效：是否包含已删除数据"),
+        customer_code: Optional[str] = Query(None, description="客户代码（模糊）"),
+        customer_name: Optional[str] = Query(None, description="客户名称（模糊）"),
+        market: Optional[str] = Query(None, description="市场（模糊）"),
+        created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
+        team_name: Optional[str] = Query(None, description="仅 super_admin：按团队过滤"),
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name = user_role
     include_deleted = _normalize_include_deleted(role_name, include_deleted)
+
+    tn = _resolve_team_name(current_user=current_user, role_name=role_name, team_name=team_name)
 
     stmt = select(CustomerGroup).order_by(CustomerGroup.id.desc())
     if not include_deleted:
         stmt = stmt.where(CustomerGroup.deleted_at.is_(None))
+
+    # ✅ 团队隔离：非 super_admin 必有 tn；super_admin tn 可为 None（全量）
+    if tn is not None:
+        stmt = stmt.where(CustomerGroup.team_name == tn)
 
     clauses = []
 
@@ -194,6 +234,7 @@ async def list_customer_groups(
                 customer_code=o.customer_code,
                 customer_name=o.customer_name,
                 market=getattr(o, "market", None),
+                team_name=getattr(o, "team_name", None),
                 group_name=o.customer_name,
                 region=o.region or "",
                 contacts=o.contacts or [],
@@ -210,12 +251,17 @@ async def list_customer_groups(
 
 @customer_router.post("", response_model=CustomerGroupOut, status_code=201)
 async def create_customer_group(
-    payload: CustomerGroupCreate,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        payload: CustomerGroupCreate,
+        team_name: Optional[str] = Query(None, description="仅 super_admin：创建到指定团队"),
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     current_user, role_name = user_role
     _ensure_can_modify(role_name)
+
+    tn = _resolve_team_name(current_user=current_user, role_name=role_name, team_name=team_name)
+    if role_name == ROLE_SUPER_ADMIN and tn is None:
+        raise HTTPException(status_code=400, detail="super_admin 创建客户必须指定 team_name")
 
     code = (payload.customer_code or "").strip()
     name = (payload.customer_name or "").strip()
@@ -228,6 +274,7 @@ async def create_customer_group(
 
     stmt = select(CustomerGroup).where(
         and_(
+            CustomerGroup.team_name == tn,
             CustomerGroup.customer_code == code,
             CustomerGroup.customer_name == name,
         )
@@ -250,6 +297,7 @@ async def create_customer_group(
             customer_code=existing.customer_code,
             customer_name=existing.customer_name,
             market=getattr(existing, "market", None),
+            team_name=getattr(existing, "team_name", None),
             group_name=existing.customer_name,
             region=existing.region or "",
             contacts=existing.contacts or [],
@@ -261,6 +309,7 @@ async def create_customer_group(
         )
 
     obj = CustomerGroup(
+        team_name=tn,
         customer_code=code,
         customer_name=name,
         market=mk or None,
@@ -278,6 +327,7 @@ async def create_customer_group(
         customer_code=obj.customer_code,
         customer_name=obj.customer_name,
         market=getattr(obj, "market", None),
+        team_name=getattr(obj, "team_name", None),
         group_name=obj.customer_name,
         region=obj.region or "",
         contacts=obj.contacts or [],
@@ -291,16 +341,23 @@ async def create_customer_group(
 
 @customer_router.put("/{group_id}", response_model=CustomerGroupOut)
 async def update_customer_group(
-    group_id: int,
-    payload: CustomerGroupUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        payload: CustomerGroupUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     current_user, role_name = user_role
     _ensure_can_modify(role_name)
     _ensure_can_edit(role_name)
 
-    obj = (await db.execute(select(CustomerGroup).where(CustomerGroup.id == group_id))).scalar_one_or_none()
+    # ✅ 先按 team 限制读取
+    if role_name == ROLE_SUPER_ADMIN:
+        obj = (await db.execute(select(CustomerGroup).where(CustomerGroup.id == group_id))).scalar_one_or_none()
+    else:
+        tn = _current_team_name_or_403(current_user, role_name)
+        obj = (await db.execute(select(CustomerGroup).where(
+            and_(CustomerGroup.id == group_id, CustomerGroup.team_name == tn)))).scalar_one_or_none()
+
     if not obj:
         raise HTTPException(status_code=404, detail="Customer group not found")
     if getattr(obj, "deleted_at", None) is not None:
@@ -317,6 +374,7 @@ async def update_customer_group(
 
     stmt = select(CustomerGroup).where(
         and_(
+            CustomerGroup.team_name == getattr(obj, "team_name", None),
             CustomerGroup.customer_code == code,
             CustomerGroup.customer_name == name,
             CustomerGroup.id != group_id,
@@ -340,6 +398,7 @@ async def update_customer_group(
         customer_code=obj.customer_code,
         customer_name=obj.customer_name,
         market=getattr(obj, "market", None),
+        team_name=getattr(obj, "team_name", None),
         group_name=obj.customer_name,
         region=obj.region or "",
         contacts=obj.contacts or [],
@@ -353,14 +412,20 @@ async def update_customer_group(
 
 @customer_router.delete("/{group_id}")
 async def delete_customer_group(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name = user_role
     _ensure_can_modify(role_name)
 
-    stmt = select(CustomerGroup).where(and_(CustomerGroup.id == group_id, CustomerGroup.deleted_at.is_(None)))
+    if role_name == ROLE_SUPER_ADMIN:
+        stmt = select(CustomerGroup).where(and_(CustomerGroup.id == group_id, CustomerGroup.deleted_at.is_(None)))
+    else:
+        tn = _current_team_name_or_403(current_user, role_name)
+        stmt = select(CustomerGroup).where(
+            and_(CustomerGroup.id == group_id, CustomerGroup.team_name == tn, CustomerGroup.deleted_at.is_(None)))
+
     obj = (await db.execute(stmt)).scalar_one_or_none()
     if not obj:
         raise HTTPException(status_code=404, detail="Customer group not found")
@@ -372,9 +437,9 @@ async def delete_customer_group(
 
 @customer_router.post("/{group_id}/restore")
 async def restore_customer_group(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     _, role_name = user_role
     await _ensure_can_restore(role_name)
@@ -387,6 +452,7 @@ async def restore_customer_group(
 
     stmt = select(CustomerGroup).where(
         and_(
+            CustomerGroup.team_name == getattr(obj, "team_name", None),
             CustomerGroup.customer_code == obj.customer_code,
             CustomerGroup.customer_name == obj.customer_name,
             CustomerGroup.id != group_id,
@@ -394,7 +460,8 @@ async def restore_customer_group(
     )
     conflict = (await db.execute(stmt)).scalar_one_or_none()
     if conflict:
-        raise HTTPException(status_code=400, detail="Cannot restore: same customer_code + customer_name already exists")
+        raise HTTPException(status_code=400,
+                            detail="Cannot restore: same team_name + customer_code + customer_name already exists")
 
     obj.deleted_at = None
     await db.commit()
@@ -408,21 +475,27 @@ channel_router = APIRouter(prefix="/channel-groups", tags=["channel-groups"])
 
 @channel_router.get("", response_model=ChannelGroupListResponse)
 async def list_channel_groups(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-    include_deleted: bool = Query(False, description="仅 super_admin 生效：是否包含已删除数据"),
-    channel_code: Optional[str] = Query(None, description="渠道代码（模糊）"),
-    channel_name: Optional[str] = Query(None, description="渠道名称（模糊）"),
-    created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        include_deleted: bool = Query(False, description="仅 super_admin 生效：是否包含已删除数据"),
+        channel_code: Optional[str] = Query(None, description="渠道代码（模糊）"),
+        channel_name: Optional[str] = Query(None, description="渠道名称（模糊）"),
+        created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
+        team_name: Optional[str] = Query(None, description="仅 super_admin：按团队过滤"),
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name = user_role
     include_deleted = _normalize_include_deleted(role_name, include_deleted)
+
+    tn = _resolve_team_name(current_user=current_user, role_name=role_name, team_name=team_name)
 
     stmt = select(ChannelGroup).order_by(ChannelGroup.id.desc())
     if not include_deleted:
         stmt = stmt.where(ChannelGroup.deleted_at.is_(None))
+
+    if tn is not None:
+        stmt = stmt.where(ChannelGroup.team_name == tn)
 
     clauses = []
 
@@ -459,6 +532,7 @@ async def list_channel_groups(
                 id=o.id,
                 channel_code=o.channel_code,
                 channel_name=o.channel_name,
+                team_name=getattr(o, "team_name", None),
                 group_name=o.channel_name,
                 region=o.region or "",
                 contacts=o.contacts or [],
@@ -475,12 +549,17 @@ async def list_channel_groups(
 
 @channel_router.post("", response_model=ChannelGroupOut, status_code=201)
 async def create_channel_group(
-    payload: ChannelGroupCreate,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        payload: ChannelGroupCreate,
+        team_name: Optional[str] = Query(None, description="仅 super_admin：创建到指定团队"),
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     current_user, role_name = user_role
     _ensure_can_modify(role_name)
+
+    tn = _resolve_team_name(current_user=current_user, role_name=role_name, team_name=team_name)
+    if role_name == ROLE_SUPER_ADMIN and tn is None:
+        raise HTTPException(status_code=400, detail="super_admin 创建渠道必须指定 team_name")
 
     code = (payload.channel_code or "").strip()
     name = (payload.channel_name or "").strip()
@@ -491,6 +570,7 @@ async def create_channel_group(
 
     stmt = select(ChannelGroup).where(
         and_(
+            ChannelGroup.team_name == tn,
             ChannelGroup.channel_code == code,
             ChannelGroup.channel_name == name,
         )
@@ -511,6 +591,7 @@ async def create_channel_group(
             id=existing.id,
             channel_code=existing.channel_code,
             channel_name=existing.channel_name,
+            team_name=getattr(existing, "team_name", None),
             group_name=existing.channel_name,
             region=existing.region or "",
             contacts=existing.contacts or [],
@@ -522,6 +603,7 @@ async def create_channel_group(
         )
 
     obj = ChannelGroup(
+        team_name=tn,
         channel_code=code,
         channel_name=name,
         region=(payload.region or "").strip(),
@@ -537,6 +619,7 @@ async def create_channel_group(
         id=obj.id,
         channel_code=obj.channel_code,
         channel_name=obj.channel_name,
+        team_name=getattr(obj, "team_name", None),
         group_name=obj.channel_name,
         region=obj.region or "",
         contacts=obj.contacts or [],
@@ -550,16 +633,22 @@ async def create_channel_group(
 
 @channel_router.put("/{group_id}", response_model=ChannelGroupOut)
 async def update_channel_group(
-    group_id: int,
-    payload: ChannelGroupUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        payload: ChannelGroupUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     current_user, role_name = user_role
     _ensure_can_modify(role_name)
     _ensure_can_edit(role_name)
 
-    obj = (await db.execute(select(ChannelGroup).where(ChannelGroup.id == group_id))).scalar_one_or_none()
+    if role_name == ROLE_SUPER_ADMIN:
+        obj = (await db.execute(select(ChannelGroup).where(ChannelGroup.id == group_id))).scalar_one_or_none()
+    else:
+        tn = _current_team_name_or_403(current_user, role_name)
+        obj = (await db.execute(select(ChannelGroup).where(
+            and_(ChannelGroup.id == group_id, ChannelGroup.team_name == tn)))).scalar_one_or_none()
+
     if not obj:
         raise HTTPException(status_code=404, detail="Channel group not found")
     if getattr(obj, "deleted_at", None) is not None:
@@ -574,6 +663,7 @@ async def update_channel_group(
 
     stmt = select(ChannelGroup).where(
         and_(
+            ChannelGroup.team_name == getattr(obj, "team_name", None),
             ChannelGroup.channel_code == code,
             ChannelGroup.channel_name == name,
             ChannelGroup.id != group_id,
@@ -595,6 +685,7 @@ async def update_channel_group(
         id=obj.id,
         channel_code=obj.channel_code,
         channel_name=obj.channel_name,
+        team_name=getattr(obj, "team_name", None),
         group_name=obj.channel_name,
         region=obj.region or "",
         contacts=obj.contacts or [],
@@ -608,14 +699,20 @@ async def update_channel_group(
 
 @channel_router.delete("/{group_id}")
 async def delete_channel_group(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name = user_role
     _ensure_can_modify(role_name)
 
-    stmt = select(ChannelGroup).where(and_(ChannelGroup.id == group_id, ChannelGroup.deleted_at.is_(None)))
+    if role_name == ROLE_SUPER_ADMIN:
+        stmt = select(ChannelGroup).where(and_(ChannelGroup.id == group_id, ChannelGroup.deleted_at.is_(None)))
+    else:
+        tn = _current_team_name_or_403(current_user, role_name)
+        stmt = select(ChannelGroup).where(
+            and_(ChannelGroup.id == group_id, ChannelGroup.team_name == tn, ChannelGroup.deleted_at.is_(None)))
+
     obj = (await db.execute(stmt)).scalar_one_or_none()
     if not obj:
         raise HTTPException(status_code=404, detail="Channel group not found")
@@ -627,9 +724,9 @@ async def delete_channel_group(
 
 @channel_router.post("/{group_id}/restore")
 async def restore_channel_group(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
     _, role_name = user_role
     await _ensure_can_restore(role_name)
@@ -642,6 +739,7 @@ async def restore_channel_group(
 
     stmt = select(ChannelGroup).where(
         and_(
+            ChannelGroup.team_name == getattr(obj, "team_name", None),
             ChannelGroup.channel_code == obj.channel_code,
             ChannelGroup.channel_name == obj.channel_name,
             ChannelGroup.id != group_id,
@@ -649,7 +747,8 @@ async def restore_channel_group(
     )
     conflict = (await db.execute(stmt)).scalar_one_or_none()
     if conflict:
-        raise HTTPException(status_code=400, detail="Cannot restore: same channel_code + channel_name already exists")
+        raise HTTPException(status_code=400,
+                            detail="Cannot restore: same team_name + channel_code + channel_name already exists")
 
     obj.deleted_at = None
     await db.commit()

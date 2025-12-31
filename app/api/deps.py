@@ -7,6 +7,11 @@
 - 会话只认 DB 的 UserSession + expired + last_active_at + settings.SESSION_TIMEOUT_SECONDS
 - 心跳续命：节流更新 last_active_at（避免每请求 commit 打爆 DB）
 - 主角色取 Role.id 最小值（稳定）
+
+团队隔离（增强版，兼容旧字段）：
+- 兼容旧：user.team_name（单团队）
+- 兼容新：user.team_names / user.team_ids / user.teams(relationship) / user.team_id / user.team_id_list 等多种形态
+- 本文件只做“抽取与归一化”，不在这里猜业务规则（业务规则在各 API/service 层落地）
 """
 
 from __future__ import annotations
@@ -14,10 +19,10 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, List
 
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import select, update, inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -69,6 +74,148 @@ def _get_redis():
         return redis
     except Exception:
         return None
+
+
+def _as_list(v: Any) -> List[Any]:
+    """
+    将各种输入归一成 list：
+    - None -> []
+    - str: 若包含逗号，按逗号切；否则单元素
+    - set/tuple/list -> list(...)
+    - 其它 -> [v]
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple) or isinstance(v, set):
+        return list(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        if "," in s:
+            return [x.strip() for x in s.split(",") if x and x.strip()]
+        return [s]
+    return [v]
+
+
+def _normalize_team_names(raw: Any) -> Tuple[str, ...]:
+    items = _as_list(raw)
+    out: List[str] = []
+    for x in items:
+        try:
+            s = str(x).strip()
+        except Exception:
+            continue
+        if not s:
+            continue
+        out.append(s)
+    # 去重 + 稳定排序（避免响应漂移）
+    return tuple(sorted(set(out)))
+
+
+def _normalize_team_ids(raw: Any) -> Tuple[int, ...]:
+    items = _as_list(raw)
+    out: List[int] = []
+    for x in items:
+        try:
+            if isinstance(x, bool):
+                continue
+            if isinstance(x, int):
+                out.append(int(x))
+                continue
+            s = str(x).strip()
+            if not s:
+                continue
+            out.append(int(s))
+        except Exception:
+            continue
+    # 去重 + 稳定排序
+    return tuple(sorted(set(out)))
+
+
+def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
+    """
+    从 user 对象上“尽力抽取”团队信息（不做业务判断）：
+    支持字段/形态（任一存在即可）：
+    - team_ids / team_id_list / teams_ids
+    - team_names / team_name_list
+    - team_id / team_name（旧版单团队）
+    - teams（relationship，元素可能有 id/name/team_id/team_name 属性）
+
+    ✅ 关键优化：
+    - 对 relationship: teams 仅在“已加载”情况下读取，避免 Async SQLAlchemy 懒加载触发 greenlet 错误。
+    """
+    # 1) 先尝试 ids
+    id_candidates = [
+        "team_ids",
+        "team_id_list",
+        "teams_ids",
+        "teamIds",
+        "teamIdList",
+        "team_id",
+    ]
+    raw_ids: Any = None
+    for k in id_candidates:
+        if hasattr(user, k):
+            raw_ids = getattr(user, k, None)
+            if raw_ids is not None:
+                break
+    team_ids = _normalize_team_ids(raw_ids)
+
+    # 2) 再尝试 names
+    name_candidates = [
+        "team_names",
+        "team_name_list",
+        "teamNames",
+        "teamNameList",
+        "team_name",
+    ]
+    raw_names: Any = None
+    for k in name_candidates:
+        if hasattr(user, k):
+            raw_names = getattr(user, k, None)
+            if raw_names is not None:
+                break
+    team_names = _normalize_team_names(raw_names)
+
+    # 3) relationship: teams（仅作为补充）
+    # 仅在 teams 已加载时读取，避免 async 懒加载
+    rel = None
+    try:
+        st = inspect(user)
+        if hasattr(st, "unloaded") and "teams" not in st.unloaded:
+            rel = getattr(user, "teams", None)
+    except Exception:
+        rel = None
+
+    if rel:
+        try:
+            for t in list(rel):  # type: ignore
+                # id
+                tid = None
+                for k in ("id", "team_id", "teamId"):
+                    if hasattr(t, k):
+                        tid = getattr(t, k, None)
+                        if tid is not None:
+                            break
+                # name
+                tname = None
+                for k in ("name", "team_name", "teamName"):
+                    if hasattr(t, k):
+                        tname = getattr(t, k, None)
+                        if tname is not None:
+                            break
+
+                if tid is not None:
+                    team_ids = tuple(sorted(set(team_ids) | set(_normalize_team_ids(tid))))
+                if tname is not None:
+                    team_names = tuple(sorted(set(team_names) | set(_normalize_team_names(tname))))
+        except Exception:
+            pass
+
+    return team_ids, team_names
 
 
 async def get_current_session(
@@ -215,3 +362,56 @@ async def get_current_user_with_role(
     # 兼容旧调用：仍只返回主角色
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     return user, primary
+
+
+async def get_current_user_with_role_and_team(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Tuple[User, Optional[str], Optional[str]]:
+    """
+    ✅ 兼容旧：返回 user + 主角色 + team_name（单值）
+    - 若 user 具备多团队信息：取稳定排序后的第一个 team_name（用于旧接口的“默认团队”语义）
+    - 新接口请用 get_current_user_with_role_and_teams()
+    """
+    user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
+    _team_ids, team_names = _extract_teams_from_user(user)
+    team_name = team_names[0] if team_names else None
+    return user, primary, team_name
+
+
+async def get_current_user_with_role_and_teams(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Tuple[User, Optional[str], Tuple[str, ...], Tuple[int, ...]]:
+    """
+    ✅ 新增：返回 user + 主角色 + team_names + team_ids
+    - 用于后续“按团队隔离数据”统一依赖
+    - 本文件不判断谁是经理/谁能多选，只负责把 user 上的团队信息抽取出来
+    """
+    user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
+    team_ids, team_names = _extract_teams_from_user(user)
+    return user, primary, team_names, team_ids
+
+
+async def get_current_user_scope(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    ✅ 新增：统一返回“访问范围”字典，后续 API 可直接用它做过滤
+    返回字段（稳定）：
+    - user
+    - primary_role
+    - roles
+    - team_names
+    - team_ids
+    """
+    user, primary, roles = await get_current_user_with_roles(user=user, db=db)
+    team_ids, team_names = _extract_teams_from_user(user)
+    return {
+        "user": user,
+        "primary_role": primary,
+        "roles": roles,
+        "team_names": team_names,
+        "team_ids": team_ids,
+    }

@@ -13,6 +13,9 @@ class CustomerGroup(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
+    # ✅ 团队（用于隔离范围）
+    team_name = Column(String(32), nullable=True, index=True)
+
     # 客户代码
     customer_code = Column(String(64), nullable=False, index=True)
 
@@ -46,6 +49,6 @@ class CustomerGroup(Base):
     )
 
     __table_args__ = (
-        # ✅ 永远唯一：同 code+name 只能存在一条（无论是否软删除）
-        UniqueConstraint("customer_code", "customer_name", name="uq_customer_group_code_name"),
+        # ✅ 团队内唯一：同 team + code + name 只能存在一条（无论是否软删除）
+        UniqueConstraint("team_name", "customer_code", "customer_name", name="uq_customer_group_team_code_name"),
     )

@@ -89,7 +89,7 @@ class ChannelGroupCreate(BaseModel):
     contacts: Optional[List[ContactItemIn]] = None
 
 
-# ✅ 编辑入参（本轮新增）：字段沿用创建结构，保持一致性
+# ✅ 编辑入参：字段沿用创建结构，保持一致性
 class CustomerGroupUpdate(BaseModel):
     customer_code: str
     customer_name: str
@@ -111,6 +111,9 @@ class CustomerGroupOut(BaseModel):
     customer_name: str
     market: Optional[str] = None
 
+    # ✅ 团队（输出用；前端可用于展示/调试/筛选）
+    team_name: Optional[str] = None
+
     # ✅ 前端下拉统一读这个（这里给“名称”，保证订单/列表展示为纯名称）
     group_name: str
 
@@ -128,6 +131,9 @@ class ChannelGroupOut(BaseModel):
     id: int
     channel_code: str
     channel_name: str
+
+    # ✅ 团队（输出用；前端可用于展示/调试/筛选）
+    team_name: Optional[str] = None
 
     # ✅ 前端下拉统一读这个（这里给“名称”）
     group_name: str

@@ -2,13 +2,15 @@
 # encoding: utf-8
 from __future__ import annotations
 
-from typing import Optional, Any, Dict, List, Tuple
 import hashlib
 import hmac
-from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Any, Dict, List, Tuple
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
+import anyio
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
@@ -16,20 +18,18 @@ from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from zoneinfo import ZoneInfo
 
-from app.api.deps import get_current_user_with_role
+from app.api.deps import get_current_user_with_role_and_teams
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET, TEAM_NAMES
 from app.core.db import get_db, engine
-from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET
-
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
 from app.models.image_file import ImageFile
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
-from app.models.user import User
 from app.models.role import Role
+from app.models.user import User
 from app.models.user_role import UserRole
 from app.schemas.order import (
     OrderCreate,
@@ -135,12 +135,12 @@ def _group_display_name(g) -> Optional[str]:
     if not g:
         return None
     return (
-        getattr(g, "channel_name", None)
-        or getattr(g, "customer_name", None)
-        or getattr(g, "group_name", None)
-        or getattr(g, "name", None)
-        or getattr(g, "customer_code", None)
-        or getattr(g, "channel_code", None)
+            getattr(g, "channel_name", None)
+            or getattr(g, "customer_name", None)
+            or getattr(g, "group_name", None)
+            or getattr(g, "name", None)
+            or getattr(g, "customer_code", None)
+            or getattr(g, "channel_code", None)
     )
 
 
@@ -179,11 +179,11 @@ def _recalc_order_info(info: OrderInfo) -> None:
     ch_reward = _to_decimal(getattr(info, "channel_reward", 0))
 
     channel_total = (
-        (cm * ch_cm_p / Decimal("100"))
-        + (ca * ch_ca_p / Decimal("100"))
-        + (vta * ch_vta_p / Decimal("100"))
-        + (nva * ch_nva_p / Decimal("100"))
-        + ch_reward
+            (cm * ch_cm_p / Decimal("100"))
+            + (ca * ch_ca_p / Decimal("100"))
+            + (vta * ch_vta_p / Decimal("100"))
+            + (nva * ch_nva_p / Decimal("100"))
+            + ch_reward
     )
     info.channel_total = channel_total
 
@@ -194,11 +194,11 @@ def _recalc_order_info(info: OrderInfo) -> None:
     cu_reward = _to_decimal(getattr(info, "customer_reward", 0))
 
     customer_total = (
-        (cm * cu_cm_p / Decimal("100"))
-        + (ca * cu_ca_p / Decimal("100"))
-        + (vta * cu_vta_p / Decimal("100"))
-        + (nva * cu_nva_p / Decimal("100"))
-        + cu_reward
+            (cm * cu_cm_p / Decimal("100"))
+            + (ca * cu_ca_p / Decimal("100"))
+            + (vta * cu_vta_p / Decimal("100"))
+            + (nva * cu_nva_p / Decimal("100"))
+            + cu_reward
     )
     info.customer_total = customer_total
 
@@ -242,8 +242,6 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
     if payload.customer_vehicle_tax_point is not None:
         info.customer_vehicle_tax_point = _to_decimal(payload.customer_vehicle_tax_point)
     if payload.customer_non_vehicle_point is not None:
-        info.customer_vehicle_tax_point = _to_decimal(payload.customer_vehicle_tax_point)
-    if payload.customer_non_vehicle_point is not None:
         info.customer_non_vehicle_point = _to_decimal(payload.customer_non_vehicle_point)
     if payload.customer_reward is not None:
         info.customer_reward = _to_decimal(payload.customer_reward)
@@ -257,7 +255,148 @@ def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
     return OrderInfoOut.from_orm(info)
 
 
-async def _load_order_out(db: AsyncSession, order_id: int) -> OrderOut:
+# ===========================
+# ✅ 团队/角色 ACL（orders 域）
+# ===========================
+def _normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> Tuple[str, ...]:
+    if not team_names:
+        return tuple()
+    if isinstance(team_names, tuple):
+        return tuple([str(x or "").strip() for x in team_names if str(x or "").strip()])
+    return tuple([str(x or "").strip() for x in (team_names or []) if str(x or "").strip()])
+
+
+def _require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
+    if role_name == ROLE_SUPER_ADMIN:
+        return
+    tns = _normalize_team_names(team_names)
+    if not tns:
+        raise HTTPException(status_code=400, detail="当前账号未配置团队，无法访问该模块")
+    invalid = [t for t in tns if t not in TEAM_NAMES]
+    if invalid:
+        raise HTTPException(status_code=403, detail="当前账号团队非法（team_name）")
+
+
+def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: Tuple[str, ...]) -> str:
+    """
+    业务/财务/市场：只能属于 1 个团队（只能看自己团队）
+    经理：允许多团队
+    """
+    _require_team_for_non_super_admin(role_name, team_names)
+    rn = role_name or ""
+    tns = _normalize_team_names(team_names)
+    if rn in (ROLE_SALES, ROLE_FINANCE, ROLE_MARKET):
+        if len(tns) != 1:
+            raise HTTPException(status_code=400, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
+        return tns[0]
+    # manager/super_admin：不强制单团队，这里返回稳定的第一个仅供需要字符串的地方
+    return tns[0] if tns else ""
+
+
+async def _manager_allowed_salesperson_ids(db: AsyncSession, manager_id: int, team_names: Tuple[str, ...]) -> List[int]:
+    tns = _normalize_team_names(team_names)
+    child_ids = (
+        await db.execute(
+            select(User.id).where(
+                and_(
+                    User.parent_id == int(manager_id),
+                    User.team_name.in_(list(tns)),
+                )
+            )
+        )
+    ).scalars().all()
+    out = [int(manager_id)] + [int(x) for x in (child_ids or [])]
+    # 去重保持顺序
+    seen = set()
+    uniq: List[int] = []
+    for x in out:
+        if x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq
+
+
+async def _ensure_order_acl_by_salesperson_id(
+        db: AsyncSession,
+        *,
+        salesperson_id: int,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+) -> None:
+    rn = role_name or ""
+    if rn == ROLE_SUPER_ADMIN:
+        return
+
+    _require_team_for_non_super_admin(role_name, team_names)
+    tns = _normalize_team_names(team_names)
+
+    if rn == ROLE_SALES:
+        # 业务只能看自己
+        if int(salesperson_id) != int(current_user.id):
+            raise HTTPException(status_code=403, detail="No permission")
+        return
+
+    if rn == ROLE_MANAGER:
+        # 经理可看“自己多团队范围 + 自己创建的业务员”
+        allowed = await _manager_allowed_salesperson_ids(db, int(current_user.id), tns)
+        if int(salesperson_id) not in allowed:
+            raise HTTPException(status_code=403, detail="No permission")
+        return
+
+    # market / finance：只能本团队
+    if rn in (ROLE_MARKET, ROLE_FINANCE):
+        my_team = _require_single_team_for_strict_roles(role_name, tns)
+        sp_team = (await db.execute(select(User.team_name).where(User.id == int(salesperson_id)))).scalars().first()
+        if str(sp_team or "").strip() != my_team:
+            raise HTTPException(status_code=403, detail="No permission")
+        return
+
+    raise HTTPException(status_code=403, detail="No permission")
+
+
+async def _apply_orders_list_acl(
+        db: AsyncSession,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+        clauses: List,
+) -> None:
+    rn = role_name or ""
+    if rn == ROLE_SUPER_ADMIN:
+        return
+
+    _require_team_for_non_super_admin(role_name, team_names)
+    tns = _normalize_team_names(team_names)
+
+    if rn == ROLE_SALES:
+        clauses.append(Order.salesperson_id == int(current_user.id))
+        return
+
+    if rn == ROLE_MANAGER:
+        allowed = await _manager_allowed_salesperson_ids(db, int(current_user.id), tns)
+        clauses.append(Order.salesperson_id.in_(allowed))
+        return
+
+    if rn in (ROLE_MARKET, ROLE_FINANCE):
+        my_team = _require_single_team_for_strict_roles(role_name, tns)
+        # 本团队：用子查询，避免全量拉 ID
+        team_user_ids = select(User.id).where(User.team_name == my_team)
+        clauses.append(Order.salesperson_id.in_(team_user_ids))
+        return
+
+    raise HTTPException(status_code=403, detail="No permission")
+
+
+async def _load_order_out(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+) -> OrderOut:
     stmt = (
         select(Order)
         .where(Order.id == order_id)
@@ -273,6 +412,15 @@ async def _load_order_out(db: AsyncSession, order_id: int) -> OrderOut:
     o = (await db.execute(stmt)).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # ✅ ACL：按订单 salesperson 归属判定
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
+        current_user=current_user,
+        role_name=role_name,
+        team_names=team_names,
+    )
 
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
 
@@ -308,15 +456,15 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
 
 
 async def _get_or_create_image_file(
-    db: AsyncSession,
-    *,
-    storage_key: str,
-    url: str,
-    size: int,
-    original_name: Optional[str],
-    content_type: Optional[str],
-    etag: Optional[str],
-    md5: str,
+        db: AsyncSession,
+        *,
+        storage_key: str,
+        url: str,
+        size: int,
+        original_name: Optional[str],
+        content_type: Optional[str],
+        etag: Optional[str],
+        md5: str,
 ) -> ImageFile:
     storage_key = (storage_key or "").strip().lstrip("/")
     md5 = (md5 or "").strip().lower()
@@ -395,12 +543,14 @@ class OptionListOut(BaseModel):
 
 @router.get("/customer-groups", response_model=OptionListOut)
 async def list_customer_groups(
-    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
+    # ✅ customer/channel 是否需要团队过滤，取决于模型字段，当前未提供，不能猜
+    _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
 
     stmt = select(CustomerGroup).order_by(CustomerGroup.id.asc())
     if hasattr(CustomerGroup, "deleted_at"):
@@ -414,12 +564,14 @@ async def list_customer_groups(
 
 @router.get("/channel-groups", response_model=OptionListOut)
 async def list_channel_groups(
-    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
+    # ✅ customer/channel 是否需要团队过滤，取决于模型字段，当前未提供，不能猜
+    _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
 
     stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
     if hasattr(ChannelGroup, "deleted_at"):
@@ -443,12 +595,15 @@ class SalespersonListOut(BaseModel):
 
 @router.get("/salespersons", response_model=SalespersonListOut)
 async def list_salespersons(
-    status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name = user_with_role
+    current_user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
     # ✅ market 只读：允许查看业务员列表（用于筛选/展示），但仍不允许写订单
     if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET):
@@ -464,13 +619,25 @@ async def list_salespersons(
     )
     stmt = stmt.where(User.status == int(status))
 
+    # ✅ 团队隔离：
+    # - super_admin：全量
+    # - manager：多团队范围
+    # - sales/market：单团队范围
+    if role_name != ROLE_SUPER_ADMIN:
+        if role_name == ROLE_MANAGER:
+            stmt = stmt.where(User.team_name.in_(list(tns)))
+        else:
+            my_team = _require_single_team_for_strict_roles(role_name, tns)
+            stmt = stmt.where(User.team_name == my_team)
+
     if role_name == ROLE_MANAGER:
         stmt = stmt.where(User.parent_id == current_user.id)
     elif role_name == ROLE_SALES:
         stmt = stmt.where(User.id == current_user.id)
 
     rows = (await db.execute(stmt)).all()
-    return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
+    return SalespersonListOut(
+        items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
 
 
 # ===========================
@@ -489,11 +656,12 @@ class OcrTaskListOut(BaseModel):
 
 
 async def _apply_ocr_task_acl(
-    db: AsyncSession,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    stmt,
+        db: AsyncSession,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+        stmt,
 ):
     rn = role_name or ""
 
@@ -504,13 +672,34 @@ async def _apply_ocr_task_acl(
     if rn == ROLE_SUPER_ADMIN:
         return stmt
 
+    _require_team_for_non_super_admin(role_name, team_names)
+    tns = _normalize_team_names(team_names)
+
     stmt = stmt.join(Order, and_(Order.id == OcrTask.scope_id, OcrTask.scope_type == "order"))
+
+    # ✅ 团队隔离（先收紧，再叠加角色范围）
+    if rn == ROLE_MANAGER:
+        team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
+    else:
+        my_team = _require_single_team_for_strict_roles(role_name, tns)
+        team_user_ids = select(User.id).where(User.team_name == my_team)
+
+    stmt = stmt.where(Order.salesperson_id.in_(team_user_ids))
 
     if rn == ROLE_SALES:
         return stmt.where(Order.salesperson_id == int(current_user.id))
 
     if rn == ROLE_MANAGER:
-        child_ids = (await db.execute(select(User.id).where(User.parent_id == int(current_user.id)))).scalars().all()
+        child_ids = (
+            await db.execute(
+                select(User.id).where(
+                    and_(
+                        User.parent_id == int(current_user.id),
+                        User.team_name.in_(list(tns)),
+                    )
+                )
+            )
+        ).scalars().all()
         allow_salesperson_ids = [int(current_user.id)] + [int(x) for x in child_ids]
         return stmt.where(Order.salesperson_id.in_(allow_salesperson_ids))
 
@@ -519,14 +708,14 @@ async def _apply_ocr_task_acl(
 
 @router.get("/ocr-tasks", response_model=OcrTaskListOut)
 async def list_order_ocr_tasks(
-    limit: int = Query(50, ge=1, le=200),
-    order_id: Optional[int] = Query(None),
-    active_only: bool = Query(False),
-    status: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
-    user_with_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+        limit: int = Query(50, ge=1, le=200),
+        order_id: Optional[int] = Query(None),
+        active_only: bool = Query(False),
+        status: Optional[str] = Query(None),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name = user_with_role
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
 
     stmt = select(OcrTask).where(OcrTask.scope_type == "order").order_by(OcrTask.id.desc())
@@ -538,7 +727,13 @@ async def list_order_ocr_tasks(
     if status:
         stmt = stmt.where(OcrTask.status == str(status).strip())
 
-    stmt = await _apply_ocr_task_acl(db, current_user=current_user, role_name=role_name, stmt=stmt)
+    stmt = await _apply_ocr_task_acl(
+        db,
+        current_user=current_user,
+        role_name=role_name,
+        team_names=_normalize_team_names(team_names),
+        stmt=stmt,
+    )
     stmt = stmt.limit(int(limit))
 
     rows = (await db.execute(stmt)).scalars().all()
@@ -570,14 +765,15 @@ class BosStsOut(BaseModel):
 
 @router.get("/bos-sts", response_model=BosStsOut)
 async def get_bos_sts(
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    _user, role_name, team_names, _team_ids = user_with_role
     # finance 仍然禁止拿 sts（避免直传任意 slot）
     _ensure_orders_access(role_name)
     # ✅ market 只读：禁止拿 sts（属于上传写入口）
     _ensure_orders_write_access(role_name)
+    _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
 
     _ = db
 
@@ -624,15 +820,15 @@ def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> s
 
 
 def _bce_auth_v1(
-    *,
-    ak: str,
-    sk: str,
-    method: str,
-    path: str,
-    timestamp: str,
-    expire_seconds: int,
-    headers_to_sign: List[str],
-    headers: Dict[str, str],
+        *,
+        ak: str,
+        sk: str,
+        method: str,
+        path: str,
+        timestamp: str,
+        expire_seconds: int,
+        headers_to_sign: List[str],
+        headers: Dict[str, str],
 ) -> str:
     auth_prefix = f"bce-auth-v1/{ak}/{timestamp}/{expire_seconds}"
     signing_key_hex = _hmac_sha256_hex(sk, auth_prefix)
@@ -697,14 +893,17 @@ class BosProxyUploadOut(BaseModel):
 
 @router.post("/bos-upload", response_model=BosProxyUploadOut)
 async def bos_upload_proxy(
-    slot_key: str = Form(...),
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        slot_key: str = Form(...),
+        file: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     # 仅放开给 finance，用于维护 related
     _ensure_orders_access(role_name, allow_finance=True)
+    _require_team_for_non_super_admin(role_name, tns)
     _ = db
 
     # ✅ market 禁止上传
@@ -820,15 +1019,22 @@ async def bos_upload_proxy(
         )
 
     try:
-        exists, etag = _signed_head()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
-
-    if not exists:
+        # ✅ 关键优化：requests(同步IO) 放线程里跑，避免阻塞 FastAPI 事件循环
         try:
-            etag = _signed_put()
+            exists, etag = await anyio.to_thread.run_sync(_signed_head)
         except requests.RequestException as e:
-            raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+            raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
+
+        if not exists:
+            try:
+                etag = await anyio.to_thread.run_sync(_signed_put)
+            except requests.RequestException as e:
+                raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
 
     url = storage.object_url_for_display(storage_key, expires_in=900)
 
@@ -957,11 +1163,11 @@ def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime
 
 
 def _add_json_date_range_any(
-    clauses: list,
-    *,
-    keys: List[str],
-    start_ymd: Optional[str],
-    end_ymd: Optional[str],
+        clauses: list,
+        *,
+        keys: List[str],
+        start_ymd: Optional[str],
+        end_ymd: Optional[str],
 ):
     """
     在 Order.dynamic_data 中按多个 key 任选其一命中区间。
@@ -975,7 +1181,8 @@ def _add_json_date_range_any(
     if not s and not e:
         return
     if not s or not e:
-        raise HTTPException(status_code=400, detail="first_register_date_start and first_register_date_end are required")
+        raise HTTPException(status_code=400,
+                            detail="first_register_date_start and first_register_date_end are required")
 
     try:
         datetime.strptime(s, "%Y-%m-%d")
@@ -1018,16 +1225,31 @@ class OrderDraftOut(BaseModel):
 
 @router.post("/draft", response_model=OrderDraftOut)
 async def create_order_draft(
-    payload: OrderDraftIn,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        payload: OrderDraftIn,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
     _ensure_orders_write_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
-    spid = int(payload.salesperson_id or user.id)
+    # ✅ role 范围控制 + 团队一致性
+    if role_name == ROLE_SALES:
+        spid = int(user.id)
+    else:
+        spid = int(payload.salesperson_id or user.id)
+
     await _ensure_salesperson_exists(db, spid)
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=spid,
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+    )
 
     o = Order(
         module=payload.module or "order",
@@ -1087,13 +1309,16 @@ class OrderFinalizeOut(BaseModel):
 
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
-    payload: OrderFinalizeIn,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        payload: OrderFinalizeIn,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     # 仅放开给 finance，用于维护 related
     _ensure_orders_access(role_name, allow_finance=True)
+    _require_team_for_non_super_admin(role_name, tns)
 
     # ✅ market 禁止走 finalize（上传写入口）
     if role_name == ROLE_MARKET:
@@ -1109,6 +1334,15 @@ async def finalize_order_upload(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
+    # ✅ ACL：finance/market/manager/sales 都必须限制在可见范围
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+    )
+
     # ✅ finance 仅允许操作“已完成订单”（与 finance 模块约束对齐）
     if role_name == ROLE_FINANCE and not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
@@ -1118,6 +1352,14 @@ async def finalize_order_upload(
         if payload.salesperson_id is not None:
             spid = int(payload.salesperson_id)
             await _ensure_salesperson_exists(db, spid)
+            # ✅ salesperson 变更也必须符合 ACL（含团队/角色范围）
+            await _ensure_order_acl_by_salesperson_id(
+                db,
+                salesperson_id=spid,
+                current_user=user,
+                role_name=role_name,
+                team_names=tns,
+            )
             o.salesperson_id = spid
         if payload.customer_group_id is not None:
             o.customer_group_id = int(payload.customer_group_id)
@@ -1261,34 +1503,37 @@ async def finalize_order_upload(
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-    is_finished: Optional[bool] = Query(None),
-    salesperson_id: Optional[int] = Query(None),
-    created_by: Optional[int] = Query(None),
-    customer_group_id: Optional[int] = Query(None),
-    channel_group_id: Optional[int] = Query(None),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        is_finished: Optional[bool] = Query(None),
+        salesperson_id: Optional[int] = Query(None),
+        created_by: Optional[int] = Query(None),
+        customer_group_id: Optional[int] = Query(None),
+        channel_group_id: Optional[int] = Query(None),
 
-    # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
-    created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
-    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
-    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+        # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
+        created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
+        created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
+        created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
 
-    first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
-    first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
-    owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
-    id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
-    plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
-    engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
-    vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
-    vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
-    vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
-    remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
+        first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
+        owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
+        id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
+        plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
+        engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
+        vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
+        vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
+        vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
+        remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    current_user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
     stmt = (
         select(Order)
@@ -1305,9 +1550,13 @@ async def list_orders(
 
     clauses: list = []
 
+    # ✅ ACL（团队 + 角色范围）
+    await _apply_orders_list_acl(db, current_user=current_user, role_name=role_name, team_names=tns, clauses=clauses)
+
     if is_finished is not None:
         clauses.append(Order.is_finished.is_(is_finished))
 
+    # 注意：下面这些“显式筛选条件”仍生效，但最终结果仍会被 ACL 限制在可见范围内
     if salesperson_id is not None:
         clauses.append(Order.salesperson_id == int(salesperson_id))
     if created_by is not None:
@@ -1404,32 +1653,50 @@ async def list_orders(
 
 @router.get("/{order_id:int}", response_model=OrderOut)
 async def get_order_detail(
-    order_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        order_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
-    return await _load_order_out(db, order_id)
+    _require_team_for_non_super_admin(role_name, tns)
+    return await _load_order_out(db, order_id, current_user=user, role_name=role_name, team_names=tns)
 
 
 @router.post("", response_model=OrderOut)
 async def create_order(
-    payload: OrderCreate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        payload: OrderCreate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
     _ensure_orders_write_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
     _ensure_required_customer_channel(
         customer_group_id=payload.customer_group_id,
         channel_group_id=payload.channel_group_id,
     )
 
-    spid = int(payload.salesperson_id or user.id)
+    # ✅ sales 只能给自己创建；manager/super_admin 允许指定，但仍需通过 ACL（含团队/归属）
+    if role_name == ROLE_SALES:
+        spid = int(user.id)
+    else:
+        spid = int(payload.salesperson_id or user.id)
+
     await _ensure_salesperson_exists(db, spid)
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=spid,
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+    )
 
     o = Order(
         module=payload.module or "order",
@@ -1456,23 +1723,35 @@ async def create_order(
     db.add(info)
 
     await db.commit()
-    return await _load_order_out(db, o.id)
+    return await _load_order_out(db, o.id, current_user=user, role_name=role_name, team_names=tns)
 
 
 @router.put("/{order_id:int}", response_model=OrderOut)
 async def update_order_detail(
-    order_id: int,
-    payload: OrderUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        order_id: int,
+        payload: OrderUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
     _ensure_orders_write_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
     o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # ✅ ACL：必须能访问该订单
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+    )
 
     if o.is_finished and role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
         raise HTTPException(status_code=403, detail="Finished order cannot be edited")
@@ -1480,6 +1759,14 @@ async def update_order_detail(
     if payload.salesperson_id is not None:
         spid = int(payload.salesperson_id)
         await _ensure_salesperson_exists(db, spid)
+        # ✅ 变更 salesperson 仍需通过 ACL
+        await _ensure_order_acl_by_salesperson_id(
+            db,
+            salesperson_id=spid,
+            current_user=user,
+            role_name=role_name,
+            team_names=tns,
+        )
         o.salesperson_id = spid
     if payload.customer_group_id is not None:
         o.customer_group_id = payload.customer_group_id
@@ -1496,30 +1783,43 @@ async def update_order_detail(
         _apply_order_info_patch(info, payload.order_info)
 
     await db.commit()
-    return await _load_order_out(db, order_id)
+    return await _load_order_out(db, order_id, current_user=user, role_name=role_name, team_names=tns)
 
 
 @router.patch("/{order_id:int}/status")
 async def update_order_status(
-    order_id: int,
-    payload: OrderStatusUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+        order_id: int,
+        payload: OrderStatusUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
+    tns = _normalize_team_names(team_names)
+
     _ensure_orders_access(role_name)
     _ensure_orders_write_access(role_name)
+    _require_team_for_non_super_admin(role_name, tns)
 
     o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # ✅ ACL：必须能访问该订单
+    await _ensure_order_acl_by_salesperson_id(
+        db,
+        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+    )
 
     if payload.is_finished is not None:
         if o.is_finished and payload.is_finished is False and role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
             raise HTTPException(status_code=403, detail="Only manager/super_admin can reopen finished order")
 
         if bool(payload.is_finished) is True:
-            _ensure_required_customer_channel(customer_group_id=o.customer_group_id, channel_group_id=o.channel_group_id)
+            _ensure_required_customer_channel(customer_group_id=o.customer_group_id,
+                                              channel_group_id=o.channel_group_id)
 
         o.is_finished = bool(payload.is_finished)
 

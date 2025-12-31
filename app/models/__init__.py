@@ -1,7 +1,12 @@
+# app/models/__init__.py
 # encoding: utf-8
 """
 确保所有 SQLAlchemy 模型在启动时被 import，从而被 Base.metadata 收集到。
 否则 Base.metadata.create_all 可能建出“缺列/缺表”的旧结构。
+
+注意：
+- 这里只做模型 import 聚合，不写任何业务逻辑。
+- 如果你新增/拆分了模型文件，务必把新模型也加到这里。
 """
 
 from app.models.user import User  # noqa: F401

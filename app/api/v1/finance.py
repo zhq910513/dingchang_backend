@@ -13,6 +13,11 @@
 - /finance/orders 支持 first_register_date_start / first_register_date_end（按 dynamic_data 常见字段范围过滤，包含结束日）
 - 保留旧参数 created_date / first_register_date 兼容（单日）
 
+✅ 本轮新增：团队隔离（支持经理多团队）
+- super_admin：可查看全部
+- manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name）
+- finance：只能查看自己 team_name 下的数据（单团队）
+
 ⚠️ 权限与范围：
 - 仅 finance/manager/super_admin 可用
 - 仅允许操作已完成订单
@@ -23,8 +28,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Tuple
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
@@ -35,13 +39,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo
 
-from app.api.deps import get_current_user_with_role
+from app.api.deps import get_current_user_with_role_and_teams
 from app.core.constants import (
     ROLE_FINANCE,
     ROLE_MANAGER,
     ROLE_SUPER_ADMIN,
     ROLE_SALES,
     ROLE_MARKET,
+    TEAM_NAMES,
 )
 from app.core.db import get_db, engine
 from app.models.order import Order, OrderImage
@@ -69,13 +74,58 @@ MULTI_SLOTS = {"related"}
 
 
 def _ensure_finance_access(role_name: Optional[str]) -> None:
-    # ✅ 显式钉死 market：财务模块禁止访问（避免靠“不在白名单”隐式拒绝导致歧义）
+    # ✅ 显式钉死 market/sales：财务模块禁止访问
     if role_name == ROLE_MARKET:
         raise HTTPException(status_code=403, detail="Market has no permission to access finance")
     if role_name == ROLE_SALES:
         raise HTTPException(status_code=403, detail="Sales has no permission to access finance")
     if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN):
         raise HTTPException(status_code=403, detail="No permission")
+
+
+def _normalize_team_names(team_names: Tuple[str, ...] | List[str] | None) -> Tuple[str, ...]:
+    if not team_names:
+        return tuple()
+    if isinstance(team_names, tuple):
+        arr = [str(x or "").strip() for x in team_names]
+    else:
+        arr = [str(x or "").strip() for x in team_names]
+    arr = [x for x in arr if x]
+    # 去重+稳定排序
+    return tuple(sorted(set(arr)))
+
+
+def _current_team_names_or_403(
+    *,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
+) -> Optional[Tuple[str, ...]]:
+    """
+    super_admin：None（表示不限制）
+    manager：允许多团队（>=1），返回 tuple(team_names...）
+    finance：必须单团队（==1），返回 tuple(team_name,）
+    """
+    if role_name == ROLE_SUPER_ADMIN:
+        return None
+
+    tns = _normalize_team_names(team_names)
+    if not tns:
+        raise HTTPException(status_code=403, detail="当前账号未绑定团队（team_name/team_names）")
+
+    invalid = [t for t in tns if t not in TEAM_NAMES]
+    if invalid:
+        raise HTTPException(status_code=403, detail="当前账号团队非法（team_name/team_names）")
+
+    if role_name == ROLE_FINANCE:
+        if len(tns) != 1:
+            raise HTTPException(status_code=403, detail="当前账号团队配置异常：财务必须且只能属于 1 个团队")
+        return (tns[0],)
+
+    if role_name == ROLE_MANAGER:
+        return tuple(tns)
+
+    # 其它角色已在 _ensure_finance_access 拦截，这里防御
+    raise HTTPException(status_code=403, detail="No permission")
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
@@ -240,7 +290,7 @@ def _add_json_date_range_any(
 ):
     """
     在 Order.dynamic_data 中按多个 key 任选其一命中区间。
-    ✅ 关键修复：把两端都归一化成 YYYYMMDD（8位数字）再比较，兼容：
+    ✅ 把两端都归一化成 YYYYMMDD（8位数字）再比较，兼容：
        - dl_register_date: 20251113
        - register_date / first_register_date: 2025-11-13
     注意：包含 end_ymd。
@@ -285,7 +335,12 @@ def _to_float(v) -> Optional[float]:
         return None
 
 
-async def _load_finance_order_out(db: AsyncSession, order_id: int) -> OrderOut:
+async def _load_finance_order_out(
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_team_names: Optional[Tuple[str, ...]],
+) -> OrderOut:
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
@@ -304,6 +359,13 @@ async def _load_finance_order_out(db: AsyncSession, order_id: int) -> OrderOut:
 
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be viewed in finance")
+
+    # ✅ 团队隔离：按订单 salesperson.team_name（支持经理多团队）
+    if current_team_names is not None:
+        sp = getattr(o, "salesperson", None)
+        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
+        if not sp_tn or sp_tn not in set(current_team_names):
+            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
 
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
 
@@ -334,31 +396,27 @@ async def _load_finance_order_out(db: AsyncSession, order_id: int) -> OrderOut:
 async def list_finance_orders(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-
     order_id: Optional[int] = Query(None, description="精确订单ID"),
-
     created_date: Optional[str] = Query(None, description="日期 YYYY-MM-DD（兼容旧参数：按北京时间过滤 created_at 单日）"),
     created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
     created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
-
     channel_group_id: Optional[int] = Query(None, description="渠道"),
     customer_group_id: Optional[int] = Query(None, description="客户"),
     market: Optional[str] = Query(None, description="市场（模糊）"),
     owner_name: Optional[str] = Query(None, description="车主（模糊）"),
     insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
-
     first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
     first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
-
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
-
     db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     stmt = (
         select(Order)
@@ -373,6 +431,12 @@ async def list_finance_orders(
     count_stmt = select(func.count(Order.id)).where(Order.is_finished.is_(True))
 
     clauses: list = []
+
+    # ✅ 团队隔离：按 salesperson.team_name（支持经理多团队）
+    if current_team_names is not None:
+        stmt = stmt.join(User, User.id == Order.salesperson_id)
+        count_stmt = count_stmt.join(User, User.id == Order.salesperson_id)
+        clauses.append(User.team_name.in_(list(current_team_names)))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -468,7 +532,6 @@ async def list_finance_orders(
         items.append(
             FinanceOrderOut(
                 id=int(o.id),
-
                 col_01_date=_fmt_dt(getattr(o, "created_at", None)),
                 col_02_channel=_group_display_name(ch),
                 col_03_customer=_group_display_name(cg),
@@ -476,42 +539,41 @@ async def list_finance_orders(
                 col_05_owner=owner or None,
                 col_06_plate_no=plate_no or None,
                 col_07_insurance_expire_date=(
-                    info.insurance_expire_date.strftime("%Y-%m-%d") if info and getattr(info, "insurance_expire_date", None) else None
+                    info.insurance_expire_date.strftime("%Y-%m-%d")
+                    if info and getattr(info, "insurance_expire_date", None)
+                    else None
                 ),
                 col_08_vin=vin or None,
                 col_09_engine_no=engine_no or None,
                 col_10_vehicle_model=vehicle_model or None,
                 col_11_first_register_date=(dd.get("dl_register_date") if isinstance(dd, dict) else None),
                 col_12_id_number=id_number or None,
-                col_13_owner_phone=str(getattr(info, "owner_phone", None)) if info and getattr(info, "owner_phone", None) is not None else None,
-
+                col_13_owner_phone=(
+                    str(getattr(info, "owner_phone", None))
+                    if info and getattr(info, "owner_phone", None) is not None
+                    else None
+                ),
                 col_14_commercial_amount=_to_float(getattr(info, "commercial_amount", None)) if info else None,
                 col_15_compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)) if info else None,
                 col_16_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)) if info else None,
                 col_17_noncar_amount=_to_float(getattr(info, "non_vehicle_amount", None)) if info else None,
-
                 col_18_ch_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)) if info else None,
                 col_19_ch_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)) if info else None,
                 col_20_ch_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)) if info else None,
                 col_21_ch_noncar_point=_to_float(getattr(info, "channel_non_vehicle_point", None)) if info else None,
-
                 col_22_cu_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)) if info else None,
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-
                 col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
                 col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
-
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
-
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
                 salesperson_name=_user_display_name(sp),
-
                 dynamic_data=dd,
                 created_at=_fmt_dt(getattr(o, "created_at", None)),
                 updated_at=_fmt_dt(getattr(o, "updated_at", None)),
@@ -525,11 +587,12 @@ async def list_finance_orders(
 async def get_finance_order_detail(
     order_id: int,
     db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    return await _load_finance_order_out(db, order_id)
+    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    return await _load_finance_order_out(db, order_id, current_team_names=tns)
 
 
 @router.patch("/orders/{order_id:int}/status")
@@ -537,17 +600,30 @@ async def update_finance_order_status(
     order_id: int,
     payload: FinanceOrderStatusUpdate,
     db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
-    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+    o = (
+        await db.execute(
+            select(Order)
+            .where(Order.id == int(order_id))
+            .options(selectinload(Order.salesperson))
+        )
+    ).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
+
+    if tns is not None:
+        sp = getattr(o, "salesperson", None)
+        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
+        if not sp_tn or sp_tn not in set(tns):
+            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
 
     if payload.is_rebate is not None:
         o.is_rebate = bool(payload.is_rebate)
@@ -562,17 +638,30 @@ async def update_finance_order_status(
 async def return_finance_order_to_unfinished(
     order_id: int,
     db: AsyncSession = Depends(get_db),
-    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name = user_role
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
-    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+    o = (
+        await db.execute(
+            select(Order)
+            .where(Order.id == int(order_id))
+            .options(selectinload(Order.salesperson))
+        )
+    ).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Order is already unfinished")
+
+    if tns is not None:
+        sp = getattr(o, "salesperson", None)
+        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
+        if not sp_tn or sp_tn not in set(tns):
+            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
 
     o.is_finished = False
     o.is_rebate = False
@@ -597,9 +686,9 @@ class BosStsOut(BaseModel):
 @router.get("/orders/bos-sts", response_model=BosStsOut)  # 兼容旧前端
 async def finance_get_bos_sts(
     db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    _user, role_name, _team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     _ = db
 
@@ -622,6 +711,7 @@ def _utc_iso_z() -> str:
 
 def _uri_encode(s: str, encode_slash: bool = True) -> str:
     from urllib.parse import quote
+
     out = quote(str(s), safe="")
     if not encode_slash:
         out = out.replace("%2F", "/").replace("%2f", "/")
@@ -715,12 +805,31 @@ class BosProxyUploadOut(BaseModel):
     url: str
 
 
-async def _ensure_order_finished_for_finance(db: AsyncSession, order_id: int) -> Order:
-    o = (await db.execute(select(Order).where(Order.id == int(order_id)))).scalars().first()
+async def _ensure_order_finished_for_finance(
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_team_names: Optional[Tuple[str, ...]],
+) -> Order:
+    o = (
+        await db.execute(
+            select(Order)
+            .where(Order.id == int(order_id))
+            .options(selectinload(Order.salesperson))
+        )
+    ).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
+
+    # ✅ 团队隔离：按订单 salesperson.team_name（支持经理多团队）
+    if current_team_names is not None:
+        sp = getattr(o, "salesperson", None)
+        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
+        if not sp_tn or sp_tn not in set(current_team_names):
+            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+
     return o
 
 
@@ -731,15 +840,17 @@ async def finance_bos_upload_proxy(
     slot_key: str = Form(...),
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     if not storage.enabled:
         raise HTTPException(status_code=400, detail="BOS 未启用（BOS_ENABLED=false）")
 
-    _ = await _ensure_order_finished_for_finance(db, int(order_id))
+    _ = await _ensure_order_finished_for_finance(db, int(order_id), current_team_names=current_team_names)
 
     skey = (slot_key or "").strip()
     if skey not in FINANCE_ALLOWED_SLOTS:
@@ -963,19 +1074,21 @@ class FinanceFinalizeOut(BaseModel):
 
 
 @router.post("/finalize", response_model=FinanceFinalizeOut)
-@router.post("/finalize-upload", response_model=FinanceFinalizeOut)          # 兼容旧前端
-@router.post("/orders/finalize", response_model=FinanceFinalizeOut)          # 兼容旧前端
-@router.post("/orders/finalize-upload", response_model=FinanceFinalizeOut)   # 兼容旧前端
+@router.post("/finalize-upload", response_model=FinanceFinalizeOut)  # 兼容旧前端
+@router.post("/orders/finalize", response_model=FinanceFinalizeOut)  # 兼容旧前端
+@router.post("/orders/finalize-upload", response_model=FinanceFinalizeOut)  # 兼容旧前端
 async def finance_finalize_images(
     payload: FinanceFinalizeIn,
     db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _user, role_name = user_with_role
+    user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
     order_id = int(payload.order_id)
-    _ = await _ensure_order_finished_for_finance(db, order_id)
+    _ = await _ensure_order_finished_for_finance(db, order_id, current_team_names=current_team_names)
 
     clear_slots = [str(x or "").strip() for x in (payload.clear_slots or [])]
     clear_slots = [x for x in clear_slots if x]
