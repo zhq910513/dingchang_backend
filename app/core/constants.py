@@ -1,3 +1,4 @@
+# app/core/constants.py
 # encoding: utf-8
 """
 全局常量定义
@@ -45,20 +46,23 @@ ROLE_SUPER_ADMIN = "super_admin"
 ROLE_MANAGER = "manager"
 ROLE_SALES = "sales"
 ROLE_FINANCE = "finance"
+ROLE_MARKET = "market"
 
 ROLE_ALL = (
     ROLE_SUPER_ADMIN,
     ROLE_MANAGER,
     ROLE_SALES,
     ROLE_FINANCE,
+    ROLE_MARKET,
 )
 
-# ✅ 去兼容版：按你现在的业务规则
-# - 超级账号 -> 可创建 经理 / 业务 / 财务
-# - 经理账号 -> 可创建 业务 / 财务
+# 当前业务规则（创建下级账号的“角色选项”）
+# - 超级账号 -> 可创建 经理 / 业务 / 财务 / 市场
+# - 经理账号 -> 可创建 业务 / 财务 / 市场
+# 注：sales/finance/market 默认不具备创建下级账号入口（由路由与接口鉴权控制）
 ROLE_CHILD_CREATABLE_MAP = {
-    ROLE_SUPER_ADMIN: (ROLE_MANAGER, ROLE_SALES, ROLE_FINANCE),
-    ROLE_MANAGER: (ROLE_SALES, ROLE_FINANCE),
+    ROLE_SUPER_ADMIN: (ROLE_MANAGER, ROLE_SALES, ROLE_FINANCE, ROLE_MARKET),
+    ROLE_MANAGER: (ROLE_SALES, ROLE_FINANCE, ROLE_MARKET),
 }
 
 ROLE_LABEL_MAP = {
@@ -66,6 +70,7 @@ ROLE_LABEL_MAP = {
     ROLE_MANAGER: "经理账号",
     ROLE_SALES: "业务账号",
     ROLE_FINANCE: "财务账号",
+    ROLE_MARKET: "市场账号",
 }
 
 __all__ = [
@@ -77,6 +82,7 @@ __all__ = [
     "ROLE_MANAGER",
     "ROLE_SALES",
     "ROLE_FINANCE",
+    "ROLE_MARKET",
     "ROLE_ALL",
     "ROLE_CHILD_CREATABLE_MAP",
     "ROLE_LABEL_MAP",

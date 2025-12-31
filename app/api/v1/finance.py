@@ -41,6 +41,7 @@ from app.core.constants import (
     ROLE_MANAGER,
     ROLE_SUPER_ADMIN,
     ROLE_SALES,
+    ROLE_MARKET,
 )
 from app.core.db import get_db, engine
 from app.models.order import Order, OrderImage
@@ -68,6 +69,9 @@ MULTI_SLOTS = {"related"}
 
 
 def _ensure_finance_access(role_name: Optional[str]) -> None:
+    # ✅ 显式钉死 market：财务模块禁止访问（避免靠“不在白名单”隐式拒绝导致歧义）
+    if role_name == ROLE_MARKET:
+        raise HTTPException(status_code=403, detail="Market has no permission to access finance")
     if role_name == ROLE_SALES:
         raise HTTPException(status_code=403, detail="Sales has no permission to access finance")
     if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN):

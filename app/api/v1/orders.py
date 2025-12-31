@@ -20,7 +20,8 @@ from zoneinfo import ZoneInfo
 
 from app.api.deps import get_current_user_with_role
 from app.core.db import get_db, engine
-from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET
+
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
 from app.models.image_file import ImageFile
@@ -68,6 +69,16 @@ def _ensure_orders_access(role_name: Optional[str], *, allow_finance: bool = Fal
     """
     if role_name == ROLE_FINANCE and not allow_finance:
         raise HTTPException(status_code=403, detail="Finance has no permission to access orders")
+
+
+def _ensure_orders_write_access(role_name: Optional[str]) -> None:
+    """
+    订单写入口（创建/编辑/状态/上传流程等）：
+    - finance：禁止（仅 related 图片维护例外，由单独接口/校验放行）
+    - market：只读，禁止
+    """
+    if role_name in (ROLE_FINANCE, ROLE_MARKET):
+        raise HTTPException(status_code=403, detail="No permission")
 
 
 def _ensure_finance_related_only_slot(slot_key: str) -> None:
@@ -229,6 +240,8 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
     if payload.customer_compulsory_point is not None:
         info.customer_compulsory_point = _to_decimal(payload.customer_compulsory_point)
     if payload.customer_vehicle_tax_point is not None:
+        info.customer_vehicle_tax_point = _to_decimal(payload.customer_vehicle_tax_point)
+    if payload.customer_non_vehicle_point is not None:
         info.customer_vehicle_tax_point = _to_decimal(payload.customer_vehicle_tax_point)
     if payload.customer_non_vehicle_point is not None:
         info.customer_non_vehicle_point = _to_decimal(payload.customer_non_vehicle_point)
@@ -437,7 +450,8 @@ async def list_salespersons(
     current_user, role_name = user_with_role
     _ensure_orders_access(role_name)
 
-    if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES):
+    # ✅ market 只读：允许查看业务员列表（用于筛选/展示），但仍不允许写订单
+    if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET):
         raise HTTPException(status_code=403, detail="No permission")
 
     stmt = (
@@ -482,6 +496,10 @@ async def _apply_ocr_task_acl(
     stmt,
 ):
     rn = role_name or ""
+
+    # market 禁止走导入/OCR 相关链路
+    if rn == ROLE_MARKET:
+        raise HTTPException(status_code=403, detail="No permission")
 
     if rn == ROLE_SUPER_ADMIN:
         return stmt
@@ -558,6 +576,9 @@ async def get_bos_sts(
     _user, role_name = user_with_role
     # finance 仍然禁止拿 sts（避免直传任意 slot）
     _ensure_orders_access(role_name)
+    # ✅ market 只读：禁止拿 sts（属于上传写入口）
+    _ensure_orders_write_access(role_name)
+
     _ = db
 
     if not storage.enabled:
@@ -685,6 +706,10 @@ async def bos_upload_proxy(
     # 仅放开给 finance，用于维护 related
     _ensure_orders_access(role_name, allow_finance=True)
     _ = db
+
+    # ✅ market 禁止上传
+    if role_name == ROLE_MARKET:
+        raise HTTPException(status_code=403, detail="No permission")
 
     if role_name == ROLE_FINANCE:
         _ensure_finance_related_only_slot(slot_key)
@@ -830,6 +855,14 @@ def _dialect_name() -> str:
 
 
 def _json_text(col, key: str):
+    """
+    返回 dynamic_data[key] 的“文本表达式”。
+
+    ✅ 关键修复（与 finance.py 对齐）：
+    - MySQL/MariaDB：优先用 JSON_UNQUOTE(JSON_EXTRACT())，避免 cast 后带双引号
+    - Postgres：优先走 json path 的 as_string / astext
+    - 其它：尽量用 json_extract + cast
+    """
     d = _dialect_name()
     k = (key or "").strip()
     if not k:
@@ -844,6 +877,12 @@ def _json_text(col, key: str):
             except Exception:
                 return cast(col, String)
 
+    if "mysql" in d or "mariadb" in d:
+        try:
+            return func.json_unquote(func.json_extract(col, f"$.{k}"))
+        except Exception:
+            return cast(func.json_extract(col, f"$.{k}"), String)
+
     try:
         return cast(func.json_extract(col, f"$.{k}"), String)
     except Exception:
@@ -852,14 +891,29 @@ def _json_text(col, key: str):
 
 def _json_text_unquoted(col, key: str):
     """
-    兼容 MySQL JSON_EXTRACT cast 后可能带引号： "2025-01-01"
+    统一把字符串表达式“去引号+去空白”，兼容 MySQL JSON_EXTRACT cast 后可能带引号： "2025-01-01"
     """
     try:
-        expr = func.trim(_json_text(col, key))
-        expr = func.trim(expr, '"')
+        expr = _json_text(col, key)
+        expr = func.trim(expr)
+        expr = func.replace(expr, '"', "")
         return expr
     except Exception:
         return _json_text(col, key)
+
+
+def _digits8_expr(expr):
+    """
+    把日期字符串归一化为 YYYYMMDD 的前 8 位数字：
+    - 2025-11-13 -> 20251113
+    - 20251113 -> 20251113
+    - 2025-11-13T00:00:00 -> 20251113
+    """
+    e = func.replace(expr, "-", "")
+    e = func.replace(e, "/", "")
+    e = func.replace(e, ".", "")
+    e = func.replace(e, " ", "")
+    return func.substr(e, 1, 8)
 
 
 def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
@@ -910,8 +964,11 @@ def _add_json_date_range_any(
     end_ymd: Optional[str],
 ):
     """
-    在 Order.dynamic_data 中按多个 key 任选其一命中区间（YYYY-MM-DD，字符串比较即可保持时间顺序）
-    注意：这里做的是“包含 end_ymd”。
+    在 Order.dynamic_data 中按多个 key 任选其一命中区间。
+    ✅ 关键修复：把两端都归一化成 YYYYMMDD（8位数字）再比较，兼容：
+       - dl_register_date: 20251113
+       - register_date / first_register_date: 2025-11-13
+    注意：包含 end_ymd。
     """
     s = (start_ymd or "").strip()
     e = (end_ymd or "").strip()
@@ -919,20 +976,26 @@ def _add_json_date_range_any(
         return
     if not s or not e:
         raise HTTPException(status_code=400, detail="first_register_date_start and first_register_date_end are required")
+
     try:
         datetime.strptime(s, "%Y-%m-%d")
         datetime.strptime(e, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="first_register_date_* must be YYYY-MM-DD")
+
     if e < s:
         raise HTTPException(status_code=400, detail="first_register_date_end must be >= first_register_date_start")
+
+    s8 = s.replace("-", "")
+    e8 = e.replace("-", "")
+    if len(s8) != 8 or len(e8) != 8:
+        raise HTTPException(status_code=400, detail="first_register_date_* must be YYYY-MM-DD")
 
     or_terms = []
     for k in keys:
         txt = _json_text_unquoted(Order.dynamic_data, k)
-        # 只取前 10 位，容忍某些值带时间或更长字符串
-        txt10 = func.substr(txt, 1, 10)
-        or_terms.append(and_(txt10 >= s, txt10 <= e))
+        txt8 = _digits8_expr(txt)
+        or_terms.append(and_(txt8 >= s8, txt8 <= e8))
 
     if or_terms:
         clauses.append(or_(*or_terms))
@@ -961,6 +1024,7 @@ async def create_order_draft(
 ):
     user, role_name = user_with_role
     _ensure_orders_access(role_name)
+    _ensure_orders_write_access(role_name)
 
     spid = int(payload.salesperson_id or user.id)
     await _ensure_salesperson_exists(db, spid)
@@ -1031,13 +1095,23 @@ async def finalize_order_upload(
     # 仅放开给 finance，用于维护 related
     _ensure_orders_access(role_name, allow_finance=True)
 
+    # ✅ market 禁止走 finalize（上传写入口）
+    if role_name == ROLE_MARKET:
+        raise HTTPException(status_code=403, detail="No permission")
+
     if role_name == ROLE_FINANCE:
         _ensure_finance_finalize_payload_related_only(payload)
+    else:
+        _ensure_orders_write_access(role_name)
 
     order_id = int(payload.order_id)
     o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
+
+    # ✅ finance 仅允许操作“已完成订单”（与 finance 模块约束对齐）
+    if role_name == ROLE_FINANCE and not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
     # finance 不允许改任何订单字段（上面已校验），这里保留原逻辑给非 finance
     if role_name != ROLE_FINANCE:
@@ -1347,6 +1421,7 @@ async def create_order(
 ):
     user, role_name = user_with_role
     _ensure_orders_access(role_name)
+    _ensure_orders_write_access(role_name)
 
     _ensure_required_customer_channel(
         customer_group_id=payload.customer_group_id,
@@ -1393,6 +1468,7 @@ async def update_order_detail(
 ):
     _user, role_name = user_with_role
     _ensure_orders_access(role_name)
+    _ensure_orders_write_access(role_name)
 
     o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
     if not o:
@@ -1432,6 +1508,7 @@ async def update_order_status(
 ):
     _user, role_name = user_with_role
     _ensure_orders_access(role_name)
+    _ensure_orders_write_access(role_name)
 
     o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
     if not o:

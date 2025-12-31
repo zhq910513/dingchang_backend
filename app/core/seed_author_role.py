@@ -1,3 +1,4 @@
+# app/core/seed_author_role.py
 # encoding: utf-8
 """
 初始化种子数据（dev）
@@ -19,6 +20,7 @@ ROLE_SEEDS = [
     (2, "manager", "主管角色"),
     (3, "sales", "业务账号"),
     (4, "finance", "财务账号"),
+    (5, "market", "市场账号"),  # ✅ 新增：市场账号（具体可见/可写范围由接口与前端权限控制）
 ]
 
 

@@ -1,3 +1,4 @@
+# app/api/v1/users.py
 # encoding: utf-8
 """
 v1 - 用户 / 账号管理（去兼容版）
@@ -20,6 +21,7 @@ from app.core.constants import (
     ROLE_MANAGER,
     ROLE_SALES,
     ROLE_FINANCE,
+    ROLE_MARKET,
     ROLE_CHILD_CREATABLE_MAP,
 )
 from app.models.user import User
@@ -101,10 +103,10 @@ async def create_user(
     """
     创建子账号（去兼容版规则）：
 
-    - super_admin 可创建：manager / sales / finance
-      * 创建 sales/finance：必须指定 manager_id，且 parent_id = manager_id
+    - super_admin 可创建：manager / sales / finance / market
+      * 创建 sales/finance/market：必须指定 manager_id，且 parent_id = manager_id
       * 创建 manager：parent_id = super_admin.id（便于追溯）
-    - manager 可创建：sales / finance
+    - manager 可创建：sales / finance / market
       * parent_id = manager.id
     """
     current_user, current_role_name = user_role
@@ -134,14 +136,14 @@ async def create_user(
     parent_id: Optional[int]
 
     if current_role_name == ROLE_MANAGER:
-        if role.role_name not in (ROLE_SALES, ROLE_FINANCE):
-            raise HTTPException(status_code=403, detail="Manager can only create sales/finance")
+        if role.role_name not in (ROLE_SALES, ROLE_FINANCE, ROLE_MARKET):
+            raise HTTPException(status_code=403, detail="Manager can only create sales/finance/market")
         parent_id = current_user.id
 
     elif current_role_name == ROLE_SUPER_ADMIN:
         if role.role_name == ROLE_MANAGER:
             parent_id = current_user.id
-        elif role.role_name in (ROLE_SALES, ROLE_FINANCE):
+        elif role.role_name in (ROLE_SALES, ROLE_FINANCE, ROLE_MARKET):
             if not payload.manager_id:
                 raise HTTPException(status_code=400, detail="请指定分配给哪个经理（manager_id）")
             mgr = await _ensure_user_is_manager(db, int(payload.manager_id))

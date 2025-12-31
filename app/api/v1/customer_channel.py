@@ -1,17 +1,16 @@
 # app/api/v1/customer_channel.py
 # encoding: utf-8
 """
-客户 / 渠道 分组管理接口（去兼容版 / 共享数据版）
+客户 / 渠道 分组管理接口（共享数据版）
 
-新权限规则（按强哥最新需求）：
-1) 客户管理、渠道管理：不再做 created_by 范围限制，所有人共享（都能查看未删除数据）
-2) 财务账号：只能看，不能新增/删除/恢复
+规则（按当前需求落地）：
+1) 客户管理、渠道管理：共享（都能查看未删除数据）
+2) 财务账号：只能看，不能新增/删除/编辑/覆盖
 3) include_deleted：仅 super_admin 生效（其他角色传 true 也会被忽略）
-4) restore：仅 super_admin 可恢复（与“仅超管可看已删除”匹配）
-
-✅ 新增搜索（后端模糊）：
-- 渠道：channel_code / channel_name / created_by
-- 客户：customer_code / customer_name / market / created_by
+4) restore：仅 super_admin 可恢复（保留接口）
+5) ✅ 编辑：manager / super_admin / market
+6) ✅ 新增：若命中“同键已软删”，则执行“恢复并覆盖”（永远只保留一条）
+   - 若命中“同键未删除”，返回中文提示禁止重复创建
 """
 
 from __future__ import annotations
@@ -27,7 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user_with_role
 from app.core.constants import (
     ROLE_SUPER_ADMIN,
+    ROLE_MANAGER,
     ROLE_FINANCE,
+    ROLE_MARKET,
 )
 from app.core.db import get_db
 from app.models.user import User
@@ -35,9 +36,11 @@ from app.models.customer_group import CustomerGroup
 from app.models.channel_group import ChannelGroup
 from app.schemas.customer_channel import (
     CustomerGroupCreate,
+    CustomerGroupUpdate,
     CustomerGroupOut,
     CustomerGroupListResponse,
     ChannelGroupCreate,
+    ChannelGroupUpdate,
     ChannelGroupOut,
     ChannelGroupListResponse,
     ContactItem,
@@ -64,12 +67,17 @@ def _normalize_include_deleted(role_name: Optional[str], include_deleted: bool) 
 
 def _ensure_can_modify(role_name: Optional[str]) -> None:
     if role_name == ROLE_FINANCE:
-        raise HTTPException(status_code=403, detail="Finance cannot modify customer/channel groups")
+        raise HTTPException(status_code=403, detail="财务账号无操作权限")
+
+
+def _ensure_can_edit(role_name: Optional[str]) -> None:
+    if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_MARKET):
+        raise HTTPException(status_code=403, detail="仅经理账号/超级账号/市场账号可编辑")
 
 
 async def _ensure_can_restore(role_name: Optional[str]) -> None:
     if role_name != ROLE_SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Only super_admin can restore deleted groups")
+        raise HTTPException(status_code=403, detail="仅超级账号可恢复已删除数据")
 
 
 async def _load_user_map(db: AsyncSession, user_ids: list[int]) -> Dict[int, User]:
@@ -101,7 +109,7 @@ def _creator_like_expr(v: Optional[str]):
 
 def _normalize_contacts(contacts: Optional[List[ContactItem]]) -> List[dict]:
     """
-    ✅ 入库前统一规整：
+    入库前统一规整：
     - 去空（value 空的不入库）
     - 去重（type+value）
     - value/type 做 strip（Pydantic 已做校验与部分归一，这里再兜底）
@@ -225,10 +233,32 @@ async def create_customer_group(
         )
     )
     existing = (await db.execute(stmt)).scalar_one_or_none()
+
     if existing:
         if getattr(existing, "deleted_at", None) is None:
-            raise HTTPException(status_code=400, detail="customer_code + customer_name already exists")
-        raise HTTPException(status_code=400, detail="customer_code + customer_name exists but deleted; restore it instead")
+            raise HTTPException(status_code=400, detail="该客户信息已存在，请勿重复创建")
+
+        existing.market = mk or None
+        existing.region = (payload.region or "").strip()
+        existing.contacts = _normalize_contacts(payload.contacts)
+        existing.deleted_at = None
+        await db.commit()
+        await db.refresh(existing)
+
+        return CustomerGroupOut(
+            id=existing.id,
+            customer_code=existing.customer_code,
+            customer_name=existing.customer_name,
+            market=getattr(existing, "market", None),
+            group_name=existing.customer_name,
+            region=existing.region or "",
+            contacts=existing.contacts or [],
+            created_by=getattr(existing, "created_by", None),
+            created_by_name=_user_display_name(current_user),
+            created_at=getattr(existing, "created_at", None),
+            deleted_at=getattr(existing, "deleted_at", None),
+            is_deleted=False,
+        )
 
     obj = CustomerGroup(
         customer_code=code,
@@ -252,6 +282,68 @@ async def create_customer_group(
         region=obj.region or "",
         contacts=obj.contacts or [],
         created_by=obj.created_by,
+        created_by_name=_user_display_name(current_user),
+        created_at=getattr(obj, "created_at", None),
+        deleted_at=getattr(obj, "deleted_at", None),
+        is_deleted=False,
+    )
+
+
+@customer_router.put("/{group_id}", response_model=CustomerGroupOut)
+async def update_customer_group(
+    group_id: int,
+    payload: CustomerGroupUpdate,
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    current_user, role_name = user_role
+    _ensure_can_modify(role_name)
+    _ensure_can_edit(role_name)
+
+    obj = (await db.execute(select(CustomerGroup).where(CustomerGroup.id == group_id))).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Customer group not found")
+    if getattr(obj, "deleted_at", None) is not None:
+        raise HTTPException(status_code=400, detail="该客户已删除，请先恢复后再编辑")
+
+    code = (payload.customer_code or "").strip()
+    name = (payload.customer_name or "").strip()
+    mk = (payload.market or "").strip()
+
+    if not code:
+        raise HTTPException(status_code=400, detail="customer_code is required")
+    if not name:
+        raise HTTPException(status_code=400, detail="customer_name is required")
+
+    stmt = select(CustomerGroup).where(
+        and_(
+            CustomerGroup.customer_code == code,
+            CustomerGroup.customer_name == name,
+            CustomerGroup.id != group_id,
+        )
+    )
+    conflict = (await db.execute(stmt)).scalar_one_or_none()
+    if conflict:
+        raise HTTPException(status_code=400, detail="该客户信息已存在，请勿重复创建")
+
+    obj.customer_code = code
+    obj.customer_name = name
+    obj.market = mk or None
+    obj.region = (payload.region or "").strip()
+    obj.contacts = _normalize_contacts(payload.contacts)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return CustomerGroupOut(
+        id=obj.id,
+        customer_code=obj.customer_code,
+        customer_name=obj.customer_name,
+        market=getattr(obj, "market", None),
+        group_name=obj.customer_name,
+        region=obj.region or "",
+        contacts=obj.contacts or [],
+        created_by=getattr(obj, "created_by", None),
         created_by_name=_user_display_name(current_user),
         created_at=getattr(obj, "created_at", None),
         deleted_at=getattr(obj, "deleted_at", None),
@@ -297,7 +389,7 @@ async def restore_customer_group(
         and_(
             CustomerGroup.customer_code == obj.customer_code,
             CustomerGroup.customer_name == obj.customer_name,
-            CustomerGroup.deleted_at.is_(None),
+            CustomerGroup.id != group_id,
         )
     )
     conflict = (await db.execute(stmt)).scalar_one_or_none()
@@ -404,10 +496,30 @@ async def create_channel_group(
         )
     )
     existing = (await db.execute(stmt)).scalar_one_or_none()
+
     if existing:
         if getattr(existing, "deleted_at", None) is None:
-            raise HTTPException(status_code=400, detail="channel_code + channel_name already exists")
-        raise HTTPException(status_code=400, detail="channel_code + channel_name exists but deleted; restore it instead")
+            raise HTTPException(status_code=400, detail="该渠道信息已存在，请勿重复创建")
+
+        existing.region = (payload.region or "").strip()
+        existing.contacts = _normalize_contacts(payload.contacts)
+        existing.deleted_at = None
+        await db.commit()
+        await db.refresh(existing)
+
+        return ChannelGroupOut(
+            id=existing.id,
+            channel_code=existing.channel_code,
+            channel_name=existing.channel_name,
+            group_name=existing.channel_name,
+            region=existing.region or "",
+            contacts=existing.contacts or [],
+            created_by=getattr(existing, "created_by", None),
+            created_by_name=_user_display_name(current_user),
+            created_at=getattr(existing, "created_at", None),
+            deleted_at=getattr(existing, "deleted_at", None),
+            is_deleted=False,
+        )
 
     obj = ChannelGroup(
         channel_code=code,
@@ -429,6 +541,64 @@ async def create_channel_group(
         region=obj.region or "",
         contacts=obj.contacts or [],
         created_by=obj.created_by,
+        created_by_name=_user_display_name(current_user),
+        created_at=getattr(obj, "created_at", None),
+        deleted_at=getattr(obj, "deleted_at", None),
+        is_deleted=False,
+    )
+
+
+@channel_router.put("/{group_id}", response_model=ChannelGroupOut)
+async def update_channel_group(
+    group_id: int,
+    payload: ChannelGroupUpdate,
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    current_user, role_name = user_role
+    _ensure_can_modify(role_name)
+    _ensure_can_edit(role_name)
+
+    obj = (await db.execute(select(ChannelGroup).where(ChannelGroup.id == group_id))).scalar_one_or_none()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Channel group not found")
+    if getattr(obj, "deleted_at", None) is not None:
+        raise HTTPException(status_code=400, detail="该渠道已删除，请先恢复后再编辑")
+
+    code = (payload.channel_code or "").strip()
+    name = (payload.channel_name or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="channel_code is required")
+    if not name:
+        raise HTTPException(status_code=400, detail="channel_name is required")
+
+    stmt = select(ChannelGroup).where(
+        and_(
+            ChannelGroup.channel_code == code,
+            ChannelGroup.channel_name == name,
+            ChannelGroup.id != group_id,
+        )
+    )
+    conflict = (await db.execute(stmt)).scalar_one_or_none()
+    if conflict:
+        raise HTTPException(status_code=400, detail="该渠道信息已存在，请勿重复创建")
+
+    obj.channel_code = code
+    obj.channel_name = name
+    obj.region = (payload.region or "").strip()
+    obj.contacts = _normalize_contacts(payload.contacts)
+
+    await db.commit()
+    await db.refresh(obj)
+
+    return ChannelGroupOut(
+        id=obj.id,
+        channel_code=obj.channel_code,
+        channel_name=obj.channel_name,
+        group_name=obj.channel_name,
+        region=obj.region or "",
+        contacts=obj.contacts or [],
+        created_by=getattr(obj, "created_by", None),
         created_by_name=_user_display_name(current_user),
         created_at=getattr(obj, "created_at", None),
         deleted_at=getattr(obj, "deleted_at", None),
@@ -474,7 +644,7 @@ async def restore_channel_group(
         and_(
             ChannelGroup.channel_code == obj.channel_code,
             ChannelGroup.channel_name == obj.channel_name,
-            ChannelGroup.deleted_at.is_(None),
+            ChannelGroup.id != group_id,
         )
     )
     conflict = (await db.execute(stmt)).scalar_one_or_none()

@@ -89,6 +89,22 @@ class ChannelGroupCreate(BaseModel):
     contacts: Optional[List[ContactItemIn]] = None
 
 
+# ✅ 编辑入参（本轮新增）：字段沿用创建结构，保持一致性
+class CustomerGroupUpdate(BaseModel):
+    customer_code: str
+    customer_name: str
+    market: Optional[str] = None
+    region: Optional[str] = ""
+    contacts: Optional[List[ContactItemIn]] = None
+
+
+class ChannelGroupUpdate(BaseModel):
+    channel_code: str
+    channel_name: str
+    region: Optional[str] = ""
+    contacts: Optional[List[ContactItemIn]] = None
+
+
 class CustomerGroupOut(BaseModel):
     id: int
     customer_code: str
