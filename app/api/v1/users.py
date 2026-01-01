@@ -149,6 +149,31 @@ async def _ensure_user_is_manager(db: AsyncSession, user_id: int) -> User:
     return u
 
 
+@router.get("/me", response_model=UserSimple)
+async def get_me(
+    db: AsyncSession = Depends(get_db),
+    user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
+):
+    """
+    ✅ 当前登录账号信息（给前端取 team_names / team_name 用）
+    - 任意已登录账号可用
+    - 返回 team_names（兼容 team_name）
+    """
+    _ = db
+    u, role_name = user_role
+    teams = _user_team_names(u)
+
+    return UserSimple(
+        id=int(u.id),
+        username=str(u.username),
+        real_name=getattr(u, "real_name", None),
+        role_name=role_name,
+        is_online=False,
+        team_name=getattr(u, "team_name", None),
+        team_names=teams or None,
+    )
+
+
 @router.get("/managers", response_model=List[UserSimple])
 async def list_managers(
     status: int = Query(1, description="默认仅返回启用账号"),

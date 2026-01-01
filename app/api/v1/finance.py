@@ -18,6 +18,12 @@
 - manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name）
 - finance：只能查看自己 team_name 下的数据（单团队）
 
+✅ 本轮继续补齐（链路打通）：
+- 财务端下拉筛选（只读）：
+  - GET /finance/customer-groups
+  - GET /finance/channel-groups
+  - GET /finance/salespersons
+
 ⚠️ 权限与范围：
 - 仅 finance/manager/super_admin 可用
 - 仅允许操作已完成订单
@@ -30,10 +36,11 @@ import hmac
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
+import anyio
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, delete
+from sqlalchemy import func, select, and_, or_, cast, String, delete, distinct
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -53,7 +60,10 @@ from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
 from app.models.user import User
 from app.models.customer_group import CustomerGroup
+from app.models.channel_group import ChannelGroup
 from app.models.image_file import ImageFile
+from app.models.role import Role
+from app.models.user_role import UserRole
 from app.schemas.order import OrderOut, OrderInfoOut
 from app.schemas.finance import (
     FinanceOrderOut,
@@ -333,6 +343,106 @@ def _to_float(v) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+# ===========================
+# ✅ 财务端筛选下拉（只读）
+# ===========================
+class OptionItem(BaseModel):
+    id: int
+    group_name: str
+
+
+class OptionListOut(BaseModel):
+    items: List[OptionItem] = Field(default_factory=list)
+
+
+class SalespersonItem(BaseModel):
+    id: int
+    username: str
+    real_name: Optional[str] = None
+
+
+class SalespersonListOut(BaseModel):
+    items: List[SalespersonItem] = Field(default_factory=list)
+
+
+@router.get("/customer-groups", response_model=OptionListOut)
+async def finance_list_customer_groups(
+    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
+):
+    _user, role_name, team_names, _team_ids = user_with_role
+    _ensure_finance_access(role_name)
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    stmt = select(CustomerGroup).order_by(CustomerGroup.id.asc())
+
+    if hasattr(CustomerGroup, "deleted_at"):
+        stmt = stmt.where(getattr(CustomerGroup, "deleted_at").is_(None))
+    if status is not None and hasattr(CustomerGroup, "status"):
+        stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
+
+    # ✅ 若 customer_group 具备 team_name 字段，则按财务团队隔离；否则不强行猜字段
+    if hasattr(CustomerGroup, "team_name") and current_team_names is not None:
+        stmt = stmt.where(getattr(CustomerGroup, "team_name").in_(list(current_team_names)))
+
+    rows = (await db.execute(stmt)).scalars().all()
+    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
+
+
+@router.get("/channel-groups", response_model=OptionListOut)
+async def finance_list_channel_groups(
+    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
+):
+    _user, role_name, team_names, _team_ids = user_with_role
+    _ensure_finance_access(role_name)
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
+
+    if hasattr(ChannelGroup, "deleted_at"):
+        stmt = stmt.where(getattr(ChannelGroup, "deleted_at").is_(None))
+    if status is not None and hasattr(ChannelGroup, "status"):
+        stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
+
+    # ✅ channel_group 一般有 team_name：严格按财务团队隔离
+    if hasattr(ChannelGroup, "team_name") and current_team_names is not None:
+        stmt = stmt.where(getattr(ChannelGroup, "team_name").in_(list(current_team_names)))
+
+    rows = (await db.execute(stmt)).scalars().all()
+    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
+
+
+@router.get("/salespersons", response_model=SalespersonListOut)
+async def finance_list_salespersons(
+    status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
+):
+    _user, role_name, team_names, _team_ids = user_with_role
+    _ensure_finance_access(role_name)
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    stmt = (
+        select(distinct(User.id).label("id"), User.username, User.real_name)
+        .select_from(User)
+        .join(UserRole, UserRole.user_id == User.id)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(Role.role_name == ROLE_SALES)
+        .where(User.status == int(status))
+        .order_by(User.id.asc())
+    )
+
+    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance 单团队
+    if current_team_names is not None:
+        stmt = stmt.where(User.team_name.in_(list(current_team_names)))
+
+    rows = (await db.execute(stmt)).all()
+    return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
 
 
 async def _load_finance_order_out(
@@ -718,8 +828,12 @@ def _uri_encode(s: str, encode_slash: bool = True) -> str:
     return out
 
 
-def _hmac_sha256_hex(key: str, msg: str) -> str:
-    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+def _hmac_sha256_digest(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _hmac_sha256_hex(key: bytes, msg: str) -> str:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> str:
@@ -744,15 +858,16 @@ def _bce_auth_v1(
     headers_to_sign: List[str],
     headers: Dict[str, str],
 ) -> str:
+    # ✅ 修复：signing_key 必须是 HMAC digest bytes，不能用 hexdigest 当 key
     auth_prefix = f"bce-auth-v1/{ak}/{timestamp}/{expire_seconds}"
-    signing_key_hex = _hmac_sha256_hex(sk, auth_prefix)
+    signing_key = _hmac_sha256_digest(sk.encode("utf-8"), auth_prefix)
 
     canonical_uri = _uri_encode(path, encode_slash=False)
     canonical_query = ""
     canonical_hdrs = _canonical_headers(headers, headers_to_sign)
     canonical_request = "\n".join([method.upper(), canonical_uri, canonical_query, canonical_hdrs])
 
-    signature = _hmac_sha256_hex(signing_key_hex, canonical_request)
+    signature = _hmac_sha256_hex(signing_key, canonical_request)
     signed_headers_str = ";".join(sorted({str(h).strip().lower() for h in (headers_to_sign or [])}))
     return f"{auth_prefix}/{signed_headers_str}/{signature}"
 
@@ -956,15 +1071,22 @@ async def finance_bos_upload_proxy(
         )
 
     try:
-        exists, etag = _signed_head()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
-
-    if not exists:
+        # ✅ 修复：requests 同步 IO 放线程执行，避免阻塞事件循环
         try:
-            etag = _signed_put()
+            exists, etag = await anyio.to_thread.run_sync(_signed_head)
         except requests.RequestException as e:
-            raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+            raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
+
+        if not exists:
+            try:
+                etag = await anyio.to_thread.run_sync(_signed_put)
+            except requests.RequestException as e:
+                raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
 
     url = storage.object_url_for_display(storage_key, expires_in=900)
 

@@ -89,7 +89,7 @@ def _ensure_finance_related_only_slot(slot_key: str) -> None:
 def _ensure_finance_finalize_payload_related_only(payload) -> None:
     """
     finance 通过 /orders/finalize 仅允许维护 related 图片：
-    - 禁止修改任何订单字段（dynamic_data / customer/channel/salesperson）
+    - 禁止修改任何订单字段（dynamic_data / customer/channel/salesperson / order_info）
     - images/clear_slots 仅允许 related
     """
     # 禁止携带订单字段修改
@@ -99,6 +99,10 @@ def _ensure_finance_finalize_payload_related_only(payload) -> None:
         raise HTTPException(status_code=403, detail="Finance cannot update customer_group_id in orders.finalize")
     if getattr(payload, "channel_group_id", None) is not None:
         raise HTTPException(status_code=403, detail="Finance cannot update channel_group_id in orders.finalize")
+
+    # ✅ 新增：finance 禁止携带 order_info
+    if getattr(payload, "order_info", None) is not None:
+        raise HTTPException(status_code=403, detail="Finance cannot update order_info in orders.finalize")
 
     dyn = getattr(payload, "dynamic_data", None) or {}
     if isinstance(dyn, dict) and len(dyn) > 0:
@@ -135,12 +139,12 @@ def _group_display_name(g) -> Optional[str]:
     if not g:
         return None
     return (
-            getattr(g, "channel_name", None)
-            or getattr(g, "customer_name", None)
-            or getattr(g, "group_name", None)
-            or getattr(g, "name", None)
-            or getattr(g, "customer_code", None)
-            or getattr(g, "channel_code", None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "channel_code", None)
     )
 
 
@@ -159,6 +163,12 @@ def _ensure_non_negative(v: Decimal, field: str) -> None:
 
 
 def _recalc_order_info(info: OrderInfo) -> None:
+    """
+    ✅ 对齐前端 OrderDetail.vue 规则：
+    - premium_total = commercial_amount + compulsory_amount + vehicle_tax_amount + non_vehicle_amount
+    - 渠道合计/客户合计：商业部分 = commercial_amount * (商业点位% + 商业后补%)/100
+    - commercial_after_amount 若历史存在：不再参与合计计算（避免与“点位后补”双口径冲突）
+    """
     cm = _to_decimal(getattr(info, "commercial_amount", 0))
     ca = _to_decimal(getattr(info, "compulsory_amount", 0))
     vta = _to_decimal(getattr(info, "vehicle_tax_amount", 0))
@@ -173,32 +183,36 @@ def _recalc_order_info(info: OrderInfo) -> None:
     info.premium_total = premium_total
 
     ch_cm_p = _to_decimal(getattr(info, "channel_commercial_point", 0))
+    ch_cm_supp_p = _to_decimal(getattr(info, "channel_commercial_supplement_point", 0))  # ✅ 新增
     ch_ca_p = _to_decimal(getattr(info, "channel_compulsory_point", 0))
     ch_vta_p = _to_decimal(getattr(info, "channel_vehicle_tax_point", 0))
     ch_nva_p = _to_decimal(getattr(info, "channel_non_vehicle_point", 0))
     ch_reward = _to_decimal(getattr(info, "channel_reward", 0))
 
     channel_total = (
-            (cm * ch_cm_p / Decimal("100"))
-            + (ca * ch_ca_p / Decimal("100"))
-            + (vta * ch_vta_p / Decimal("100"))
-            + (nva * ch_nva_p / Decimal("100"))
-            + ch_reward
+        (cm * ch_cm_p / Decimal("100"))
+        + (cm * ch_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
+        + (ca * ch_ca_p / Decimal("100"))
+        + (vta * ch_vta_p / Decimal("100"))
+        + (nva * ch_nva_p / Decimal("100"))
+        + ch_reward
     )
     info.channel_total = channel_total
 
     cu_cm_p = _to_decimal(getattr(info, "customer_commercial_point", 0))
+    cu_cm_supp_p = _to_decimal(getattr(info, "customer_commercial_supplement_point", 0))  # ✅ 新增
     cu_ca_p = _to_decimal(getattr(info, "customer_compulsory_point", 0))
     cu_vta_p = _to_decimal(getattr(info, "customer_vehicle_tax_point", 0))
     cu_nva_p = _to_decimal(getattr(info, "customer_non_vehicle_point", 0))
     cu_reward = _to_decimal(getattr(info, "customer_reward", 0))
 
     customer_total = (
-            (cm * cu_cm_p / Decimal("100"))
-            + (ca * cu_ca_p / Decimal("100"))
-            + (vta * cu_vta_p / Decimal("100"))
-            + (nva * cu_nva_p / Decimal("100"))
-            + cu_reward
+        (cm * cu_cm_p / Decimal("100"))
+        + (cm * cu_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
+        + (ca * cu_ca_p / Decimal("100"))
+        + (vta * cu_vta_p / Decimal("100"))
+        + (nva * cu_nva_p / Decimal("100"))
+        + cu_reward
     )
     info.customer_total = customer_total
 
@@ -217,6 +231,11 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     if payload.commercial_amount is not None:
         info.commercial_amount = _to_decimal(payload.commercial_amount)
+
+    # ✅ 兼容旧字段（若 schema/model 仍存在），但不再参与合计计算
+    if getattr(payload, "commercial_after_amount", None) is not None:
+        info.commercial_after_amount = _to_decimal(getattr(payload, "commercial_after_amount"))
+
     if payload.compulsory_amount is not None:
         info.compulsory_amount = _to_decimal(payload.compulsory_amount)
     if payload.vehicle_tax_amount is not None:
@@ -226,6 +245,11 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     if payload.channel_commercial_point is not None:
         info.channel_commercial_point = _to_decimal(payload.channel_commercial_point)
+
+    # ✅ 新增：渠道-商业后补点位
+    if getattr(payload, "channel_commercial_supplement_point", None) is not None:
+        info.channel_commercial_supplement_point = _to_decimal(getattr(payload, "channel_commercial_supplement_point"))
+
     if payload.channel_compulsory_point is not None:
         info.channel_compulsory_point = _to_decimal(payload.channel_compulsory_point)
     if payload.channel_vehicle_tax_point is not None:
@@ -237,6 +261,11 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     if payload.customer_commercial_point is not None:
         info.customer_commercial_point = _to_decimal(payload.customer_commercial_point)
+
+    # ✅ 新增：客户-商业后补点位
+    if getattr(payload, "customer_commercial_supplement_point", None) is not None:
+        info.customer_commercial_supplement_point = _to_decimal(getattr(payload, "customer_commercial_supplement_point"))
+
     if payload.customer_compulsory_point is not None:
         info.customer_compulsory_point = _to_decimal(payload.customer_compulsory_point)
     if payload.customer_vehicle_tax_point is not None:
@@ -317,12 +346,12 @@ async def _manager_allowed_salesperson_ids(db: AsyncSession, manager_id: int, te
 
 
 async def _ensure_order_acl_by_salesperson_id(
-        db: AsyncSession,
-        *,
-        salesperson_id: int,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
+    db: AsyncSession,
+    *,
+    salesperson_id: int,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
 ) -> None:
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -356,12 +385,12 @@ async def _ensure_order_acl_by_salesperson_id(
 
 
 async def _apply_orders_list_acl(
-        db: AsyncSession,
-        *,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
-        clauses: List,
+    db: AsyncSession,
+    *,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
+    clauses: List,
 ) -> None:
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -390,12 +419,12 @@ async def _apply_orders_list_acl(
 
 
 async def _load_order_out(
-        db: AsyncSession,
-        order_id: int,
-        *,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
 ) -> OrderOut:
     stmt = (
         select(Order)
@@ -456,15 +485,15 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
 
 
 async def _get_or_create_image_file(
-        db: AsyncSession,
-        *,
-        storage_key: str,
-        url: str,
-        size: int,
-        original_name: Optional[str],
-        content_type: Optional[str],
-        etag: Optional[str],
-        md5: str,
+    db: AsyncSession,
+    *,
+    storage_key: str,
+    url: str,
+    size: int,
+    original_name: Optional[str],
+    content_type: Optional[str],
+    etag: Optional[str],
+    md5: str,
 ) -> ImageFile:
     storage_key = (storage_key or "").strip().lstrip("/")
     md5 = (md5 or "").strip().lower()
@@ -543,9 +572,9 @@ class OptionListOut(BaseModel):
 
 @router.get("/customer-groups", response_model=OptionListOut)
 async def list_customer_groups(
-        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -564,20 +593,31 @@ async def list_customer_groups(
 
 @router.get("/channel-groups", response_model=OptionListOut)
 async def list_channel_groups(
-        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
-    # ✅ customer/channel 是否需要团队过滤，取决于模型字段，当前未提供，不能猜
     _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
+
+    tns = _normalize_team_names(team_names)
 
     stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
     if hasattr(ChannelGroup, "deleted_at"):
         stmt = stmt.where(getattr(ChannelGroup, "deleted_at").is_(None))
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
+
+    # ✅ 团队隔离：ChannelGroup 已有 team_name 字段，必须过滤
+    if hasattr(ChannelGroup, "team_name"):
+        if role_name == ROLE_SUPER_ADMIN:
+            pass
+        elif role_name == ROLE_MANAGER:
+            stmt = stmt.where(ChannelGroup.team_name.in_(list(tns)))
+        else:
+            my_team = _require_single_team_for_strict_roles(role_name, tns)
+            stmt = stmt.where(ChannelGroup.team_name == my_team)
 
     rows = (await db.execute(stmt)).scalars().all()
     return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
@@ -595,9 +635,9 @@ class SalespersonListOut(BaseModel):
 
 @router.get("/salespersons", response_model=SalespersonListOut)
 async def list_salespersons(
-        status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -636,8 +676,7 @@ async def list_salespersons(
         stmt = stmt.where(User.id == current_user.id)
 
     rows = (await db.execute(stmt)).all()
-    return SalespersonListOut(
-        items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
+    return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
 
 
 # ===========================
@@ -656,12 +695,12 @@ class OcrTaskListOut(BaseModel):
 
 
 async def _apply_ocr_task_acl(
-        db: AsyncSession,
-        *,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
-        stmt,
+    db: AsyncSession,
+    *,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
+    stmt,
 ):
     rn = role_name or ""
 
@@ -708,12 +747,12 @@ async def _apply_ocr_task_acl(
 
 @router.get("/ocr-tasks", response_model=OcrTaskListOut)
 async def list_order_ocr_tasks(
-        limit: int = Query(50, ge=1, le=200),
-        order_id: Optional[int] = Query(None),
-        active_only: bool = Query(False),
-        status: Optional[str] = Query(None),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    limit: int = Query(50, ge=1, le=200),
+    order_id: Optional[int] = Query(None),
+    active_only: bool = Query(False),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -765,8 +804,8 @@ class BosStsOut(BaseModel):
 
 @router.get("/bos-sts", response_model=BosStsOut)
 async def get_bos_sts(
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     # finance 仍然禁止拿 sts（避免直传任意 slot）
@@ -804,8 +843,12 @@ def _uri_encode(s: str, encode_slash: bool = True) -> str:
     return out
 
 
-def _hmac_sha256_hex(key: str, msg: str) -> str:
-    return hmac.new(key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+def _hmac_sha256_digest(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _hmac_sha256_hex(key: bytes, msg: str) -> str:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> str:
@@ -820,25 +863,26 @@ def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> s
 
 
 def _bce_auth_v1(
-        *,
-        ak: str,
-        sk: str,
-        method: str,
-        path: str,
-        timestamp: str,
-        expire_seconds: int,
-        headers_to_sign: List[str],
-        headers: Dict[str, str],
+    *,
+    ak: str,
+    sk: str,
+    method: str,
+    path: str,
+    timestamp: str,
+    expire_seconds: int,
+    headers_to_sign: List[str],
+    headers: Dict[str, str],
 ) -> str:
+    # ✅ 修复：signing_key 必须是 HMAC digest bytes，不能用 hexdigest 当 key
     auth_prefix = f"bce-auth-v1/{ak}/{timestamp}/{expire_seconds}"
-    signing_key_hex = _hmac_sha256_hex(sk, auth_prefix)
+    signing_key = _hmac_sha256_digest(sk.encode("utf-8"), auth_prefix)
 
     canonical_uri = _uri_encode(path, encode_slash=False)
     canonical_query = ""
     canonical_hdrs = _canonical_headers(headers, headers_to_sign)
     canonical_request = "\n".join([method.upper(), canonical_uri, canonical_query, canonical_hdrs])
 
-    signature = _hmac_sha256_hex(signing_key_hex, canonical_request)
+    signature = _hmac_sha256_hex(signing_key, canonical_request)
     signed_headers_str = ";".join(sorted({str(h).strip().lower() for h in (headers_to_sign or [])}))
     return f"{auth_prefix}/{signed_headers_str}/{signature}"
 
@@ -893,10 +937,10 @@ class BosProxyUploadOut(BaseModel):
 
 @router.post("/bos-upload", response_model=BosProxyUploadOut)
 async def bos_upload_proxy(
-        slot_key: str = Form(...),
-        file: UploadFile = File(...),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    slot_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1005,10 +1049,10 @@ async def bos_upload_proxy(
 
         r = sess.request("PUT", url0, headers=headers, data=file.file, timeout=(10, 180))
         if 200 <= r.status_code < 300:
-            return (r.headers.get("ETag") or "")
+            return r.headers.get("ETag") or ""
         rid = r.headers.get("x-bce-request-id") or ""
         dbg = r.headers.get("x-bce-debug-id") or ""
-        body = ""
+
         try:
             body = r.text or ""
         except Exception:
@@ -1019,7 +1063,7 @@ async def bos_upload_proxy(
         )
 
     try:
-        # ✅ 关键优化：requests(同步IO) 放线程里跑，避免阻塞 FastAPI 事件循环
+        # ✅ requests(同步IO) 放线程里跑，避免阻塞 FastAPI 事件循环
         try:
             exists, etag = await anyio.to_thread.run_sync(_signed_head)
         except requests.RequestException as e:
@@ -1163,11 +1207,11 @@ def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime
 
 
 def _add_json_date_range_any(
-        clauses: list,
-        *,
-        keys: List[str],
-        start_ymd: Optional[str],
-        end_ymd: Optional[str],
+    clauses: list,
+    *,
+    keys: List[str],
+    start_ymd: Optional[str],
+    end_ymd: Optional[str],
 ):
     """
     在 Order.dynamic_data 中按多个 key 任选其一命中区间。
@@ -1181,8 +1225,7 @@ def _add_json_date_range_any(
     if not s and not e:
         return
     if not s or not e:
-        raise HTTPException(status_code=400,
-                            detail="first_register_date_start and first_register_date_end are required")
+        raise HTTPException(status_code=400, detail="first_register_date_start and first_register_date_end are required")
 
     try:
         datetime.strptime(s, "%Y-%m-%d")
@@ -1218,6 +1261,9 @@ class OrderDraftIn(BaseModel):
     channel_group_id: Optional[int] = None
     salesperson_id: Optional[int] = None
 
+    # ✅ 对齐前端：草稿阶段允许携带 order_info
+    order_info: Optional[OrderInfoIn] = None
+
 
 class OrderDraftOut(BaseModel):
     order_id: int
@@ -1225,9 +1271,9 @@ class OrderDraftOut(BaseModel):
 
 @router.post("/draft", response_model=OrderDraftOut)
 async def create_order_draft(
-        payload: OrderDraftIn,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    payload: OrderDraftIn,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1269,7 +1315,10 @@ async def create_order_draft(
     await db.flush()
 
     info = OrderInfo(order_id=int(o.id))
-    _recalc_order_info(info)
+    if payload.order_info is not None:
+        _apply_order_info_patch(info, payload.order_info)
+    else:
+        _recalc_order_info(info)
     db.add(info)
 
     await db.commit()
@@ -1299,6 +1348,9 @@ class OrderFinalizeIn(BaseModel):
     channel_group_id: Optional[int] = None
     salesperson_id: Optional[int] = None
 
+    # ✅ 对齐前端：finalize 阶段允许携带 order_info（finance 会被禁止）
+    order_info: Optional[OrderInfoIn] = None
+
 
 class OrderFinalizeOut(BaseModel):
     ok: bool = True
@@ -1309,9 +1361,9 @@ class OrderFinalizeOut(BaseModel):
 
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
-        payload: OrderFinalizeIn,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    payload: OrderFinalizeIn,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1467,8 +1519,15 @@ async def finalize_order_upload(
     info = (await db.execute(select(OrderInfo).where(OrderInfo.order_id == order_id))).scalar_one_or_none()
     if not info:
         info = OrderInfo(order_id=order_id)
-        _recalc_order_info(info)
         db.add(info)
+
+    # ✅ 对齐前端：finalize 阶段允许同步更新 order_info（finance 已被拦截）
+    if role_name != ROLE_FINANCE and payload.order_info is not None:
+        _apply_order_info_patch(info, payload.order_info)
+    else:
+        # 没传且是新建：补齐计算字段
+        if getattr(info, "premium_total", None) is None:
+            _recalc_order_info(info)
 
     ocr_task_id: Optional[int] = None
     ocr_status: Optional[str] = None
@@ -1503,31 +1562,29 @@ async def finalize_order_upload(
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
-        page: int = Query(1, ge=1),
-        page_size: int = Query(20, ge=1, le=200),
-        is_finished: Optional[bool] = Query(None),
-        salesperson_id: Optional[int] = Query(None),
-        created_by: Optional[int] = Query(None),
-        customer_group_id: Optional[int] = Query(None),
-        channel_group_id: Optional[int] = Query(None),
-
-        # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
-        created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
-        created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
-        created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
-
-        first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
-        first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
-        owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
-        id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
-        plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
-        engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
-        vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
-        vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
-        vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
-        remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    is_finished: Optional[bool] = Query(None),
+    salesperson_id: Optional[int] = Query(None),
+    created_by: Optional[int] = Query(None),
+    customer_group_id: Optional[int] = Query(None),
+    channel_group_id: Optional[int] = Query(None),
+    # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
+    created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
+    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
+    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+    first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
+    first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
+    owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
+    id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
+    plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
+    engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
+    vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
+    vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
+    vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
+    remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1653,9 +1710,9 @@ async def list_orders(
 
 @router.get("/{order_id:int}", response_model=OrderOut)
 async def get_order_detail(
-        order_id: int,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1667,9 +1724,9 @@ async def get_order_detail(
 
 @router.post("", response_model=OrderOut)
 async def create_order(
-        payload: OrderCreate,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    payload: OrderCreate,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1728,10 +1785,10 @@ async def create_order(
 
 @router.put("/{order_id:int}", response_model=OrderOut)
 async def update_order_detail(
-        order_id: int,
-        payload: OrderUpdate,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    payload: OrderUpdate,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1788,10 +1845,10 @@ async def update_order_detail(
 
 @router.patch("/{order_id:int}/status")
 async def update_order_status(
-        order_id: int,
-        payload: OrderStatusUpdate,
-        db: AsyncSession = Depends(get_db),
-        user_with_role=Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    payload: OrderStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1818,8 +1875,7 @@ async def update_order_status(
             raise HTTPException(status_code=403, detail="Only manager/super_admin can reopen finished order")
 
         if bool(payload.is_finished) is True:
-            _ensure_required_customer_channel(customer_group_id=o.customer_group_id,
-                                              channel_group_id=o.channel_group_id)
+            _ensure_required_customer_channel(customer_group_id=o.customer_group_id, channel_group_id=o.channel_group_id)
 
         o.is_finished = bool(payload.is_finished)
 

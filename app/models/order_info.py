@@ -35,6 +35,10 @@ class OrderInfo(Base):
 
     # Row 2 渠道点位（允许负数）
     channel_commercial_point = Column(Numeric(10, 4), nullable=False, default=0)
+
+    # ✅ 新增：渠道-商业后补点位（允许负数）
+    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, default=0)
+
     channel_compulsory_point = Column(Numeric(10, 4), nullable=False, default=0)
     channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, default=0)
     channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, default=0)
@@ -44,6 +48,10 @@ class OrderInfo(Base):
 
     # Row 3 客户/产品点位（允许负数）
     customer_commercial_point = Column(Numeric(10, 4), nullable=False, default=0)
+
+    # ✅ 新增：客户-商业后补点位（允许负数）
+    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, default=0)
+
     customer_compulsory_point = Column(Numeric(10, 4), nullable=False, default=0)
     customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, default=0)
     customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, default=0)

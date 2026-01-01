@@ -55,12 +55,20 @@ class OrderInfoIn(BaseModel):
     non_vehicle_amount: Optional[float] = None
 
     channel_commercial_point: Optional[float] = None
+
+    # ✅ 新增：渠道-商业后补点位
+    channel_commercial_supplement_point: Optional[float] = None
+
     channel_compulsory_point: Optional[float] = None
     channel_vehicle_tax_point: Optional[float] = None
     channel_non_vehicle_point: Optional[float] = None
     channel_reward: Optional[float] = None
 
     customer_commercial_point: Optional[float] = None
+
+    # ✅ 新增：客户-商业后补点位
+    customer_commercial_supplement_point: Optional[float] = None
+
     customer_compulsory_point: Optional[float] = None
     customer_vehicle_tax_point: Optional[float] = None
     customer_non_vehicle_point: Optional[float] = None
@@ -78,6 +86,10 @@ class OrderInfoOut(BaseModel):
     premium_total: float = 0
 
     channel_commercial_point: float = 0
+
+    # ✅ 新增：渠道-商业后补点位
+    channel_commercial_supplement_point: float = 0
+
     channel_compulsory_point: float = 0
     channel_vehicle_tax_point: float = 0
     channel_non_vehicle_point: float = 0
@@ -85,6 +97,10 @@ class OrderInfoOut(BaseModel):
     channel_total: float = 0
 
     customer_commercial_point: float = 0
+
+    # ✅ 新增：客户-商业后补点位
+    customer_commercial_supplement_point: float = 0
+
     customer_compulsory_point: float = 0
     customer_vehicle_tax_point: float = 0
     customer_non_vehicle_point: float = 0
