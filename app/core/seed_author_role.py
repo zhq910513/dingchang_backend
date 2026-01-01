@@ -1,14 +1,14 @@
 # app/core/seed_author_role.py
 # encoding: utf-8
 """
-初始化种子数据（dev）
+初始化种子数据
 - 初始化角色（幂等）
 - 初始化超级用户（幂等）
 
-✅ 安全门禁（本轮修复）：
-- 默认仅允许在 dev/local 环境创建“默认超管账号”
-- 或者显式设置环境变量 ALLOW_DEV_SEED_SUPER_USER=1 才允许创建
-- 支持 env 覆盖账号/密码/姓名，避免写死口令
+⚠️ 注意：
+- 已取消“仅 dev/local 才允许创建默认超管”的门禁。
+- 只要 AUTO_SEED_AUTH=1 并调用 seed_initial_data，就会尝试创建默认超管账号（幂等）。
+- 默认不会覆盖已存在用户的密码（避免覆盖真实环境改过的密码）。
 """
 
 import os
@@ -28,40 +28,6 @@ ROLE_SEEDS = [
     (4, "finance", "财务账号"),
     (5, "market", "市场账号"),  # ✅ 新增：市场账号（具体可见/可写范围由接口与前端权限控制）
 ]
-
-
-def _truthy(v: str | None) -> bool:
-    s = (v or "").strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
-
-
-def _guess_env_name() -> str:
-    # 多种常见 env 变量兜底
-    for k in ("APP_ENV", "ENV", "FASTAPI_ENV", "PYTHON_ENV", "ENVIRONMENT"):
-        v = (os.getenv(k) or "").strip().lower()
-        if v:
-            return v
-    # 尝试从 settings 读取（如果项目有）
-    try:
-        from app.core.config import settings  # type: ignore
-
-        for attr in ("ENV", "env", "environment", "APP_ENV"):
-            v = str(getattr(settings, attr, "") or "").strip().lower()
-            if v:
-                return v
-    except Exception:
-        pass
-    return ""
-
-
-def _allow_seed_super_user() -> bool:
-    # 显式开关优先
-    if _truthy(os.getenv("ALLOW_DEV_SEED_SUPER_USER")):
-        return True
-
-    env_name = _guess_env_name()
-    # 仅 dev/local 类环境允许默认超管种子
-    return env_name in ("dev", "development", "local", "test")
 
 
 async def seed_roles(db: AsyncSession):
@@ -88,10 +54,7 @@ async def seed_roles(db: AsyncSession):
 
 
 async def seed_super_user(db: AsyncSession):
-    # ✅ 安全门禁：非允许环境直接跳过
-    if not _allow_seed_super_user():
-        return
-
+    # ✅ 已取消环境门禁：只要调用到这里就允许创建默认超管（幂等）
     username = (os.getenv("SEED_SUPER_USERNAME") or "dingchang_admin").strip()
     raw_password = (os.getenv("SEED_SUPER_PASSWORD") or "dingchang_admin@123456").strip()
     real_name = (os.getenv("SEED_SUPER_REAL_NAME") or "dingchang").strip()
