@@ -41,7 +41,7 @@ def _build_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
-    # ✅ 关键：避免公司代理/系统代理干扰（对齐你的 Python 成功脚本）
+    # ✅ 关键：避免系统代理干扰
     s.trust_env = False
     return s
 
@@ -70,23 +70,23 @@ class BceStsService:
         self._safety_seconds = 120
 
     def _require_config(self) -> tuple[str, str, str, str, str]:
-        ak = (getattr(settings, "BCE_AK", "") or "").strip()
-        sk = (getattr(settings, "BCE_SK", "") or "").strip()
-        account_id = (getattr(settings, "BCE_ACCOUNT_ID", "") or "").strip()
-        role_name = (getattr(settings, "BCE_ROLE_NAME", "") or "").strip()
-        sts_host = (getattr(settings, "BCE_STS_HOST", "") or "sts.bj.baidubce.com").strip()
+        # ✅ 对齐你的 .env：BOS_STS_*
+        ak = (getattr(settings, "BOS_STS_ACCESS_KEY", "") or "").strip()
+        sk = (getattr(settings, "BOS_STS_SECRET_KEY", "") or "").strip()
+        account_id = (getattr(settings, "BOS_STS_ACCOUNT_ID", "") or "").strip()
+        role_name = (getattr(settings, "BOS_STS_ROLE_NAME", "") or "").strip()
+        sts_host = (getattr(settings, "BOS_STS_HOST", "") or "sts.bj.baidubce.com").strip()
         if not (ak and sk and account_id and role_name):
-            raise RuntimeError("STS 未配置：请设置 BCE_AK/BCE_SK/BCE_ACCOUNT_ID/BCE_ROLE_NAME")
+            raise RuntimeError("STS 未配置：请设置 BOS_STS_ACCESS_KEY/BOS_STS_SECRET_KEY/BOS_STS_ACCOUNT_ID/BOS_STS_ROLE_NAME")
         return ak, sk, account_id, role_name, sts_host
 
     def _build_access_control_list(self) -> Optional[list[dict]]:
         """
-        ✅ 对齐你 Python 成功脚本：给临时凭证绑定 BOS 权限
+        给临时凭证绑定 BOS 权限（session policy）
         """
         bucket = (getattr(settings, "BOS_BUCKET", "") or "").strip()
         region = (getattr(settings, "BOS_REGION", "") or "").strip()
         if not (bucket and region):
-            # 没有桶/区域配置就不强行绑定 ACL（避免上线直接炸）
             return None
 
         return [
@@ -113,7 +113,7 @@ class BceStsService:
                 return self._cached
 
             ak, sk, account_id, role_name, sts_host = self._require_config()
-            dur = int(duration_seconds or getattr(settings, "BCE_STS_DURATION_SECONDS", 900) or 900)
+            dur = int(duration_seconds or 900)
 
             path = "/v1/credential"
             endpoint = f"https://{sts_host}{path}"
@@ -126,7 +126,6 @@ class BceStsService:
 
             x_bce_date = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-            # ✅ 对齐 Python：body 里塞 accessControlList
             acl = self._build_access_control_list()
             body_obj: dict[str, Any] = {}
             if acl:
