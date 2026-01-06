@@ -24,6 +24,9 @@
   - GET /finance/channel-groups
   - GET /finance/salespersons
 
+✅ 本轮新增（财务汇总）：
+- GET /finance/orders/summary：按“搜索条件”在数据库全量聚合（不受分页影响）
+
 ⚠️ 权限与范围：
 - 仅 finance/manager/super_admin 可用
 - 仅允许操作已完成订单
@@ -241,10 +244,14 @@ def _digits8_expr(expr):
 
 
 def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
+    """
+    ✅ 修正点：
+    - 用 _json_text_unquoted() 再 lower，避免部分方言/驱动返回带引号导致 like 命中不稳定
+    """
     v = (value or "").strip()
     if not v:
         return
-    expr = func.lower(_json_text(Order.dynamic_data, key))
+    expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
     clauses.append(expr.like(f"%{v.lower()}%"))
 
 
@@ -499,6 +506,144 @@ async def _load_finance_order_out(
         channel_group_name=_group_display_name(getattr(o, "channel_group", None)),
         salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
         order_info=_order_info_out(info),
+    )
+
+
+# ===========================
+# ✅ 财务汇总（数据库全量聚合）
+# ===========================
+class FinanceOrdersSummaryOut(BaseModel):
+    commercial_amount: float = 0.0
+    compulsory_amount: float = 0.0
+    vehicle_tax_amount: float = 0.0
+    noncar_amount: float = 0.0
+    receivable: float = 0.0
+    payable: float = 0.0
+    profit: float = 0.0
+
+
+@router.get("/orders/summary", response_model=FinanceOrdersSummaryOut)
+async def finance_orders_summary(
+    order_id: Optional[int] = Query(None, description="精确订单ID"),
+    created_date: Optional[str] = Query(None, description="日期 YYYY-MM-DD（兼容旧参数：按北京时间过滤 created_at 单日）"),
+    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
+    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+    channel_group_id: Optional[int] = Query(None, description="渠道"),
+    customer_group_id: Optional[int] = Query(None, description="客户"),
+    market: Optional[str] = Query(None, description="市场（模糊）"),
+    owner_name: Optional[str] = Query(None, description="车主（模糊）"),
+    insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
+    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
+    first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
+    first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
+    is_paid: Optional[bool] = Query(None, description="是否回款"),
+    is_rebate: Optional[bool] = Query(None, description="是否返点"),
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
+):
+    _current_user, role_name, team_names, _team_ids = user_with_role
+    _ensure_finance_access(role_name)
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    clauses: list = []
+
+    # ✅ 基础范围：仅已完成订单
+    stmt = (
+        select(
+            func.coalesce(func.sum(OrderInfo.commercial_amount), 0).label("commercial_amount"),
+            func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
+            func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
+            func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("noncar_amount"),
+            func.coalesce(func.sum(OrderInfo.customer_total), 0).label("receivable"),
+            func.coalesce(func.sum(OrderInfo.channel_total), 0).label("payable"),
+            func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
+        )
+        .select_from(Order)
+        .join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        .where(Order.is_finished.is_(True))
+    )
+
+    # ✅ 团队隔离：按 salesperson.team_name（支持经理多团队）
+    if current_team_names is not None:
+        stmt = stmt.join(User, User.id == Order.salesperson_id)
+        clauses.append(User.team_name.in_(list(current_team_names)))
+
+    if order_id is not None:
+        clauses.append(Order.id == int(order_id))
+
+    if channel_group_id is not None:
+        clauses.append(Order.channel_group_id == int(channel_group_id))
+    if customer_group_id is not None:
+        clauses.append(Order.customer_group_id == int(customer_group_id))
+
+    # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
+    if created_date_start or created_date_end:
+        if not created_date_start or not created_date_end:
+            raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
+        rng = _parse_bj_date_span(created_date_start, created_date_end)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
+        start_utc, end_utc = rng
+        clauses.append(Order.created_at >= start_utc)
+        clauses.append(Order.created_at < end_utc)
+    elif created_date:
+        rng = _parse_bj_date_range(created_date)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
+        start_utc, end_utc = rng
+        clauses.append(Order.created_at >= start_utc)
+        clauses.append(Order.created_at < end_utc)
+
+    if is_paid is not None:
+        clauses.append(Order.is_paid.is_(bool(is_paid)))
+    if is_rebate is not None:
+        clauses.append(Order.is_rebate.is_(bool(is_rebate)))
+
+    if (market or "").strip():
+        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        mk = (market or "").strip().lower()
+        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
+
+    if (owner_name or "").strip():
+        _add_json_fuzzy(clauses, "id_name", owner_name)
+
+    # ✅ 初登日期：first_register_date 对应 dl_register_date（主字段）
+    if first_register_date_start or first_register_date_end:
+        _add_json_date_range_any(
+            clauses,
+            keys=["dl_register_date", "register_date", "first_register_date"],
+            start_ymd=first_register_date_start,
+            end_ymd=first_register_date_end,
+            err_prefix="first_register_date",
+        )
+    elif (first_register_date or "").strip():
+        # ✅ 兼容旧逻辑：模糊（例如传 "2025-01"），也兼容传 "202501"
+        v = (first_register_date or "").strip()
+        v2 = v.replace("-", "")
+        _add_json_fuzzy(clauses, "dl_register_date", v)
+        _add_json_fuzzy(clauses, "dl_register_date", v2)
+        _add_json_fuzzy(clauses, "register_date", v)
+        _add_json_fuzzy(clauses, "first_register_date", v)
+
+    if (insurance_expire_date or "").strip():
+        d = _parse_ymd(insurance_expire_date)
+        if not d:
+            raise HTTPException(status_code=400, detail="insurance_expire_date must be YYYY-MM-DD")
+        clauses.append(OrderInfo.insurance_expire_date == d.date())
+
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+
+    row = (await db.execute(stmt)).mappings().first() or {}
+
+    return FinanceOrdersSummaryOut(
+        commercial_amount=float(row.get("commercial_amount") or 0),
+        compulsory_amount=float(row.get("compulsory_amount") or 0),
+        vehicle_tax_amount=float(row.get("vehicle_tax_amount") or 0),
+        noncar_amount=float(row.get("noncar_amount") or 0),
+        receivable=float(row.get("receivable") or 0),
+        payable=float(row.get("payable") or 0),
+        profit=float(row.get("profit") or 0),
     )
 
 

@@ -1,19 +1,14 @@
+# app/core/config.py
 # encoding: utf-8
 """
 应用配置（统一从 .env / 环境变量读取，代码里通过 settings 使用）
-
-B1 方案（STS + MD5 Key + 前端直传）约定：
-- 后端只负责：发放 STS 临时凭证、落库、OCR worker 侧生成短期 GET 签名 URL
-- 前端负责：MD5 去重 + HEAD 判断 + PUT 上传
 """
-
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
-# ---- Pydantic v1 / v2 兼容 ----
 PYDANTIC_V2 = False
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
@@ -45,7 +40,11 @@ class Settings(BaseSettings):
     DB_PORT: int = Field(default=3306)
     DB_NAME: str = Field(default="order_system")
 
-    # 可选：直接提供完整 DSN（提供则优先使用）
+    # ✅ 连接池参数（让 backend.env 生效）
+    DB_POOL_SIZE: int = Field(default=20)
+    DB_MAX_OVERFLOW: int = Field(default=20)
+    DB_POOL_RECYCLE: int = Field(default=1800)
+
     ASYNC_DATABASE_URI_OVERRIDE: Optional[str] = Field(default=None)
     SYNC_DATABASE_URI_OVERRIDE: Optional[str] = Field(default=None)
 
@@ -65,8 +64,16 @@ class Settings(BaseSettings):
     # Logging / Paths
     # -----------------------------
     LOG_LEVEL: str = Field(default="INFO")
+
+    # 运行期落盘目录（容器内）；建议通过 backend.env 配成 /app/storage /app/logs
     STORAGE_ROOT: str = Field(default="./storage")
     LOG_DIR: str = Field(default="./logs")
+
+    # ✅ 静态访问前缀（让你 backend.env 的 LOCAL_PUBLIC_PREFIX 生效）
+    LOCAL_PUBLIC_PREFIX: str = Field(default="/static")
+
+    # ✅ 可选：静态目录单独指定；不填则回落到 STORAGE_ROOT
+    LOCAL_STORAGE_ROOT: Optional[str] = Field(default=None)
 
     # -----------------------------
     # BOS（方案B1：STS + 前端直传）
@@ -76,14 +83,12 @@ class Settings(BaseSettings):
     BOS_BUCKET: str = Field(default="dingchang")
     BOS_REGION: str = Field(default="fwh")  # 华中-武汉
 
-    # 允许覆盖派生值（有自定义域名/CDN 或特殊网络时会用到）
     BOS_VHOST_OVERRIDE: Optional[str] = Field(default=None)
     BOS_ENDPOINT_HOST_OVERRIDE: Optional[str] = Field(default=None)
     BOS_BASE_URL_OVERRIDE: Optional[str] = Field(default=None)
 
     BOS_SIGNED_GET_URL: bool = Field(default=False)
 
-    # STS：后端用“子用户长期 AK/SK”去 AssumeRole，生成临时凭证给前端
     BOS_STS_ACCOUNT_ID: Optional[str] = Field(default=None)
     BOS_STS_ROLE_NAME: str = Field(default="bos_uploader")
     BOS_STS_ACCESS_KEY: Optional[str] = Field(default=None)
@@ -119,21 +124,14 @@ class Settings(BaseSettings):
         def _validate_prod(cls, values):
             env = str(values.get("ENV", "dev")).strip().lower()
             if env in {"prod", "production"}:
-                # 必须替换 SECRET_KEY
                 if _is_placeholder(values.get("SECRET_KEY")):
                     raise ValueError("SECRET_KEY must be set via environment variables in prod.")
-
-                # 必须提供 DB_PASSWORD（且不能是弱默认）
                 if _is_placeholder(values.get("DB_PASSWORD")):
                     raise ValueError("DB_PASSWORD must be set via environment variables in prod.")
-
-                # BOS/STS
                 if bool(values.get("BOS_ENABLED", True)):
                     for k in ("BOS_STS_ACCOUNT_ID", "BOS_STS_ACCESS_KEY", "BOS_STS_SECRET_KEY"):
                         if _is_placeholder(values.get(k)):
                             raise ValueError(f"{k} must be set via environment variables in prod when BOS_ENABLED=true.")
-
-                # OCR
                 if bool(values.get("BAIDU_OCR_ENABLED", True)):
                     for k in ("BAIDU_API_KEY", "BAIDU_SECRET_KEY"):
                         if _is_placeholder(values.get(k)):
@@ -141,28 +139,23 @@ class Settings(BaseSettings):
             return values
 
     def _validate_required_for_env(self) -> None:
-        """pydantic v2 用的校验逻辑（v1 在 root_validator 里做）。"""
         env = (self.ENV or "dev").strip().lower()
         if env not in {"prod", "production"}:
             return
 
         if _is_placeholder(self.SECRET_KEY):
             raise ValueError("SECRET_KEY must be set via environment variables in prod.")
-
         if _is_placeholder(self.DB_PASSWORD):
             raise ValueError("DB_PASSWORD must be set via environment variables in prod.")
-
         if self.BOS_ENABLED:
             for k in ("BOS_STS_ACCOUNT_ID", "BOS_STS_ACCESS_KEY", "BOS_STS_SECRET_KEY"):
                 if _is_placeholder(getattr(self, k, None)):
                     raise ValueError(f"{k} must be set via environment variables in prod when BOS_ENABLED=true.")
-
         if self.BAIDU_OCR_ENABLED:
             for k in ("BAIDU_API_KEY", "BAIDU_SECRET_KEY"):
                 if _is_placeholder(getattr(self, k, None)):
                     raise ValueError(f"{k} must be set via environment variables in prod when BAIDU_OCR_ENABLED=true.")
 
-    # ---------- 派生配置 ----------
     @property
     def IS_PROD(self) -> bool:
         return self.ENV.strip().lower() in {"prod", "production"}
@@ -186,7 +179,6 @@ class Settings(BaseSettings):
         return f"https://{self.BOS_VHOST}"
 
     def _mysql_password_for_dsn(self) -> str:
-        # None -> ""（但 prod 会校验不允许为空/占位）
         raw = self.DB_PASSWORD or ""
         return quote_plus(raw)
 
@@ -212,13 +204,14 @@ class Settings(BaseSettings):
 
     @property
     def LOCAL_STORAGE_ROOT_PATH(self) -> Path:
-        return Path(self.STORAGE_ROOT).expanduser().resolve()
+        # ✅ 优先 LOCAL_STORAGE_ROOT（若配置），否则回落 STORAGE_ROOT
+        base = (self.LOCAL_STORAGE_ROOT or "").strip() or self.STORAGE_ROOT
+        return Path(base).expanduser().resolve()
 
     @property
     def LOG_DIR_PATH(self) -> Path:
         return Path(self.LOG_DIR).expanduser().resolve()
 
-    # 配置读取：.env
     if PYDANTIC_V2:
         model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
     else:
