@@ -35,7 +35,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
@@ -844,7 +843,7 @@ async def get_finance_order_detail(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name, team_names, _team_ids = user_with_role
+    _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
     return await _load_finance_order_out(db, order_id, current_team_names=tns)
@@ -857,7 +856,7 @@ async def update_finance_order_status(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name, team_names, _team_ids = user_with_role
+    _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
@@ -895,7 +894,7 @@ async def return_finance_order_to_unfinished(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name, team_names, _team_ids = user_with_role
+    _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
@@ -958,63 +957,6 @@ async def finance_get_bos_sts(
         expiration=cred.expiration,
         bosHost=storage.vhost,
     )
-
-
-def _utc_iso_z() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _uri_encode(s: str, encode_slash: bool = True) -> str:
-    from urllib.parse import quote
-
-    out = quote(str(s), safe="")
-    if not encode_slash:
-        out = out.replace("%2F", "/").replace("%2f", "/")
-    return out
-
-
-def _hmac_sha256_digest(key: bytes, msg: str) -> bytes:
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-
-def _hmac_sha256_hex(key: bytes, msg: str) -> str:
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _canonical_headers(headers: Dict[str, str], headers_to_sign: List[str]) -> str:
-    keys = sorted({str(h).strip().lower() for h in (headers_to_sign or [])})
-    lines: List[str] = []
-    for k in keys:
-        v = (headers.get(k) or "").strip()
-        if not v:
-            continue
-        lines.append(f"{_uri_encode(k)}:{_uri_encode(v)}")
-    return "\n".join(sorted(lines))
-
-
-def _bce_auth_v1(
-    *,
-    ak: str,
-    sk: str,
-    method: str,
-    path: str,
-    timestamp: str,
-    expire_seconds: int,
-    headers_to_sign: List[str],
-    headers: Dict[str, str],
-) -> str:
-    # ✅ 修复：signing_key 必须是 HMAC digest bytes，不能用 hexdigest 当 key
-    auth_prefix = f"bce-auth-v1/{ak}/{timestamp}/{expire_seconds}"
-    signing_key = _hmac_sha256_digest(sk.encode("utf-8"), auth_prefix)
-
-    canonical_uri = _uri_encode(path, encode_slash=False)
-    canonical_query = ""
-    canonical_hdrs = _canonical_headers(headers, headers_to_sign)
-    canonical_request = "\n".join([method.upper(), canonical_uri, canonical_query, canonical_hdrs])
-
-    signature = _hmac_sha256_hex(signing_key, canonical_request)
-    signed_headers_str = ";".join(sorted({str(h).strip().lower() for h in (headers_to_sign or [])}))
-    return f"{auth_prefix}/{signed_headers_str}/{signature}"
 
 
 def _guess_ext(filename: str, content_type: str) -> str:
@@ -1102,7 +1044,7 @@ async def finance_bos_upload_proxy(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    user, role_name, team_names, _team_ids = user_with_role
+    _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
     current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
@@ -1129,109 +1071,29 @@ async def finance_bos_upload_proxy(
     if not storage.validate_b1_key(scene=skey, storage_key=storage_key, md5_hex=md5_hex):
         raise HTTPException(status_code=400, detail="storage_key 不符合B1规则或不属于该slot")
 
-    cred = storage.assume_role(duration_seconds=900)
-    bos_host = storage.vhost
+    def _head_obj() -> Tuple[bool, str]:
+        return storage.head_object(storage_key)
 
-    sess = requests.Session()
-    sess.trust_env = False
-
-    def _signed_head() -> Tuple[bool, str]:
-        path = f"/{storage_key}"
-        url0 = f"https://{bos_host}{path}"
-        ts = _utc_iso_z()
-        headers_for_sign = {
-            "host": bos_host,
-            "x-bce-date": ts,
-            "x-bce-security-token": cred.session_token,
-        }
-        headers_to_sign = ["host", "x-bce-date", "x-bce-security-token"]
-        authorization = _bce_auth_v1(
-            ak=cred.access_key_id,
-            sk=cred.secret_access_key,
-            method="HEAD",
-            path=path,
-            timestamp=ts,
-            expire_seconds=1800,
-            headers_to_sign=headers_to_sign,
-            headers=headers_for_sign,
-        )
-        headers = {
-            "x-bce-date": ts,
-            "x-bce-security-token": cred.session_token,
-            "Authorization": authorization,
-        }
-        r = sess.request("HEAD", url0, headers=headers, timeout=(10, 60))
-        if r.status_code == 200:
-            return True, (r.headers.get("ETag") or "")
-        if r.status_code == 404:
-            return False, ""
-        rid = r.headers.get("x-bce-request-id") or ""
-        dbg = r.headers.get("x-bce-debug-id") or ""
-        raise HTTPException(
-            status_code=502,
-            detail=f"BOS HEAD failed: status={r.status_code} request_id={rid} debug_id={dbg}",
-        )
-
-    def _signed_put() -> str:
-        path = f"/{storage_key}"
-        url0 = f"https://{bos_host}{path}"
-        ts = _utc_iso_z()
-        headers_for_sign = {
-            "host": bos_host,
-            "content-type": content_type,
-            "x-bce-date": ts,
-            "x-bce-security-token": cred.session_token,
-        }
-        headers_to_sign = ["host", "content-type", "x-bce-date", "x-bce-security-token"]
-        authorization = _bce_auth_v1(
-            ak=cred.access_key_id,
-            sk=cred.secret_access_key,
-            method="PUT",
-            path=path,
-            timestamp=ts,
-            expire_seconds=1800,
-            headers_to_sign=headers_to_sign,
-            headers=headers_for_sign,
-        )
-        headers = {
-            "x-bce-date": ts,
-            "x-bce-security-token": cred.session_token,
-            "Authorization": authorization,
-            "Content-Type": content_type,
-        }
-
-        r = sess.request("PUT", url0, headers=headers, data=file.file, timeout=(10, 180))
-        if 200 <= r.status_code < 300:
-            return (r.headers.get("ETag") or "")
-        rid = r.headers.get("x-bce-request-id") or ""
-        dbg = r.headers.get("x-bce-debug-id") or ""
-        body = ""
-        try:
-            body = r.text or ""
-        except Exception:
-            body = ""
-        raise HTTPException(
-            status_code=502,
-            detail=f"BOS PUT failed: status={r.status_code} request_id={rid} debug_id={dbg} body={body[:300]}",
-        )
+    def _put_obj() -> str:
+        return storage.put_object(storage_key, data=file.file, content_type=content_type)
 
     try:
-        # ✅ 修复：requests 同步 IO 放线程执行，避免阻塞事件循环
         try:
-            exists, etag = await anyio.to_thread.run_sync(_signed_head)
+            exists, etag = await anyio.to_thread.run_sync(_head_obj)
         except requests.RequestException as e:
             raise HTTPException(status_code=502, detail=f"BOS HEAD network error: {str(e) or e.__class__.__name__}")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"BOS HEAD failed: {str(e) or e.__class__.__name__}")
 
         if not exists:
             try:
-                etag = await anyio.to_thread.run_sync(_signed_put)
+                etag = await anyio.to_thread.run_sync(_put_obj)
             except requests.RequestException as e:
                 raise HTTPException(status_code=502, detail=f"BOS PUT network error: {str(e) or e.__class__.__name__}")
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"BOS PUT failed: {str(e) or e.__class__.__name__}")
     finally:
-        try:
-            sess.close()
-        except Exception:
-            pass
+        pass
 
     url = storage.object_url_for_display(storage_key, expires_in=900)
 
@@ -1349,7 +1211,7 @@ async def finance_finalize_images(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    user, role_name, team_names, _team_ids = user_with_role
+    _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
     current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
