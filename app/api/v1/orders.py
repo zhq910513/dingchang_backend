@@ -100,7 +100,7 @@ def _ensure_finance_finalize_payload_related_only(payload) -> None:
     if getattr(payload, "channel_group_id", None) is not None:
         raise HTTPException(status_code=403, detail="Finance cannot update channel_group_id in orders.finalize")
 
-    # ✅ 新增：finance 禁止携带 order_info
+    # ✅ finance 禁止携带 order_info
     if getattr(payload, "order_info", None) is not None:
         raise HTTPException(status_code=403, detail="Finance cannot update order_info in orders.finalize")
 
@@ -322,49 +322,59 @@ def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: 
     return tns[0] if tns else ""
 
 
-def _team_user_ids_subquery(team_names: Tuple[str, ...]):
-    tns = _normalize_team_names(team_names)
-    return select(User.id).where(User.team_name.in_(list(tns)))
+async def _get_user_team_name(db: AsyncSession, user_id: int) -> str:
+    tn = (await db.execute(select(User.team_name).where(User.id == int(user_id)))).scalars().first()
+    return str(tn or "").strip()
 
 
-async def _manager_allowed_salesperson_ids(db: AsyncSession, manager_id: int, team_names: Tuple[str, ...]) -> List[int]:
-    """
-    ⚠️ 保留旧逻辑：用于“写权限”范围（经理仍只可操作自己创建的业务员 + 自己）
-    """
-    tns = _normalize_team_names(team_names)
-    child_ids = (
-        await db.execute(
-            select(User.id).where(
-                and_(
-                    User.parent_id == int(manager_id),
-                    User.team_name.in_(list(tns)),
-                )
-            )
-        )
-    ).scalars().all()
-    out = [int(manager_id)] + [int(x) for x in (child_ids or [])]
-    # 去重保持顺序
-    seen = set()
-    uniq: List[int] = []
-    for x in out:
-        if x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq
-
-
-async def _ensure_order_acl_by_salesperson_id(
+async def _ensure_order_read_acl_by_salesperson_id(
     db: AsyncSession,
     *,
     salesperson_id: int,
     current_user: User,
     role_name: Optional[str],
     team_names: Tuple[str, ...],
-    for_write: bool = False,
 ) -> None:
     """
-    ✅ 读权限（for_write=False）：按“同团队即可看”，不再看经理是谁
-    ✅ 写权限（for_write=True）：保持原逻辑，经理仍仅可操作自己创建的业务员
+    ✅ 读权限（列表/详情）：按“团队共享”实现 —— 不看经理归属(parent_id)
+    - super_admin：全量
+    - manager：可读自己 team_names 范围内全部订单
+    - sales/market/finance：可读自己单团队范围内全部订单
+    """
+    rn = role_name or ""
+    if rn == ROLE_SUPER_ADMIN:
+        return
+
+    _require_team_for_non_super_admin(role_name, team_names)
+    tns = _normalize_team_names(team_names)
+
+    # 允许的团队集合
+    if rn == ROLE_MANAGER:
+        allowed_teams = set(tns)
+    elif rn in (ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
+        my_team = _require_single_team_for_strict_roles(role_name, tns)
+        allowed_teams = {my_team}
+    else:
+        raise HTTPException(status_code=403, detail="No permission")
+
+    sp_team = await _get_user_team_name(db, int(salesperson_id))
+    if not sp_team or sp_team not in allowed_teams:
+        raise HTTPException(status_code=403, detail="No permission")
+
+
+async def _ensure_order_write_acl_by_salesperson_id(
+    db: AsyncSession,
+    *,
+    salesperson_id: int,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
+) -> None:
+    """
+    ✅ 写权限（创建/编辑/状态/上传等）：在“读权限团队共享”的基础上收紧
+    - sales：只能写自己的订单
+    - manager：可写自己 team_names 范围内订单（不看 parent_id）
+    - market/finance：写入口外层已拦截；这里保留防御
     """
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -374,30 +384,20 @@ async def _ensure_order_acl_by_salesperson_id(
     tns = _normalize_team_names(team_names)
 
     if rn == ROLE_SALES:
-        # 业务只能看自己（读写一致）
         if int(salesperson_id) != int(current_user.id):
             raise HTTPException(status_code=403, detail="No permission")
         return
 
     if rn == ROLE_MANAGER:
-        if for_write:
-            # ✅ 写权限：保持旧规则（仅自己 + 自己创建的业务员）
-            allowed = await _manager_allowed_salesperson_ids(db, int(current_user.id), tns)
-            if int(salesperson_id) not in allowed:
-                raise HTTPException(status_code=403, detail="No permission")
-            return
-
-        # ✅ 读权限：同团队可见（不再看 parent_id）
-        sp_team = (await db.execute(select(User.team_name).where(User.id == int(salesperson_id)))).scalars().first()
-        if str(sp_team or "").strip() not in set(tns):
+        sp_team = await _get_user_team_name(db, int(salesperson_id))
+        if not sp_team or sp_team not in set(tns):
             raise HTTPException(status_code=403, detail="No permission")
         return
 
-    # market / finance：只能本团队（读写一致）
     if rn in (ROLE_MARKET, ROLE_FINANCE):
         my_team = _require_single_team_for_strict_roles(role_name, tns)
-        sp_team = (await db.execute(select(User.team_name).where(User.id == int(salesperson_id)))).scalars().first()
-        if str(sp_team or "").strip() != my_team:
+        sp_team = await _get_user_team_name(db, int(salesperson_id))
+        if not sp_team or sp_team != my_team:
             raise HTTPException(status_code=403, detail="No permission")
         return
 
@@ -412,6 +412,12 @@ async def _apply_orders_list_acl(
     team_names: Tuple[str, ...],
     clauses: List,
 ) -> None:
+    """
+    ✅ 列表 ACL：团队共享（不看 parent_id）
+    - super_admin：全量
+    - manager：team_names 范围
+    - sales/market/finance：单团队范围
+    """
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
         return
@@ -419,18 +425,13 @@ async def _apply_orders_list_acl(
     _require_team_for_non_super_admin(role_name, team_names)
     tns = _normalize_team_names(team_names)
 
-    if rn == ROLE_SALES:
-        clauses.append(Order.salesperson_id == int(current_user.id))
-        return
-
     if rn == ROLE_MANAGER:
-        # ✅ 读权限：同团队可见（不再看 parent_id）
-        clauses.append(Order.salesperson_id.in_(_team_user_ids_subquery(tns)))
+        team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
+        clauses.append(Order.salesperson_id.in_(team_user_ids))
         return
 
-    if rn in (ROLE_MARKET, ROLE_FINANCE):
+    if rn in (ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
         my_team = _require_single_team_for_strict_roles(role_name, tns)
-        # 本团队：用子查询，避免全量拉 ID
         team_user_ids = select(User.id).where(User.team_name == my_team)
         clauses.append(Order.salesperson_id.in_(team_user_ids))
         return
@@ -462,14 +463,13 @@ async def _load_order_out(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ ACL：按订单 salesperson 归属判定（读权限：同团队即可）
-    await _ensure_order_acl_by_salesperson_id(
+    # ✅ 读 ACL：团队共享
+    await _ensure_order_read_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
         current_user=current_user,
         role_name=role_name,
         team_names=team_names,
-        for_write=False,
     )
 
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
@@ -682,7 +682,7 @@ async def list_salespersons(
 
     # ✅ 团队隔离：
     # - super_admin：全量
-    # - manager：多团队范围（同团队可见：不再按 parent_id 限制）
+    # - manager：多团队范围（不看 parent_id）
     # - sales/market：单团队范围
     if role_name != ROLE_SUPER_ADMIN:
         if role_name == ROLE_MANAGER:
@@ -691,6 +691,7 @@ async def list_salespersons(
             my_team = _require_single_team_for_strict_roles(role_name, tns)
             stmt = stmt.where(User.team_name == my_team)
 
+    # ✅ sales 仍只看自己（筛选下拉无需看到全团队）
     if role_name == ROLE_SALES:
         stmt = stmt.where(User.id == current_user.id)
 
@@ -735,7 +736,7 @@ async def _apply_ocr_task_acl(
 
     stmt = stmt.join(Order, and_(Order.id == OcrTask.scope_id, OcrTask.scope_type == "order"))
 
-    # ✅ 团队隔离（先收紧，再叠加角色范围）
+    # ✅ 团队隔离（团队共享）：manager 也只按团队，不看 parent_id
     if rn == ROLE_MANAGER:
         team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
     else:
@@ -744,10 +745,10 @@ async def _apply_ocr_task_acl(
 
     stmt = stmt.where(Order.salesperson_id.in_(team_user_ids))
 
+    # ✅ sales：仍只看自己任务
     if rn == ROLE_SALES:
         return stmt.where(Order.salesperson_id == int(current_user.id))
 
-    # ✅ manager：同团队可见（不再按 parent_id 限制）
     if rn == ROLE_MANAGER:
         return stmt
 
@@ -955,7 +956,6 @@ async def bos_upload_proxy(
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"BOS PUT failed: {str(e) or e.__class__.__name__}")
     finally:
-        # 这里不手动 close UploadFile：FastAPI 会处理；只确保指针不乱即可
         pass
 
     url = storage.object_url_for_display(storage_key, expires_in=900)
@@ -1167,13 +1167,12 @@ async def create_order_draft(
         spid = int(payload.salesperson_id or user.id)
 
     await _ensure_salesperson_exists(db, spid)
-    await _ensure_order_acl_by_salesperson_id(
+    await _ensure_order_write_acl_by_salesperson_id(
         db,
         salesperson_id=spid,
         current_user=user,
         role_name=role_name,
         team_names=tns,
-        for_write=True,
     )
 
     o = Order(
@@ -1265,14 +1264,13 @@ async def finalize_order_upload(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ ACL：写入口必须用 write 范围
-    await _ensure_order_acl_by_salesperson_id(
+    # ✅ 写 ACL：sales 只能写自己；manager 按团队；finance/market 按团队
+    await _ensure_order_write_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
         current_user=user,
         role_name=role_name,
         team_names=tns,
-        for_write=True,
     )
 
     # ✅ finance 仅允许操作“已完成订单”（与 finance 模块约束对齐）
@@ -1284,14 +1282,12 @@ async def finalize_order_upload(
         if payload.salesperson_id is not None:
             spid = int(payload.salesperson_id)
             await _ensure_salesperson_exists(db, spid)
-            # ✅ salesperson 变更也必须符合写 ACL
-            await _ensure_order_acl_by_salesperson_id(
+            await _ensure_order_write_acl_by_salesperson_id(
                 db,
                 salesperson_id=spid,
                 current_user=user,
                 role_name=role_name,
                 team_names=tns,
-                for_write=True,
             )
             o.salesperson_id = spid
         if payload.customer_group_id is not None:
@@ -1488,7 +1484,7 @@ async def list_orders(
 
     clauses: list = []
 
-    # ✅ ACL（团队 + 角色范围）
+    # ✅ ACL（团队共享：不看 parent_id）
     await _apply_orders_list_acl(db, current_user=current_user, role_name=role_name, team_names=tns, clauses=clauses)
 
     if is_finished is not None:
@@ -1621,20 +1617,19 @@ async def create_order(
         channel_group_id=payload.channel_group_id,
     )
 
-    # ✅ sales 只能给自己创建；manager/super_admin 允许指定，但仍需通过写 ACL（含团队/归属）
+    # ✅ sales 只能给自己创建；manager/super_admin 允许指定，但仍需通过写 ACL（团队共享不看经理）
     if role_name == ROLE_SALES:
         spid = int(user.id)
     else:
         spid = int(payload.salesperson_id or user.id)
 
     await _ensure_salesperson_exists(db, spid)
-    await _ensure_order_acl_by_salesperson_id(
+    await _ensure_order_write_acl_by_salesperson_id(
         db,
         salesperson_id=spid,
         current_user=user,
         role_name=role_name,
         team_names=tns,
-        for_write=True,
     )
 
     o = Order(
@@ -1683,14 +1678,13 @@ async def update_order_detail(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ ACL：写入口必须用 write 范围
-    await _ensure_order_acl_by_salesperson_id(
+    # ✅ 写 ACL：sales 只能改自己；manager 按团队共享不看经理
+    await _ensure_order_write_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
         current_user=user,
         role_name=role_name,
         team_names=tns,
-        for_write=True,
     )
 
     if o.is_finished and role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
@@ -1699,14 +1693,12 @@ async def update_order_detail(
     if payload.salesperson_id is not None:
         spid = int(payload.salesperson_id)
         await _ensure_salesperson_exists(db, spid)
-        # ✅ 变更 salesperson 仍需通过写 ACL
-        await _ensure_order_acl_by_salesperson_id(
+        await _ensure_order_write_acl_by_salesperson_id(
             db,
             salesperson_id=spid,
             current_user=user,
             role_name=role_name,
             team_names=tns,
-            for_write=True,
         )
         o.salesperson_id = spid
     if payload.customer_group_id is not None:
@@ -1745,14 +1737,13 @@ async def update_order_status(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ ACL：写入口必须用 write 范围
-    await _ensure_order_acl_by_salesperson_id(
+    # ✅ 写 ACL
+    await _ensure_order_write_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
         current_user=user,
         role_name=role_name,
         team_names=tns,
-        for_write=True,
     )
 
     if payload.is_finished is not None:
