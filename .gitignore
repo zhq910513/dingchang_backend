@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+cmd.txt
+tree-src.txt
 
 # IDE
 .idea/

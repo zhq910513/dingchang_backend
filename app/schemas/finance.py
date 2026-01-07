@@ -48,6 +48,12 @@ class FinanceOrderOut(BaseModel):
     col_29_is_paid: bool = False
     col_30_is_rebate: bool = False
 
+    # ✅ 列表末尾追加：所属经理/所属团队（满足“所有订单展示列表、财务管理列表”追加字段）
+    manager_id: Optional[int] = None
+    manager_name: Optional[str] = None
+    team_name: Optional[str] = None
+    team_names: List[str] = Field(default_factory=list)
+
     # 兼容/辅助
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None

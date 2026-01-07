@@ -32,13 +32,13 @@
 - finance/manager/super_admin：可读可写（写含：paid/rebate、备用图 related）
 - market：只读（不可改 paid/rebate，不可上传/维护图片，不可拿 sts）
 - 仅允许操作已完成订单（财务域）
-- 仅允许操作 slot_key = related（备用图）
+- 仅允许操作 slot_key = related（备用图 related）
 """
 from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 
 import anyio
 import requests
@@ -662,6 +662,93 @@ async def finance_orders_summary(
     )
 
 
+def _split_team_names_any(val) -> List[str]:
+    """
+    兼容：
+    - None -> []
+    - ["A","B"] / ("A","B") / {"A"} -> list
+    - "A,B" / "A，B" / "A|B" -> list
+    """
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple, set)):
+        out = []
+        for x in val:
+            s = str(x or "").strip()
+            if s:
+                out.append(s)
+        # 去重保持顺序
+        seen = set()
+        uniq = []
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        for sep in [",", "，", "|", ";", "；", " "]:
+            if sep in s:
+                parts = [p.strip() for p in s.split(sep)]
+                parts = [p for p in parts if p]
+                if parts:
+                    # 去重保持顺序
+                    seen = set()
+                    uniq = []
+                    for x in parts:
+                        if x in seen:
+                            continue
+                        seen.add(x)
+                        uniq.append(x)
+                    return uniq
+        return [s]
+    s2 = str(val or "").strip()
+    return [s2] if s2 else []
+
+
+def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
+    """
+    ✅ 只读字段推断（不触发 ORM 懒加载，避免 async MissingGreenlet）：
+    优先尝试常见 manager 字段名。
+    """
+    if not sp:
+        return None
+    for key in ("manager_id", "leader_id", "supervisor_id", "parent_id"):
+        try:
+            v = getattr(sp, key, None)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        try:
+            iv = int(v)
+            if iv > 0:
+                return iv
+        except Exception:
+            continue
+    return None
+
+
+def _pick_manager_name_inline(sp: Optional[User]) -> Optional[str]:
+    """
+    若 User 上直接有 manager_name/leader_name 等字符串字段，则直接用（无需额外查表）。
+    """
+    if not sp:
+        return None
+    for key in ("manager_name", "leader_name", "supervisor_name", "parent_name"):
+        try:
+            v = getattr(sp, key, None)
+        except Exception:
+            v = None
+        s = str(v or "").strip()
+        if s:
+            return s
+    return None
+
+
 @router.get("/orders", response_model=FinanceOrderListResponse)
 async def list_finance_orders(
     page: int = Query(1, ge=1),
@@ -783,6 +870,29 @@ async def list_finance_orders(
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(stmt)).scalars().all()
 
+    # ===========================
+    # ✅ 批量补齐：所属经理/所属团队（避免 N+1）
+    # ===========================
+    manager_ids: Set[int] = set()
+    salesperson_to_manager_id: Dict[int, int] = {}
+
+    for o in rows:
+        sp = getattr(o, "salesperson", None)
+        if not sp:
+            continue
+
+        # 1) 先尝试 salesperson 上直接带 manager_name（无需查表）
+        #    如果没有，再尝试 manager_id 等字段并批量查 manager User
+        mid = _pick_manager_id_from_salesperson(sp)
+        if mid:
+            salesperson_to_manager_id[int(getattr(sp, "id", 0) or 0)] = mid
+            manager_ids.add(mid)
+
+    managers_by_id: Dict[int, User] = {}
+    if manager_ids:
+        mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
+        managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
+
     items: List[FinanceOrderOut] = []
     for o in rows:
         cg = getattr(o, "customer_group", None)
@@ -796,8 +906,37 @@ async def list_finance_orders(
         vin = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
         engine_no = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
         vehicle_model = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
-        id_number = (dd.get("id_number") or "") if isinstance(dd, dict) else ""
+
+        # ✅ 关键修复：身份证号强制转字符串，避免导出时被当“数值”写入 Excel 出现 E+
+        raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
+        id_number = (str(raw_id_number).strip() if raw_id_number is not None else "")
+
         owner = (dd.get("id_name") or "") if isinstance(dd, dict) else ""
+
+        # ✅ 所属团队
+        team_name_val = None
+        team_names_val: List[str] = []
+        if sp:
+            team_name_val = (getattr(sp, "team_name", None) or None)
+            team_names_val = _split_team_names_any(getattr(sp, "team_names", None))
+            # 兜底：只有 team_name 没有 team_names 时，给 team_names 填一个（前端可选用）
+            if not team_names_val and team_name_val:
+                team_names_val = [str(team_name_val).strip()] if str(team_name_val).strip() else []
+
+        # ✅ 所属经理
+        manager_id_val = None
+        manager_name_val = None
+        if sp:
+            inline_name = _pick_manager_name_inline(sp)
+            if inline_name:
+                manager_name_val = inline_name
+
+            sp_id_int = int(getattr(sp, "id", 0) or 0)
+            mid = salesperson_to_manager_id.get(sp_id_int) or _pick_manager_id_from_salesperson(sp)
+            if mid:
+                manager_id_val = int(mid)
+                if not manager_name_val:
+                    manager_name_val = _user_display_name(managers_by_id.get(int(mid)))
 
         items.append(
             FinanceOrderOut(
@@ -817,7 +956,7 @@ async def list_finance_orders(
                 col_09_engine_no=engine_no or None,
                 col_10_vehicle_model=vehicle_model or None,
                 col_11_first_register_date=(dd.get("dl_register_date") if isinstance(dd, dict) else None),
-                col_12_id_number=id_number or None,
+                col_12_id_number=(id_number or None),
                 col_13_owner_phone=(
                     str(getattr(info, "owner_phone", None))
                     if info and getattr(info, "owner_phone", None) is not None
@@ -844,6 +983,13 @@ async def list_finance_orders(
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
                 salesperson_name=_user_display_name(sp),
+
+                # ✅ 新增回填：所属经理/所属团队
+                manager_id=manager_id_val,
+                manager_name=manager_name_val,
+                team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
+                team_names=team_names_val,
+
                 dynamic_data=dd,
                 created_at=_fmt_dt(getattr(o, "created_at", None)),
                 updated_at=_fmt_dt(getattr(o, "updated_at", None)),
