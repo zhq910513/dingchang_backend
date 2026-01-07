@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Any, Dict, List, Tuple
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import anyio
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete
+from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete, false as sql_false
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -144,12 +142,12 @@ def _group_display_name(g) -> Optional[str]:
     if not g:
         return None
     return (
-        getattr(g, "channel_name", None)
-        or getattr(g, "customer_name", None)
-        or getattr(g, "group_name", None)
-        or getattr(g, "name", None)
-        or getattr(g, "customer_code", None)
-        or getattr(g, "channel_code", None)
+            getattr(g, "channel_name", None)
+            or getattr(g, "customer_name", None)
+            or getattr(g, "group_name", None)
+            or getattr(g, "name", None)
+            or getattr(g, "customer_code", None)
+            or getattr(g, "channel_code", None)
     )
 
 
@@ -195,12 +193,12 @@ def _recalc_order_info(info: OrderInfo) -> None:
     ch_reward = _to_decimal(getattr(info, "channel_reward", 0))
 
     channel_total = (
-        (cm * ch_cm_p / Decimal("100"))
-        + (cm * ch_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
-        + (ca * ch_ca_p / Decimal("100"))
-        + (vta * ch_vta_p / Decimal("100"))
-        + (nva * ch_nva_p / Decimal("100"))
-        + ch_reward
+            (cm * ch_cm_p / Decimal("100"))
+            + (cm * ch_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
+            + (ca * ch_ca_p / Decimal("100"))
+            + (vta * ch_vta_p / Decimal("100"))
+            + (nva * ch_nva_p / Decimal("100"))
+            + ch_reward
     )
     info.channel_total = channel_total
 
@@ -212,12 +210,12 @@ def _recalc_order_info(info: OrderInfo) -> None:
     cu_reward = _to_decimal(getattr(info, "customer_reward", 0))
 
     customer_total = (
-        (cm * cu_cm_p / Decimal("100"))
-        + (cm * cu_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
-        + (ca * cu_ca_p / Decimal("100"))
-        + (vta * cu_vta_p / Decimal("100"))
-        + (nva * cu_nva_p / Decimal("100"))
-        + cu_reward
+            (cm * cu_cm_p / Decimal("100"))
+            + (cm * cu_cm_supp_p / Decimal("100"))  # ✅ 新增：商业后补点位
+            + (ca * cu_ca_p / Decimal("100"))
+            + (vta * cu_vta_p / Decimal("100"))
+            + (nva * cu_nva_p / Decimal("100"))
+            + cu_reward
     )
     info.customer_total = customer_total
 
@@ -269,7 +267,8 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     # ✅ 新增：客户-商业后补点位
     if getattr(payload, "customer_commercial_supplement_point", None) is not None:
-        info.customer_commercial_supplement_point = _to_decimal(getattr(payload, "customer_commercial_supplement_point"))
+        info.customer_commercial_supplement_point = _to_decimal(
+            getattr(payload, "customer_commercial_supplement_point"))
 
     if payload.customer_compulsory_point is not None:
         info.customer_compulsory_point = _to_decimal(payload.customer_compulsory_point)
@@ -300,6 +299,24 @@ def _normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> 
     return tuple([str(x or "").strip() for x in (team_names or []) if str(x or "").strip()])
 
 
+def _split_csv(v: Optional[str]) -> List[str]:
+    s = (v or "").strip()
+    if not s:
+        return []
+    parts = [x.strip() for x in s.split(",")]
+    return [x for x in parts if x]
+
+
+def _normalize_team_list(items: List[str]) -> Tuple[str, ...]:
+    out: List[str] = []
+    for x in items or []:
+        s = (x or "").strip()
+        if not s:
+            continue
+        out.append(s)
+    return tuple(sorted(set(out)))
+
+
 def _require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
     if role_name == ROLE_SUPER_ADMIN:
         return
@@ -312,12 +329,6 @@ def _require_team_for_non_super_admin(role_name: Optional[str], team_names: Tupl
 
 
 def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: Tuple[str, ...]) -> str:
-    """
-    ✅ 严格单团队角色：业务/财务/市场
-    - sales：本轮调整为“只能看自己的数据”，但仍要求账号团队配置为 1 个（数据治理一致性）
-    - finance/market：单团队（按 team_name 共享查看）
-    经理：允许多团队
-    """
     _require_team_for_non_super_admin(role_name, team_names)
     rn = role_name or ""
     tns = _normalize_team_names(team_names)
@@ -325,27 +336,71 @@ def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: 
         if len(tns) != 1:
             raise HTTPException(status_code=400, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
         return tns[0]
-    # manager/super_admin：不强制单团队，这里返回稳定的第一个仅供需要字符串的地方
     return tns[0] if tns else ""
 
 
+def _user_team_match_expr(teams: Tuple[str, ...]):
+    """
+    ✅ 兼容 team_name + team_names(CSV) 的“用户属于团队”表达式
+    """
+    tns = [str(x or "").strip() for x in (teams or []) if str(x or "").strip()]
+    if not tns:
+        return sql_false()
+
+    terms = [User.team_name.in_(tns)]
+
+    if hasattr(User, "team_names"):
+        for t in tns:
+            terms.append(User.team_names == t)
+            terms.append(User.team_names.like(f"{t},%"))
+            terms.append(User.team_names.like(f"%,{t},%"))
+            terms.append(User.team_names.like(f"%,{t}"))
+
+    return or_(*terms)
+
+
 async def _get_user_team_name(db: AsyncSession, user_id: int) -> str:
-    tn = (await db.execute(select(User.team_name).where(User.id == int(user_id)))).scalars().first()
-    return str(tn or "").strip()
+    """
+    ✅ 返回“用户生效 team_name”（用于 orders ACL）：
+    - 优先 user.team_name
+    - 若 team_name 为空：从 team_names(CSV) 取第一个合法团队兜底
+    """
+    cols = [User.team_name]
+    has_team_names = hasattr(User, "team_names")
+    if has_team_names:
+        cols.append(User.team_names)
+
+    row = (await db.execute(select(*cols).where(User.id == int(user_id)))).first()
+    if not row:
+        return ""
+
+    tn = str((row[0] or "")).strip()
+    if tn and tn in TEAM_NAMES:
+        return tn
+
+    if not has_team_names:
+        return ""
+
+    raw_csv = str((row[1] or "")).strip()
+    teams = _normalize_team_list(_split_csv(raw_csv))
+    for t in teams:
+        if t in TEAM_NAMES:
+            return t
+    return ""
 
 
 async def _ensure_order_read_acl_by_salesperson_id(
-    db: AsyncSession,
-    *,
-    salesperson_id: int,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
+        db: AsyncSession,
+        *,
+        salesperson_id: int,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
 ) -> None:
     """
     ✅ 读权限（列表/详情）：
     - super_admin：全量
-    - manager：可读自己 team_names 范围内全部订单（按 salesperson.team_name）
+    - manager：可读自己 team_names 范围内全部订单（按 salesperson.team ）
     - finance/market：可读自己 team_name 下全部订单
     - sales：只能读自己的订单（本轮调整）
     """
@@ -376,12 +431,12 @@ async def _ensure_order_read_acl_by_salesperson_id(
 
 
 async def _ensure_order_write_acl_by_salesperson_id(
-    db: AsyncSession,
-    *,
-    salesperson_id: int,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
+        db: AsyncSession,
+        *,
+        salesperson_id: int,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
 ) -> None:
     """
     ✅ 写权限（创建/编辑/状态/上传等）：在“读权限团队共享”的基础上收紧
@@ -418,17 +473,17 @@ async def _ensure_order_write_acl_by_salesperson_id(
 
 
 async def _apply_orders_list_acl(
-    db: AsyncSession,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-    clauses: List,
+        db: AsyncSession,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+        clauses: List,
 ) -> None:
     """
     ✅ 列表 ACL（团队共享 / sales 自己）：
     - super_admin：全量
-    - manager：team_names 范围（按 salesperson.team_name）
+    - manager：team_names 范围（按 salesperson.team ）
     - finance/market：单团队范围
     - sales：只能看自己（本轮调整）
     """
@@ -444,13 +499,13 @@ async def _apply_orders_list_acl(
         return
 
     if rn == ROLE_MANAGER:
-        team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
+        team_user_ids = select(User.id).where(_user_team_match_expr(tns))
         clauses.append(Order.salesperson_id.in_(team_user_ids))
         return
 
     if rn in (ROLE_MARKET, ROLE_FINANCE):
         my_team = _require_single_team_for_strict_roles(role_name, tns)
-        team_user_ids = select(User.id).where(User.team_name == my_team)
+        team_user_ids = select(User.id).where(_user_team_match_expr((my_team,)))
         clauses.append(Order.salesperson_id.in_(team_user_ids))
         return
 
@@ -458,12 +513,12 @@ async def _apply_orders_list_acl(
 
 
 async def _load_order_out(
-    db: AsyncSession,
-    order_id: int,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
+        db: AsyncSession,
+        order_id: int,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
 ) -> OrderOut:
     stmt = (
         select(Order)
@@ -481,7 +536,7 @@ async def _load_order_out(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ 读 ACL：sales 自己；manager/finance/market 按 team_name
+    # ✅ 读 ACL：sales 自己；manager/finance/market 按团队
     await _ensure_order_read_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
@@ -524,15 +579,15 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
 
 
 async def _get_or_create_image_file(
-    db: AsyncSession,
-    *,
-    storage_key: str,
-    url: str,
-    size: int,
-    original_name: Optional[str],
-    content_type: Optional[str],
-    etag: Optional[str],
-    md5: str,
+        db: AsyncSession,
+        *,
+        storage_key: str,
+        url: str,
+        size: int,
+        original_name: Optional[str],
+        content_type: Optional[str],
+        etag: Optional[str],
+        md5: str,
 ) -> ImageFile:
     storage_key = (storage_key or "").strip().lstrip("/")
     md5 = (md5 or "").strip().lower()
@@ -611,9 +666,9 @@ class OptionListOut(BaseModel):
 
 @router.get("/customer-groups", response_model=OptionListOut)
 async def list_customer_groups(
-    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -632,9 +687,9 @@ async def list_customer_groups(
 
 @router.get("/channel-groups", response_model=OptionListOut)
 async def list_channel_groups(
-    status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        status: Optional[int] = Query(None, description="可选：启用状态过滤（若模型有该字段）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -674,9 +729,9 @@ class SalespersonListOut(BaseModel):
 
 @router.get("/salespersons", response_model=SalespersonListOut)
 async def list_salespersons(
-    status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -705,17 +760,18 @@ async def list_salespersons(
     # - sales：只看自己（本轮仍保持）
     if role_name != ROLE_SUPER_ADMIN:
         if role_name == ROLE_MANAGER:
-            stmt = stmt.where(User.team_name.in_(list(tns)))
+            stmt = stmt.where(_user_team_match_expr(tns))
         else:
             my_team = _require_single_team_for_strict_roles(role_name, tns)
-            stmt = stmt.where(User.team_name == my_team)
+            stmt = stmt.where(_user_team_match_expr((my_team,)))
 
     # ✅ sales 仍只看自己
     if role_name == ROLE_SALES:
         stmt = stmt.where(User.id == current_user.id)
 
     rows = (await db.execute(stmt)).all()
-    return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
+    return SalespersonListOut(
+        items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
 
 
 # ===========================
@@ -734,12 +790,12 @@ class OcrTaskListOut(BaseModel):
 
 
 async def _apply_ocr_task_acl(
-    db: AsyncSession,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-    stmt,
+        db: AsyncSession,
+        *,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+        stmt,
 ):
     rn = role_name or ""
 
@@ -757,10 +813,10 @@ async def _apply_ocr_task_acl(
 
     # ✅ 团队隔离（团队共享）：manager 也只按团队，不看 parent_id
     if rn == ROLE_MANAGER:
-        team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
+        team_user_ids = select(User.id).where(_user_team_match_expr(tns))
     else:
         my_team = _require_single_team_for_strict_roles(role_name, tns)
-        team_user_ids = select(User.id).where(User.team_name == my_team)
+        team_user_ids = select(User.id).where(_user_team_match_expr((my_team,)))
 
     stmt = stmt.where(Order.salesperson_id.in_(team_user_ids))
 
@@ -780,12 +836,12 @@ async def _apply_ocr_task_acl(
 
 @router.get("/ocr-tasks", response_model=OcrTaskListOut)
 async def list_order_ocr_tasks(
-    limit: int = Query(50, ge=1, le=200),
-    order_id: Optional[int] = Query(None),
-    active_only: bool = Query(False),
-    status: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        limit: int = Query(50, ge=1, le=200),
+        order_id: Optional[int] = Query(None),
+        active_only: bool = Query(False),
+        status: Optional[str] = Query(None),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -837,8 +893,8 @@ class BosStsOut(BaseModel):
 
 @router.get("/bos-sts", response_model=BosStsOut)
 async def get_bos_sts(
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
@@ -914,10 +970,10 @@ class BosProxyUploadOut(BaseModel):
 
 @router.post("/bos-upload", response_model=BosProxyUploadOut)
 async def bos_upload_proxy(
-    slot_key: str = Form(...),
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        slot_key: str = Form(...),
+        file: UploadFile = File(...),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1107,11 +1163,11 @@ def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime
 
 
 def _add_json_date_range_any(
-    clauses: list,
-    *,
-    keys: List[str],
-    start_ymd: Optional[str],
-    end_ymd: Optional[str],
+        clauses: list,
+        *,
+        keys: List[str],
+        start_ymd: Optional[str],
+        end_ymd: Optional[str],
 ):
     """
     在 Order.dynamic_data 中按多个 key 任选其一命中区间。
@@ -1125,7 +1181,8 @@ def _add_json_date_range_any(
     if not s and not e:
         return
     if not s or not e:
-        raise HTTPException(status_code=400, detail="first_register_date_start and first_register_date_end are required")
+        raise HTTPException(status_code=400,
+                            detail="first_register_date_start and first_register_date_end are required")
 
     try:
         datetime.strptime(s, "%Y-%m-%d")
@@ -1171,9 +1228,9 @@ class OrderDraftOut(BaseModel):
 
 @router.post("/draft", response_model=OrderDraftOut)
 async def create_order_draft(
-    payload: OrderDraftIn,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        payload: OrderDraftIn,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1261,9 +1318,9 @@ class OrderFinalizeOut(BaseModel):
 
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
-    payload: OrderFinalizeIn,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        payload: OrderFinalizeIn,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1461,29 +1518,29 @@ async def finalize_order_upload(
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=200),
-    is_finished: Optional[bool] = Query(None),
-    salesperson_id: Optional[int] = Query(None),
-    created_by: Optional[int] = Query(None),
-    customer_group_id: Optional[int] = Query(None),
-    channel_group_id: Optional[int] = Query(None),
-    # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
-    created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
-    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
-    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
-    first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
-    first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
-    owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
-    id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
-    plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
-    engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
-    vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
-    vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
-    vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
-    remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+        is_finished: Optional[bool] = Query(None),
+        salesperson_id: Optional[int] = Query(None),
+        created_by: Optional[int] = Query(None),
+        customer_group_id: Optional[int] = Query(None),
+        channel_group_id: Optional[int] = Query(None),
+        # ✅ 日期筛选：created_date_* 只按 created_at（按北京时间过滤）
+        created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
+        created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
+        created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+        first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
+        first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
+        owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
+        id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
+        plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
+        engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
+        vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
+        vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
+        vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
+        remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1609,9 +1666,9 @@ async def list_orders(
 
 @router.get("/{order_id:int}", response_model=OrderOut)
 async def get_order_detail(
-    order_id: int,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        order_id: int,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1623,9 +1680,9 @@ async def get_order_detail(
 
 @router.post("", response_model=OrderOut)
 async def create_order(
-    payload: OrderCreate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        payload: OrderCreate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1684,10 +1741,10 @@ async def create_order(
 
 @router.put("/{order_id:int}", response_model=OrderOut)
 async def update_order_detail(
-    order_id: int,
-    payload: OrderUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        order_id: int,
+        payload: OrderUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1743,10 +1800,10 @@ async def update_order_detail(
 
 @router.patch("/{order_id:int}/status")
 async def update_order_status(
-    order_id: int,
-    payload: OrderStatusUpdate,
-    db: AsyncSession = Depends(get_db),
-    user_with_role=Depends(get_current_user_with_role_and_teams),
+        order_id: int,
+        payload: OrderStatusUpdate,
+        db: AsyncSession = Depends(get_db),
+        user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
@@ -1773,7 +1830,8 @@ async def update_order_status(
             raise HTTPException(status_code=403, detail="Only manager/super_admin can reopen finished order")
 
         if bool(payload.is_finished) is True:
-            _ensure_required_customer_channel(customer_group_id=o.customer_group_id, channel_group_id=o.channel_group_id)
+            _ensure_required_customer_channel(customer_group_id=o.customer_group_id,
+                                              channel_group_id=o.channel_group_id)
 
         o.is_finished = bool(payload.is_finished)
 
