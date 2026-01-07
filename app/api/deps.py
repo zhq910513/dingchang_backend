@@ -6,7 +6,7 @@
 去兼容版原则：
 - 会话只认 DB 的 UserSession + expired + last_active_at + settings.SESSION_TIMEOUT_SECONDS
 - 心跳续命：节流更新 last_active_at（避免每请求 commit 打爆 DB）
-- 主角色取 Role.id 最小值（稳定）
+- ✅ 主角色：按“业务优先级”选主角色（避免同时拥有 sales+manager 时被误判为 sales）
 
 团队隔离（增强版，兼容旧字段）：
 - 兼容旧：user.team_name（单团队）
@@ -31,6 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.config import settings
+from app.core.constants import (
+    ROLE_SUPER_ADMIN,
+    ROLE_MANAGER,
+    ROLE_FINANCE,
+    ROLE_MARKET,
+    ROLE_SALES,
+)
 from app.models.session import UserSession
 from app.models.user import User
 from app.models.role import Role
@@ -41,6 +48,29 @@ logger = logging.getLogger(__name__)
 # ✅ 心跳写库节流：默认 30s 写一次（生产强烈建议开启）
 # 设为 0 可恢复“每请求更新”
 SESSION_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("SESSION_HEARTBEAT_INTERVAL_SECONDS", "30") or "30")
+
+# ✅ 主角色优先级（数值越小优先级越高）
+_ROLE_PRIORITY = {
+    ROLE_SUPER_ADMIN: 0,
+    ROLE_MANAGER: 10,
+    ROLE_FINANCE: 20,
+    ROLE_MARKET: 30,
+    ROLE_SALES: 40,
+}
+
+
+def _pick_primary_role(role_names: Tuple[str, ...]) -> Optional[str]:
+    """
+    ✅ 选主角色：
+    - 优先按业务优先级（避免 manager+sales 被当成 sales）
+    - 若都不在优先级表中：回退到 role_names[0]（保持兼容旧逻辑的稳定性）
+    """
+    if not role_names:
+        return None
+    known = [r for r in role_names if r in _ROLE_PRIORITY]
+    if known:
+        return min(known, key=lambda r: _ROLE_PRIORITY.get(r, 999999))
+    return role_names[0]
 
 
 def _utcnow_naive() -> datetime:
@@ -202,14 +232,13 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
     if rel:
         try:
             for t in list(rel):  # type: ignore
-                # id
                 tid = None
                 for k in ("id", "team_id", "teamId"):
                     if hasattr(t, k):
                         tid = getattr(t, k, None)
                         if tid is not None:
                             break
-                # name
+
                 tname = None
                 for k in ("name", "team_name", "teamName"):
                     if hasattr(t, k):
@@ -241,7 +270,6 @@ async def get_current_session(
     sess = (await db.execute(stmt)).scalars().first()
 
     if not sess or int(getattr(sess, "expired", 0) or 0) == 1:
-        # 若启用了 Redis，顺手清理（失败不影响）
         try:
             rds = _get_redis()
             if rds:
@@ -262,7 +290,6 @@ async def get_current_session(
     last_active_utc = _to_utc_naive(last_active_at)
 
     if now - last_active_utc > timedelta(seconds=ttl):
-        # 过期则顺手标记 expired=1（失败不影响返回）
         try:
             await db.execute(
                 update(UserSession)
@@ -276,7 +303,6 @@ async def get_current_session(
             except Exception:
                 pass
 
-        # Redis 删除（有就删）
         try:
             rds = _get_redis()
             if rds:
@@ -286,7 +312,6 @@ async def get_current_session(
 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
 
-    # ✅ 心跳续命：节流写 DB（默认 30 秒最多写一次）
     hb = SESSION_HEARTBEAT_INTERVAL_SECONDS
     if hb < 0:
         hb = 0
@@ -303,19 +328,16 @@ async def get_current_session(
                 .values(last_active_at=now)
             )
             await db.commit()
-            # 同步内存态，便于本次请求后续使用
             try:
                 sess.last_active_at = now
             except Exception:
                 pass
-        # 否则不写库，降低 DB 压力
     except Exception:
         try:
             await db.rollback()
         except Exception:
             pass
 
-    # 若启用了 Redis，则刷新 TTL（失败不影响）
     try:
         rds = _get_redis()
         if rds:
@@ -351,7 +373,7 @@ async def get_current_user_with_roles(
     """
     返回：
     - user
-    - primary_role_name：按 Role.id 最小值选主角色
+    - primary_role_name：✅ 按业务优先级选主角色
     - role_names：该用户的全部角色（按 Role.id 升序）
     """
     stmt = (
@@ -362,7 +384,8 @@ async def get_current_user_with_roles(
     )
     rows = (await db.execute(stmt)).all()
     role_names = tuple([rname for _, rname in rows if rname])
-    primary = role_names[0] if role_names else None
+
+    primary = _pick_primary_role(role_names)
     return user, primary, role_names
 
 
@@ -370,7 +393,6 @@ async def get_current_user_with_role(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str]]:
-    # 兼容旧调用：仍只返回主角色
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     return user, primary
 
