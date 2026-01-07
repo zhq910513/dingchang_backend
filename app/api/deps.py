@@ -12,6 +12,10 @@
 - 兼容旧：user.team_name（单团队）
 - 兼容新：user.team_names / user.team_ids / user.teams(relationship) / user.team_id / user.team_id_list 等多种形态
 - 本文件只做“抽取与归一化”，不在这里猜业务规则（业务规则在各 API/service 层落地）
+
+✅ 关键修复：
+- _extract_teams_from_user 不再“命中第一个字段就 break”，改为多来源 union 合并。
+  避免：User 同时存在 team_names="" 与 team_name="A"，结果团队被抽成空的严重问题。
 """
 
 from __future__ import annotations
@@ -139,15 +143,19 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
     """
     从 user 对象上“尽力抽取”团队信息（不做业务判断）：
     支持字段/形态（任一存在即可）：
-    - team_ids / team_id_list / teams_ids
-    - team_names / team_name_list
+    - team_ids / team_id_list / teams_ids / teamIds / teamIdList
+    - team_names / team_name_list / teamNames / teamNameList
     - team_id / team_name（旧版单团队）
     - teams（relationship，元素可能有 id/name/team_id/team_name 属性）
 
     ✅ 关键优化：
+    - 多来源 union 合并：不会因为某个字段存在但为空（如 team_names=""）而“提前 break”导致漏 team_name。
     - 对 relationship: teams 仅在“已加载”情况下读取，避免 Async SQLAlchemy 懒加载触发 greenlet 错误。
     """
-    # 1) 先尝试 ids
+    team_ids_set: set[int] = set()
+    team_names_set: set[str] = set()
+
+    # 1) ids：多来源合并
     id_candidates = [
         "team_ids",
         "team_id_list",
@@ -156,15 +164,16 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
         "teamIdList",
         "team_id",
     ]
-    raw_ids: Any = None
     for k in id_candidates:
-        if hasattr(user, k):
-            raw_ids = getattr(user, k, None)
-            if raw_ids is not None:
-                break
-    team_ids = _normalize_team_ids(raw_ids)
+        if not hasattr(user, k):
+            continue
+        raw = getattr(user, k, None)
+        if raw is None:
+            continue
+        for tid in _normalize_team_ids(raw):
+            team_ids_set.add(int(tid))
 
-    # 2) 再尝试 names
+    # 2) names：多来源合并（重点：team_names 为空也不会遮蔽 team_name）
     name_candidates = [
         "team_names",
         "team_name_list",
@@ -172,16 +181,16 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
         "teamNameList",
         "team_name",
     ]
-    raw_names: Any = None
     for k in name_candidates:
-        if hasattr(user, k):
-            raw_names = getattr(user, k, None)
-            if raw_names is not None:
-                break
-    team_names = _normalize_team_names(raw_names)
+        if not hasattr(user, k):
+            continue
+        raw = getattr(user, k, None)
+        if raw is None:
+            continue
+        for tn in _normalize_team_names(raw):
+            team_names_set.add(str(tn))
 
-    # 3) relationship: teams（仅作为补充）
-    # 仅在 teams 已加载时读取，避免 async 懒加载
+    # 3) relationship: teams（仅作为补充；且仅在已加载时读取）
     rel = None
     try:
         st = inspect(user)
@@ -208,13 +217,15 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
                         if tname is not None:
                             break
 
-                if tid is not None:
-                    team_ids = tuple(sorted(set(team_ids) | set(_normalize_team_ids(tid))))
-                if tname is not None:
-                    team_names = tuple(sorted(set(team_names) | set(_normalize_team_names(tname))))
+                for x in _normalize_team_ids(tid):
+                    team_ids_set.add(int(x))
+                for x in _normalize_team_names(tname):
+                    team_names_set.add(str(x))
         except Exception:
             pass
 
+    team_ids = tuple(sorted(team_ids_set))
+    team_names = tuple(sorted(team_names_set))
     return team_ids, team_names
 
 

@@ -64,11 +64,16 @@ MULTI_SLOTS = {"related"}
 
 def _ensure_orders_access(role_name: Optional[str], *, allow_finance: bool = False) -> None:
     """
-    orders 模块默认禁止 finance 访问。
-    allow_finance=True 仅用于“财务维护备用图 related”的极少数接口（bos-upload / finalize）。
+    ✅ orders 模块访问控制（读）：
+    - super_admin / manager / finance / market / sales：允许访问（读）
+    - 其它角色：禁止
+    说明：
+    - “编辑权限保持原样”由 _ensure_orders_write_access + 各写入 ACL 负责
+    - allow_finance 参数保留兼容历史调用（不再用于限制 finance 读）
     """
-    if role_name == ROLE_FINANCE and not allow_finance:
-        raise HTTPException(status_code=403, detail="Finance has no permission to access orders")
+    rn = role_name or ""
+    if rn not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_FINANCE, ROLE_MARKET, ROLE_SALES):
+        raise HTTPException(status_code=403, detail="No permission")
 
 
 def _ensure_orders_write_access(role_name: Optional[str]) -> None:
@@ -308,7 +313,9 @@ def _require_team_for_non_super_admin(role_name: Optional[str], team_names: Tupl
 
 def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: Tuple[str, ...]) -> str:
     """
-    业务/财务/市场：只能属于 1 个团队（只能看自己团队）
+    ✅ 严格单团队角色：业务/财务/市场
+    - sales：本轮调整为“只能看自己的数据”，但仍要求账号团队配置为 1 个（数据治理一致性）
+    - finance/market：单团队（按 team_name 共享查看）
     经理：允许多团队
     """
     _require_team_for_non_super_admin(role_name, team_names)
@@ -336,10 +343,11 @@ async def _ensure_order_read_acl_by_salesperson_id(
     team_names: Tuple[str, ...],
 ) -> None:
     """
-    ✅ 读权限（列表/详情）：按“团队共享”实现 —— 不看经理归属(parent_id)
+    ✅ 读权限（列表/详情）：
     - super_admin：全量
-    - manager：可读自己 team_names 范围内全部订单
-    - sales/market/finance：可读自己单团队范围内全部订单
+    - manager：可读自己 team_names 范围内全部订单（按 salesperson.team_name）
+    - finance/market：可读自己 team_name 下全部订单
+    - sales：只能读自己的订单（本轮调整）
     """
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -348,10 +356,15 @@ async def _ensure_order_read_acl_by_salesperson_id(
     _require_team_for_non_super_admin(role_name, team_names)
     tns = _normalize_team_names(team_names)
 
+    if rn == ROLE_SALES:
+        if int(salesperson_id) != int(current_user.id):
+            raise HTTPException(status_code=403, detail="No permission")
+        return
+
     # 允许的团队集合
     if rn == ROLE_MANAGER:
         allowed_teams = set(tns)
-    elif rn in (ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
+    elif rn in (ROLE_MARKET, ROLE_FINANCE):
         my_team = _require_single_team_for_strict_roles(role_name, tns)
         allowed_teams = {my_team}
     else:
@@ -413,10 +426,11 @@ async def _apply_orders_list_acl(
     clauses: List,
 ) -> None:
     """
-    ✅ 列表 ACL：团队共享（不看 parent_id）
+    ✅ 列表 ACL（团队共享 / sales 自己）：
     - super_admin：全量
-    - manager：team_names 范围
-    - sales/market/finance：单团队范围
+    - manager：team_names 范围（按 salesperson.team_name）
+    - finance/market：单团队范围
+    - sales：只能看自己（本轮调整）
     """
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -425,12 +439,16 @@ async def _apply_orders_list_acl(
     _require_team_for_non_super_admin(role_name, team_names)
     tns = _normalize_team_names(team_names)
 
+    if rn == ROLE_SALES:
+        clauses.append(Order.salesperson_id == int(current_user.id))
+        return
+
     if rn == ROLE_MANAGER:
         team_user_ids = select(User.id).where(User.team_name.in_(list(tns)))
         clauses.append(Order.salesperson_id.in_(team_user_ids))
         return
 
-    if rn in (ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
+    if rn in (ROLE_MARKET, ROLE_FINANCE):
         my_team = _require_single_team_for_strict_roles(role_name, tns)
         team_user_ids = select(User.id).where(User.team_name == my_team)
         clauses.append(Order.salesperson_id.in_(team_user_ids))
@@ -463,7 +481,7 @@ async def _load_order_out(
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # ✅ 读 ACL：团队共享
+    # ✅ 读 ACL：sales 自己；manager/finance/market 按 team_name
     await _ensure_order_read_acl_by_salesperson_id(
         db,
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
@@ -666,8 +684,8 @@ async def list_salespersons(
     _ensure_orders_access(role_name)
     _require_team_for_non_super_admin(role_name, tns)
 
-    # ✅ market 只读：允许查看业务员列表（用于筛选/展示），但仍不允许写订单
-    if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET):
+    # ✅ 只读角色（market/finance）允许查看业务员列表（用于筛选/展示），但仍不允许写订单
+    if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
         raise HTTPException(status_code=403, detail="No permission")
 
     stmt = (
@@ -683,7 +701,8 @@ async def list_salespersons(
     # ✅ 团队隔离：
     # - super_admin：全量
     # - manager：多团队范围（不看 parent_id）
-    # - sales/market：单团队范围
+    # - market/finance：单团队范围
+    # - sales：只看自己（本轮仍保持）
     if role_name != ROLE_SUPER_ADMIN:
         if role_name == ROLE_MANAGER:
             stmt = stmt.where(User.team_name.in_(list(tns)))
@@ -691,7 +710,7 @@ async def list_salespersons(
             my_team = _require_single_team_for_strict_roles(role_name, tns)
             stmt = stmt.where(User.team_name == my_team)
 
-    # ✅ sales 仍只看自己（筛选下拉无需看到全团队）
+    # ✅ sales 仍只看自己
     if role_name == ROLE_SALES:
         stmt = stmt.where(User.id == current_user.id)
 
@@ -745,11 +764,15 @@ async def _apply_ocr_task_acl(
 
     stmt = stmt.where(Order.salesperson_id.in_(team_user_ids))
 
-    # ✅ sales：仍只看自己任务
+    # ✅ sales：只看自己任务
     if rn == ROLE_SALES:
         return stmt.where(Order.salesperson_id == int(current_user.id))
 
     if rn == ROLE_MANAGER:
+        return stmt
+
+    # ✅ finance：允许查看本团队任务（但本文件 OCR 链路仅在 orders 域被 sales/manager 使用；这里保持兼容）
+    if rn == ROLE_FINANCE:
         return stmt
 
     raise HTTPException(status_code=403, detail="No permission")
@@ -818,9 +841,8 @@ async def get_bos_sts(
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
     _user, role_name, team_names, _team_ids = user_with_role
-    # finance 仍然禁止拿 sts（避免直传任意 slot）
     _ensure_orders_access(role_name)
-    # ✅ market 只读：禁止拿 sts（属于上传写入口）
+    # ✅ market/finance 只读：禁止拿 sts（属于上传写入口）
     _ensure_orders_write_access(role_name)
     _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
 
@@ -900,7 +922,7 @@ async def bos_upload_proxy(
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
 
-    # 仅放开给 finance，用于维护 related
+    # ✅ finance 允许走该接口（但仅 related），其余写入口仍被禁止
     _ensure_orders_access(role_name, allow_finance=True)
     _require_team_for_non_super_admin(role_name, tns)
     _ = db
@@ -1246,7 +1268,7 @@ async def finalize_order_upload(
     user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
 
-    # 仅放开给 finance，用于维护 related
+    # ✅ finance 允许进来（仅 related 图维护）
     _ensure_orders_access(role_name, allow_finance=True)
     _require_team_for_non_super_admin(role_name, tns)
 
@@ -1484,7 +1506,7 @@ async def list_orders(
 
     clauses: list = []
 
-    # ✅ ACL（团队共享：不看 parent_id）
+    # ✅ ACL（sales 自己；manager 多团队；finance/market 单团队）
     await _apply_orders_list_acl(db, current_user=current_user, role_name=role_name, team_names=tns, clauses=clauses)
 
     if is_finished is not None:

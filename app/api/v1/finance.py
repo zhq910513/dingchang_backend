@@ -17,6 +17,7 @@
 - super_admin：可查看全部
 - manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name）
 - finance：只能查看自己 team_name 下的数据（单团队）
+- market：只能查看自己 team_name 下的数据（单团队，只读）
 
 ✅ 本轮继续补齐（链路打通）：
 - 财务端下拉筛选（只读）：
@@ -28,8 +29,9 @@
 - GET /finance/orders/summary：按“搜索条件”在数据库全量聚合（不受分页影响）
 
 ⚠️ 权限与范围：
-- 仅 finance/manager/super_admin 可用
-- 仅允许操作已完成订单
+- finance/manager/super_admin：可读可写（写含：paid/rebate、备用图 related）
+- market：只读（不可改 paid/rebate，不可上传/维护图片，不可拿 sts）
+- 仅允许操作已完成订单（财务域）
 - 仅允许操作 slot_key = related（备用图）
 """
 from __future__ import annotations
@@ -86,11 +88,24 @@ MULTI_SLOTS = {"related"}
 
 
 def _ensure_finance_access(role_name: Optional[str]) -> None:
-    # ✅ 显式钉死 market/sales：财务模块禁止访问
-    if role_name == ROLE_MARKET:
-        raise HTTPException(status_code=403, detail="Market has no permission to access finance")
+    """
+    ✅ finance 域读权限：
+    - super_admin / manager / finance / market：允许（market 只读）
+    - sales：禁止
+    - 其它：禁止
+    """
     if role_name == ROLE_SALES:
         raise HTTPException(status_code=403, detail="Sales has no permission to access finance")
+    if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET):
+        raise HTTPException(status_code=403, detail="No permission")
+
+
+def _ensure_finance_write_access(role_name: Optional[str]) -> None:
+    """
+    ✅ finance 域写权限（编辑权限保持原样）：
+    - 仅 finance / manager / super_admin
+    - market：只读，禁止
+    """
     if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN):
         raise HTTPException(status_code=403, detail="No permission")
 
@@ -116,6 +131,7 @@ def _current_team_names_or_403(
     super_admin：None（表示不限制）
     manager：允许多团队（>=1），返回 tuple(team_names...）
     finance：必须单团队（==1），返回 tuple(team_name,）
+    market：必须单团队（==1），返回 tuple(team_name,）  ✅ 本轮新增：market 只读
     """
     if role_name == ROLE_SUPER_ADMIN:
         return None
@@ -128,9 +144,9 @@ def _current_team_names_or_403(
     if invalid:
         raise HTTPException(status_code=403, detail="当前账号团队非法（team_name/team_names）")
 
-    if role_name == ROLE_FINANCE:
+    if role_name in (ROLE_FINANCE, ROLE_MARKET):
         if len(tns) != 1:
-            raise HTTPException(status_code=403, detail="当前账号团队配置异常：财务必须且只能属于 1 个团队")
+            raise HTTPException(status_code=403, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
         return (tns[0],)
 
     if role_name == ROLE_MANAGER:
@@ -390,7 +406,7 @@ async def finance_list_customer_groups(
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
 
-    # ✅ 若 customer_group 具备 team_name 字段，则按财务团队隔离；否则不强行猜字段
+    # ✅ 若 customer_group 具备 team_name 字段，则按团队隔离；否则不强行猜字段
     if hasattr(CustomerGroup, "team_name") and current_team_names is not None:
         stmt = stmt.where(getattr(CustomerGroup, "team_name").in_(list(current_team_names)))
 
@@ -415,7 +431,7 @@ async def finance_list_channel_groups(
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
 
-    # ✅ channel_group 一般有 team_name：严格按财务团队隔离
+    # ✅ channel_group 一般有 team_name：严格按团队隔离
     if hasattr(ChannelGroup, "team_name") and current_team_names is not None:
         stmt = stmt.where(getattr(ChannelGroup, "team_name").in_(list(current_team_names)))
 
@@ -443,7 +459,7 @@ async def finance_list_salespersons(
         .order_by(User.id.asc())
     )
 
-    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance 单团队
+    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance/market 单团队
     if current_team_names is not None:
         stmt = stmt.where(User.team_name.in_(list(current_team_names)))
 
@@ -858,6 +874,7 @@ async def update_finance_order_status(
 ):
     _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    _ensure_finance_write_access(role_name)
     tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     o = (
@@ -896,6 +913,7 @@ async def return_finance_order_to_unfinished(
 ):
     _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    _ensure_finance_write_access(role_name)
     tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     o = (
@@ -944,6 +962,7 @@ async def finance_get_bos_sts(
 ):
     _user, role_name, _team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    _ensure_finance_write_access(role_name)
     _ = db
 
     if not storage.enabled:
@@ -1046,6 +1065,7 @@ async def finance_bos_upload_proxy(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    _ensure_finance_write_access(role_name)
 
     current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
@@ -1213,6 +1233,7 @@ async def finance_finalize_images(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
+    _ensure_finance_write_access(role_name)
 
     current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
 
