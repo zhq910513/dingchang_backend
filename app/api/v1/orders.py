@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Any, Dict, List, Tuple, Set
-from zoneinfo import ZoneInfo
 
 import anyio
 import requests
@@ -43,8 +42,6 @@ from app.utils.order_image_urls import ensure_display_urls_for_order_images, saf
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 storage = StorageService()
-
-BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 OCR_SLOTS = {
     "vehicle_cert",
@@ -736,13 +733,25 @@ async def list_customer_groups(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
-    _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
+
+    tns = _normalize_team_names(team_names)
+    _require_team_for_non_super_admin(role_name, tns)
 
     stmt = select(CustomerGroup).order_by(CustomerGroup.id.asc())
     if hasattr(CustomerGroup, "deleted_at"):
         stmt = stmt.where(getattr(CustomerGroup, "deleted_at").is_(None))
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
+
+    # ✅ 若 customer_group 具备 team_name 字段，则按团队隔离；否则不强行猜字段
+    if hasattr(CustomerGroup, "team_name"):
+        if role_name == ROLE_SUPER_ADMIN:
+            pass
+        elif role_name == ROLE_MANAGER:
+            stmt = stmt.where(CustomerGroup.team_name.in_(list(tns)))
+        else:
+            my_team = _require_single_team_for_strict_roles(role_name, tns)
+            stmt = stmt.where(CustomerGroup.team_name == my_team)
 
     rows = (await db.execute(stmt)).scalars().all()
     return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
@@ -1147,37 +1156,51 @@ def _digits8_expr(expr):
 
 
 def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
+    """
+    ✅ 修正：用 _json_text_unquoted 再 lower，避免 MySQL JSON 字符串带引号导致 like 命中不稳定
+    """
     v = (value or "").strip()
     if not v:
         return
-    expr = func.lower(_json_text(Order.dynamic_data, key))
+    expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
     clauses.append(expr.like(f"%{v.lower()}%"))
 
 
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    ✅ 方案 A：
+    - DB created_at 为北京时间 naive DATETIME
+    - 输入 YYYY-MM-DD（语义：北京时间）
+    - 输出 naive 区间：[start, end)
+    """
     s = (ymd or "").strip()
     if not s:
         return None
     try:
-        bj_start = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_start = datetime.strptime(s, "%Y-%m-%d")
         bj_end = bj_start + timedelta(days=1)
-        return bj_start.astimezone(timezone.utc), bj_end.astimezone(timezone.utc)
+        return bj_start, bj_end
     except Exception:
         return None
 
 
 def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    ✅ 方案 A：
+    start/end: YYYY-MM-DD（北京时间）
+    返回：[start_bj_naive, end_bj_exclusive_naive)，end 为“包含 end 当天”
+    """
     s0 = (start_ymd or "").strip()
     e0 = (end_ymd or "").strip()
     if not s0 or not e0:
         return None
     try:
-        bj_start = datetime.strptime(s0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
-        bj_end_inclusive = datetime.strptime(e0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_start = datetime.strptime(s0, "%Y-%m-%d")
+        bj_end_inclusive = datetime.strptime(e0, "%Y-%m-%d")
         if bj_end_inclusive < bj_start:
             return None
         bj_end_exclusive = bj_end_inclusive + timedelta(days=1)
-        return bj_start.astimezone(timezone.utc), bj_end_exclusive.astimezone(timezone.utc)
+        return bj_start, bj_end_exclusive
     except Exception:
         return None
 
@@ -1567,20 +1590,21 @@ async def list_orders(
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
 
+    # ✅ 方案 A：created_at 为北京时间 naive DATETIME，直接用北京时间边界过滤
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
         rng = _parse_bj_date_span(created_date_start, created_date_end)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
-        start_utc, end_utc = rng
-        clauses.append(and_(Order.created_at >= start_utc, Order.created_at < end_utc))
+        start_bj, end_bj = rng
+        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
     elif created_date:
         rng = _parse_bj_date_range(created_date)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
-        start_utc, end_utc = rng
-        clauses.append(and_(Order.created_at >= start_utc, Order.created_at < end_utc))
+        start_bj, end_bj = rng
+        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(

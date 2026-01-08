@@ -377,7 +377,13 @@ async def create_user(
     await db.flush()
 
     db.add(UserRole(user_id=new_user.id, role_id=role.id))
-    await db.commit()
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        # 并发下仍可能撞唯一约束
+        raise HTTPException(status_code=400, detail="Username already exists")
 
     logger.info(
         "Create user: operator=%s new_user=%s role=%s parent_id=%s team=%s teams=%s",
@@ -399,7 +405,7 @@ async def list_children_users(
     """
     获取当前账号创建的子账号，并附带在线状态：
     - super_admin / manager 可查看
-    - 在线：last_active_at 在 SESSION_TIMEOUT_SECONDS 内 且 session.expired=0
+    - 在线：last_active_at 在 SESSION_TIMEOUT_SECONDS 内 且存在 expired=0 的 session
     """
     current_user, current_role_name = user_role
     if current_role_name not in (ROLE_MANAGER, ROLE_SUPER_ADMIN):
@@ -417,28 +423,32 @@ async def list_children_users(
     if not user_ids:
         return []
 
+    # ✅ 修复：只统计 expired=0 的 session，避免历史过期 session 把在线状态误判为离线
     stmt_session = (
         select(
             UserSession.user_id,
             func.max(UserSession.last_active_at).label("last_active_at"),
-            func.max(UserSession.expired).label("max_expired"),
         )
-        .where(UserSession.user_id.in_(user_ids))
+        .where(UserSession.user_id.in_(user_ids), UserSession.expired == 0)
         .group_by(UserSession.user_id)
     )
     srows = (await db.execute(stmt_session)).all()
     session_map = {int(r.user_id): r for r in srows}
 
-    now = datetime.utcnow()
+    # ✅ 方案 A / 北京时间 naive：用 datetime.now()（容器 TZ=Asia/Shanghai 时为北京时间）
+    now = datetime.now()
     ttl = int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200) or 7200)
 
     out: List[UserSimple] = []
     for r in rows:
         sess = session_map.get(int(r.id))
         online = False
-        if sess and int(sess.max_expired or 0) == 0 and sess.last_active_at is not None:
-            if (now - sess.last_active_at) <= timedelta(seconds=ttl):
-                online = True
+        if sess and sess.last_active_at is not None:
+            try:
+                if (now - sess.last_active_at) <= timedelta(seconds=ttl):
+                    online = True
+            except Exception:
+                online = False
 
         teams = _normalize_team_list(
             _split_csv(getattr(r, "team_names", None))

@@ -1,3 +1,4 @@
+# app/api/v1/auth.py
 # encoding: utf-8
 """
 认证相关接口：
@@ -10,6 +11,8 @@
 """
 
 import logging
+import hashlib
+import hmac
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,6 +43,24 @@ def _is_legacy_password_hash(hashed: str) -> bool:
     try:
         int(hashed, 16)
         return True
+    except Exception:
+        return False
+
+
+def _legacy_sha256_hex(plain: str) -> str:
+    return hashlib.sha256((plain or "").encode("utf-8")).hexdigest()
+
+
+def _verify_password_compat(plain: str, stored_hash: str) -> bool:
+    """
+    兼容校验：
+    - 新格式：走 verify_password（PBKDF2 等）
+    - 旧格式：sha256(plain) hex 直比
+    """
+    try:
+        if _is_legacy_password_hash(stored_hash):
+            return hmac.compare_digest(_legacy_sha256_hex(plain), (stored_hash or "").lower())
+        return bool(verify_password(plain, stored_hash))
     except Exception:
         return False
 
@@ -97,14 +118,13 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     user = await _find_user_by_login_key(db, payload.username)
 
     # 统一错误信息（避免泄露“用户名存在/不存在”）
-    if not user or not verify_password(payload.password, user.password_hash):
+    if not user or not _verify_password_compat(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="账号或密码错误")
 
     if user.status != 1:
         raise HTTPException(status_code=403, detail="账号已禁用")
 
     # ✅ 渐进升级：旧 sha256 hash 在首次成功登录时升级为新 PBKDF2 格式
-    # 不影响现有用户，且提升“拖库后的抗爆破能力”
     try:
         if _is_legacy_password_hash(user.password_hash):
             user.password_hash = hash_password(payload.password)

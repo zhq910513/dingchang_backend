@@ -33,11 +33,18 @@
 - market：只读（不可改 paid/rebate，不可上传/维护图片，不可拿 sts）
 - 仅允许操作已完成订单（财务域）
 - 仅允许操作 slot_key = related（备用图 related）
+
+===========================
+✅ 方案 A（严格执行）：
+- MySQL DATETIME 存北京时间（naive）
+- 后端不做时区换算：naive 直接格式化输出
+- created_at 的日期过滤：使用北京时间 naive 边界（00:00:00 ～ 次日00:00:00）
+===========================
 """
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Set
 
 import anyio
@@ -79,6 +86,7 @@ from app.utils.order_image_urls import ensure_display_urls_for_order_images, saf
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
+# 仅用于“输出展示”，不用于 DB 存取/筛选转换
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 storage = StorageService()
 
@@ -157,11 +165,21 @@ def _current_team_names_or_403(
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
+    """
+    ✅ 方案 A（严格）：
+    - MySQL DATETIME 存的是北京时间 naive（tzinfo=None）
+    - 后端禁止做时区换算
+    - naive：直接按北京时间格式化输出
+    - aware（极少见）：仅用于展示时转到 Asia/Shanghai 再格式化
+    """
     if not dt:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:
@@ -271,33 +289,40 @@ def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
 
 
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
+    """
+    ✅ 方案 A（严格）：
+    - 输入 YYYY-MM-DD（语义：北京时间）
+    - 输出 naive datetime 区间：[start, end)（同为北京时间 naive）
+    - 用于直接过滤 MySQL DATETIME（北京时间 naive）
+    """
     s = (ymd or "").strip()
     if not s:
         return None
     try:
-        bj_start = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_start = datetime.strptime(s, "%Y-%m-%d")
         bj_end = bj_start + timedelta(days=1)
-        return bj_start.astimezone(timezone.utc), bj_end.astimezone(timezone.utc)
+        return bj_start, bj_end
     except Exception:
         return None
 
 
 def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime, datetime]]:
     """
+    ✅ 方案 A（严格）：
     start/end: YYYY-MM-DD（北京时间）
-    返回：[start_utc, end_utc_exclusive)，其中 end 为“包含 end 当天”
+    返回：[start_bj_naive, end_bj_exclusive_naive)，其中 end 为“包含 end 当天”
     """
     s0 = (start_ymd or "").strip()
     e0 = (end_ymd or "").strip()
     if not s0 or not e0:
         return None
     try:
-        bj_start = datetime.strptime(s0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
-        bj_end_inclusive = datetime.strptime(e0, "%Y-%m-%d").replace(tzinfo=BJ_TZ)
+        bj_start = datetime.strptime(s0, "%Y-%m-%d")
+        bj_end_inclusive = datetime.strptime(e0, "%Y-%m-%d")
         if bj_end_inclusive < bj_start:
             return None
         bj_end_exclusive = bj_end_inclusive + timedelta(days=1)
-        return bj_start.astimezone(timezone.utc), bj_end_exclusive.astimezone(timezone.utc)
+        return bj_start, bj_end_exclusive
     except Exception:
         return None
 
@@ -592,22 +617,23 @@ async def finance_orders_summary(
         clauses.append(Order.customer_group_id == int(customer_group_id))
 
     # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
+    # ✅ 方案 A：用北京时间 naive 区间直接过滤 MySQL DATETIME
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
         rng = _parse_bj_date_span(created_date_start, created_date_end)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
-        start_utc, end_utc = rng
-        clauses.append(Order.created_at >= start_utc)
-        clauses.append(Order.created_at < end_utc)
+        start_bj, end_bj = rng
+        clauses.append(Order.created_at >= start_bj)
+        clauses.append(Order.created_at < end_bj)
     elif created_date:
         rng = _parse_bj_date_range(created_date)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
-        start_utc, end_utc = rng
-        clauses.append(Order.created_at >= start_utc)
-        clauses.append(Order.created_at < end_utc)
+        start_bj, end_bj = rng
+        clauses.append(Order.created_at >= start_bj)
+        clauses.append(Order.created_at < end_bj)
 
     if is_paid is not None:
         clauses.append(Order.is_paid.is_(bool(is_paid)))
@@ -804,22 +830,23 @@ async def list_finance_orders(
         clauses.append(Order.customer_group_id == int(customer_group_id))
 
     # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
+    # ✅ 方案 A：用北京时间 naive 区间直接过滤 MySQL DATETIME
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
         rng = _parse_bj_date_span(created_date_start, created_date_end)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
-        start_utc, end_utc = rng
-        clauses.append(Order.created_at >= start_utc)
-        clauses.append(Order.created_at < end_utc)
+        start_bj, end_bj = rng
+        clauses.append(Order.created_at >= start_bj)
+        clauses.append(Order.created_at < end_bj)
     elif created_date:
         rng = _parse_bj_date_range(created_date)
         if not rng:
             raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
-        start_utc, end_utc = rng
-        clauses.append(Order.created_at >= start_utc)
-        clauses.append(Order.created_at < end_utc)
+        start_bj, end_bj = rng
+        clauses.append(Order.created_at >= start_bj)
+        clauses.append(Order.created_at < end_bj)
 
     if is_paid is not None:
         clauses.append(Order.is_paid.is_(bool(is_paid)))
@@ -881,8 +908,6 @@ async def list_finance_orders(
         if not sp:
             continue
 
-        # 1) 先尝试 salesperson 上直接带 manager_name（无需查表）
-        #    如果没有，再尝试 manager_id 等字段并批量查 manager User
         mid = _pick_manager_id_from_salesperson(sp)
         if mid:
             salesperson_to_manager_id[int(getattr(sp, "id", 0) or 0)] = mid
@@ -907,7 +932,6 @@ async def list_finance_orders(
         engine_no = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
         vehicle_model = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
 
-        # ✅ 关键修复：身份证号强制转字符串，避免导出时被当“数值”写入 Excel 出现 E+
         raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
         id_number = (str(raw_id_number).strip() if raw_id_number is not None else "")
 
@@ -919,7 +943,6 @@ async def list_finance_orders(
         if sp:
             team_name_val = (getattr(sp, "team_name", None) or None)
             team_names_val = _split_team_names_any(getattr(sp, "team_names", None))
-            # 兜底：只有 team_name 没有 team_names 时，给 team_names 填一个（前端可选用）
             if not team_names_val and team_name_val:
                 team_names_val = [str(team_name_val).strip()] if str(team_name_val).strip() else []
 
