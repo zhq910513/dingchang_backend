@@ -86,7 +86,7 @@ from app.utils.order_image_urls import ensure_display_urls_for_order_images, saf
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
-# 仅用于“输出展示”，不用于 DB 存取/筛选转换
+# 仅用于“输出展示”的时区对象（方案 A：正常情况下不会做换算）
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 storage = StorageService()
 
@@ -166,16 +166,31 @@ def _current_team_names_or_403(
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
     """
-    ✅ 方案 A（严格）：
-    - MySQL DATETIME 存的是北京时间 naive（tzinfo=None）
-    - 后端禁止做时区换算
-    - naive：直接按北京时间格式化输出
-    - aware（极少见）：仅用于展示时转到 Asia/Shanghai 再格式化
+    ✅ 方案 A（严格）：禁止“多加 8 小时”
+    - 我们的业务约定：MySQL DATETIME 存北京时间 naive（tzinfo=None）
+    - 因此：naive 直接格式化输出，绝不做时区换算
+
+    ✅ 兼容修复（应对驱动/模型把 DATETIME 读成 aware UTC 的情况）：
+    - 若 dt 为 aware 且 offset==0（UTC），大概率是“北京墙上时间被错误贴了 UTC 标签”
+      -> 直接去 tzinfo 再格式化（避免 .astimezone(BJ_TZ) 导致 +8）
+    - 其它 aware（极少见）：仅用于展示时转到 Asia/Shanghai 再格式化（兜底）
     """
     if not dt:
         return None
+
+    # 正常：DB DATETIME -> naive
     if dt.tzinfo is None:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ✅ 修复：aware + UTC 标签（offset=0）——当作“已是北京时间的墙上时间”
+    try:
+        off = dt.utcoffset()
+        if off is not None and abs(off.total_seconds()) < 1:
+            return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    # 兜底：其它 aware 才允许转到北京时间展示
     try:
         return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
