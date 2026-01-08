@@ -205,6 +205,12 @@ class OrderOut(BaseModel):
 
     customer_group_market: Optional[str] = None
 
+    # ✅ 新增：所属经理/所属团队（与 finance 域对齐；orders 域回填）
+    manager_id: Optional[int] = None
+    manager_name: Optional[str] = None
+    team_name: Optional[str] = None
+    team_names: List[str] = Field(default_factory=list)
+
     is_finished: bool = False
     is_rebate: bool = False
     is_paid: bool = False

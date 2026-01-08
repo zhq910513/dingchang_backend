@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple, Set
 from zoneinfo import ZoneInfo
 
 import anyio
@@ -281,6 +281,93 @@ def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
 
 
 # ===========================
+# ✅ orders 域：回填团队/经理（与 finance 域口径对齐）
+# ===========================
+def _split_team_names_any(val) -> List[str]:
+    """
+    兼容：
+    - None -> []
+    - ["A","B"] / ("A","B") / {"A"} -> list
+    - "A,B" / "A，B" / "A|B" -> list
+    """
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple, set)):
+        out = []
+        for x in val:
+            s = str(x or "").strip()
+            if s:
+                out.append(s)
+        seen = set()
+        uniq = []
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return []
+        for sep in [",", "，", "|", ";", "；", " "]:
+            if sep in s:
+                parts = [p.strip() for p in s.split(sep)]
+                parts = [p for p in parts if p]
+                if parts:
+                    seen = set()
+                    uniq = []
+                    for x in parts:
+                        if x in seen:
+                            continue
+                        seen.add(x)
+                        uniq.append(x)
+                    return uniq
+        return [s]
+    s2 = str(val or "").strip()
+    return [s2] if s2 else []
+
+
+def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
+    """
+    ✅ 只读字段推断：优先尝试常见 manager 字段名。
+    """
+    if not sp:
+        return None
+    for key in ("manager_id", "leader_id", "supervisor_id", "parent_id"):
+        try:
+            v = getattr(sp, key, None)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        try:
+            iv = int(v)
+            if iv > 0:
+                return iv
+        except Exception:
+            continue
+    return None
+
+
+def _pick_manager_name_inline(sp: Optional[User]) -> Optional[str]:
+    """
+    若 User 上直接有 manager_name/leader_name 等字符串字段，则直接用（无需额外查表）。
+    """
+    if not sp:
+        return None
+    for key in ("manager_name", "leader_name", "supervisor_name", "parent_name"):
+        try:
+            v = getattr(sp, key, None)
+        except Exception:
+            v = None
+        s = str(v or "").strip()
+        if s:
+            return s
+    return None
+
+
+# ===========================
 # ✅ 团队/角色 ACL（orders 域）
 # ===========================
 def _normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> Tuple[str, ...]:
@@ -502,6 +589,24 @@ async def _load_order_out(
 
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
 
+    # ✅ 回填：所属团队/经理（与 finance 域一致）
+    sp = getattr(o, "salesperson", None)
+    team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
+    team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
+    if not team_names_val and team_name_val and str(team_name_val).strip():
+        team_names_val = [str(team_name_val).strip()]
+
+    manager_id_val = None
+    manager_name_val = None
+    if sp:
+        manager_name_val = _pick_manager_name_inline(sp)
+        mid = _pick_manager_id_from_salesperson(sp)
+        if mid:
+            manager_id_val = int(mid)
+            if not manager_name_val:
+                mgr = (await db.execute(select(User).where(User.id == int(mid)))).scalars().first()
+                manager_name_val = _user_display_name(mgr)
+
     cg = getattr(o, "customer_group", None)
     return OrderOut(
         id=o.id,
@@ -509,6 +614,13 @@ async def _load_order_out(
         salesperson_id=o.salesperson_id,
         customer_group_id=o.customer_group_id,
         channel_group_id=o.channel_group_id,
+
+        # ✅ 新增回填
+        manager_id=manager_id_val,
+        manager_name=manager_name_val,
+        team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
+        team_names=team_names_val,
+
         is_finished=bool(o.is_finished),
         is_rebate=bool(getattr(o, "is_rebate", False)),
         is_paid=bool(getattr(o, "is_paid", False)),
@@ -1507,10 +1619,46 @@ async def list_orders(
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(stmt)).scalars().all()
 
+    # ✅ 批量补齐：所属经理/所属团队（避免 N+1）
+    manager_ids: Set[int] = set()
+    salesperson_to_manager_id: Dict[int, int] = {}
+
+    for o in rows:
+        sp = getattr(o, "salesperson", None)
+        if not sp:
+            continue
+        mid = _pick_manager_id_from_salesperson(sp)
+        if mid:
+            salesperson_to_manager_id[int(getattr(sp, "id", 0) or 0)] = int(mid)
+            manager_ids.add(int(mid))
+
+    managers_by_id: Dict[int, User] = {}
+    if manager_ids:
+        mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
+        managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
+
     items: list[OrderOut] = []
     for o in rows:
         ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
         cg = getattr(o, "customer_group", None)
+        sp = getattr(o, "salesperson", None)
+
+        team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
+        team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
+        if not team_names_val and team_name_val and str(team_name_val).strip():
+            team_names_val = [str(team_name_val).strip()]
+
+        manager_id_val = None
+        manager_name_val = None
+        if sp:
+            manager_name_val = _pick_manager_name_inline(sp)
+            sp_id_int = int(getattr(sp, "id", 0) or 0)
+            mid = salesperson_to_manager_id.get(sp_id_int) or _pick_manager_id_from_salesperson(sp)
+            if mid:
+                manager_id_val = int(mid)
+                if not manager_name_val:
+                    manager_name_val = _user_display_name(managers_by_id.get(int(mid)))
+
         items.append(
             OrderOut(
                 id=o.id,
@@ -1518,6 +1666,13 @@ async def list_orders(
                 salesperson_id=o.salesperson_id,
                 customer_group_id=o.customer_group_id,
                 channel_group_id=o.channel_group_id,
+
+                # ✅ 新增回填
+                manager_id=manager_id_val,
+                manager_name=manager_name_val,
+                team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
+                team_names=team_names_val,
+
                 is_finished=bool(o.is_finished),
                 is_rebate=bool(getattr(o, "is_rebate", False)),
                 is_paid=bool(getattr(o, "is_paid", False)),
