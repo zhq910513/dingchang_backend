@@ -7,9 +7,10 @@
 - 空值安全：dynamic_data / image_urls / images 给默认值，避免前端解构报错
 - 兼容 ORM：orm_mode=True
 
-本轮修复：
+本轮对齐：
 - ✅ created_at / updated_at 统一输出为 "%Y-%m-%d %H:%M:%S"（与 finance 域一致，避免 ISO 8601 的 "T"）
-- ✅ 明显隐患收口：旧数据/NULL 字段导致响应序列化报错（None -> 0/""）
+- ✅ OrderInfoIn：允许前端用 "" / null 显式清空数字字段（避免 float 解析报错）
+- ✅ OrderInfoOut：金额/点位/合计字段保持 Optional（None 原样输出为 null），与前端“默认空，不默认 0.00”一致
 """
 
 from __future__ import annotations
@@ -50,13 +51,13 @@ def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _to_float_or_zero(v) -> float:
+def _to_float_or_none(v) -> Optional[float]:
     if v is None or v == "":
-        return 0.0
+        return None
     try:
         return float(v)
     except Exception:
-        return 0.0
+        return None
 
 
 def _to_int_or_zero(v) -> int:
@@ -166,40 +167,70 @@ class OrderInfoIn(OrmBaseModel):
     customer_non_vehicle_point: Optional[float] = None
     customer_reward: Optional[float] = None
 
+    @validator("insurance_expire_date", pre=True, always=True)
+    def _date_empty_to_none(cls, v):
+        if v is None or v == "":
+            return None
+        return v
+
+    @validator(
+        "commercial_amount",
+        "compulsory_amount",
+        "vehicle_tax_amount",
+        "non_vehicle_amount",
+        "channel_commercial_point",
+        "channel_commercial_supplement_point",
+        "channel_compulsory_point",
+        "channel_vehicle_tax_point",
+        "channel_non_vehicle_point",
+        "channel_reward",
+        "customer_commercial_point",
+        "customer_commercial_supplement_point",
+        "customer_compulsory_point",
+        "customer_vehicle_tax_point",
+        "customer_non_vehicle_point",
+        "customer_reward",
+        pre=True,
+        always=True,
+    )
+    def _float_empty_to_none(cls, v):
+        # ✅ 允许 "" / null 清空；其它尽量转 float（失败也给 None，避免 422）
+        return _to_float_or_none(v)
+
 
 class OrderInfoOut(OrmBaseModel):
     insurance_expire_date: Optional[date] = None
     owner_phone: str = ""
 
-    commercial_amount: float = 0
-    compulsory_amount: float = 0
-    vehicle_tax_amount: float = 0
-    non_vehicle_amount: float = 0
-    premium_total: float = 0
+    commercial_amount: Optional[float] = None
+    compulsory_amount: Optional[float] = None
+    vehicle_tax_amount: Optional[float] = None
+    non_vehicle_amount: Optional[float] = None
+    premium_total: Optional[float] = None
 
-    channel_commercial_point: float = 0
+    channel_commercial_point: Optional[float] = None
 
     # ✅ 新增：渠道-商业后补点位
-    channel_commercial_supplement_point: float = 0
+    channel_commercial_supplement_point: Optional[float] = None
 
-    channel_compulsory_point: float = 0
-    channel_vehicle_tax_point: float = 0
-    channel_non_vehicle_point: float = 0
-    channel_reward: float = 0
-    channel_total: float = 0
+    channel_compulsory_point: Optional[float] = None
+    channel_vehicle_tax_point: Optional[float] = None
+    channel_non_vehicle_point: Optional[float] = None
+    channel_reward: Optional[float] = None
+    channel_total: Optional[float] = None
 
-    customer_commercial_point: float = 0
+    customer_commercial_point: Optional[float] = None
 
     # ✅ 新增：客户-商业后补点位
-    customer_commercial_supplement_point: float = 0
+    customer_commercial_supplement_point: Optional[float] = None
 
-    customer_compulsory_point: float = 0
-    customer_vehicle_tax_point: float = 0
-    customer_non_vehicle_point: float = 0
-    customer_reward: float = 0
-    customer_total: float = 0
+    customer_compulsory_point: Optional[float] = None
+    customer_vehicle_tax_point: Optional[float] = None
+    customer_non_vehicle_point: Optional[float] = None
+    customer_reward: Optional[float] = None
+    customer_total: Optional[float] = None
 
-    profit: float = 0
+    profit: Optional[float] = None
 
     @validator("owner_phone", pre=True, always=True)
     def _owner_phone_none_to_empty(cls, v):
@@ -229,8 +260,9 @@ class OrderInfoOut(OrmBaseModel):
         pre=True,
         always=True,
     )
-    def _float_none_to_zero(cls, v):
-        return _to_float_or_zero(v)
+    def _float_keep_none(cls, v):
+        # ✅ None 原样输出 null；"" 也视为 None；其它尽量转 float
+        return _to_float_or_none(v)
 
 
 class OrderFilter(OrmBaseModel):
