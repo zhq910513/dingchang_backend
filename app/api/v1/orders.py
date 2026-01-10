@@ -403,6 +403,37 @@ def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: 
     return tns[0] if tns else ""
 
 
+def _allowed_teams_for_user(role_name: Optional[str], team_names: Tuple[str, ...]) -> Tuple[str, ...]:
+    """
+    ✅ 用于“团队筛选/团队下拉”的可选团队集合：
+    - super_admin：全部 TEAM_NAMES
+    - manager：其 team_names
+    - finance/market/sales：单团队（账号自身团队）
+    """
+    rn = role_name or ""
+    if rn == ROLE_SUPER_ADMIN:
+        return tuple([str(x) for x in (TEAM_NAMES or [])])
+    tns = _normalize_team_names(team_names)
+    _require_team_for_non_super_admin(role_name, tns)
+    if rn == ROLE_MANAGER:
+        return tns
+    if rn in (ROLE_FINANCE, ROLE_MARKET, ROLE_SALES):
+        my_team = _require_single_team_for_strict_roles(role_name, tns)
+        return (my_team,)
+    return tns
+
+
+def _require_team_filter_allowed(*, role_name: Optional[str], team_names: Tuple[str, ...], team_filter: str) -> None:
+    tf = str(team_filter or "").strip()
+    if not tf:
+        return
+    if tf not in TEAM_NAMES:
+        raise HTTPException(status_code=400, detail="team_name invalid")
+    allowed = set(_allowed_teams_for_user(role_name, team_names))
+    if tf not in allowed and (role_name or "") != ROLE_SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="No permission")
+
+
 def _user_team_match_expr(teams: Tuple[str, ...]):
     """
     ✅ 核心修复：兼容 user.team_name（旧单值）+ user.team_names（CSV 多值）
@@ -714,7 +745,7 @@ async def _get_or_create_image_file(
 
 
 # ===========================
-# 下拉：客户群 / 渠道群 / 业务员
+# 下拉：客户群 / 渠道群 / 业务员 / 团队
 # ===========================
 class OptionItem(BaseModel):
     id: int
@@ -731,6 +762,9 @@ async def list_customer_groups(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
+    """
+    ✅ 共享数据：客户下拉不再按团队过滤（所有团队共享客户数据）。
+    """
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
 
@@ -743,16 +777,7 @@ async def list_customer_groups(
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
 
-    # ✅ 若 customer_group 具备 team_name 字段，则按团队隔离；否则不强行猜字段
-    if hasattr(CustomerGroup, "team_name"):
-        if role_name == ROLE_SUPER_ADMIN:
-            pass
-        elif role_name == ROLE_MANAGER:
-            stmt = stmt.where(CustomerGroup.team_name.in_(list(tns)))
-        else:
-            my_team = _require_single_team_for_strict_roles(role_name, tns)
-            stmt = stmt.where(CustomerGroup.team_name == my_team)
-
+    # ✅ 已取消：CustomerGroup.team_name 团队过滤（共享数据）
     rows = (await db.execute(stmt)).scalars().all()
     return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
 
@@ -763,11 +788,12 @@ async def list_channel_groups(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
+    """
+    ✅ 共享数据：渠道下拉不再按团队过滤（所有团队共享渠道数据）。
+    """
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_orders_access(role_name)
     _require_team_for_non_super_admin(role_name, _normalize_team_names(team_names))
-
-    tns = _normalize_team_names(team_names)
 
     stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
     if hasattr(ChannelGroup, "deleted_at"):
@@ -775,17 +801,37 @@ async def list_channel_groups(
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
 
-    if hasattr(ChannelGroup, "team_name"):
-        if role_name == ROLE_SUPER_ADMIN:
-            pass
-        elif role_name == ROLE_MANAGER:
-            stmt = stmt.where(ChannelGroup.team_name.in_(list(tns)))
-        else:
-            my_team = _require_single_team_for_strict_roles(role_name, tns)
-            stmt = stmt.where(ChannelGroup.team_name == my_team)
-
+    # ✅ 已取消：ChannelGroup.team_name 团队过滤（共享数据）
     rows = (await db.execute(stmt)).scalars().all()
     return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
+
+
+class TeamItem(BaseModel):
+    team_name: str
+
+
+class TeamListOut(BaseModel):
+    items: List[TeamItem] = Field(default_factory=list)
+
+
+@router.get("/teams", response_model=TeamListOut)
+async def list_teams(
+    db: AsyncSession = Depends(get_db),
+    user_with_role=Depends(get_current_user_with_role_and_teams),
+):
+    """
+    ✅ 团队下拉（给前端筛选框用）：
+    - super_admin：全部团队（TEAM_NAMES）
+    - manager：返回其名下 team_names
+    - finance/market/sales：仅自己所在单团队
+    """
+    _ = db
+    _user, role_name, team_names, _team_ids = user_with_role
+    _ensure_orders_access(role_name)
+
+    allowed = _allowed_teams_for_user(role_name, _normalize_team_names(team_names))
+    items = [TeamItem(team_name=str(t)) for t in allowed if str(t).strip()]
+    return TeamListOut(items=items)
 
 
 class SalespersonItem(BaseModel):
@@ -801,6 +847,7 @@ class SalespersonListOut(BaseModel):
 @router.get("/salespersons", response_model=SalespersonListOut)
 async def list_salespersons(
     status: int = Query(1, description="默认仅返回启用账号；传 0 可查禁用"),
+    team_name: Optional[str] = Query(None, description="可选：按团队过滤业务员下拉（用于前端“职位下拉框跟随团队”）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
@@ -813,6 +860,10 @@ async def list_salespersons(
     if role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET, ROLE_FINANCE):
         raise HTTPException(status_code=403, detail="No permission")
 
+    tf = str(team_name or "").strip()
+    if tf:
+        _require_team_filter_allowed(role_name=role_name, team_names=tns, team_filter=tf)
+
     stmt = (
         select(distinct(User.id).label("id"), User.username, User.real_name)
         .select_from(User)
@@ -823,6 +874,7 @@ async def list_salespersons(
     )
     stmt = stmt.where(User.status == int(status))
 
+    # ✅ 原 ACL：限制可见范围
     if role_name != ROLE_SUPER_ADMIN:
         if role_name == ROLE_MANAGER:
             stmt = stmt.where(_user_team_match_expr(tns))
@@ -832,6 +884,10 @@ async def list_salespersons(
 
     if role_name == ROLE_SALES:
         stmt = stmt.where(User.id == current_user.id)
+
+    # ✅ 新增：按团队筛选（在 ACL 范围内进一步收敛）
+    if tf:
+        stmt = stmt.where(_user_team_match_expr((tf,)))
 
     rows = (await db.execute(stmt)).all()
     return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
@@ -1539,6 +1595,7 @@ async def list_orders(
     created_by: Optional[int] = Query(None),
     customer_group_id: Optional[int] = Query(None),
     channel_group_id: Optional[int] = Query(None),
+    team_name: Optional[str] = Query(None, description="可选：按团队筛选（仅能筛选自己可见的团队）"),
     created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
     created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
     created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
@@ -1561,6 +1618,10 @@ async def list_orders(
     _ensure_orders_access(role_name)
     _require_team_for_non_super_admin(role_name, tns)
 
+    tf = str(team_name or "").strip()
+    if tf:
+        _require_team_filter_allowed(role_name=role_name, team_names=tns, team_filter=tf)
+
     stmt = (
         select(Order)
         .options(
@@ -1577,6 +1638,11 @@ async def list_orders(
     clauses: list = []
 
     await _apply_orders_list_acl(db, current_user=current_user, role_name=role_name, team_names=tns, clauses=clauses)
+
+    # ✅ 新增：团队筛选（在 ACL 的可见范围内进一步收敛）
+    if tf:
+        team_user_ids = select(User.id).where(_user_team_match_expr((tf,)))
+        clauses.append(Order.salesperson_id.in_(team_user_ids))
 
     if is_finished is not None:
         clauses.append(Order.is_finished.is_(is_finished))

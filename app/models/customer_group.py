@@ -13,7 +13,7 @@ class CustomerGroup(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # ✅ 团队（用于隔离范围）
+    # ✅ 团队（共享数据模式下仅用于历史归属/标记，不再作为隔离或唯一性边界）
     team_name = Column(String(32), nullable=True, index=True)
 
     # 客户代码
@@ -49,6 +49,6 @@ class CustomerGroup(Base):
     )
 
     __table_args__ = (
-        # ✅ 团队内唯一：同 team + code + name 只能存在一条（无论是否软删除）
-        UniqueConstraint("team_name", "customer_code", "customer_name", name="uq_customer_group_team_code_name"),
+        # ✅ 共享唯一：同 code + name 全局只能存在一条（无论是否软删除）
+        UniqueConstraint("customer_code", "customer_name", name="uq_customer_group_code_name"),
     )

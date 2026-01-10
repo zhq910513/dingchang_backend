@@ -15,7 +15,7 @@
 
 ✅ 本轮新增：团队隔离（支持经理多团队）
 - super_admin：可查看全部
-- manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name）
+- manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name / team_names）
 - finance：只能查看自己 team_name 下的数据（单团队）
 - market：只能查看自己 team_name 下的数据（单团队，只读）
 
@@ -51,7 +51,7 @@ import anyio
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, delete, distinct
+from sqlalchemy import func, select, and_, or_, cast, String, delete, distinct, false as sql_false
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -162,6 +162,32 @@ def _current_team_names_or_403(
 
     # 其它角色已在 _ensure_finance_access 拦截，这里防御
     raise HTTPException(status_code=403, detail="No permission")
+
+
+def _user_team_match_expr(teams: Tuple[str, ...]):
+    """
+    ✅ 兼容：User.team_name（旧单值） + User.team_names（CSV 多值）
+    用于“按团队选出用户集合”，避免 team_name 为空但 team_names 有值时误判。
+    """
+    tns = tuple([str(x or "").strip() for x in (teams or ()) if str(x or "").strip()])
+    if not tns:
+        return sql_false()
+
+    terms = [User.team_name.in_(list(tns))]
+
+    if hasattr(User, "team_names"):
+        for t in tns:
+            terms.append(User.team_names == t)
+            terms.append(User.team_names.like(f"{t},%"))
+            terms.append(User.team_names.like(f"%,{t},%"))
+            terms.append(User.team_names.like(f"%,{t}"))
+
+    return or_(*terms)
+
+
+def _order_salesperson_in_teams_expr(team_names: Tuple[str, ...]):
+    team_user_ids = select(User.id).where(_user_team_match_expr(team_names))
+    return Order.salesperson_id.in_(team_user_ids)
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
@@ -499,12 +525,36 @@ async def finance_list_salespersons(
         .order_by(User.id.asc())
     )
 
-    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance/market 单团队
+    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance/market 单团队（兼容 team_names）
     if current_team_names is not None:
-        stmt = stmt.where(User.team_name.in_(list(current_team_names)))
+        stmt = stmt.where(_user_team_match_expr(current_team_names))
 
     rows = (await db.execute(stmt)).all()
     return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
+
+
+async def _salesperson_in_current_teams_or_403(
+    *,
+    salesperson: Optional[User],
+    current_team_names: Optional[Tuple[str, ...]],
+) -> None:
+    if current_team_names is None:
+        return
+    allowed = set(current_team_names)
+
+    sp = salesperson
+    team_name_val = (getattr(sp, "team_name", None) or "").strip() if sp else ""
+    team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
+
+    # 兼容：team_names 为空但 team_name 有值
+    if not team_names_val and team_name_val:
+        team_names_val = [team_name_val]
+
+    if not team_names_val:
+        raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+
+    if not (set(team_names_val) & allowed):
+        raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
 
 
 async def _load_finance_order_out(
@@ -532,12 +582,11 @@ async def _load_finance_order_out(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be viewed in finance")
 
-    # ✅ 团队隔离：按订单 salesperson.team_name（支持经理多团队）
-    if current_team_names is not None:
-        sp = getattr(o, "salesperson", None)
-        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
-        if not sp_tn or sp_tn not in set(current_team_names):
-            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+    # ✅ 团队隔离：按订单 salesperson.team_name/team_names（支持经理多团队）
+    await _salesperson_in_current_teams_or_403(
+        salesperson=getattr(o, "salesperson", None),
+        current_team_names=current_team_names,
+    )
 
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
 
@@ -609,6 +658,7 @@ async def finance_orders_summary(
             func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
             func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
             func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("noncar_amount"),
+            # ✅ receivable=客户合计；payable=渠道合计（与 orders 域 profit=channel_total-customer_total 一致）
             func.coalesce(func.sum(OrderInfo.customer_total), 0).label("receivable"),
             func.coalesce(func.sum(OrderInfo.channel_total), 0).label("payable"),
             func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
@@ -618,10 +668,9 @@ async def finance_orders_summary(
         .where(Order.is_finished.is_(True))
     )
 
-    # ✅ 团队隔离：按 salesperson.team_name（支持经理多团队）
+    # ✅ 团队隔离：按 salesperson.team_name/team_names（支持经理多团队）
     if current_team_names is not None:
-        stmt = stmt.join(User, User.id == Order.salesperson_id)
-        clauses.append(User.team_name.in_(list(current_team_names)))
+        clauses.append(_order_salesperson_in_teams_expr(current_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -830,11 +879,9 @@ async def list_finance_orders(
 
     clauses: list = []
 
-    # ✅ 团队隔离：按 salesperson.team_name（支持经理多团队）
+    # ✅ 团队隔离：按 salesperson.team_name/team_names（支持经理多团队）
     if current_team_names is not None:
-        stmt = stmt.join(User, User.id == Order.salesperson_id)
-        count_stmt = count_stmt.join(User, User.id == Order.salesperson_id)
-        clauses.append(User.team_name.in_(list(current_team_names)))
+        clauses.append(_order_salesperson_in_teams_expr(current_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -1012,8 +1059,9 @@ async def list_finance_orders(
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                # ✅ 修复：receivable=客户合计；payable=渠道合计
+                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
@@ -1021,13 +1069,11 @@ async def list_finance_orders(
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
                 salesperson_name=_user_display_name(sp),
-
                 # ✅ 新增回填：所属经理/所属团队
                 manager_id=manager_id_val,
                 manager_name=manager_name_val,
                 team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
                 team_names=team_names_val,
-
                 dynamic_data=dd,
                 created_at=_fmt_dt(getattr(o, "created_at", None)),
                 updated_at=_fmt_dt(getattr(o, "updated_at", None)),
@@ -1074,11 +1120,10 @@ async def update_finance_order_status(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
-    if tns is not None:
-        sp = getattr(o, "salesperson", None)
-        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
-        if not sp_tn or sp_tn not in set(tns):
-            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+    await _salesperson_in_current_teams_or_403(
+        salesperson=getattr(o, "salesperson", None),
+        current_team_names=tns,
+    )
 
     if payload.is_rebate is not None:
         o.is_rebate = bool(payload.is_rebate)
@@ -1113,11 +1158,10 @@ async def return_finance_order_to_unfinished(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Order is already unfinished")
 
-    if tns is not None:
-        sp = getattr(o, "salesperson", None)
-        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
-        if not sp_tn or sp_tn not in set(tns):
-            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+    await _salesperson_in_current_teams_or_403(
+        salesperson=getattr(o, "salesperson", None),
+        current_team_names=tns,
+    )
 
     o.is_finished = False
     o.is_rebate = False
@@ -1228,12 +1272,10 @@ async def _ensure_order_finished_for_finance(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
-    # ✅ 团队隔离：按订单 salesperson.team_name（支持经理多团队）
-    if current_team_names is not None:
-        sp = getattr(o, "salesperson", None)
-        sp_tn = (getattr(sp, "team_name", None) or "").strip() if sp else ""
-        if not sp_tn or sp_tn not in set(current_team_names):
-            raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+    await _salesperson_in_current_teams_or_403(
+        salesperson=getattr(o, "salesperson", None),
+        current_team_names=current_team_names,
+    )
 
     return o
 
