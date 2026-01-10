@@ -1061,8 +1061,8 @@ async def list_finance_orders(
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
                 # ✅ receivable=客户合计；payable=渠道合计
-                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
