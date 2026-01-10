@@ -2,7 +2,7 @@
 # encoding: utf-8
 from __future__ import annotations
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -26,46 +26,49 @@ class OrderInfo(Base):
     insurance_expire_date = Column(Date, nullable=True)
     owner_phone = Column(String(32), nullable=True)
 
-    commercial_amount = Column(Numeric(18, 2), nullable=False, default=0)
-    compulsory_amount = Column(Numeric(18, 2), nullable=False, default=0)
-    vehicle_tax_amount = Column(Numeric(18, 2), nullable=False, default=0)
-    non_vehicle_amount = Column(Numeric(18, 2), nullable=False, default=0)
+    # ✅ 金额类：DB 级默认值，避免旧数据/直写SQL出现 NULL
+    commercial_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
+    compulsory_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
+    vehicle_tax_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
+    non_vehicle_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
-    premium_total = Column(Numeric(18, 2), nullable=False, default=0)
+    premium_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
     # Row 2 渠道点位（允许负数）
-    channel_commercial_point = Column(Numeric(10, 4), nullable=False, default=0)
+    channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
     # ✅ 新增：渠道-商业后补点位（允许负数）
-    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, default=0)
+    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
-    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, default=0)
-    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, default=0)
-    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, default=0)
-    channel_reward = Column(Numeric(18, 2), nullable=False, default=0)
+    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    channel_reward = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
-    channel_total = Column(Numeric(18, 2), nullable=False, default=0)
+    channel_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
     # Row 3 客户/产品点位（允许负数）
-    customer_commercial_point = Column(Numeric(10, 4), nullable=False, default=0)
+    customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
     # ✅ 新增：客户-商业后补点位（允许负数）
-    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, default=0)
+    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
-    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, default=0)
-    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, default=0)
-    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, default=0)
-    customer_reward = Column(Numeric(18, 2), nullable=False, default=0)
+    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    customer_reward = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
-    customer_total = Column(Numeric(18, 2), nullable=False, default=0)
+    customer_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
     # Row 4 利润
-    profit = Column(Numeric(18, 2), nullable=False, default=0)
+    profit = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
 
-    created_at = Column(DateTime(timezone=True), server_default=func.current_timestamp(), nullable=False)
+    # ✅ 方案 A 对齐：DB 存“北京时间 naive DATETIME”
+    # - 不使用 timezone=True，避免驱动/方言把 tzinfo 搞出来导致展示 +8 的坑
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(
-        DateTime(timezone=True),
+        DateTime(timezone=False),
         server_default=func.current_timestamp(),
-        onupdate=func.current_timestamp(),
+        server_onupdate=func.current_timestamp(),
         nullable=False,
     )

@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Any
+
 from pydantic import BaseModel, Field
 
 
-class FinanceOrderOut(BaseModel):
+class OrmBaseModel(BaseModel):
+    class Config:
+        orm_mode = True
+        anystr_strip_whitespace = True
+
+
+class FinanceOrderOut(OrmBaseModel):
     # 基础
     id: int
 
@@ -66,11 +73,11 @@ class FinanceOrderOut(BaseModel):
     updated_at: Optional[str] = None
 
 
-class FinanceOrderListResponse(BaseModel):
+class FinanceOrderListResponse(OrmBaseModel):
     total: int = 0
     items: List[FinanceOrderOut] = Field(default_factory=list)
 
 
-class FinanceOrderStatusUpdate(BaseModel):
+class FinanceOrderStatusUpdate(OrmBaseModel):
     is_rebate: Optional[bool] = None
     is_paid: Optional[bool] = None
