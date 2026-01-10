@@ -40,6 +40,10 @@
 - 后端不做时区换算：naive 直接格式化输出
 - created_at 的日期过滤：使用北京时间 naive 边界（00:00:00 ～ 次日00:00:00）
 ===========================
+
+✅ 本轮修复：
+- /finance/orders 支持 team_name / team_names 查询参数（超级权限可按团队筛选）
+- /finance/orders/summary 同步支持 team_name / team_names（与列表一致）
 """
 from __future__ import annotations
 
@@ -162,6 +166,77 @@ def _current_team_names_or_403(
 
     # 其它角色已在 _ensure_finance_access 拦截，这里防御
     raise HTTPException(status_code=403, detail="No permission")
+
+
+def _parse_query_team_names(team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
+    """
+    ✅ 支持：
+    - team_name=九江团队（单值）
+    - team_names=九江团队&team_names=南昌团队（多值重复参数）
+    - 两者可同时传：做并集
+    """
+    arr: List[str] = []
+    s = (team_name or "").strip()
+    if s:
+        arr.append(s)
+    if team_names:
+        for x in team_names:
+            sx = str(x or "").strip()
+            if sx:
+                arr.append(sx)
+    return _normalize_team_names(arr)
+
+
+def _effective_team_filter_for_query(
+    *,
+    role_name: Optional[str],
+    current_team_names: Optional[Tuple[str, ...]],
+    team_name: Optional[str],
+    team_names: Optional[Tuple[str, ...]],
+) -> Optional[Tuple[str, ...]]:
+    """
+    ✅ 计算“最终用于 SQL 过滤的团队集合”
+
+    - super_admin：
+        - 不传 team_* -> None（不限制）
+        - 传 team_* -> 用传入的 team 集合过滤
+    - manager/finance/market：
+        - 不传 team_* -> 用账号可见团队过滤
+        - 传 team_* -> 必须是账号可见团队的子集，否则 403
+    """
+    requested = _parse_query_team_names(team_name, team_names)
+
+    if requested:
+        invalid = [t for t in requested if t not in TEAM_NAMES]
+        if invalid:
+            raise HTTPException(status_code=400, detail="team_name/team_names 非法")
+
+    # super_admin：可选过滤
+    if role_name == ROLE_SUPER_ADMIN:
+        return requested or None
+
+    # 非 super_admin：current_team_names 一定不是 None（_current_team_names_or_403 保证）
+    allowed = current_team_names or tuple()
+    if not requested:
+        return allowed
+
+    eff = tuple(sorted(set(allowed) & set(requested)))
+    if not eff:
+        # 明确拒绝“跨团队筛选”，避免误以为筛选成功
+        raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
+
+    # finance/market：必须且只能属于 1 个团队（_current_team_names_or_403 已保证）
+    if role_name in (ROLE_FINANCE, ROLE_MARKET):
+        if len(allowed) == 1 and eff != allowed:
+            raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
+        return allowed
+
+    # manager：允许子集
+    if role_name == ROLE_MANAGER:
+        return eff
+
+    # 防御
+    return allowed
 
 
 def _user_team_match_expr(teams: Tuple[str, ...]):
@@ -643,12 +718,22 @@ async def finance_orders_summary(
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
+    # ✅ 本轮新增：按团队筛选（用于超级权限/经理在前端下拉筛选）
+    team_name: Optional[str] = Query(None, description="按团队筛选（super_admin 可跨团队；manager 仅可筛选自己可见团队）"),
+    team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name, team_names, _team_ids = user_with_role
+    _current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
+    effective_team_names = _effective_team_filter_for_query(
+        role_name=role_name,
+        current_team_names=current_team_names,
+        team_name=team_name,
+        team_names=team_names,
+    )
 
     clauses: list = []
 
@@ -669,9 +754,9 @@ async def finance_orders_summary(
         .where(Order.is_finished.is_(True))
     )
 
-    # ✅ 团队隔离：按 salesperson.team_name/team_names（支持经理多团队）
-    if current_team_names is not None:
-        clauses.append(_order_salesperson_in_teams_expr(current_team_names))
+    # ✅ 团队隔离 / 团队筛选：按 salesperson.team_name/team_names（支持经理多团队、super_admin 可选）
+    if effective_team_names is not None:
+        clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -858,13 +943,22 @@ async def list_finance_orders(
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
+    # ✅ 本轮新增：按团队筛选（用于超级权限/经理在前端下拉筛选）
+    team_name: Optional[str] = Query(None, description="按团队筛选（super_admin 可跨团队；manager 仅可筛选自己可见团队）"),
+    team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name, team_names, _team_ids = user_with_role
+    current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
+    effective_team_names = _effective_team_filter_for_query(
+        role_name=role_name,
+        current_team_names=current_team_names,
+        team_name=team_name,
+        team_names=team_names,
+    )
 
     stmt = (
         select(Order)
@@ -880,9 +974,9 @@ async def list_finance_orders(
 
     clauses: list = []
 
-    # ✅ 团队隔离：按 salesperson.team_name/team_names（支持经理多团队）
-    if current_team_names is not None:
-        clauses.append(_order_salesperson_in_teams_expr(current_team_names))
+    # ✅ 团队隔离 / 团队筛选：按 salesperson.team_name/team_names（支持经理多团队、super_admin 可选）
+    if effective_team_names is not None:
+        clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -1060,7 +1154,7 @@ async def list_finance_orders(
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                # ✅ receivable=客户合计；payable=渠道合计
+                # ✅ receivable=客户合计；payable=渠道合计（注意：此处保持现状，不在本轮改动范围内）
                 col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
                 col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
