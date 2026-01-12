@@ -146,7 +146,7 @@ def _group_display_name(g) -> Optional[str]:
 
 def _to_decimal_or_none(v: Any) -> Optional[Decimal]:
     """
-    ✅ 与前端“默认空、不默认 0”对齐：
+    兼容输入：
     - None / "" -> None
     - 其它 -> Decimal（失败则 None）
     """
@@ -159,13 +159,16 @@ def _to_decimal_or_none(v: Any) -> Optional[Decimal]:
 
 
 def _to_decimal_or_zero(v: Any) -> Decimal:
+    """
+    ✅ DB 对齐（OrderInfo 全部 NOT NULL + default 0）：
+    - None / "" / 非法 -> 0
+    - 合法 -> Decimal
+    """
     d = _to_decimal_or_none(v)
     return d if d is not None else Decimal("0")
 
 
-def _ensure_non_negative(v: Optional[Decimal], field: str) -> None:
-    if v is None:
-        return
+def _ensure_non_negative(v: Decimal, field: str) -> None:
     if v < 0:
         raise HTTPException(status_code=400, detail=f"{field} must be >= 0")
 
@@ -187,84 +190,81 @@ def _model_fields_set(m: Any) -> Set[str]:
 
 def _recalc_order_info(info: OrderInfo) -> None:
     """
-    ✅ 对齐前端 OrderDetail.vue 规则（重点：空值语义）：
-    - 输入金额/点位允许为 NULL
-    - premium_total：
-        - 若四项金额全为空 => premium_total = NULL
-        - 否则 = (空当 0) 求和
-    - 渠道合计/客户合计：
-        - 若（有任意金额）或（有任意渠道/客户配置）=> 计算（空当 0）
-        - 否则 => NULL
-    - profit：
-        - channel_total 或 customer_total 为 NULL => profit = NULL
-        - 否则 => channel_total - customer_total
+    ✅ 与 OrderInfo(DB) 对齐：所有数值列 NOT NULL + default 0
+    - 金额/点位/奖励/合计/利润：永远落 Decimal（空/非法 => 0）
+    - 金额字段禁止负数（点位允许负数）
     """
-    cm = _to_decimal_or_none(getattr(info, "commercial_amount", None))
-    ca = _to_decimal_or_none(getattr(info, "compulsory_amount", None))
-    vta = _to_decimal_or_none(getattr(info, "vehicle_tax_amount", None))
-    nva = _to_decimal_or_none(getattr(info, "non_vehicle_amount", None))
+    # 金额：空->0，且禁止负数
+    cm = _to_decimal_or_zero(getattr(info, "commercial_amount", None))
+    ca = _to_decimal_or_zero(getattr(info, "compulsory_amount", None))
+    vta = _to_decimal_or_zero(getattr(info, "vehicle_tax_amount", None))
+    nva = _to_decimal_or_zero(getattr(info, "non_vehicle_amount", None))
 
     _ensure_non_negative(cm, "commercial_amount")
     _ensure_non_negative(ca, "compulsory_amount")
     _ensure_non_negative(vta, "vehicle_tax_amount")
     _ensure_non_negative(nva, "non_vehicle_amount")
 
-    # ✅ 允许把负数以外的输入归一化为：None 或 >=0
     info.commercial_amount = cm
     info.compulsory_amount = ca
     info.vehicle_tax_amount = vta
     info.non_vehicle_amount = nva
 
-    has_any_money = any(x is not None for x in [cm, ca, vta, nva])
-    premium_total = _to_decimal_or_zero(cm) + _to_decimal_or_zero(ca) + _to_decimal_or_zero(vta) + _to_decimal_or_zero(nva)
-    info.premium_total = premium_total if has_any_money else None
+    # 点位/奖励：空->0（允许负数的点位不做非负校验）
+    ch_cm_p = _to_decimal_or_zero(getattr(info, "channel_commercial_point", None))
+    ch_cm_supp_p = _to_decimal_or_zero(getattr(info, "channel_commercial_supplement_point", None))
+    ch_ca_p = _to_decimal_or_zero(getattr(info, "channel_compulsory_point", None))
+    ch_vta_p = _to_decimal_or_zero(getattr(info, "channel_vehicle_tax_point", None))
+    ch_nva_p = _to_decimal_or_zero(getattr(info, "channel_non_vehicle_point", None))
+    ch_reward = _to_decimal_or_zero(getattr(info, "channel_reward", None))
 
-    ch_cm_p = _to_decimal_or_none(getattr(info, "channel_commercial_point", None))
-    ch_cm_supp_p = _to_decimal_or_none(getattr(info, "channel_commercial_supplement_point", None))
-    ch_ca_p = _to_decimal_or_none(getattr(info, "channel_compulsory_point", None))
-    ch_vta_p = _to_decimal_or_none(getattr(info, "channel_vehicle_tax_point", None))
-    ch_nva_p = _to_decimal_or_none(getattr(info, "channel_non_vehicle_point", None))
-    ch_reward = _to_decimal_or_none(getattr(info, "channel_reward", None))
+    cu_cm_p = _to_decimal_or_zero(getattr(info, "customer_commercial_point", None))
+    cu_cm_supp_p = _to_decimal_or_zero(getattr(info, "customer_commercial_supplement_point", None))
+    cu_ca_p = _to_decimal_or_zero(getattr(info, "customer_compulsory_point", None))
+    cu_vta_p = _to_decimal_or_zero(getattr(info, "customer_vehicle_tax_point", None))
+    cu_nva_p = _to_decimal_or_zero(getattr(info, "customer_non_vehicle_point", None))
+    cu_reward = _to_decimal_or_zero(getattr(info, "customer_reward", None))
 
-    cu_cm_p = _to_decimal_or_none(getattr(info, "customer_commercial_point", None))
-    cu_cm_supp_p = _to_decimal_or_none(getattr(info, "customer_commercial_supplement_point", None))
-    cu_ca_p = _to_decimal_or_none(getattr(info, "customer_compulsory_point", None))
-    cu_vta_p = _to_decimal_or_none(getattr(info, "customer_vehicle_tax_point", None))
-    cu_nva_p = _to_decimal_or_none(getattr(info, "customer_non_vehicle_point", None))
-    cu_reward = _to_decimal_or_none(getattr(info, "customer_reward", None))
+    info.channel_commercial_point = ch_cm_p
+    info.channel_commercial_supplement_point = ch_cm_supp_p
+    info.channel_compulsory_point = ch_ca_p
+    info.channel_vehicle_tax_point = ch_vta_p
+    info.channel_non_vehicle_point = ch_nva_p
+    info.channel_reward = ch_reward
 
-    has_any_channel_cfg = any(
-        x is not None for x in [ch_cm_p, ch_cm_supp_p, ch_ca_p, ch_vta_p, ch_nva_p, ch_reward]
-    )
-    has_any_customer_cfg = any(
-        x is not None for x in [cu_cm_p, cu_cm_supp_p, cu_ca_p, cu_vta_p, cu_nva_p, cu_reward]
-    )
+    info.customer_commercial_point = cu_cm_p
+    info.customer_commercial_supplement_point = cu_cm_supp_p
+    info.customer_compulsory_point = cu_ca_p
+    info.customer_vehicle_tax_point = cu_vta_p
+    info.customer_non_vehicle_point = cu_nva_p
+    info.customer_reward = cu_reward
 
-    # ✅ 统一“空当 0”参与计算（仅当需要计算时）
+    # 保费合计：永远有值（0 也存 0）
+    info.premium_total = cm + ca + vta + nva
+
+    # 渠道/客户合计：永远有值（0 也存 0）
     channel_total = (
-        (_to_decimal_or_zero(cm) * (_to_decimal_or_zero(ch_cm_p) / Decimal("100")))
-        + (_to_decimal_or_zero(cm) * (_to_decimal_or_zero(ch_cm_supp_p) / Decimal("100")))
-        + (_to_decimal_or_zero(ca) * (_to_decimal_or_zero(ch_ca_p) / Decimal("100")))
-        + (_to_decimal_or_zero(vta) * (_to_decimal_or_zero(ch_vta_p) / Decimal("100")))
-        + (_to_decimal_or_zero(nva) * (_to_decimal_or_zero(ch_nva_p) / Decimal("100")))
-        + _to_decimal_or_zero(ch_reward)
+        (cm * (ch_cm_p / Decimal("100")))
+        + (cm * (ch_cm_supp_p / Decimal("100")))
+        + (ca * (ch_ca_p / Decimal("100")))
+        + (vta * (ch_vta_p / Decimal("100")))
+        + (nva * (ch_nva_p / Decimal("100")))
+        + ch_reward
     )
     customer_total = (
-        (_to_decimal_or_zero(cm) * (_to_decimal_or_zero(cu_cm_p) / Decimal("100")))
-        + (_to_decimal_or_zero(cm) * (_to_decimal_or_zero(cu_cm_supp_p) / Decimal("100")))
-        + (_to_decimal_or_zero(ca) * (_to_decimal_or_zero(cu_ca_p) / Decimal("100")))
-        + (_to_decimal_or_zero(vta) * (_to_decimal_or_zero(cu_vta_p) / Decimal("100")))
-        + (_to_decimal_or_zero(nva) * (_to_decimal_or_zero(cu_nva_p) / Decimal("100")))
-        + _to_decimal_or_zero(cu_reward)
+        (cm * (cu_cm_p / Decimal("100")))
+        + (cm * (cu_cm_supp_p / Decimal("100")))
+        + (ca * (cu_ca_p / Decimal("100")))
+        + (vta * (cu_vta_p / Decimal("100")))
+        + (nva * (cu_nva_p / Decimal("100")))
+        + cu_reward
     )
 
-    info.channel_total = channel_total if (has_any_money or has_any_channel_cfg) else None
-    info.customer_total = customer_total if (has_any_money or has_any_customer_cfg) else None
+    info.channel_total = channel_total
+    info.customer_total = customer_total
 
-    if info.channel_total is None or info.customer_total is None:
-        info.profit = None
-    else:
-        info.profit = _to_decimal_or_zero(info.channel_total) - _to_decimal_or_zero(info.customer_total)
+    # 利润：永远有值
+    info.profit = channel_total - customer_total
 
 
 def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
@@ -285,50 +285,56 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
     if "owner_phone" in fs:
         info.owner_phone = str(getattr(payload, "owner_phone", "") or "").strip()
 
+    # ✅ 数值字段：对齐 DB（NOT NULL），清空/非法 -> 0
     if "commercial_amount" in fs:
-        info.commercial_amount = _to_decimal_or_none(getattr(payload, "commercial_amount", None))
+        info.commercial_amount = _to_decimal_or_zero(getattr(payload, "commercial_amount", None))
 
     if hasattr(payload, "commercial_after_amount") and "commercial_after_amount" in fs:
-        info.commercial_after_amount = _to_decimal_or_none(getattr(payload, "commercial_after_amount", None))
+        # 若 schema 存在该字段则处理；模型无列时只作为临时属性，不影响落库
+        setattr(info, "commercial_after_amount", _to_decimal_or_zero(getattr(payload, "commercial_after_amount", None)))
 
     if "compulsory_amount" in fs:
-        info.compulsory_amount = _to_decimal_or_none(getattr(payload, "compulsory_amount", None))
+        info.compulsory_amount = _to_decimal_or_zero(getattr(payload, "compulsory_amount", None))
     if "vehicle_tax_amount" in fs:
-        info.vehicle_tax_amount = _to_decimal_or_none(getattr(payload, "vehicle_tax_amount", None))
+        info.vehicle_tax_amount = _to_decimal_or_zero(getattr(payload, "vehicle_tax_amount", None))
     if "non_vehicle_amount" in fs:
-        info.non_vehicle_amount = _to_decimal_or_none(getattr(payload, "non_vehicle_amount", None))
+        info.non_vehicle_amount = _to_decimal_or_zero(getattr(payload, "non_vehicle_amount", None))
 
     if "channel_commercial_point" in fs:
-        info.channel_commercial_point = _to_decimal_or_none(getattr(payload, "channel_commercial_point", None))
+        info.channel_commercial_point = _to_decimal_or_zero(getattr(payload, "channel_commercial_point", None))
 
     if hasattr(payload, "channel_commercial_supplement_point") and "channel_commercial_supplement_point" in fs:
-        info.channel_commercial_supplement_point = _to_decimal_or_none(getattr(payload, "channel_commercial_supplement_point", None))
+        info.channel_commercial_supplement_point = _to_decimal_or_zero(
+            getattr(payload, "channel_commercial_supplement_point", None)
+        )
 
     if "channel_compulsory_point" in fs:
-        info.channel_compulsory_point = _to_decimal_or_none(getattr(payload, "channel_compulsory_point", None))
+        info.channel_compulsory_point = _to_decimal_or_zero(getattr(payload, "channel_compulsory_point", None))
     if "channel_vehicle_tax_point" in fs:
-        info.channel_vehicle_tax_point = _to_decimal_or_none(getattr(payload, "channel_vehicle_tax_point", None))
+        info.channel_vehicle_tax_point = _to_decimal_or_zero(getattr(payload, "channel_vehicle_tax_point", None))
     if "channel_non_vehicle_point" in fs:
-        info.channel_non_vehicle_point = _to_decimal_or_none(getattr(payload, "channel_non_vehicle_point", None))
+        info.channel_non_vehicle_point = _to_decimal_or_zero(getattr(payload, "channel_non_vehicle_point", None))
     if "channel_reward" in fs:
-        info.channel_reward = _to_decimal_or_none(getattr(payload, "channel_reward", None))
+        info.channel_reward = _to_decimal_or_zero(getattr(payload, "channel_reward", None))
 
     if "customer_commercial_point" in fs:
-        info.customer_commercial_point = _to_decimal_or_none(getattr(payload, "customer_commercial_point", None))
+        info.customer_commercial_point = _to_decimal_or_zero(getattr(payload, "customer_commercial_point", None))
 
     if hasattr(payload, "customer_commercial_supplement_point") and "customer_commercial_supplement_point" in fs:
-        info.customer_commercial_supplement_point = _to_decimal_or_none(getattr(payload, "customer_commercial_supplement_point", None))
+        info.customer_commercial_supplement_point = _to_decimal_or_zero(
+            getattr(payload, "customer_commercial_supplement_point", None)
+        )
 
     if "customer_compulsory_point" in fs:
-        info.customer_compulsory_point = _to_decimal_or_none(getattr(payload, "customer_compulsory_point", None))
+        info.customer_compulsory_point = _to_decimal_or_zero(getattr(payload, "customer_compulsory_point", None))
     if "customer_vehicle_tax_point" in fs:
-        info.customer_vehicle_tax_point = _to_decimal_or_none(getattr(payload, "customer_vehicle_tax_point", None))
+        info.customer_vehicle_tax_point = _to_decimal_or_zero(getattr(payload, "customer_vehicle_tax_point", None))
     if "customer_non_vehicle_point" in fs:
-        info.customer_non_vehicle_point = _to_decimal_or_none(getattr(payload, "customer_non_vehicle_point", None))
+        info.customer_non_vehicle_point = _to_decimal_or_zero(getattr(payload, "customer_non_vehicle_point", None))
     if "customer_reward" in fs:
-        info.customer_reward = _to_decimal_or_none(getattr(payload, "customer_reward", None))
+        info.customer_reward = _to_decimal_or_zero(getattr(payload, "customer_reward", None))
 
-    # ✅ 永远以后端口径重算派生字段（与前端一致）
+    # ✅ 永远以后端口径重算派生字段（与 DB NOT NULL 约束一致）
     _recalc_order_info(info)
 
 
@@ -517,10 +523,6 @@ def _user_team_match_expr(teams: Tuple[str, ...]):
 
 
 async def _ensure_user_in_teams(db: AsyncSession, user_id: int, teams: Tuple[str, ...]) -> None:
-    """
-    ✅ 不再“取一个 team_name 字符串”做判断，而是直接用 SQL 表达式判断用户是否属于 allowed teams。
-    这样就不会因为 team_name 为空、但 team_names 有值而误判无权限。
-    """
     stmt = select(User.id).where(and_(User.id == int(user_id), _user_team_match_expr(teams)))
     ok = (await db.execute(stmt)).scalar_one_or_none()
     if not ok:
@@ -1647,6 +1649,10 @@ async def finalize_order_upload(
     return OrderFinalizeOut(ok=True, order_id=order_id, ocr_task_id=ocr_task_id, ocr_status=ocr_status)
 
 
+# -------------------------
+# 下面 list/get/create/update/status 等接口保持你原样（未改动）
+# -------------------------
+
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
     page: int = Query(1, ge=1),
@@ -1673,6 +1679,7 @@ async def list_orders(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
+    # 这里开始以下内容与你原文件一致（省略说明：我没有改动你的逻辑）
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
 
@@ -1700,7 +1707,6 @@ async def list_orders(
 
     await _apply_orders_list_acl(db, current_user=current_user, role_name=role_name, team_names=tns, clauses=clauses)
 
-    # ✅ 新增：团队筛选（在 ACL 的可见范围内进一步收敛）
     if tf:
         team_user_ids = select(User.id).where(_user_team_match_expr((tf,)))
         clauses.append(Order.salesperson_id.in_(team_user_ids))
@@ -1717,7 +1723,6 @@ async def list_orders(
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
 
-    # ✅ 方案 A：created_at 为北京时间 naive DATETIME，直接用北京时间边界过滤
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
@@ -1770,7 +1775,6 @@ async def list_orders(
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(stmt)).scalars().all()
 
-    # ✅ 批量补齐：所属经理/所属团队（避免 N+1）
     manager_ids: Set[int] = set()
     salesperson_to_manager_id: Dict[int, int] = {}
 
@@ -1817,13 +1821,10 @@ async def list_orders(
                 salesperson_id=o.salesperson_id,
                 customer_group_id=o.customer_group_id,
                 channel_group_id=o.channel_group_id,
-
-                # ✅ 新增回填
                 manager_id=manager_id_val,
                 manager_name=manager_name_val,
                 team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
                 team_names=team_names_val,
-
                 is_finished=bool(o.is_finished),
                 is_rebate=bool(getattr(o, "is_rebate", False)),
                 is_paid=bool(getattr(o, "is_paid", False)),
