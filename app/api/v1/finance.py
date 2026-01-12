@@ -28,6 +28,10 @@
 ✅ 本轮新增（财务汇总）：
 - GET /finance/orders/summary：按“搜索条件”在数据库全量聚合（不受分页影响）
 
+✅ 需求2补齐：
+- /finance/orders：新增【渠道奖励】【客户奖励】字段（来自 OrderInfo.channel_reward / customer_reward）
+- /finance/orders/summary：新增【渠道奖励汇总】【客户奖励汇总】
+
 ⚠️ 权限与范围：
 - finance/manager/super_admin：可读可写（写含：paid/rebate、备用图 related）
 - market：只读（不可改 paid/rebate，不可上传/维护图片，不可拿 sts）
@@ -701,6 +705,10 @@ class FinanceOrdersSummaryOut(BaseModel):
     payable: float = 0.0
     profit: float = 0.0
 
+    # ✅ 需求2：奖励汇总
+    channel_reward: float = 0.0
+    customer_reward: float = 0.0
+
 
 @router.get("/orders/summary", response_model=FinanceOrdersSummaryOut)
 async def finance_orders_summary(
@@ -748,6 +756,9 @@ async def finance_orders_summary(
             func.coalesce(func.sum(OrderInfo.customer_total), 0).label("receivable"),
             func.coalesce(func.sum(OrderInfo.channel_total), 0).label("payable"),
             func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
+            # ✅ 需求2：奖励汇总
+            func.coalesce(func.sum(OrderInfo.channel_reward), 0).label("channel_reward"),
+            func.coalesce(func.sum(OrderInfo.customer_reward), 0).label("customer_reward"),
         )
         .select_from(Order)
         .join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
@@ -835,6 +846,8 @@ async def finance_orders_summary(
         receivable=float(row.get("receivable") or 0),
         payable=float(row.get("payable") or 0),
         profit=float(row.get("profit") or 0),
+        channel_reward=float(row.get("channel_reward") or 0),
+        customer_reward=float(row.get("customer_reward") or 0),
     )
 
 
@@ -1160,6 +1173,9 @@ async def list_finance_orders(
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
+                # ✅ 需求2：新增两列（明细）
+                col_31_channel_reward=_to_float(getattr(info, "channel_reward", None)) if info else None,
+                col_32_customer_reward=_to_float(getattr(info, "customer_reward", None)) if info else None,
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),

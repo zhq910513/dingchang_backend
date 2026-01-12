@@ -55,6 +55,10 @@ class FinanceOrderOut(OrmBaseModel):
     col_29_is_paid: bool = False
     col_30_is_rebate: bool = False
 
+    # ✅ 新增（需求2）：财务管理列表新增两个字段
+    col_31_channel_reward: Optional[float] = None  # 渠道奖励（对应 order_info.channel_reward）
+    col_32_customer_reward: Optional[float] = None  # 客户奖励（对应 order_info.customer_reward）
+
     # ✅ 列表末尾追加：所属经理/所属团队（满足“所有订单展示列表、财务管理列表”追加字段）
     manager_id: Optional[int] = None
     manager_name: Optional[str] = None
