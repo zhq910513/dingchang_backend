@@ -814,6 +814,12 @@ class OptionItem(BaseModel):
     id: int
     group_name: str
 
+    # ✅ 为前端“代码 + 名称”对齐补充（可选字段，保持兼容）
+    customer_code: Optional[str] = None
+    customer_name: Optional[str] = None
+    channel_code: Optional[str] = None
+    channel_name: Optional[str] = None
+
 
 class OptionListOut(BaseModel):
     items: List[OptionItem] = Field(default_factory=list)
@@ -840,9 +846,26 @@ async def list_customer_groups(
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
 
-    # ✅ 已取消：CustomerGroup.team_name 团队过滤（共享数据）
     rows = (await db.execute(stmt)).scalars().all()
-    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
+
+    items: List[OptionItem] = []
+    for x in rows:
+        c_code = getattr(x, "customer_code", None)
+        c_name = getattr(x, "customer_name", None)
+
+        c_code_s = str(c_code).strip() if c_code is not None and str(c_code).strip() else None
+        c_name_s = str(c_name).strip() if c_name is not None and str(c_name).strip() else None
+
+        items.append(
+            OptionItem(
+                id=int(x.id),
+                group_name=str(_group_display_name(x) or ""),
+                customer_code=c_code_s,
+                customer_name=c_name_s,
+            )
+        )
+
+    return OptionListOut(items=items)
 
 
 @router.get("/channel-groups", response_model=OptionListOut)
@@ -864,9 +887,26 @@ async def list_channel_groups(
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
 
-    # ✅ 已取消：ChannelGroup.team_name 团队过滤（共享数据）
     rows = (await db.execute(stmt)).scalars().all()
-    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_display_name(x) or "")) for x in rows])
+
+    items: List[OptionItem] = []
+    for x in rows:
+        ch_code = getattr(x, "channel_code", None)
+        ch_name = getattr(x, "channel_name", None)
+
+        ch_code_s = str(ch_code).strip() if ch_code is not None and str(ch_code).strip() else None
+        ch_name_s = str(ch_name).strip() if ch_name is not None and str(ch_name).strip() else None
+
+        items.append(
+            OptionItem(
+                id=int(x.id),
+                group_name=str(_group_display_name(x) or ""),
+                channel_code=ch_code_s,
+                channel_name=ch_name_s,
+            )
+        )
+
+    return OptionListOut(items=items)
 
 
 class TeamItem(BaseModel):
@@ -1679,7 +1719,6 @@ async def list_orders(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    # 这里开始以下内容与你原文件一致（省略说明：我没有改动你的逻辑）
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
 
