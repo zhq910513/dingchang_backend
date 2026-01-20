@@ -143,11 +143,13 @@ def _creator_like_expr(v: Optional[str]):
     if not s:
         return None
     kw = f"%{s.lower()}%"
-    return or_(
-        func.lower(getattr(User, "username")).like(kw),
-        func.lower(getattr(User, "real_name")).like(kw),
-        func.lower(getattr(User, "full_name")).like(kw),
-    )
+    # ✅ 兼容历史字段：User 模型在不同版本里字段名不同。
+    # 当前项目 User 模型使用 real_name；部分旧代码可能曾使用 full_name。
+    exprs = []
+    for attr in ("username", "real_name", "full_name"):
+        if hasattr(User, attr):
+            exprs.append(func.lower(getattr(User, attr)).like(kw))
+    return or_(*exprs) if exprs else None
 
 
 def _normalize_contacts(contacts: Optional[List[ContactItem]]) -> List[dict]:
