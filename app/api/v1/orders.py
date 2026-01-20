@@ -143,6 +143,42 @@ def _group_display_name(g) -> Optional[str]:
         or getattr(g, "channel_code", None)
     )
 
+def _group_code_name(g) -> Optional[str]:
+    """
+    Unified display: [CODE] - [NAME].
+    - channel_group: channel_code + channel_name
+    - customer_group: customer_code + customer_name
+    Fallback: group_name / name / _group_display_name
+    """
+    if not g:
+        return None
+
+    code = (
+        getattr(g, 'channel_code', None)
+        or getattr(g, 'customer_code', None)
+        or getattr(g, 'group_code', None)
+        or getattr(g, 'code', None)
+    )
+    name = (
+        getattr(g, 'channel_name', None)
+        or getattr(g, 'customer_name', None)
+        or getattr(g, 'group_name', None)
+        or getattr(g, 'name', None)
+    )
+
+    code_s = str(code).strip() if code is not None and str(code).strip() else ''
+    name_s = str(name).strip() if name is not None and str(name).strip() else ''
+
+    if code_s and name_s:
+        return f"{code_s} - {name_s}"
+    if name_s:
+        return name_s
+    if code_s:
+        return code_s
+
+    fallback = _group_display_name(g)
+    return str(fallback).strip() if fallback is not None and str(fallback).strip() else None
+
 
 def _to_decimal_or_none(v: Any) -> Optional[Decimal]:
     """
@@ -720,8 +756,8 @@ async def _load_order_out(
         images=getattr(o, "images", None) or [],
         created_at=getattr(o, "created_at", None),
         updated_at=getattr(o, "updated_at", None),
-        customer_group_name=_group_display_name(cg),
-        channel_group_name=_group_display_name(getattr(o, "channel_group", None)),
+        customer_group_name=_group_code_name(cg),
+        channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
         salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
         customer_group_market=getattr(cg, "market", None) if cg else None,
         order_info=_order_info_out(getattr(o, "order_info", None)),
@@ -859,7 +895,7 @@ async def list_customer_groups(
         items.append(
             OptionItem(
                 id=int(x.id),
-                group_name=str(_group_display_name(x) or ""),
+                group_name=str(_group_code_name(x) or _group_display_name(x) or ""),
                 customer_code=c_code_s,
                 customer_name=c_name_s,
             )
@@ -900,7 +936,7 @@ async def list_channel_groups(
         items.append(
             OptionItem(
                 id=int(x.id),
-                group_name=str(_group_display_name(x) or ""),
+                group_name=str(_group_code_name(x) or _group_display_name(x) or ""),
                 channel_code=ch_code_s,
                 channel_name=ch_name_s,
             )
@@ -1872,8 +1908,8 @@ async def list_orders(
                 images=getattr(o, "images", None) or [],
                 created_at=getattr(o, "created_at", None),
                 updated_at=getattr(o, "updated_at", None),
-                customer_group_name=_group_display_name(cg),
-                channel_group_name=_group_display_name(getattr(o, "channel_group", None)),
+                customer_group_name=_group_code_name(cg),
+                channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
                 salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
                 customer_group_market=getattr(cg, "market", None) if cg else None,
                 order_info=_order_info_out(getattr(o, "order_info", None)),

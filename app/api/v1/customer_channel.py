@@ -186,6 +186,7 @@ async def list_customer_groups(
     customer_code: Optional[str] = Query(None, description="客户代码（模糊）"),
     customer_name: Optional[str] = Query(None, description="客户名称（模糊）"),
     market: Optional[str] = Query(None, description="市场（模糊）"),
+    region: Optional[str] = Query(None, description="地区（模糊）"),
     created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
     team_name: Optional[str] = Query(None, description="（兼容参数）共享数据模式下不再用于过滤"),
     db: AsyncSession = Depends(get_db),
@@ -209,6 +210,10 @@ async def list_customer_groups(
         clauses.append(ex)
 
     ex = _like_ci(CustomerGroup.market, market)
+    if ex is not None:
+        clauses.append(ex)
+
+    ex = _like_ci(CustomerGroup.region, region)
     if ex is not None:
         clauses.append(ex)
 
@@ -478,6 +483,7 @@ async def list_channel_groups(
     include_deleted: bool = Query(False, description="仅 super_admin 生效：是否包含已删除数据"),
     channel_code: Optional[str] = Query(None, description="渠道代码（模糊）"),
     channel_name: Optional[str] = Query(None, description="渠道名称（模糊）"),
+    region: Optional[str] = Query(None, description="地区（模糊）"),
     created_by: Optional[str] = Query(None, description="创建人（模糊：用户名/姓名）"),
     team_name: Optional[str] = Query(None, description="（兼容参数）共享数据模式下不再用于过滤"),
     db: AsyncSession = Depends(get_db),
@@ -497,6 +503,10 @@ async def list_channel_groups(
         clauses.append(ex)
 
     ex = _like_ci(ChannelGroup.channel_name, channel_name)
+    if ex is not None:
+        clauses.append(ex)
+
+    ex = _like_ci(ChannelGroup.region, region)
     if ex is not None:
         clauses.append(ex)
 
