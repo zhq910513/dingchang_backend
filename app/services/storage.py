@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union, IO
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import requests
 
@@ -122,8 +122,9 @@ class StorageService:
             return False
 
         parts = k.split("/")
-        # prefix/ab/cd/md5.ext => 至少 4 段
-        if len(parts) < 4:
+        # ✅ 严格：必须正好 4 段：prefix/ab/cd/md5.ext
+        # 否则 prefix/ab/cd/md5.ext/xxx 这种会“误过校验”
+        if len(parts) != 4:
             return False
         if parts[0] != prefix:
             return False
@@ -497,6 +498,21 @@ class StorageService:
             return self.base_url.rstrip("/") + "/" + k
         return f"https://{self.vhost}/{k}"
 
+    @classmethod
+    def _urlencode_rfc3986(cls, params: Dict[str, Any]) -> str:
+        """
+        ✅ RFC3986 编码 + 稳定排序（避免 urlencode 的 quote_plus 产生 '+'）
+        """
+        if not params:
+            return ""
+        items = []
+        for k, v in params.items():
+            ks = str(k)
+            vs = "" if v is None else str(v)
+            items.append((ks, vs))
+        items.sort(key=lambda x: (x[0], x[1]))
+        return "&".join([f"{cls._uri_encode(k)}={cls._uri_encode(v)}" for k, v in items])
+
     def generate_signed_get_url(self, *, storage_key: str, expires_in: int = 900) -> str:
         """
         生成 querystring authorization 的 GET URL（可被浏览器/第三方直接 GET）。
@@ -543,7 +559,7 @@ class StorageService:
             "authorization": auth,
             "x-bce-security-token": cred.session_token,
         }
-        return f"https://{host}{path}?{urlencode(q)}"
+        return f"https://{host}{path}?{self._urlencode_rfc3986(q)}"
 
     # ✅ 统一出口（展示用/返回给前端用）
     def object_url_for_display(self, storage_key: str, *, signed: Optional[bool] = None, expires_in: int = 900) -> str:

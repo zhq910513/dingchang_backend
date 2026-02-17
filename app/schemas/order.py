@@ -11,6 +11,7 @@
 - ✅ created_at / updated_at 统一输出为 "%Y-%m-%d %H:%M:%S"（与 finance 域一致，避免 ISO 8601 的 "T"）
 - ✅ OrderInfoIn：允许前端用 "" / null 显式清空数字字段（避免 float 解析报错）
 - ✅ OrderInfoOut：金额/点位/合计字段保持 Optional（None 原样输出为 null），与前端“默认空，不默认 0.00”一致
+- ✅ OrderFilter：补齐 list_orders 已支持的筛选参数（team_name / created_date_start|end / first_register_date_start|end）
 """
 
 from __future__ import annotations
@@ -284,10 +285,23 @@ class OrderFilter(OrmBaseModel):
     vehicle_model: Optional[str] = None
     vin: Optional[str] = None
     remark: Optional[str] = None
+
+    # 单日（兼容历史）
     created_date: Optional[str] = None  # YYYY-MM-DD
+
+    # ✅ 新增：起止日期（list_orders 已支持）
+    created_date_start: Optional[str] = None  # YYYY-MM-DD
+    created_date_end: Optional[str] = None  # YYYY-MM-DD（包含当天）
+
+    # ✅ 新增：初登日期起止（list_orders 已支持）
+    first_register_date_start: Optional[str] = None  # YYYY-MM-DD
+    first_register_date_end: Optional[str] = None  # YYYY-MM-DD（包含当天）
 
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
+
+    # ✅ 新增：团队筛选（list_orders 已支持）
+    team_name: Optional[str] = None
 
 
 class OrderCreate(OrmBaseModel):

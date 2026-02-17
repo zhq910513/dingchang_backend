@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Index
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Index, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -32,13 +32,23 @@ class ImageFile(Base):
     storage_key = Column(String(512), nullable=False, unique=True)
 
     # 直链（私有桶不可直接访问；展示时后端会签名覆盖）
-    url = Column(String(512), nullable=False, default="")
+    # ✅ DB 级默认值，避免直写 SQL / 老数据出现 NULL
+    url = Column(String(512), nullable=False, server_default=text("''"))
 
     etag = Column(String(128), nullable=True)
-    size = Column(BigInteger, nullable=False, default=0)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    # ✅ DB 级默认值：避免直写 SQL / 迁移脚本出现 NULL
+    size = Column(BigInteger, nullable=False, server_default=text("0"))
+
+    # ✅ 方案 A 对齐：DB 存“北京时间 naive DATETIME”
+    # - 不使用 timezone=True，避免驱动/方言把 tzinfo 搞出来导致展示 +8 的坑
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=False),
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+        nullable=False,
+    )
 
     order_images = relationship(
         "OrderImage",

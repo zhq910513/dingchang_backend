@@ -3,57 +3,21 @@
 """
 财务管理（订单维度 / 去兼容版）
 
-✅ 新增：
 - BOS STS：GET /finance/bos-sts（兼容 /finance/orders/bos-sts）
 - BOS 代传：POST /finance/bos-upload（兼容 /finance/orders/bos-upload）
 - finalize：POST /finance/finalize（兼容 /finance/finalize-upload /finance/orders/finalize /finance/orders/finalize-upload）
 
-✅ 本次补齐：
+补齐：
 - /finance/orders 支持 created_date_start / created_date_end（按北京时间过滤 created_at，包含结束日）
 - /finance/orders 支持 first_register_date_start / first_register_date_end（按 dynamic_data 常见字段范围过滤，包含结束日）
 - 保留旧参数 created_date / first_register_date 兼容（单日）
 
-✅ 本轮新增：团队隔离（支持经理多团队）
-- super_admin：可查看全部
-- manager：可查看“自己多选团队”下所有数据（按订单 salesperson.team_name / team_names）
-- finance：只能查看自己 team_name 下的数据（单团队）
-- market：只能查看自己 team_name 下的数据（单团队，只读）
-
-✅ 本轮继续补齐（链路打通）：
-- 财务端下拉筛选（只读）：
-  - GET /finance/customer-groups
-  - GET /finance/channel-groups
-  - GET /finance/salespersons
-
-✅ 本轮新增（财务汇总）：
-- GET /finance/orders/summary：按“搜索条件”在数据库全量聚合（不受分页影响）
-
-✅ 需求2补齐：
-- /finance/orders：新增【渠道奖励】【客户奖励】字段（来自 OrderInfo.channel_reward / customer_reward）
-- /finance/orders/summary：新增【渠道奖励汇总】【客户奖励汇总】
-
-✅ 新增（稳定导出推荐）：
-- GET /finance/orders/export：一次性导出“全部符合条件”的数据（不再翻页拼接）
-  - 支持传 ids（勾选导出）
-  - 不传 ids（按筛选条件导全量）
-  - 输出为 HTML xls（与前端原本下载方案一致，避免身份证号科学计数法）
-
-⚠️ 权限与范围：
-- finance/manager/super_admin：可读可写（写含：paid/rebate、备用图 related），并允许导出
-- market：只读（不可改 paid/rebate，不可上传/维护图片，不可拿 sts），并禁止导出
-- 仅允许操作已完成订单（财务域）
-- 仅允许操作 slot_key = related（备用图 related）
-
-===========================
-✅ 方案 A（严格执行）：
-- MySQL DATETIME 存北京时间（naive）
-- 后端不做时区换算：naive 直接格式化输出
-- created_at 的日期过滤：使用北京时间 naive 边界（00:00:00 ～ 次日00:00:00）
-===========================
-
-✅ 本轮修复：
-- /finance/orders 支持 team_name / team_names 查询参数（超级权限可按团队筛选）
-- /finance/orders/summary 同步支持 team_name / team_names（与列表一致）
+本轮：
+- 团队隔离（支持经理多团队）
+- 财务端下拉筛选（只读）：customer-groups / channel-groups / salespersons
+- 财务汇总：/finance/orders/summary（按搜索条件全量聚合）
+- 稳定导出：/finance/orders/export（一次性导出全部符合条件）
+- 修复搜索栏未生效：新增 salesperson_id / plate_no / vin / engine_no / id_number / vehicle_model 筛选（列表/汇总/导出一致）
 """
 from __future__ import annotations
 
@@ -104,22 +68,14 @@ from app.utils.order_image_urls import ensure_display_urls_for_order_images, saf
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
-# 仅用于“输出展示”的时区对象（方案 A：正常情况下不会做换算）
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 storage = StorageService()
 
-# ✅ finance 只允许动备用图
 FINANCE_ALLOWED_SLOTS = {"related"}
 MULTI_SLOTS = {"related"}
 
 
 def _ensure_finance_access(role_name: Optional[str]) -> None:
-    """
-    ✅ finance 域读权限：
-    - super_admin / manager / finance / market：允许（market 只读）
-    - sales：禁止
-    - 其它：禁止
-    """
     if role_name == ROLE_SALES:
         raise HTTPException(status_code=403, detail="Sales has no permission to access finance")
     if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET):
@@ -127,21 +83,11 @@ def _ensure_finance_access(role_name: Optional[str]) -> None:
 
 
 def _ensure_finance_write_access(role_name: Optional[str]) -> None:
-    """
-    ✅ finance 域写权限（编辑权限保持原样）：
-    - 仅 finance / manager / super_admin
-    - market：只读，禁止
-    """
     if role_name not in (ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN):
         raise HTTPException(status_code=403, detail="No permission")
 
 
 def _ensure_finance_export_access(role_name: Optional[str]) -> None:
-    """
-    ✅ 导出权限（稳定导出接口）：
-    - 仅 finance / manager / super_admin
-    - market：禁止导出（只读）
-    """
     _ensure_finance_write_access(role_name)
 
 
@@ -153,7 +99,6 @@ def _normalize_team_names(team_names: Tuple[str, ...] | List[str] | None) -> Tup
     else:
         arr = [str(x or "").strip() for x in team_names]
     arr = [x for x in arr if x]
-    # 去重+稳定排序
     return tuple(sorted(set(arr)))
 
 
@@ -162,12 +107,6 @@ def _current_team_names_or_403(
     role_name: Optional[str],
     team_names: Tuple[str, ...],
 ) -> Optional[Tuple[str, ...]]:
-    """
-    super_admin：None（表示不限制）
-    manager：允许多团队（>=1），返回 tuple(team_names...）
-    finance：必须单团队（==1），返回 tuple(team_name,）
-    market：必须单团队（==1），返回 tuple(team_name,）  ✅ 本轮新增：market 只读
-    """
     if role_name == ROLE_SUPER_ADMIN:
         return None
 
@@ -187,17 +126,10 @@ def _current_team_names_or_403(
     if role_name == ROLE_MANAGER:
         return tuple(tns)
 
-    # 其它角色已在 _ensure_finance_access 拦截，这里防御
     raise HTTPException(status_code=403, detail="No permission")
 
 
 def _parse_query_team_names(team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
-    """
-    ✅ 支持：
-    - team_name=九江团队（单值）
-    - team_names=九江团队&team_names=南昌团队（多值重复参数）
-    - 两者可同时传：做并集
-    """
     arr: List[str] = []
     s = (team_name or "").strip()
     if s:
@@ -217,16 +149,6 @@ def _effective_team_filter_for_query(
     team_name: Optional[str],
     team_names: Optional[Tuple[str, ...]],
 ) -> Optional[Tuple[str, ...]]:
-    """
-    ✅ 计算“最终用于 SQL 过滤的团队集合”
-
-    - super_admin：
-        - 不传 team_* -> None（不限制）
-        - 传 team_* -> 用传入的 team 集合过滤
-    - manager/finance/market：
-        - 不传 team_* -> 用账号可见团队过滤
-        - 传 team_* -> 必须是账号可见团队的子集，否则 403
-    """
     requested = _parse_query_team_names(team_name, team_names)
 
     if requested:
@@ -234,39 +156,29 @@ def _effective_team_filter_for_query(
         if invalid:
             raise HTTPException(status_code=400, detail="team_name/team_names 非法")
 
-    # super_admin：可选过滤
     if role_name == ROLE_SUPER_ADMIN:
         return requested or None
 
-    # 非 super_admin：current_team_names 一定不是 None（_current_team_names_or_403 保证）
     allowed = current_team_names or tuple()
     if not requested:
         return allowed
 
     eff = tuple(sorted(set(allowed) & set(requested)))
     if not eff:
-        # 明确拒绝“跨团队筛选”，避免误以为筛选成功
         raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
 
-    # finance/market：必须且只能属于 1 个团队（_current_team_names_or_403 已保证）
     if role_name in (ROLE_FINANCE, ROLE_MARKET):
         if len(allowed) == 1 and eff != allowed:
             raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
         return allowed
 
-    # manager：允许子集
     if role_name == ROLE_MANAGER:
         return eff
 
-    # 防御
     return allowed
 
 
 def _user_team_match_expr(teams: Tuple[str, ...]):
-    """
-    ✅ 兼容：User.team_name（旧单值） + User.team_names（CSV 多值）
-    用于“按团队选出用户集合”，避免 team_name 为空但 team_names 有值时误判。
-    """
     tns = tuple([str(x or "").strip() for x in (teams or ()) if str(x or "").strip()])
     if not tns:
         return sql_false()
@@ -289,24 +201,12 @@ def _order_salesperson_in_teams_expr(team_names: Tuple[str, ...]):
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
-    """
-    ✅ 方案 A（严格）：禁止“多加 8 小时”
-    - 我们的业务约定：MySQL DATETIME 存北京时间 naive（tzinfo=None）
-    - 因此：naive 直接格式化输出，绝不做时区换算
-
-    ✅ 兼容修复（应对驱动/模型把 DATETIME 读成 aware UTC 的情况）：
-    - 若 dt 为 aware 且 offset==0（UTC），大概率是“北京墙上时间被错误贴了 UTC 标签”
-      -> 直接去 tzinfo 再格式化（避免 .astimezone(BJ_TZ) 导致 +8）
-    - 其它 aware（极少见）：仅用于展示时转到 Asia/Shanghai 再格式化（兜底）
-    """
     if not dt:
         return None
 
-    # 正常：DB DATETIME -> naive
     if dt.tzinfo is None:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # ✅ 修复：aware + UTC 标签（offset=0）——当作“已是北京时间的墙上时间”
     try:
         off = dt.utcoffset()
         if off is not None and abs(off.total_seconds()) < 1:
@@ -314,7 +214,6 @@ def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
     except Exception:
         pass
 
-    # 兜底：其它 aware 才允许转到北京时间展示
     try:
         return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -339,29 +238,26 @@ def _group_display_name(g) -> Optional[str]:
         or getattr(g, "channel_code", None)
     )
 
+
 def _group_code_name(g) -> Optional[str]:
-    """
-    Unified display: [CODE] - [NAME].
-    Works for channel_group/customer_group, fall back to _group_display_name.
-    """
     if not g:
         return None
 
     code = (
-        getattr(g, 'channel_code', None)
-        or getattr(g, 'customer_code', None)
-        or getattr(g, 'group_code', None)
-        or getattr(g, 'code', None)
+        getattr(g, "channel_code", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "group_code", None)
+        or getattr(g, "code", None)
     )
     name = (
-        getattr(g, 'channel_name', None)
-        or getattr(g, 'customer_name', None)
-        or getattr(g, 'group_name', None)
-        or getattr(g, 'name', None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
     )
 
-    code_s = str(code).strip() if code is not None and str(code).strip() else ''
-    name_s = str(name).strip() if name is not None and str(name).strip() else ''
+    code_s = str(code).strip() if code is not None and str(code).strip() else ""
+    name_s = str(name).strip() if name is not None and str(name).strip() else ""
 
     if code_s and name_s:
         return f"{code_s} - {name_s}"
@@ -372,7 +268,6 @@ def _group_code_name(g) -> Optional[str]:
 
     fallback = _group_display_name(g)
     return str(fallback).strip() if fallback is not None and str(fallback).strip() else None
-
 
 
 def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
@@ -389,14 +284,6 @@ def _dialect_name() -> str:
 
 
 def _json_text(col, key: str):
-    """
-    返回 dynamic_data[key] 的“文本表达式”。
-
-    ✅ 关键修复：
-    - MySQL/MariaDB：优先用 JSON_UNQUOTE(JSON_EXTRACT())，避免 cast 后带双引号
-    - Postgres：优先走 json path 的 as_string / astext
-    - 其它：尽量用 json_extract + cast
-    """
     d = _dialect_name()
     k = (key or "").strip()
     if not k:
@@ -424,9 +311,6 @@ def _json_text(col, key: str):
 
 
 def _json_text_unquoted(col, key: str):
-    """
-    统一把字符串表达式“去引号+去空白”。
-    """
     try:
         expr = _json_text(col, key)
         expr = func.trim(expr)
@@ -437,12 +321,6 @@ def _json_text_unquoted(col, key: str):
 
 
 def _digits8_expr(expr):
-    """
-    把日期字符串归一化为 YYYYMMDD 的前 8 位数字：
-    - 2025-11-13 -> 20251113
-    - 20251113 -> 20251113
-    - 2025-11-13T00:00:00 -> 20251113
-    """
     e = func.replace(expr, "-", "")
     e = func.replace(e, "/", "")
     e = func.replace(e, ".", "")
@@ -451,10 +329,6 @@ def _digits8_expr(expr):
 
 
 def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
-    """
-    ✅ 修正点：
-    - 用 _json_text_unquoted() 再 lower，避免部分方言/驱动返回带引号导致 like 命中不稳定
-    """
     v = (value or "").strip()
     if not v:
         return
@@ -462,13 +336,22 @@ def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
     clauses.append(expr.like(f"%{v.lower()}%"))
 
 
+def _add_json_fuzzy_any(clauses: list, keys: List[str], value: Optional[str]):
+    v = (value or "").strip()
+    if not v:
+        return
+    vv = v.lower()
+    terms = []
+    for k in keys:
+        if not (k or "").strip():
+            continue
+        expr = func.lower(_json_text_unquoted(Order.dynamic_data, k))
+        terms.append(expr.like(f"%{vv}%"))
+    if terms:
+        clauses.append(or_(*terms))
+
+
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
-    """
-    ✅ 方案 A（严格）：
-    - 输入 YYYY-MM-DD（语义：北京时间）
-    - 输出 naive datetime 区间：[start, end)（同为北京时间 naive）
-    - 用于直接过滤 MySQL DATETIME（北京时间 naive）
-    """
     s = (ymd or "").strip()
     if not s:
         return None
@@ -481,11 +364,6 @@ def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
 
 
 def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime, datetime]]:
-    """
-    ✅ 方案 A（严格）：
-    start/end: YYYY-MM-DD（北京时间）
-    返回：[start_bj_naive, end_bj_exclusive_naive)，其中 end 为“包含 end 当天”
-    """
     s0 = (start_ymd or "").strip()
     e0 = (end_ymd or "").strip()
     if not s0 or not e0:
@@ -519,13 +397,6 @@ def _add_json_date_range_any(
     end_ymd: Optional[str],
     err_prefix: str,
 ):
-    """
-    在 Order.dynamic_data 中按多个 key 任选其一命中区间。
-    ✅ 把两端都归一化成 YYYYMMDD（8位数字）再比较，兼容：
-       - dl_register_date: 20251113
-       - register_date / first_register_date: 2025-11-13
-    注意：包含 end_ymd。
-    """
     s = (start_ymd or "").strip()
     e = (end_ymd or "").strip()
     if not s and not e:
@@ -566,9 +437,19 @@ def _to_float(v) -> Optional[float]:
         return None
 
 
-# ===========================
-# ✅ 财务端筛选下拉（只读）
-# ===========================
+def _extract_dd(dd: dict, *keys: str) -> str:
+    for k in keys:
+        if not k:
+            continue
+        v = dd.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return ""
+
+
 class OptionItem(BaseModel):
     id: int
     group_name: str
@@ -605,7 +486,6 @@ async def finance_list_customer_groups(
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
 
-    # ✅ 若 customer_group 具备 team_name 字段，则按团队隔离；否则不强行猜字段
     if hasattr(CustomerGroup, "team_name") and current_team_names is not None:
         stmt = stmt.where(getattr(CustomerGroup, "team_name").in_(list(current_team_names)))
 
@@ -630,7 +510,6 @@ async def finance_list_channel_groups(
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
 
-    # ✅ channel_group 一般有 team_name：严格按团队隔离
     if hasattr(ChannelGroup, "team_name") and current_team_names is not None:
         stmt = stmt.where(getattr(ChannelGroup, "team_name").in_(list(current_team_names)))
 
@@ -658,7 +537,6 @@ async def finance_list_salespersons(
         .order_by(User.id.asc())
     )
 
-    # ✅ 团队隔离：super_admin 全量；manager 多团队；finance/market 单团队（兼容 team_names）
     if current_team_names is not None:
         stmt = stmt.where(_user_team_match_expr(current_team_names))
 
@@ -667,12 +545,6 @@ async def finance_list_salespersons(
 
 
 def _split_team_names_any(val) -> List[str]:
-    """
-    兼容：
-    - None -> []
-    - ["A","B"] / ("A","B") / {"A"} -> list
-    - "A,B" / "A，B" / "A|B" -> list
-    """
     if val is None:
         return []
     if isinstance(val, (list, tuple, set)):
@@ -681,7 +553,6 @@ def _split_team_names_any(val) -> List[str]:
             s = str(x or "").strip()
             if s:
                 out.append(s)
-        # 去重保持顺序
         seen = set()
         uniq = []
         for x in out:
@@ -699,7 +570,6 @@ def _split_team_names_any(val) -> List[str]:
                 parts = [p.strip() for p in s.split(sep)]
                 parts = [p for p in parts if p]
                 if parts:
-                    # 去重保持顺序
                     seen = set()
                     uniq = []
                     for x in parts:
@@ -726,7 +596,6 @@ async def _salesperson_in_current_teams_or_403(
     team_name_val = (getattr(sp, "team_name", None) or "").strip() if sp else ""
     team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
 
-    # 兼容：team_names 为空但 team_name 有值
     if not team_names_val and team_name_val:
         team_names_val = [team_name_val]
 
@@ -738,10 +607,6 @@ async def _salesperson_in_current_teams_or_403(
 
 
 def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
-    """
-    ✅ 只读字段推断（不触发 ORM 懒加载，避免 async MissingGreenlet）：
-    优先尝试常见 manager 字段名。
-    """
     if not sp:
         return None
     for key in ("manager_id", "leader_id", "supervisor_id", "parent_id"):
@@ -761,9 +626,6 @@ def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
 
 
 def _pick_manager_name_inline(sp: Optional[User]) -> Optional[str]:
-    """
-    若 User 上直接有 manager_name/leader_name 等字符串字段，则直接用（无需额外查表）。
-    """
     if not sp:
         return None
     for key in ("manager_name", "leader_name", "supervisor_name", "parent_name"):
@@ -802,13 +664,11 @@ async def _load_finance_order_out(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be viewed in finance")
 
-    # ✅ 团队隔离：按订单 salesperson.team_name/team_names（支持经理多团队）
     await _salesperson_in_current_teams_or_403(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=current_team_names,
     )
 
-    # ✅ 与 orders 域对齐：补齐图片可展示 url
     ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
 
     info = getattr(o, "order_info", None)
@@ -834,9 +694,6 @@ async def _load_finance_order_out(
     )
 
 
-# ===========================
-# ✅ 财务汇总（数据库全量聚合）
-# ===========================
 class FinanceOrdersSummaryOut(BaseModel):
     commercial_amount: float = 0.0
     compulsory_amount: float = 0.0
@@ -846,7 +703,6 @@ class FinanceOrdersSummaryOut(BaseModel):
     payable: float = 0.0
     profit: float = 0.0
 
-    # ✅ 需求2：奖励汇总
     channel_reward: float = 0.0
     customer_reward: float = 0.0
 
@@ -867,9 +723,15 @@ async def finance_orders_summary(
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
-    # ✅ 本轮新增：按团队筛选（用于超级权限/经理在前端下拉筛选）
-    team_name: Optional[str] = Query(None, description="按团队筛选（super_admin 可跨团队；manager 仅可筛选自己可见团队）"),
+    team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
+    # ✅ 新增：搜索栏常用字段
+    salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
+    plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
+    vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
+    engine_no: Optional[str] = Query(None, description="发动机号（模糊）"),
+    id_number: Optional[str] = Query(None, description="身份证号（模糊）"),
+    vehicle_model: Optional[str] = Query(None, description="车型（模糊）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
@@ -886,18 +748,15 @@ async def finance_orders_summary(
 
     clauses: list = []
 
-    # ✅ 基础范围：仅已完成订单
     stmt = (
         select(
             func.coalesce(func.sum(OrderInfo.commercial_amount), 0).label("commercial_amount"),
             func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
             func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
             func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("noncar_amount"),
-            # ✅ receivable=客户合计；payable=渠道合计（与 orders 域 profit=channel_total-customer_total 一致）
             func.coalesce(func.sum(OrderInfo.customer_total), 0).label("receivable"),
             func.coalesce(func.sum(OrderInfo.channel_total), 0).label("payable"),
             func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
-            # ✅ 需求2：奖励汇总
             func.coalesce(func.sum(OrderInfo.channel_reward), 0).label("channel_reward"),
             func.coalesce(func.sum(OrderInfo.customer_reward), 0).label("customer_reward"),
         )
@@ -906,20 +765,20 @@ async def finance_orders_summary(
         .where(Order.is_finished.is_(True))
     )
 
-    # ✅ 团队隔离 / 团队筛选：按 salesperson.team_name/team_names（支持经理多团队、super_admin 可选）
     if effective_team_names is not None:
         clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
 
+    if salesperson_id is not None:
+        clauses.append(Order.salesperson_id == int(salesperson_id))
+
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
     if customer_group_id is not None:
         clauses.append(Order.customer_group_id == int(customer_group_id))
 
-    # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
-    # ✅ 方案 A：用北京时间 naive 区间直接过滤 MySQL DATETIME
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
@@ -950,7 +809,18 @@ async def finance_orders_summary(
     if (owner_name or "").strip():
         _add_json_fuzzy(clauses, "id_name", owner_name)
 
-    # ✅ 初登日期：first_register_date 对应 dl_register_date（主字段）
+    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
+    if (plate_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+    if (vin or "").strip():
+        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+    if (engine_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+    if (id_number or "").strip():
+        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+    if (vehicle_model or "").strip():
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
+
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
             clauses,
@@ -960,7 +830,6 @@ async def finance_orders_summary(
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        # ✅ 兼容旧逻辑：模糊（例如传 "2025-01"），也兼容传 "202501"
         v = (first_register_date or "").strip()
         v2 = v.replace("-", "")
         _add_json_fuzzy(clauses, "dl_register_date", v)
@@ -1010,13 +879,19 @@ async def list_finance_orders(
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
-    # ✅ 本轮新增：按团队筛选（用于超级权限/经理在前端下拉筛选）
-    team_name: Optional[str] = Query(None, description="按团队筛选（super_admin 可跨团队；manager 仅可筛选自己可见团队）"),
+    team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
+    # ✅ 新增：搜索栏常用字段
+    salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
+    plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
+    vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
+    engine_no: Optional[str] = Query(None, description="发动机号（模糊）"),
+    id_number: Optional[str] = Query(None, description="身份证号（模糊）"),
+    vehicle_model: Optional[str] = Query(None, description="车型（模糊）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    current_user, role_name, user_team_names, _team_ids = user_with_role
+    _current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
     current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
@@ -1041,20 +916,20 @@ async def list_finance_orders(
 
     clauses: list = []
 
-    # ✅ 团队隔离 / 团队筛选：按 salesperson.team_name/team_names（支持经理多团队、super_admin 可选）
     if effective_team_names is not None:
         clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
 
+    if salesperson_id is not None:
+        clauses.append(Order.salesperson_id == int(salesperson_id))
+
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
     if customer_group_id is not None:
         clauses.append(Order.customer_group_id == int(customer_group_id))
 
-    # ✅ created_at：支持 start/end（优先）；兼容 created_date 单日
-    # ✅ 方案 A：用北京时间 naive 区间直接过滤 MySQL DATETIME
     if created_date_start or created_date_end:
         if not created_date_start or not created_date_end:
             raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
@@ -1086,7 +961,18 @@ async def list_finance_orders(
     if (owner_name or "").strip():
         _add_json_fuzzy(clauses, "id_name", owner_name)
 
-    # ✅ 初登日期：first_register_date 对应 dl_register_date（主字段）
+    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
+    if (plate_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+    if (vin or "").strip():
+        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+    if (engine_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+    if (id_number or "").strip():
+        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+    if (vehicle_model or "").strip():
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
+
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
             clauses,
@@ -1096,7 +982,6 @@ async def list_finance_orders(
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        # ✅ 兼容旧逻辑：模糊（例如传 "2025-01"），也兼容传 "202501"
         v = (first_register_date or "").strip()
         v2 = v.replace("-", "")
         _add_json_fuzzy(clauses, "dl_register_date", v)
@@ -1121,9 +1006,6 @@ async def list_finance_orders(
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(stmt)).scalars().all()
 
-    # ===========================
-    # ✅ 批量补齐：所属经理/所属团队（避免 N+1）
-    # ===========================
     manager_ids: Set[int] = set()
     salesperson_to_manager_id: Dict[int, int] = {}
 
@@ -1151,17 +1033,21 @@ async def list_finance_orders(
 
         dd = getattr(o, "dynamic_data", None) or {}
 
-        plate_no = (dd.get("dl_plate_no") or dd.get("plate_no") or "") if isinstance(dd, dict) else ""
-        vin = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
-        engine_no = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
-        vehicle_model = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
+        plate_no_val = (dd.get("dl_plate_no") or dd.get("plate_no") or "") if isinstance(dd, dict) else ""
+        vin_val = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
+        engine_no_val = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
+        vehicle_model_val = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
 
         raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
-        id_number = (str(raw_id_number).strip() if raw_id_number is not None else "")
+        id_number_val = (str(raw_id_number).strip() if raw_id_number is not None else "")
 
         owner = (dd.get("id_name") or "") if isinstance(dd, dict) else ""
 
-        # ✅ 所属团队
+        # ✅ 修复：初登日期展示与筛选/导出一致，按多个key兜底
+        first_register_val = ""
+        if isinstance(dd, dict):
+            first_register_val = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
+
         team_name_val = None
         team_names_val: List[str] = []
         if sp:
@@ -1170,7 +1056,6 @@ async def list_finance_orders(
             if not team_names_val and team_name_val:
                 team_names_val = [str(team_name_val).strip()] if str(team_name_val).strip() else []
 
-        # ✅ 所属经理
         manager_id_val = None
         manager_name_val = None
         if sp:
@@ -1193,17 +1078,17 @@ async def list_finance_orders(
                 col_03_customer=_group_code_name(cg),
                 col_04_market=getattr(cg, "market", None) if cg else None,
                 col_05_owner=owner or None,
-                col_06_plate_no=plate_no or None,
+                col_06_plate_no=plate_no_val or None,
                 col_07_insurance_expire_date=(
                     info.insurance_expire_date.strftime("%Y-%m-%d")
                     if info and getattr(info, "insurance_expire_date", None)
                     else None
                 ),
-                col_08_vin=vin or None,
-                col_09_engine_no=engine_no or None,
-                col_10_vehicle_model=vehicle_model or None,
-                col_11_first_register_date=(dd.get("dl_register_date") if isinstance(dd, dict) else None),
-                col_12_id_number=(id_number or None),
+                col_08_vin=vin_val or None,
+                col_09_engine_no=engine_no_val or None,
+                col_10_vehicle_model=vehicle_model_val or None,
+                col_11_first_register_date=(first_register_val or None),
+                col_12_id_number=(id_number_val or None),
                 col_13_owner_phone=(
                     str(getattr(info, "owner_phone", None))
                     if info and getattr(info, "owner_phone", None) is not None
@@ -1221,20 +1106,18 @@ async def list_finance_orders(
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                # ✅ receivable=客户合计；payable=渠道合计（注意：此处保持现状，不在本轮改动范围内）
-                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                # ✅ 修复：与 summary/export 统一口径：应收=customer_total，应付=channel_total
+                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
-                # ✅ 需求2：新增两列（明细）
                 col_31_channel_reward=_to_float(getattr(info, "channel_reward", None)) if info else None,
                 col_32_customer_reward=_to_float(getattr(info, "customer_reward", None)) if info else None,
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
                 salesperson_name=_user_display_name(sp),
-                # ✅ 新增回填：所属经理/所属团队
                 manager_id=manager_id_val,
                 manager_name=manager_name_val,
                 team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
@@ -1336,9 +1219,6 @@ async def return_finance_order_to_unfinished(
     return {"ok": True}
 
 
-# ===========================
-# ✅ BOS STS + 代传 + finalize（finance 专用：仅 related）
-# ===========================
 class BosStsOut(BaseModel):
     accessKeyId: str
     secretAccessKey: str
@@ -1348,7 +1228,7 @@ class BosStsOut(BaseModel):
 
 
 @router.get("/bos-sts", response_model=BosStsOut)
-@router.get("/orders/bos-sts", response_model=BosStsOut)  # 兼容旧前端
+@router.get("/orders/bos-sts", response_model=BosStsOut)
 async def finance_get_bos_sts(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
@@ -1446,7 +1326,7 @@ async def _ensure_order_finished_for_finance(
 
 
 @router.post("/bos-upload", response_model=BosProxyUploadOut)
-@router.post("/orders/bos-upload", response_model=BosProxyUploadOut)  # 兼容旧前端
+@router.post("/orders/bos-upload", response_model=BosProxyUploadOut)
 async def finance_bos_upload_proxy(
     order_id: int = Form(...),
     slot_key: str = Form(...),
@@ -1614,9 +1494,9 @@ class FinanceFinalizeOut(BaseModel):
 
 
 @router.post("/finalize", response_model=FinanceFinalizeOut)
-@router.post("/finalize-upload", response_model=FinanceFinalizeOut)  # 兼容旧前端
-@router.post("/orders/finalize", response_model=FinanceFinalizeOut)  # 兼容旧前端
-@router.post("/orders/finalize-upload", response_model=FinanceFinalizeOut)  # 兼容旧前端
+@router.post("/finalize-upload", response_model=FinanceFinalizeOut)
+@router.post("/orders/finalize", response_model=FinanceFinalizeOut)
+@router.post("/orders/finalize-upload", response_model=FinanceFinalizeOut)
 async def finance_finalize_images(
     payload: FinanceFinalizeIn,
     db: AsyncSession = Depends(get_db),
@@ -1717,9 +1597,6 @@ async def finance_finalize_images(
     return FinanceFinalizeOut(ok=True, order_id=order_id)
 
 
-# ===========================
-# ✅ 稳定导出（一次请求导出全部符合条件）
-# ===========================
 def _esc_html(s: str) -> str:
     return (
         str(s or "")
@@ -1762,7 +1639,6 @@ def _join_teams_export(team_names: List[str], team_name: Optional[str]) -> str:
     tn = str(team_name or "").strip()
     if tn and tn not in arr:
         arr.append(tn)
-    # 去重保持顺序
     seen = set()
     out = []
     for x in arr:
@@ -1780,22 +1656,8 @@ def _now_shanghai_stamp() -> str:
         return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 
-def _extract_dd(dd: dict, *keys: str) -> str:
-    for k in keys:
-        if not k:
-            continue
-        v = dd.get(k)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return ""
-
-
 @router.get("/orders/export")
 async def finance_orders_export(
-    # ✅ 支持勾选导出：ids 可重复传（ids=1&ids=2）或前端数组
     ids: Optional[Tuple[int, ...]] = Query(None, description="可选：勾选导出订单ID列表（可重复 ids=1）"),
     order_id: Optional[int] = Query(None, description="精确订单ID"),
     created_date: Optional[str] = Query(None, description="日期 YYYY-MM-DD（兼容旧参数：按北京时间过滤 created_at 单日）"),
@@ -1811,17 +1673,18 @@ async def finance_orders_export(
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
-    team_name: Optional[str] = Query(None, description="按团队筛选（super_admin 可跨团队；manager 仅可筛选自己可见团队）"),
+    team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
+    # ✅ 新增：搜索栏常用字段
+    salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
+    plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
+    vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
+    engine_no: Optional[str] = Query(None, description="发动机号（模糊）"),
+    id_number: Optional[str] = Query(None, description="身份证号（模糊）"),
+    vehicle_model: Optional[str] = Query(None, description="车型（模糊）"),
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    """
-    ✅ 一次请求导出全部匹配数据（不再分页拉取拼接）。
-
-    输出：HTML xls（与前端原本下载一致）
-    - 强制“身份证号列”为文本（mso-number-format:'\\@'）
-    """
     _current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     _ensure_finance_export_access(role_name)
@@ -1845,11 +1708,13 @@ async def finance_orders_export(
         if id_list:
             clauses.append(Order.id.in_(id_list))
         else:
-            # ids 传了但全不合法：直接导出空
             clauses.append(sql_false())
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
+
+    if salesperson_id is not None:
+        clauses.append(Order.salesperson_id == int(salesperson_id))
 
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
@@ -1878,7 +1743,6 @@ async def finance_orders_export(
     if is_rebate is not None:
         clauses.append(Order.is_rebate.is_(bool(is_rebate)))
 
-    # ✅ joins：用于 market / insurance_expire_date 的过滤
     need_join_customer = bool((market or "").strip())
     need_join_info = bool((insurance_expire_date or "").strip())
 
@@ -1888,6 +1752,18 @@ async def finance_orders_export(
 
     if (owner_name or "").strip():
         _add_json_fuzzy(clauses, "id_name", owner_name)
+
+    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
+    if (plate_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+    if (vin or "").strip():
+        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+    if (engine_no or "").strip():
+        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+    if (id_number or "").strip():
+        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+    if (vehicle_model or "").strip():
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
@@ -1912,7 +1788,6 @@ async def finance_orders_export(
         clauses.append(OrderInfo.insurance_expire_date == d.date())
         need_join_info = True
 
-    # ✅ 导出字段：严格对齐前端 _financeExportHeaders() 的顺序
     headers = [
         "日期",
         "渠道",
@@ -1953,7 +1828,6 @@ async def finance_orders_export(
         "是否返点",
     ]
 
-    # ✅ 主查询：分批拉取，避免一次性内存暴涨（keyset 分页）
     base_stmt = (
         select(Order)
         .select_from(Order)
@@ -1965,7 +1839,6 @@ async def finance_orders_export(
         )
     )
 
-    # ✅ 关键修复：当 clauses 引用了 CustomerGroup / OrderInfo 时，必须 join 入 FROM
     if need_join_customer:
         base_stmt = base_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
     if need_join_info:
@@ -1977,7 +1850,6 @@ async def finance_orders_export(
     disp = f"attachment; filename*=UTF-8''{quote(filename)}"
 
     async def gen():
-        # ✅ HTML xls 头
         yield (
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\" /></head><body>"
             "<table border=\"1\"><thead><tr>"
@@ -1998,7 +1870,6 @@ async def finance_orders_export(
             if not rows:
                 break
 
-            # ✅ 经理名批量（避免 N+1）
             manager_ids: Set[int] = set()
             salesperson_to_manager_id: Dict[int, int] = {}
             for o in rows:
@@ -2017,7 +1888,6 @@ async def finance_orders_export(
                 mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
                 managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
 
-            # ✅ 输出行
             for o in rows:
                 cg = getattr(o, "customer_group", None)
                 ch = getattr(o, "channel_group", None)
@@ -2034,11 +1904,11 @@ async def finance_orders_export(
 
                 owner = _extract_dd(dd, "id_name")
                 plate = _extract_dd(dd, "dl_plate_no", "plate_no")
-                vin = _extract_dd(dd, "vin", "dl_vin")
-                engine_no = _extract_dd(dd, "engine_no", "dl_engine_no")
-                vehicle_model = _extract_dd(dd, "vehicle_model", "dl_vehicle_model")
+                vin_val = _extract_dd(dd, "vin", "dl_vin")
+                engine_no_val = _extract_dd(dd, "engine_no", "dl_engine_no")
+                vehicle_model_val = _extract_dd(dd, "vehicle_model", "dl_vehicle_model")
                 first_register = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
-                id_number = _extract_dd(dd, "id_number")
+                id_number_val = _extract_dd(dd, "id_number")
                 phone = str(getattr(info, "owner_phone", None) or "").strip()
 
                 insurance_expire = "-"
@@ -2067,12 +1937,11 @@ async def finance_orders_export(
                 cu_nc_p = _fmt_point_export(getattr(info, "customer_non_vehicle_point", None) if info else None)
                 cu_reward = _fmt_money_export(getattr(info, "customer_reward", None) if info else None)
 
-                # ✅ receivable/payable：保持与你现有 finance 列表/前端取值一致（不在本轮纠正语义）
-                receivable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
-                payable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
+                # ✅ 修复：与 summary/list 统一口径：应收=customer_total，应付=channel_total
+                receivable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
+                payable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
                 profit = _fmt_money_export(getattr(info, "profit", None) if info else None)
 
-                # 经理
                 manager_name = "-"
                 if sp:
                     inline_name = _pick_manager_name_inline(sp)
@@ -2084,7 +1953,6 @@ async def finance_orders_export(
                         if mid:
                             manager_name = _user_display_name(managers_by_id.get(int(mid))) or "-"
 
-                # 团队
                 team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
                 team_name_val = str(getattr(sp, "team_name", None) or "").strip() if sp else ""
                 team_display = _join_teams_export(team_names_val, team_name_val or None)
@@ -2101,11 +1969,11 @@ async def finance_orders_export(
                     owner or "-",
                     plate or "-",
                     insurance_expire,
-                    vin or "-",
-                    engine_no or "-",
-                    vehicle_model or "-",
+                    vin_val or "-",
+                    engine_no_val or "-",
+                    vehicle_model_val or "-",
                     first_register or "-",
-                    id_number or "-",
+                    id_number_val or "-",
                     phone or "-",
                     cm,
                     jq,
@@ -2135,7 +2003,7 @@ async def finance_orders_export(
                 tds = []
                 for idx, c in enumerate(cols):
                     cc = _esc_html(_fmt_text_export(c))
-                    if idx == 12:  # 0-based：身份证号列
+                    if idx == 12:
                         tds.append(f"<td style=\"mso-number-format:'\\@';\">{cc}</td>")
                     else:
                         tds.append(f"<td>{cc}</td>")

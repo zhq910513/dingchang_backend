@@ -2,7 +2,7 @@
 # encoding: utf-8
 from __future__ import annotations
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String, text
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String, text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -15,9 +15,13 @@ class OrderInfo(Base):
     id = Column(Integer, primary_key=True, index=True)
 
     # ✅ 一单一条（强约束）
-    # - 不要再同时：index=True + unique=True + UniqueConstraint + Index
-    # - 否则 metadata 内会出现同名 index，create_all 直接 Duplicate key name
-    order_id = Column(Integer, ForeignKey("order.id", ondelete="CASCADE"), nullable=False, unique=True)
+    # - 避免同时叠 index/unique/UniqueConstraint/Index 导致重复 index 名
+    # - 这里用 UniqueConstraint 显式命名，更利于迁移/对比稳定
+    order_id = Column(Integer, ForeignKey("order.id", ondelete="CASCADE"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("order_id", name="uq_order_info_order_id"),
+    )
 
     # ✅ 反向关系
     order = relationship("Order", back_populates="order_info", lazy="selectin")
@@ -69,6 +73,6 @@ class OrderInfo(Base):
     updated_at = Column(
         DateTime(timezone=False),
         server_default=func.current_timestamp(),
-        server_onupdate=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
         nullable=False,
     )

@@ -143,6 +143,7 @@ def _group_display_name(g) -> Optional[str]:
         or getattr(g, "channel_code", None)
     )
 
+
 def _group_code_name(g) -> Optional[str]:
     """
     Unified display: [CODE] - [NAME].
@@ -154,20 +155,20 @@ def _group_code_name(g) -> Optional[str]:
         return None
 
     code = (
-        getattr(g, 'channel_code', None)
-        or getattr(g, 'customer_code', None)
-        or getattr(g, 'group_code', None)
-        or getattr(g, 'code', None)
+        getattr(g, "channel_code", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "group_code", None)
+        or getattr(g, "code", None)
     )
     name = (
-        getattr(g, 'channel_name', None)
-        or getattr(g, 'customer_name', None)
-        or getattr(g, 'group_name', None)
-        or getattr(g, 'name', None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
     )
 
-    code_s = str(code).strip() if code is not None and str(code).strip() else ''
-    name_s = str(name).strip() if name is not None and str(name).strip() else ''
+    code_s = str(code).strip() if code is not None and str(code).strip() else ""
+    name_s = str(name).strip() if name is not None and str(name).strip() else ""
 
     if code_s and name_s:
         return f"{code_s} - {name_s}"
@@ -741,13 +742,10 @@ async def _load_order_out(
         salesperson_id=o.salesperson_id,
         customer_group_id=o.customer_group_id,
         channel_group_id=o.channel_group_id,
-
-        # ✅ 新增回填
         manager_id=manager_id_val,
         manager_name=manager_name_val,
         team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
         team_names=team_names_val,
-
         is_finished=bool(o.is_finished),
         is_rebate=bool(getattr(o, "is_rebate", False)),
         is_paid=bool(getattr(o, "is_paid", False)),
@@ -824,8 +822,9 @@ async def _get_or_create_image_file(
         if obj2:
             return obj2
 
+        # ✅ md5 不唯一：只能 first()，不能 scalar_one_or_none()
         if md5:
-            obj3 = (await db.execute(select(ImageFile).where(ImageFile.md5 == md5))).scalar_one_or_none()
+            obj3 = (await db.execute(select(ImageFile).where(ImageFile.md5 == md5))).scalars().first()
             if obj3:
                 if url and not (obj3.url or "").strip():
                     obj3.url = url
@@ -1539,6 +1538,51 @@ class OrderFinalizeOut(BaseModel):
     ocr_status: Optional[str] = None
 
 
+def _expected_prefix_for_slot(slot_key: str) -> str:
+    """
+    ✅ B1 key 规则：slot_key -> prefix（cert/idcard/dl/backup）
+    - 若 StorageService 有 SLOT_PREFIX_MAP：按映射取 prefix
+    - 否则：退回用 slot_key（兼容旧逻辑/非B1场景）
+    """
+    sk = str(slot_key or "").strip()
+    mp = getattr(storage, "SLOT_PREFIX_MAP", None)
+    if isinstance(mp, dict) and sk in mp and str(mp.get(sk) or "").strip():
+        return str(mp.get(sk) or "").strip()
+    return sk
+
+
+def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: str) -> None:
+    """
+    ✅ finalize 防御：校验 storage_key 归属 slot_key（避免跨槽引用/构造）。
+    - 若 storage.enabled 且存在 validate_b1_key：优先严格校验（需要 md5）
+    - 否则：至少保证 storage_key 以 "{prefix}/" 开头（prefix 来自 slot_key 映射）
+    """
+    sk = str(slot_key or "").strip()
+    key = str(storage_key or "").strip().lstrip("/")
+    if not sk or not key:
+        raise HTTPException(status_code=400, detail="slot_key/storage_key invalid")
+
+    if sk not in ALL_SLOTS:
+        raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
+
+    # ✅ 兜底：按 prefix 校验归属（B1 规则 key 以 prefix 开头，不是 slot_key 开头）
+    prefix = _expected_prefix_for_slot(sk)
+    if not key.startswith(prefix + "/"):
+        raise HTTPException(status_code=400, detail="storage_key does not belong to slot_key")
+
+    if getattr(storage, "enabled", False) and hasattr(storage, "validate_b1_key"):
+        m = str(md5_hex or "").strip().lower()
+        # 客户端若没给 md5，则无法做严格校验：直接拒绝，避免放水
+        if not m:
+            raise HTTPException(status_code=400, detail="md5 is required for finalize")
+        try:
+            ok = storage.validate_b1_key(scene=sk, storage_key=key, md5_hex=m)
+        except Exception:
+            ok = False
+        if not ok:
+            raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
+
+
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
     payload: OrderFinalizeIn,
@@ -1642,6 +1686,9 @@ async def finalize_order_upload(
         storage_key = (im.storage_key or "").strip().lstrip("/")
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
+
+        # ✅ finalize 校验 storage_key 归属 slot（B1: prefix 规则）
+        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=(im.md5 or "").strip())
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 

@@ -32,8 +32,14 @@ class Order(Base):
     dynamic_data = Column(JSON, nullable=False, default=dict)
     ocr_raw_json = Column(JSON, nullable=False, default=dict)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.current_timestamp(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.current_timestamp(), onupdate=func.current_timestamp(), nullable=False)
+    # ✅ 与接口层口径对齐：DB 存北京时间 naive DATETIME（不要 timezone=True，避免被 SQLAlchemy/driver 误做时区换算）
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=False),
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+        nullable=False,
+    )
 
     images = relationship(
         "OrderImage",
@@ -42,7 +48,7 @@ class Order(Base):
         lazy="selectin",
     )
 
-    # ✅ 新增：订单信息块（一对一）
+    # ✅ 订单信息块（一对一）
     order_info = relationship(
         "OrderInfo",
         back_populates="order",
@@ -68,7 +74,8 @@ class OrderImage(Base):
     slot_key = Column(String(64), nullable=False, index=True)
     slot = synonym("slot_key")
 
-    storage_key = Column(String(512), nullable=False, index=True, default="")
+    # ✅ 不要 default=""：避免脏数据（API 已强校验非空）
+    storage_key = Column(String(512), nullable=False, index=True)
     image_url = Column(String(512), nullable=False, default="")
 
     image_file_id = Column(
@@ -78,7 +85,7 @@ class OrderImage(Base):
         index=True,
     )
 
-    created_at = Column(DateTime(timezone=True), server_default=func.current_timestamp(), nullable=False)
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
 
     order = relationship("Order", back_populates="images", lazy="selectin")
     image_file = relationship("ImageFile", back_populates="order_images", lazy="selectin")
