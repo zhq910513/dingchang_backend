@@ -1106,9 +1106,8 @@ async def list_finance_orders(
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                # ✅ 修复：与 summary/export 统一口径：应收=customer_total，应付=channel_total
-                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
