@@ -822,9 +822,8 @@ async def _get_or_create_image_file(
         if obj2:
             return obj2
 
-        # ✅ md5 不唯一：只能 first()，不能 scalar_one_or_none()
         if md5:
-            obj3 = (await db.execute(select(ImageFile).where(ImageFile.md5 == md5))).scalars().first()
+            obj3 = (await db.execute(select(ImageFile).where(ImageFile.md5 == md5))).scalar_one_or_none()
             if obj3:
                 if url and not (obj3.url or "").strip():
                     obj3.url = url
@@ -1351,13 +1350,33 @@ def _digits8_expr(expr):
 
 def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
     """
-    ✅ 修正：用 _json_text_unquoted 再 lower，避免 MySQL JSON 字符串带引号导致 like 命中不稳定
+    ✅ 单 key 模糊：lower(coalesce(json, "")) like %v%
     """
     v = (value or "").strip()
     if not v:
         return
-    expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
+    expr = func.lower(func.coalesce(_json_text_unquoted(Order.dynamic_data, key), ""))
     clauses.append(expr.like(f"%{v.lower()}%"))
+
+
+def _add_json_fuzzy_any(clauses: list, *, keys: List[str], value: Optional[str]) -> None:
+    """
+    ✅ 多 key 模糊：同一个搜索词在多个 key 之间用 OR
+    - 关键：每个 expr 都 coalesce(...,"")，避免 NULL like -> NULL 进 WHERE 变 false
+    """
+    v = (value or "").strip()
+    if not v:
+        return
+    vv = f"%{v.lower()}%"
+    terms = []
+    for k in (keys or []):
+        kk = (k or "").strip()
+        if not kk:
+            continue
+        expr = func.lower(func.coalesce(_json_text_unquoted(Order.dynamic_data, kk), ""))
+        terms.append(expr.like(vv))
+    if terms:
+        clauses.append(or_(*terms))
 
 
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
@@ -1538,24 +1557,11 @@ class OrderFinalizeOut(BaseModel):
     ocr_status: Optional[str] = None
 
 
-def _expected_prefix_for_slot(slot_key: str) -> str:
-    """
-    ✅ B1 key 规则：slot_key -> prefix（cert/idcard/dl/backup）
-    - 若 StorageService 有 SLOT_PREFIX_MAP：按映射取 prefix
-    - 否则：退回用 slot_key（兼容旧逻辑/非B1场景）
-    """
-    sk = str(slot_key or "").strip()
-    mp = getattr(storage, "SLOT_PREFIX_MAP", None)
-    if isinstance(mp, dict) and sk in mp and str(mp.get(sk) or "").strip():
-        return str(mp.get(sk) or "").strip()
-    return sk
-
-
 def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: str) -> None:
     """
     ✅ finalize 防御：校验 storage_key 归属 slot_key（避免跨槽引用/构造）。
     - 若 storage.enabled 且存在 validate_b1_key：优先严格校验（需要 md5）
-    - 否则：至少保证 storage_key 以 "{prefix}/" 开头（prefix 来自 slot_key 映射）
+    - 否则：至少保证 storage_key 以 "{slot_key}/" 开头
     """
     sk = str(slot_key or "").strip()
     key = str(storage_key or "").strip().lstrip("/")
@@ -1565,9 +1571,8 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
     if sk not in ALL_SLOTS:
         raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
 
-    # ✅ 兜底：按 prefix 校验归属（B1 规则 key 以 prefix 开头，不是 slot_key 开头）
-    prefix = _expected_prefix_for_slot(sk)
-    if not key.startswith(prefix + "/"):
+    # 兜底前缀校验（即便 BOS 未启用也不允许跨槽）
+    if not key.startswith(f"{sk}/"):
         raise HTTPException(status_code=400, detail="storage_key does not belong to slot_key")
 
     if getattr(storage, "enabled", False) and hasattr(storage, "validate_b1_key"):
@@ -1687,7 +1692,7 @@ async def finalize_order_upload(
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        # ✅ finalize 校验 storage_key 归属 slot（B1: prefix 规则）
+        # ✅ 本轮修复：finalize 时校验 storage_key 归属 slot（避免构造跨槽）
         _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=(im.md5 or "").strip())
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
@@ -1868,25 +1873,17 @@ async def list_orders(
             end_ymd=first_register_date_end,
         )
 
+    # ✅ 单 key：保持 AND
     _add_json_fuzzy(clauses, "id_name", owner_name)
     _add_json_fuzzy(clauses, "id_number", id_number)
-
-    _add_json_fuzzy(clauses, "dl_plate_no", plate_no)
-    _add_json_fuzzy(clauses, "plate_no", plate_no)
-
-    _add_json_fuzzy(clauses, "engine_no", engine_no)
-    _add_json_fuzzy(clauses, "dl_engine_no", engine_no)
-
-    _add_json_fuzzy(clauses, "vehicle_brand_name", vehicle_name)
-    _add_json_fuzzy(clauses, "vehicle_name", vehicle_name)
-
     _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
 
-    _add_json_fuzzy(clauses, "vin", vin)
-    _add_json_fuzzy(clauses, "dl_vin", vin)
-
-    _add_json_fuzzy(clauses, "remark", remark)
-    _add_json_fuzzy(clauses, "dla_remark", remark)
+    # ✅ 多 key：改为 OR（核心修复）
+    _add_json_fuzzy_any(clauses, keys=["dl_plate_no", "plate_no"], value=plate_no)
+    _add_json_fuzzy_any(clauses, keys=["engine_no", "dl_engine_no"], value=engine_no)
+    _add_json_fuzzy_any(clauses, keys=["vin", "dl_vin"], value=vin)
+    _add_json_fuzzy_any(clauses, keys=["vehicle_brand_name", "vehicle_name"], value=vehicle_name)
+    _add_json_fuzzy_any(clauses, keys=["remark", "dla_remark"], value=remark)
 
     if clauses:
         stmt = stmt.where(and_(*clauses))
