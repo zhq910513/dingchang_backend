@@ -12,7 +12,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from typing import Optional, Dict, List, Tuple, Set
+from typing import Optional, Dict, List, Tuple
 
 from sqlalchemy import event, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -170,8 +170,10 @@ def _diff_missing_columns(conn) -> Dict[str, List[str]]:
 
 
 def _get_model_column(conn, table_name: str, col_name: str):
+    # Base.metadata.tables.get() 返回 Table 或 None
+    # SQLAlchemy 的 Table/ClauseElement 不能用于 bool 判断（会抛 TypeError），必须用 is None
     t = Base.metadata.tables.get(table_name)
-    if not t:
+    if t is None:
         return None
     return t.columns.get(col_name)
 
