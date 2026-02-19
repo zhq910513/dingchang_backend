@@ -22,6 +22,10 @@
 重要修复（2026-02-19）：
 - 路由匹配顺序：/orders/export 必须在 /orders/{order_id} 之前，否则 export 会被当成 order_id 导致 422
 - 进一步加固：/orders/{order_id:int} 仅匹配整数，避免静态子路由被吞
+
+导出修复（2026-02-19）：
+- 日期列仅输出 YYYY-MM-DD（不再带时分秒）
+- “应收/应付”与列表口径一致：应收=channel_total，应付=customer_total
 """
 from __future__ import annotations
 
@@ -236,6 +240,17 @@ def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
         return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_date_only(dt: Optional[datetime]) -> Optional[str]:
+    """
+    ✅ 导出专用：仅输出 YYYY-MM-DD
+    - 跟 _fmt_dt 一样的防 tz 兜底，但只保留日期
+    """
+    s = _fmt_dt(dt)
+    if not s:
+        return None
+    return s.split(" ")[0]
 
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:
@@ -1479,7 +1494,8 @@ async def finance_orders_export(
                 dd = getattr(o, "dynamic_data", None) or {}
                 dd = dd if isinstance(dd, dict) else {}
 
-                created_at = _fmt_dt(getattr(o, "created_at", None)) or "-"
+                # ✅ 修复1：日期只要 YYYY-MM-DD
+                created_at = _fmt_date_only(getattr(o, "created_at", None)) or "-"
                 channel_name = _group_code_name(ch) or "-"
                 customer_name = _group_code_name(cg) or "-"
                 market_val = (getattr(cg, "market", None) if cg else None) or "-"
@@ -1520,9 +1536,10 @@ async def finance_orders_export(
                 cu_nc_p = _fmt_point_export(getattr(info, "customer_non_vehicle_point", None) if info else None)
                 cu_reward = _fmt_money_export(getattr(info, "customer_reward", None) if info else None)
 
-                # ✅ 与 summary/list/export 统一口径：应收=customer_total，应付=channel_total
-                receivable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
-                payable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
+                # ✅ 修复2：导出口径与列表一致：应收=channel_total，应付=customer_total
+                receivable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
+                payable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
+
                 profit = _fmt_money_export(getattr(info, "profit", None) if info else None)
 
                 manager_name = "-"
