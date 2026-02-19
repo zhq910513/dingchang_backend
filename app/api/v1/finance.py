@@ -21,9 +21,7 @@
 """
 from __future__ import annotations
 
-import csv
 import hashlib
-import io
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Set
 from urllib.parse import quote
@@ -33,7 +31,17 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, delete, distinct, false as sql_false
+from sqlalchemy import (
+    func,
+    select,
+    and_,
+    or_,
+    cast,
+    String,
+    delete,
+    distinct,
+    false as sql_false,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -201,6 +209,12 @@ def _order_salesperson_in_teams_expr(team_names: Tuple[str, ...]):
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
+    """
+    与 orders 域 schemas/order.py 的 _fmt_dt 同口径：
+    - DB DATETIME 若为 naive：直接格式化输出（禁止无脑 +8）
+    - 若被错误贴了 UTC tzinfo（offset=0）：去 tzinfo 再格式化（避免 +8）
+    - 其它 aware：兜底转 Asia/Shanghai 再格式化（极少见）
+    """
     if not dt:
         return None
 
@@ -389,6 +403,18 @@ def _parse_ymd(ymd: str) -> Optional[datetime]:
         return None
 
 
+def _json_date_expr_mysql(col, key: str):
+    """
+    ✅ MySQL/MariaDB：把 JSON 字段尽量解析成 DATE
+    - 兼容：YYYY-MM-DD / YYYY-M-D（STR_TO_DATE 允许）/ YYYYMMDD
+    - 解析失败返回 NULL（不会抛错）
+    """
+    raw = func.nullif(func.trim(_json_text_unquoted(col, key)), "")
+    d1 = func.str_to_date(raw, "%Y-%m-%d")
+    d2 = func.str_to_date(raw, "%Y%m%d")
+    return func.coalesce(d1, d2)
+
+
 def _add_json_date_range_any(
     clauses: list,
     *,
@@ -413,6 +439,21 @@ def _add_json_date_range_any(
     if e < s:
         raise HTTPException(status_code=400, detail=f"{err_prefix}_end must be >= {err_prefix}_start")
 
+    d = _dialect_name()
+
+    # ✅ 优先：MySQL/MariaDB 用 STR_TO_DATE 做稳健解析（兼容 YYYY-M-D / YYYYMMDD）
+    if "mysql" in d or "mariadb" in d:
+        s_date = datetime.strptime(s, "%Y-%m-%d").date()
+        e_date = datetime.strptime(e, "%Y-%m-%d").date()
+        or_terms = []
+        for k in keys:
+            dt_expr = _json_date_expr_mysql(Order.dynamic_data, k)
+            or_terms.append(and_(dt_expr.is_not(None), dt_expr >= s_date, dt_expr <= e_date))
+        if or_terms:
+            clauses.append(or_(*or_terms))
+        return
+
+    # 其他方言：保持原有 digits8 字符串比较（默认数据为 YYYYMMDD / YYYY-MM-DD）
     s8 = s.replace("-", "")
     e8 = e.replace("-", "")
     if len(s8) != 8 or len(e8) != 8:
@@ -817,7 +858,7 @@ async def finance_orders_summary(
     if (engine_no or "").strip():
         _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
         _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
 
@@ -969,7 +1010,7 @@ async def list_finance_orders(
     if (engine_no or "").strip():
         _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
         _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
 
@@ -1039,6 +1080,8 @@ async def list_finance_orders(
         vehicle_model_val = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
 
         raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
+        if raw_id_number is None and isinstance(dd, dict):
+            raw_id_number = dd.get("dl_id_number")
         id_number_val = (str(raw_id_number).strip() if raw_id_number is not None else "")
 
         owner = (dd.get("id_name") or "") if isinstance(dd, dict) else ""
@@ -1069,6 +1112,13 @@ async def list_finance_orders(
                 manager_id_val = int(mid)
                 if not manager_name_val:
                     manager_name_val = _user_display_name(managers_by_id.get(int(mid)))
+
+        # ✅ 新增：订单备注（order_info.remark），仅用于列表/详情展示；导出不包含
+        remark_val = None
+        if info is not None:
+            rv = getattr(info, "remark", None)
+            rs = str(rv or "").strip()
+            remark_val = rs or None
 
         items.append(
             FinanceOrderOut(
@@ -1106,13 +1156,16 @@ async def list_finance_orders(
                 col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                # ✅ 修复：与 summary/export 统一口径：应收=customer_total，应付=channel_total
+                col_26_receivable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                col_27_payable=_to_float(getattr(info, "channel_total", None)) if info else None,
                 col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
                 col_29_is_paid=bool(getattr(o, "is_paid", False)),
                 col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
                 col_31_channel_reward=_to_float(getattr(info, "channel_reward", None)) if info else None,
                 col_32_customer_reward=_to_float(getattr(info, "customer_reward", None)) if info else None,
+                # ✅ 新增：备注（列表展示）
+                remark=remark_val,
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
@@ -1130,7 +1183,8 @@ async def list_finance_orders(
     return FinanceOrderListResponse(total=int(total or 0), items=items)
 
 
-@router.get("/orders/{order_id:int}", response_model=OrderOut)
+# ✅ 修复：FastAPI 路由参数不要写 {order_id:int}，用函数参数类型约束即可
+@router.get("/orders/{order_id}", response_model=OrderOut)
 async def get_finance_order_detail(
     order_id: int,
     db: AsyncSession = Depends(get_db),
@@ -1142,7 +1196,7 @@ async def get_finance_order_detail(
     return await _load_finance_order_out(db, order_id, current_team_names=tns)
 
 
-@router.patch("/orders/{order_id:int}/status")
+@router.patch("/orders/{order_id}/status")
 async def update_finance_order_status(
     order_id: int,
     payload: FinanceOrderStatusUpdate,
@@ -1181,7 +1235,7 @@ async def update_finance_order_status(
     return {"ok": True}
 
 
-@router.post("/orders/{order_id:int}/return")
+@router.post("/orders/{order_id}/return")
 async def return_finance_order_to_unfinished(
     order_id: int,
     db: AsyncSession = Depends(get_db),
@@ -1657,7 +1711,6 @@ def _now_shanghai_stamp() -> str:
 
 @router.get("/orders/export")
 async def finance_orders_export(
-    ids: Optional[Tuple[int, ...]] = Query(None, description="可选：勾选导出订单ID列表（可重复 ids=1）"),
     order_id: Optional[int] = Query(None, description="精确订单ID"),
     created_date: Optional[str] = Query(None, description="日期 YYYY-MM-DD（兼容旧参数：按北京时间过滤 created_at 单日）"),
     created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
@@ -1700,14 +1753,6 @@ async def finance_orders_export(
 
     if effective_team_names is not None:
         clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
-
-    if ids:
-        id_list = [int(x) for x in ids if x is not None]
-        id_list = [x for x in id_list if x > 0]
-        if id_list:
-            clauses.append(Order.id.in_(id_list))
-        else:
-            clauses.append(sql_false())
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -1760,7 +1805,7 @@ async def finance_orders_export(
     if (engine_no or "").strip():
         _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
         _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
 
@@ -1821,8 +1866,9 @@ async def finance_orders_export(
         "应收",
         "应付",
         "利润",
-        "所属经理",
+        # ✅ 调整：所属团队在所属经理前
         "所属团队",
+        "所属经理",
         "是否回款",
         "是否返点",
     ]
@@ -1907,7 +1953,7 @@ async def finance_orders_export(
                 engine_no_val = _extract_dd(dd, "engine_no", "dl_engine_no")
                 vehicle_model_val = _extract_dd(dd, "vehicle_model", "dl_vehicle_model")
                 first_register = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
-                id_number_val = _extract_dd(dd, "id_number")
+                id_number_val = _extract_dd(dd, "id_number", "dl_id_number")
                 phone = str(getattr(info, "owner_phone", None) or "").strip()
 
                 insurance_expire = "-"
@@ -1936,7 +1982,7 @@ async def finance_orders_export(
                 cu_nc_p = _fmt_point_export(getattr(info, "customer_non_vehicle_point", None) if info else None)
                 cu_reward = _fmt_money_export(getattr(info, "customer_reward", None) if info else None)
 
-                # ✅ 修复：与 summary/list 统一口径：应收=customer_total，应付=channel_total
+                # ✅ 与 summary/list/export 统一口径：应收=customer_total，应付=channel_total
                 receivable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
                 payable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
                 profit = _fmt_money_export(getattr(info, "profit", None) if info else None)
@@ -1993,16 +2039,20 @@ async def finance_orders_export(
                     receivable,
                     payable,
                     profit,
-                    manager_name,
+                    # ✅ 调整：团队在经理前
                     team_display,
+                    manager_name,
                     paid,
                     rebate,
                 ]
 
+                # ✅ Excel 文本保护列（避免科学计数/去前导0）
+                text_cols = {6, 8, 9, 11, 12, 13}
+
                 tds = []
                 for idx, c in enumerate(cols):
                     cc = _esc_html(_fmt_text_export(c))
-                    if idx == 12:
+                    if idx in text_cols:
                         tds.append(f"<td style=\"mso-number-format:'\\@';\">{cc}</td>")
                     else:
                         tds.append(f"<td>{cc}</td>")

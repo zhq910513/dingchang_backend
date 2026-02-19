@@ -322,6 +322,14 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
     if "owner_phone" in fs:
         info.owner_phone = str(getattr(payload, "owner_phone", "") or "").strip()
 
+    # ✅ 订单备注唯一口径：OrderInfo.remark
+    if hasattr(payload, "remark") and "remark" in fs:
+        v = getattr(payload, "remark", None)
+        if v is None or v == "":
+            setattr(info, "remark", None)
+        else:
+            setattr(info, "remark", str(v).strip())
+
     # ✅ 数值字段：对齐 DB（NOT NULL），清空/非法 -> 0
     if "commercial_amount" in fs:
         info.commercial_amount = _to_decimal_or_zero(getattr(payload, "commercial_amount", None))
@@ -758,6 +766,7 @@ async def _load_order_out(
         channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
         salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
         customer_group_market=getattr(cg, "market", None) if cg else None,
+        # ✅ 订单备注唯一口径：order_info.remark
         order_info=_order_info_out(getattr(o, "order_info", None)),
     )
 
@@ -1692,7 +1701,7 @@ async def finalize_order_upload(
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        # ✅ 本轮修复：finalize 时校验 storage_key 归属 slot（避免构造跨槽）
+        # ✅ finalize 时校验 storage_key 归属 slot（避免构造跨槽）
         _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=(im.md5 or "").strip())
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
@@ -1778,7 +1787,7 @@ async def finalize_order_upload(
 
 
 # -------------------------
-# 下面 list/get/create/update/status 等接口保持你原样（未改动）
+# 下面 list/get/create/update/status 等接口保持你原样（仅做 remark 口径对齐）
 # -------------------------
 
 @router.get("", response_model=OrderListResponse)
@@ -1803,7 +1812,10 @@ async def list_orders(
     vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
     vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
     vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
-    remark: Optional[str] = Query(None, description="备注（remark / dla_remark）"),
+
+    # ✅ 订单备注唯一口径：order_info.remark
+    remark: Optional[str] = Query(None, description="订单备注（order_info.remark）"),
+
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
@@ -1878,12 +1890,21 @@ async def list_orders(
     _add_json_fuzzy(clauses, "id_number", id_number)
     _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
 
-    # ✅ 多 key：改为 OR（核心修复）
+    # ✅ 多 key：改为 OR
     _add_json_fuzzy_any(clauses, keys=["dl_plate_no", "plate_no"], value=plate_no)
     _add_json_fuzzy_any(clauses, keys=["engine_no", "dl_engine_no"], value=engine_no)
     _add_json_fuzzy_any(clauses, keys=["vin", "dl_vin"], value=vin)
     _add_json_fuzzy_any(clauses, keys=["vehicle_brand_name", "vehicle_name"], value=vehicle_name)
-    _add_json_fuzzy_any(clauses, keys=["remark", "dla_remark"], value=remark)
+
+    # ✅ 订单备注过滤：order_info.remark（需要 join OrderInfo）
+    rmk = (remark or "").strip()
+    if rmk:
+        if not hasattr(OrderInfo, "remark"):
+            raise HTTPException(status_code=500, detail="OrderInfo.remark column not found")
+        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id)
+        count_stmt = count_stmt.select_from(Order).join(OrderInfo, OrderInfo.order_id == Order.id)
+        expr = func.lower(func.coalesce(cast(getattr(OrderInfo, "remark"), String), ""))
+        clauses.append(expr.like(f"%{rmk.lower()}%"))
 
     if clauses:
         stmt = stmt.where(and_(*clauses))
@@ -1956,6 +1977,7 @@ async def list_orders(
                 channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
                 salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
                 customer_group_market=getattr(cg, "market", None) if cg else None,
+                # ✅ 订单备注唯一口径：order_info.remark
                 order_info=_order_info_out(getattr(o, "order_info", None)),
             )
         )

@@ -15,7 +15,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1 import router as v1_router
 from app.core.config import settings
-from app.core.db import Base, close_redis, engine, init_redis
+from app.core.db import (
+    Base,
+    close_redis,
+    engine,
+    init_redis,
+    ensure_schema_additive_on_startup,
+)
 from app.core.logging_config import setup_logging
 from app.core.seed_author_role import seed_initial_data
 from app.core.seed_order_fields import seed_order_fields
@@ -28,6 +34,11 @@ logger = logging.getLogger(__name__)
 AUTO_SEED_FIELDS = os.getenv("AUTO_SEED_FIELDS", "1") == "1"
 AUTO_SEED_AUTH = os.getenv("AUTO_SEED_AUTH", "1") == "1"
 AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "1") == "1"
+
+# ✅ 新增：启动期 schema 校验/只增补列（默认开启）
+AUTO_SCHEMA_CHECK = os.getenv("AUTO_SCHEMA_CHECK", "1") == "1"
+AUTO_ADD_COLUMNS = os.getenv("AUTO_ADD_COLUMNS", "1") == "1"
+AUTO_ADD_COLUMNS_STRICT = os.getenv("AUTO_ADD_COLUMNS_STRICT", "1") == "1"
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -93,13 +104,30 @@ async def _ocr_poller_loop(stop_event: asyncio.Event) -> None:
 async def lifespan(app: FastAPI):
     await init_redis()
 
-    from app import models as _models  # noqa: F401
-
-    if AUTO_CREATE_TABLES:
-        async with engine.begin() as conn:
-            await _apply_db_time_zone(conn)
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("AUTO_CREATE_TABLES=1 -> Base.metadata.create_all executed")
+    # ✅ 启动期 schema：先校验并日志打印，再按开关执行 create_all + 仅 ADD COLUMN
+    if AUTO_SCHEMA_CHECK or AUTO_CREATE_TABLES or AUTO_ADD_COLUMNS:
+        logger.info(
+            "[schema_boot] AUTO_SCHEMA_CHECK=%s AUTO_CREATE_TABLES=%s AUTO_ADD_COLUMNS=%s STRICT=%s",
+            int(AUTO_SCHEMA_CHECK),
+            int(AUTO_CREATE_TABLES),
+            int(AUTO_ADD_COLUMNS),
+            int(AUTO_ADD_COLUMNS_STRICT),
+        )
+        # 注意：ensure_schema_additive_on_startup 内部会 load_all_models()
+        await ensure_schema_additive_on_startup(
+            add_tables=bool(AUTO_CREATE_TABLES),
+            add_columns=bool(AUTO_ADD_COLUMNS),
+            log_details=bool(AUTO_SCHEMA_CHECK),
+            strict_add_columns=bool(AUTO_ADD_COLUMNS_STRICT),
+        )
+    else:
+        # 保留你原有逻辑（理论上走不到，因为默认 AUTO_SCHEMA_CHECK=1）
+        from app import models as _models  # noqa: F401
+        if AUTO_CREATE_TABLES:
+            async with engine.begin() as conn:
+                await _apply_db_time_zone(conn)
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("AUTO_CREATE_TABLES=1 -> Base.metadata.create_all executed")
 
     async with SessionLocal() as db:
         await _apply_db_time_zone(db)

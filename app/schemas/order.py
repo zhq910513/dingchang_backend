@@ -1,3 +1,4 @@
+# app/schemas/order.py
 # encoding: utf-8
 """
 订单相关 Pydantic 模型（Pydantic v1）
@@ -7,11 +8,18 @@
 - 空值安全：dynamic_data / image_urls / images 给默认值，避免前端解构报错
 - 兼容 ORM：orm_mode=True
 
-本轮对齐：
+字段命名（本轮定稿）：
+- ✅ remark：订单备注（唯一口径），位于 OrderInfo.remark
+  - 前端用法：row.order_info.remark
+  - 财务侧与订单侧同一个备注字段（无额外“财务备注/订单备注”拆分）
+- ❌ 不再存在：order_remark / order_note / order_remark 等兼容字段
+
+对齐：
 - ✅ created_at / updated_at 统一输出为 "%Y-%m-%d %H:%M:%S"（与 finance 域一致，避免 ISO 8601 的 "T"）
 - ✅ OrderInfoIn：允许前端用 "" / null 显式清空数字字段（避免 float 解析报错）
 - ✅ OrderInfoOut：金额/点位/合计字段保持 Optional（None 原样输出为 null），与前端“默认空，不默认 0.00”一致
 - ✅ OrderFilter：补齐 list_orders 已支持的筛选参数（team_name / created_date_start|end / first_register_date_start|end）
+- ✅ 订单列表/财务列表展示“订单备注”：通过 order_info.remark 展示；导出是否包含由导出接口控制
 """
 
 from __future__ import annotations
@@ -79,6 +87,11 @@ def _to_str_or_empty(v) -> str:
         return ""
 
 
+def _to_str_or_none(v) -> Optional[str]:
+    s = _to_str_or_empty(v)
+    return s or None
+
+
 class OrmBaseModel(BaseModel):
     class Config:
         orm_mode = True
@@ -110,7 +123,6 @@ class ImageFileOut(OrmBaseModel):
             return None
         if isinstance(v, datetime):
             return _fmt_dt(v)
-        # 允许已经是字符串的情况（避免重复处理）
         s = _to_str_or_empty(v)
         return s or None
 
@@ -143,6 +155,9 @@ class OrderInfoIn(OrmBaseModel):
     insurance_expire_date: Optional[date] = None
     owner_phone: Optional[str] = None
 
+    # ✅ 订单备注（唯一口径）
+    remark: Optional[str] = None
+
     commercial_amount: Optional[float] = None
     compulsory_amount: Optional[float] = None
     vehicle_tax_amount: Optional[float] = None
@@ -150,7 +165,7 @@ class OrderInfoIn(OrmBaseModel):
 
     channel_commercial_point: Optional[float] = None
 
-    # ✅ 新增：渠道-商业后补点位
+    # ✅ 渠道-商业后补点位
     channel_commercial_supplement_point: Optional[float] = None
 
     channel_compulsory_point: Optional[float] = None
@@ -160,7 +175,7 @@ class OrderInfoIn(OrmBaseModel):
 
     customer_commercial_point: Optional[float] = None
 
-    # ✅ 新增：客户-商业后补点位
+    # ✅ 客户-商业后补点位
     customer_commercial_supplement_point: Optional[float] = None
 
     customer_compulsory_point: Optional[float] = None
@@ -173,6 +188,16 @@ class OrderInfoIn(OrmBaseModel):
         if v is None or v == "":
             return None
         return v
+
+    @validator("owner_phone", pre=True, always=True)
+    def _owner_phone_strip(cls, v):
+        s = _to_str_or_empty(v)
+        return s or None
+
+    @validator("remark", pre=True, always=True)
+    def _remark_empty_to_none(cls, v):
+        # ✅ 允许 "" / null 清空
+        return _to_str_or_none(v)
 
     @validator(
         "commercial_amount",
@@ -203,6 +228,9 @@ class OrderInfoOut(OrmBaseModel):
     insurance_expire_date: Optional[date] = None
     owner_phone: str = ""
 
+    # ✅ 订单备注（唯一口径）
+    remark: Optional[str] = None
+
     commercial_amount: Optional[float] = None
     compulsory_amount: Optional[float] = None
     vehicle_tax_amount: Optional[float] = None
@@ -211,7 +239,7 @@ class OrderInfoOut(OrmBaseModel):
 
     channel_commercial_point: Optional[float] = None
 
-    # ✅ 新增：渠道-商业后补点位
+    # ✅ 渠道-商业后补点位
     channel_commercial_supplement_point: Optional[float] = None
 
     channel_compulsory_point: Optional[float] = None
@@ -222,7 +250,7 @@ class OrderInfoOut(OrmBaseModel):
 
     customer_commercial_point: Optional[float] = None
 
-    # ✅ 新增：客户-商业后补点位
+    # ✅ 客户-商业后补点位
     customer_commercial_supplement_point: Optional[float] = None
 
     customer_compulsory_point: Optional[float] = None
@@ -236,6 +264,11 @@ class OrderInfoOut(OrmBaseModel):
     @validator("owner_phone", pre=True, always=True)
     def _owner_phone_none_to_empty(cls, v):
         return _to_str_or_empty(v)
+
+    @validator("remark", pre=True, always=True)
+    def _remark_keep_none(cls, v):
+        # ✅ None 输出 null；"" 视为 None
+        return _to_str_or_none(v)
 
     @validator(
         "commercial_amount",
@@ -270,9 +303,8 @@ class OrderFilter(OrmBaseModel):
     page: int = 1
     page_size: int = 20
 
+    # ✅ 与 list_orders 对齐：仅支持 is_finished
     is_finished: Optional[bool] = None
-    is_rebate: Optional[bool] = None
-    is_paid: Optional[bool] = None
 
     salesperson_id: Optional[int] = None
     created_by: Optional[int] = None
@@ -284,6 +316,8 @@ class OrderFilter(OrmBaseModel):
     vehicle_name: Optional[str] = None
     vehicle_model: Optional[str] = None
     vin: Optional[str] = None
+
+    # ✅ 订单备注筛选（唯一口径：order_info.remark）
     remark: Optional[str] = None
 
     # 单日（兼容历史）
@@ -319,9 +353,8 @@ class OrderCreate(OrmBaseModel):
     audit_status: Optional[int] = 0
 
     is_finished: Optional[bool] = False
-    is_rebate: Optional[bool] = False
-    is_paid: Optional[bool] = False
 
+    # ✅ 订单详情保存时允许提交 order_info（其中含 remark）
     order_info: Optional[OrderInfoIn] = None
 
 
@@ -335,20 +368,13 @@ class OrderUpdate(OrmBaseModel):
     dynamic_data: Optional[Dict[str, Any]] = None
     image_urls: Optional[List[str]] = None
 
-    status: Optional[int] = None
-    audit_status: Optional[int] = None
-
-    is_finished: Optional[bool] = None
-    is_rebate: Optional[bool] = None
-    is_paid: Optional[bool] = None
-
+    # ✅ 与 update_order_detail 对齐：该接口的订单信息块
     order_info: Optional[OrderInfoIn] = None
 
 
 class OrderStatusUpdate(OrmBaseModel):
+    # ✅ 与 update_order_status 对齐：只允许更新 is_finished
     is_finished: Optional[bool] = None
-    is_rebate: Optional[bool] = None
-    is_paid: Optional[bool] = None
 
 
 class OrderOut(OrmBaseModel):
@@ -365,7 +391,7 @@ class OrderOut(OrmBaseModel):
 
     customer_group_market: Optional[str] = None
 
-    # ✅ 新增：所属经理/所属团队（与 finance 域对齐；orders 域回填）
+    # ✅ 所属经理/所属团队（与 finance 域对齐；orders 域回填）
     manager_id: Optional[int] = None
     manager_name: Optional[str] = None
     team_name: Optional[str] = None
@@ -380,6 +406,7 @@ class OrderOut(OrmBaseModel):
     image_urls: List[str] = Field(default_factory=list)
     images: List[OrderImageOut] = Field(default_factory=list)
 
+    # ✅ 订单备注在这里：order_info.remark（唯一口径）
     order_info: Optional[OrderInfoOut] = None
 
     # ✅ 统一输出格式：与 finance 域一致（空格分隔，不要 "T"）

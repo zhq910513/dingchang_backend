@@ -30,6 +30,11 @@ class OrderInfo(Base):
     insurance_expire_date = Column(Date, nullable=True)
     owner_phone = Column(String(32), nullable=True)
 
+    # ✅ 订单备注（唯一口径：remark）
+    # - 前端使用：row.order_info.remark
+    # - finance 下载不需要：finance 导出不选此字段即可
+    remark = Column(String(1024), nullable=True, default=None)
+
     # ✅ 金额类：DB 级默认值，避免旧数据/直写SQL出现 NULL
     commercial_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
     compulsory_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
@@ -41,7 +46,7 @@ class OrderInfo(Base):
     # Row 2 渠道点位（允许负数）
     channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
-    # ✅ 新增：渠道-商业后补点位（允许负数）
+    # ✅ 渠道-商业后补点位（允许负数）
     channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
     channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
@@ -54,7 +59,7 @@ class OrderInfo(Base):
     # Row 3 客户/产品点位（允许负数）
     customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
-    # ✅ 新增：客户-商业后补点位（允许负数）
+    # ✅ 客户-商业后补点位（允许负数）
     customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
 
     customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
