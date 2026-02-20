@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Index
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Index, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -28,25 +28,33 @@ class ImageOcrResult(Base):
     )
 
     # provider/api_type/side：都保持非 NULL，避免三值逻辑坑
-    provider = Column(String(32), nullable=False, default="baidu")
+    provider = Column(String(32), nullable=False, default="baidu", server_default=text("'baidu'"))
     api_type = Column(String(64), nullable=False)
 
     # side 统一：不要 NULL（用 "" 表示无 side）
-    side = Column(String(32), nullable=False, default="")
+    side = Column(String(32), nullable=False, default="", server_default=text("''"))
 
     raw_result = Column(JSON, nullable=False)
 
-    usage_count = Column(Integer, nullable=False, default=0)
-    last_used_at = Column(DateTime(timezone=True), nullable=True)
+    usage_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    # ✅ 全局时间口径：北京时间 naive DATETIME
+    last_used_at = Column(DateTime(timezone=False), nullable=True)
+
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=False),
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+        nullable=False,
+    )
 
     __table_args__ = (
-        # ✅ OCR 缓存唯一键：同一张图 + 同 provider + 同 api_type + 同 side 只能有一条
+        # ✅ OCR 结果唯一键：同一张图 + 同 provider + 同 api_type + 同 side 只能有一条
         Index("ux_ocr_cache_key", "image_file_id", "provider", "api_type", "side", unique=True),
         # ✅ 常用查询：按 image_file_id 拉取
         Index("ix_ocr_cache_file", "image_file_id"),
+        Index("ix_image_ocr_result_created_at", "created_at"),
     )
 
     image_file = relationship("ImageFile", back_populates="ocr_results", lazy="selectin")

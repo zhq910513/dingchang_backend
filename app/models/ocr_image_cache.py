@@ -7,7 +7,7 @@ OCR 结果缓存表：
 
 from __future__ import annotations
 
-from sqlalchemy import Column, BigInteger, String, DateTime, UniqueConstraint, Index
+from sqlalchemy import Column, BigInteger, String, DateTime, UniqueConstraint, Index, text
 from sqlalchemy.sql import func
 from sqlalchemy.types import JSON
 
@@ -20,7 +20,7 @@ class OcrImageCache(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     # 方案A：永久定位（直传 BOS 时立即可用）
-    storage_key = Column(String(512), nullable=False, default="")
+    storage_key = Column(String(512), nullable=False, default="", server_default=text("''"))
 
     # sha256（可选，后算补齐）
     sha256 = Column(String(64), nullable=True)
@@ -28,17 +28,18 @@ class OcrImageCache(Base):
     api_type = Column(String(64), nullable=False)
 
     # side：front/back/main/sub 等；没有就用空字符串
-    side = Column(String(32), nullable=False, default="")
+    side = Column(String(32), nullable=False, default="", server_default=text("''"))
 
-    provider = Column(String(32), nullable=False, default="baidu")
+    provider = Column(String(32), nullable=False, default="baidu", server_default=text("'baidu'"))
 
     result = Column(JSON, nullable=False)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # ✅ 全局时间口径：北京时间 naive DATETIME
+    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
+        DateTime(timezone=False),
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
         nullable=False,
     )
 

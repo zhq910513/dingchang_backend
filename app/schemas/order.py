@@ -2,26 +2,7 @@
 # encoding: utf-8
 """
 订单相关 Pydantic 模型（Pydantic v1）
-
-约束：
-- 兼容 schemas/__init__.py 的导入：必须包含 OrderFilter
-- 空值安全：dynamic_data / image_urls / images 给默认值，避免前端解构报错
-- 兼容 ORM：orm_mode=True
-
-字段命名（本轮定稿）：
-- ✅ remark：订单备注（唯一口径），位于 OrderInfo.remark
-  - 前端用法：row.order_info.remark
-  - 财务侧与订单侧同一个备注字段（无额外“财务备注/订单备注”拆分）
-- ❌ 不再存在：order_remark / order_note / order_remark 等兼容字段
-
-对齐：
-- ✅ created_at / updated_at 统一输出为 "%Y-%m-%d %H:%M:%S"（与 finance 域一致，避免 ISO 8601 的 "T"）
-- ✅ OrderInfoIn：允许前端用 "" / null 显式清空数字字段（避免 float 解析报错）
-- ✅ OrderInfoOut：金额/点位/合计字段保持 Optional（None 原样输出为 null），与前端“默认空，不默认 0.00”一致
-- ✅ OrderFilter：补齐 list_orders 已支持的筛选参数（team_name / created_date_start|end / first_register_date_start|end）
-- ✅ 订单列表/财务列表展示“订单备注”：通过 order_info.remark 展示；导出是否包含由导出接口控制
 """
-
 from __future__ import annotations
 
 from datetime import date, datetime
@@ -30,30 +11,20 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, validator
 
-# 仅用于“展示兜底”的时区对象（正常情况下 DB 存北京时间 naive，不做换算）
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
-    """
-    与 finance 域 _fmt_dt 同口径：
-    - DB DATETIME 若为 naive：直接格式化输出（禁止无脑 +8）
-    - 若被错误贴了 UTC tzinfo（offset=0）：去 tzinfo 再格式化（避免 +8）
-    - 其它 aware：兜底转 Asia/Shanghai 再格式化（极少见）
-    """
     if not dt:
         return None
-
     if dt.tzinfo is None:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
-
     try:
         off = dt.utcoffset()
         if off is not None and abs(off.total_seconds()) < 1:
             return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         pass
-
     try:
         return dt.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -90,6 +61,19 @@ def _to_str_or_empty(v) -> str:
 def _to_str_or_none(v) -> Optional[str]:
     s = _to_str_or_empty(v)
     return s or None
+
+
+def _clean_str_list(v) -> List[str]:
+    if v is None:
+        return []
+    if not isinstance(v, (list, tuple)):
+        return []
+    out: List[str] = []
+    for x in v:
+        s = _to_str_or_empty(x)
+        if s:
+            out.append(s)
+    return out
 
 
 class OrmBaseModel(BaseModel):
@@ -154,30 +138,25 @@ class OrderImageOut(OrmBaseModel):
 class OrderInfoIn(OrmBaseModel):
     insurance_expire_date: Optional[date] = None
     owner_phone: Optional[str] = None
-
-    # ✅ 订单备注（唯一口径）
     remark: Optional[str] = None
 
     commercial_amount: Optional[float] = None
+    # ✅ 兼容可选字段（后端 _apply_order_info_patch 已兼容 hasattr 检测）
+    commercial_after_amount: Optional[float] = None
+
     compulsory_amount: Optional[float] = None
     vehicle_tax_amount: Optional[float] = None
     non_vehicle_amount: Optional[float] = None
 
     channel_commercial_point: Optional[float] = None
-
-    # ✅ 渠道-商业后补点位
     channel_commercial_supplement_point: Optional[float] = None
-
     channel_compulsory_point: Optional[float] = None
     channel_vehicle_tax_point: Optional[float] = None
     channel_non_vehicle_point: Optional[float] = None
     channel_reward: Optional[float] = None
 
     customer_commercial_point: Optional[float] = None
-
-    # ✅ 客户-商业后补点位
     customer_commercial_supplement_point: Optional[float] = None
-
     customer_compulsory_point: Optional[float] = None
     customer_vehicle_tax_point: Optional[float] = None
     customer_non_vehicle_point: Optional[float] = None
@@ -185,9 +164,7 @@ class OrderInfoIn(OrmBaseModel):
 
     @validator("insurance_expire_date", pre=True, always=True)
     def _date_empty_to_none(cls, v):
-        if v is None or v == "":
-            return None
-        return v
+        return None if v is None or v == "" else v
 
     @validator("owner_phone", pre=True, always=True)
     def _owner_phone_strip(cls, v):
@@ -196,52 +173,37 @@ class OrderInfoIn(OrmBaseModel):
 
     @validator("remark", pre=True, always=True)
     def _remark_empty_to_none(cls, v):
-        # ✅ 允许 "" / null 清空
         return _to_str_or_none(v)
 
     @validator(
-        "commercial_amount",
-        "compulsory_amount",
-        "vehicle_tax_amount",
-        "non_vehicle_amount",
-        "channel_commercial_point",
-        "channel_commercial_supplement_point",
-        "channel_compulsory_point",
-        "channel_vehicle_tax_point",
-        "channel_non_vehicle_point",
-        "channel_reward",
-        "customer_commercial_point",
-        "customer_commercial_supplement_point",
-        "customer_compulsory_point",
-        "customer_vehicle_tax_point",
-        "customer_non_vehicle_point",
-        "customer_reward",
-        pre=True,
-        always=True,
+        "commercial_amount", "commercial_after_amount",
+        "compulsory_amount", "vehicle_tax_amount", "non_vehicle_amount",
+        "channel_commercial_point", "channel_commercial_supplement_point", "channel_compulsory_point",
+        "channel_vehicle_tax_point", "channel_non_vehicle_point", "channel_reward",
+        "customer_commercial_point", "customer_commercial_supplement_point", "customer_compulsory_point",
+        "customer_vehicle_tax_point", "customer_non_vehicle_point", "customer_reward",
+        pre=True, always=True,
     )
     def _float_empty_to_none(cls, v):
-        # ✅ 允许 "" / null 清空；其它尽量转 float（失败也给 None，避免 422）
         return _to_float_or_none(v)
 
 
 class OrderInfoOut(OrmBaseModel):
     insurance_expire_date: Optional[date] = None
     owner_phone: str = ""
-
-    # ✅ 订单备注（唯一口径）
     remark: Optional[str] = None
 
     commercial_amount: Optional[float] = None
+    # ✅ 若数据库/模型存在该字段可透出；不存在也不影响 from_orm
+    commercial_after_amount: Optional[float] = None
+
     compulsory_amount: Optional[float] = None
     vehicle_tax_amount: Optional[float] = None
     non_vehicle_amount: Optional[float] = None
     premium_total: Optional[float] = None
 
     channel_commercial_point: Optional[float] = None
-
-    # ✅ 渠道-商业后补点位
     channel_commercial_supplement_point: Optional[float] = None
-
     channel_compulsory_point: Optional[float] = None
     channel_vehicle_tax_point: Optional[float] = None
     channel_non_vehicle_point: Optional[float] = None
@@ -249,16 +211,12 @@ class OrderInfoOut(OrmBaseModel):
     channel_total: Optional[float] = None
 
     customer_commercial_point: Optional[float] = None
-
-    # ✅ 客户-商业后补点位
     customer_commercial_supplement_point: Optional[float] = None
-
     customer_compulsory_point: Optional[float] = None
     customer_vehicle_tax_point: Optional[float] = None
     customer_non_vehicle_point: Optional[float] = None
     customer_reward: Optional[float] = None
     customer_total: Optional[float] = None
-
     profit: Optional[float] = None
 
     @validator("owner_phone", pre=True, always=True)
@@ -267,35 +225,18 @@ class OrderInfoOut(OrmBaseModel):
 
     @validator("remark", pre=True, always=True)
     def _remark_keep_none(cls, v):
-        # ✅ None 输出 null；"" 视为 None
         return _to_str_or_none(v)
 
     @validator(
-        "commercial_amount",
-        "compulsory_amount",
-        "vehicle_tax_amount",
-        "non_vehicle_amount",
-        "premium_total",
-        "channel_commercial_point",
-        "channel_commercial_supplement_point",
-        "channel_compulsory_point",
-        "channel_vehicle_tax_point",
-        "channel_non_vehicle_point",
-        "channel_reward",
-        "channel_total",
-        "customer_commercial_point",
-        "customer_commercial_supplement_point",
-        "customer_compulsory_point",
-        "customer_vehicle_tax_point",
-        "customer_non_vehicle_point",
-        "customer_reward",
-        "customer_total",
-        "profit",
-        pre=True,
-        always=True,
+        "commercial_amount", "commercial_after_amount",
+        "compulsory_amount", "vehicle_tax_amount", "non_vehicle_amount", "premium_total",
+        "channel_commercial_point", "channel_commercial_supplement_point", "channel_compulsory_point",
+        "channel_vehicle_tax_point", "channel_non_vehicle_point", "channel_reward", "channel_total",
+        "customer_commercial_point", "customer_commercial_supplement_point", "customer_compulsory_point",
+        "customer_vehicle_tax_point", "customer_non_vehicle_point", "customer_reward", "customer_total", "profit",
+        pre=True, always=True,
     )
     def _float_keep_none(cls, v):
-        # ✅ None 原样输出 null；"" 也视为 None；其它尽量转 float
         return _to_float_or_none(v)
 
 
@@ -303,9 +244,7 @@ class OrderFilter(OrmBaseModel):
     page: int = 1
     page_size: int = 20
 
-    # ✅ 与 list_orders 对齐：仅支持 is_finished
     is_finished: Optional[bool] = None
-
     salesperson_id: Optional[int] = None
     created_by: Optional[int] = None
 
@@ -316,65 +255,69 @@ class OrderFilter(OrmBaseModel):
     vehicle_name: Optional[str] = None
     vehicle_model: Optional[str] = None
     vin: Optional[str] = None
-
-    # ✅ 订单备注筛选（唯一口径：order_info.remark）
     remark: Optional[str] = None
 
-    # 单日（兼容历史）
-    created_date: Optional[str] = None  # YYYY-MM-DD
+    created_date: Optional[str] = None
+    created_date_start: Optional[str] = None
+    created_date_end: Optional[str] = None
 
-    # ✅ 新增：起止日期（list_orders 已支持）
-    created_date_start: Optional[str] = None  # YYYY-MM-DD
-    created_date_end: Optional[str] = None  # YYYY-MM-DD（包含当天）
-
-    # ✅ 新增：初登日期起止（list_orders 已支持）
-    first_register_date_start: Optional[str] = None  # YYYY-MM-DD
-    first_register_date_end: Optional[str] = None  # YYYY-MM-DD（包含当天）
+    # ✅ 补齐单日兼容参数（对应 orders.list 接口）
+    first_register_date: Optional[str] = None
+    first_register_date_start: Optional[str] = None
+    first_register_date_end: Optional[str] = None
 
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
-
-    # ✅ 新增：团队筛选（list_orders 已支持）
     team_name: Optional[str] = None
 
 
 class OrderCreate(OrmBaseModel):
     module: Optional[str] = "order"
-
     salesperson_id: Optional[int] = None
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
 
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
     image_urls: List[str] = Field(default_factory=list)
-    ocr_raw_json: Optional[Dict[str, Any]] = None
 
+    ocr_raw_json: Optional[Dict[str, Any]] = None
     status: Optional[int] = 0
     audit_status: Optional[int] = 0
-
     is_finished: Optional[bool] = False
 
-    # ✅ 订单详情保存时允许提交 order_info（其中含 remark）
+    # ✅ 补齐：orders.create_order 已在使用，避免 AttributeError
+    is_rebate: Optional[bool] = False
+    is_paid: Optional[bool] = False
+
     order_info: Optional[OrderInfoIn] = None
+
+    @validator("image_urls", pre=True, always=True)
+    def _image_urls_clean(cls, v):
+        return _clean_str_list(v)
 
 
 class OrderUpdate(OrmBaseModel):
     module: Optional[str] = None
-
     salesperson_id: Optional[int] = None
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
 
     dynamic_data: Optional[Dict[str, Any]] = None
     image_urls: Optional[List[str]] = None
-
-    # ✅ 与 update_order_detail 对齐：该接口的订单信息块
     order_info: Optional[OrderInfoIn] = None
+
+    @validator("image_urls", pre=True, always=True)
+    def _image_urls_clean_optional(cls, v):
+        if v is None:
+            return None
+        return _clean_str_list(v)
 
 
 class OrderStatusUpdate(OrmBaseModel):
-    # ✅ 与 update_order_status 对齐：只允许更新 is_finished
     is_finished: Optional[bool] = None
+    # ✅ 补齐占位字段：接口层会显式拒绝 finance 字段在 orders 域更新
+    is_rebate: Optional[bool] = None
+    is_paid: Optional[bool] = None
 
 
 class OrderOut(OrmBaseModel):
@@ -388,12 +331,11 @@ class OrderOut(OrmBaseModel):
     channel_group_id: Optional[int] = None
     customer_group_name: Optional[str] = None
     channel_group_name: Optional[str] = None
-
     customer_group_market: Optional[str] = None
 
-    # ✅ 所属经理/所属团队（与 finance 域对齐；orders 域回填）
     manager_id: Optional[int] = None
     manager_name: Optional[str] = None
+
     team_name: Optional[str] = None
     team_names: List[str] = Field(default_factory=list)
 
@@ -402,16 +344,21 @@ class OrderOut(OrmBaseModel):
     is_paid: bool = False
 
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
-
     image_urls: List[str] = Field(default_factory=list)
     images: List[OrderImageOut] = Field(default_factory=list)
 
-    # ✅ 订单备注在这里：order_info.remark（唯一口径）
     order_info: Optional[OrderInfoOut] = None
 
-    # ✅ 统一输出格式：与 finance 域一致（空格分隔，不要 "T"）
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+    @validator("team_names", pre=True, always=True)
+    def _team_names_clean(cls, v):
+        return _clean_str_list(v)
+
+    @validator("image_urls", pre=True, always=True)
+    def _image_urls_clean(cls, v):
+        return _clean_str_list(v)
 
     @validator("created_at", "updated_at", pre=True, always=True)
     def _order_dt_to_str(cls, v):

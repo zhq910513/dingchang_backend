@@ -11,21 +11,23 @@ from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
-from app.models.ocr_task import OcrTask
-from app.models.order import Order, OrderImage
 from app.models.image_file import ImageFile
 from app.models.image_ocr_result import ImageOcrResult
 from app.models.ocr_image_cache import OcrImageCache
+from app.models.ocr_task import OcrTask
+from app.models.order import Order, OrderImage
 from app.services.baidu_ocr import call_ocr, OcrNotConfigured
 from app.services.storage import StorageService
 
 logger = logging.getLogger(__name__)
 
 storage = StorageService()
+BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 # ✅ 只做这三类卡证 OCR：行驶证 / 车辆合格证 / 身份证
 SLOT_TO_OCR: Dict[str, Tuple[str, Optional[str]]] = {
@@ -38,8 +40,12 @@ SLOT_TO_OCR: Dict[str, Tuple[str, Optional[str]]] = {
 
 
 def _now() -> datetime:
-    # 统一北京时间写入（DB timezone=True）
-    return datetime.now(ZoneInfo("Asia/Shanghai"))
+    """
+    ✅ 全局时间口径对齐：
+    - DB 存北京时间 naive DATETIME（timezone=False）
+    - 显式按 Asia/Shanghai 取当前时间，再去掉 tzinfo
+    """
+    return datetime.now(BJ_TZ).replace(tzinfo=None)
 
 
 def _safe_str(v: Any) -> str:
@@ -48,7 +54,22 @@ def _safe_str(v: Any) -> str:
     return str(v).strip()
 
 
+def _clamp_progress(v: Any) -> int:
+    try:
+        n = int(v)
+    except Exception:
+        n = 0
+    if n < 0:
+        return 0
+    if n > 100:
+        return 100
+    return n
+
+
 def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    仅在目标字段为空时回填 OCR 提取值，避免覆盖人工修正值。
+    """
     for k, v in (src or {}).items():
         if v is None:
             continue
@@ -64,13 +85,14 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
         x = wr.get(name) or {}
         return _safe_str(x.get("words"))
 
-    out: Dict[str, Any] = {}
-    out["id_name"] = g("姓名")
-    out["id_number"] = g("公民身份号码")
-    out["id_address"] = g("住址")
-    out["id_birth_date"] = g("出生")
-    out["id_gender"] = g("性别")
-    out["id_ethnicity"] = g("民族")
+    out: Dict[str, Any] = {
+        "id_name": g("姓名"),
+        "id_number": g("公民身份号码"),
+        "id_address": g("住址"),
+        "id_birth_date": g("出生"),
+        "id_gender": g("性别"),
+        "id_ethnicity": g("民族"),
+    }
     return {k: v for k, v in out.items() if v}
 
 
@@ -81,17 +103,18 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         x = wr.get(name) or {}
         return _safe_str(x.get("words") if isinstance(x, dict) else x)
 
-    out: Dict[str, Any] = {}
-    out["dl_plate_no"] = g("号牌号码")
-    out["dl_owner"] = g("所有人")
-    out["dl_vin"] = g("车辆识别代号")
-    out["dl_engine_no"] = g("发动机号码")
-    out["dl_brand_model"] = g("品牌型号")
-    out["dl_vehicle_type"] = g("车辆类型")
-    out["dl_use_nature"] = g("使用性质")
-    out["dl_register_date"] = g("注册日期")
-    out["dl_issue_date"] = g("发证日期")
-    out["dl_issuer_org"] = g("发证机关") or g("发证单位")
+    out: Dict[str, Any] = {
+        "dl_plate_no": g("号牌号码"),
+        "dl_owner": g("所有人"),
+        "dl_vin": g("车辆识别代号"),
+        "dl_engine_no": g("发动机号码"),
+        "dl_brand_model": g("品牌型号"),
+        "dl_vehicle_type": g("车辆类型"),
+        "dl_use_nature": g("使用性质"),
+        "dl_register_date": g("注册日期"),
+        "dl_issue_date": g("发证日期"),
+        "dl_issuer_org": g("发证机关") or g("发证单位"),
+    }
     return {k: v for k, v in out.items() if v}
 
 
@@ -101,13 +124,14 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
     def g(name: str) -> str:
         return _safe_str(wr.get(name))
 
-    out: Dict[str, Any] = {}
-    out["vehicle_model"] = g("CarModel") or g("VehicleModel")
-    out["vin"] = g("VinNo") or g("VIN")
-    out["engine_no"] = g("EngineNo")
-    out["approved_passenger_count"] = g("SeatingCapacity") or g("LimitPassenger")
-    out["vehicle_brand_name"] = g("CarBrand") or g("BrandModel")
-    out["manufacturer_name"] = g("Manufacturer")
+    out: Dict[str, Any] = {
+        "vehicle_model": g("CarModel") or g("VehicleModel"),
+        "vin": g("VinNo") or g("VIN"),
+        "engine_no": g("EngineNo"),
+        "approved_passenger_count": g("SeatingCapacity") or g("LimitPassenger"),
+        "vehicle_brand_name": g("CarBrand") or g("BrandModel"),
+        "manufacturer_name": g("Manufacturer"),
+    }
     return {k: v for k, v in out.items() if v}
 
 
@@ -134,13 +158,23 @@ async def _set_task(
     progress: int,
     error_message: Optional[str] = None,
 ) -> None:
-    task.status = status
-    task.progress = int(progress)
+    """
+    统一任务状态落库：
+    - progress 强制 0~100
+    - 终态自动清 active_scope_id + 写 finished_at
+    - 非终态清理 finished_at，避免脏状态残留
+    """
+    task.status = str(status or "").strip() or "failed"
+    task.progress = _clamp_progress(progress)
     task.error_message = error_message
 
-    if status in ("finished", "failed", "skipped", "finished_with_errors"):
+    if task.status in ("finished", "failed", "skipped", "finished_with_errors"):
         task.active_scope_id = None
-        task.finished_at = _now()
+        if hasattr(task, "finished_at"):
+            task.finished_at = _now()
+    else:
+        if hasattr(task, "finished_at"):
+            task.finished_at = None
 
     await db.commit()
 
@@ -174,6 +208,11 @@ async def _cache_put(
     provider: str,
     result: Dict[str, Any],
 ) -> None:
+    """
+    ✅ 并发安全 upsert（应用层兜底）：
+    - 正常先查后写
+    - 若并发撞唯一键，回查并覆盖 result
+    """
     stmt = select(OcrImageCache).where(
         and_(
             OcrImageCache.storage_key == storage_key,
@@ -197,7 +236,17 @@ async def _cache_put(
         result=result,
     )
     db.add(obj)
-    await db.flush()
+
+    try:
+        async with db.begin_nested():
+            await db.flush()
+    except IntegrityError:
+        obj2 = (await db.execute(stmt)).scalar_one_or_none()
+        if obj2:
+            obj2.result = result
+            await db.flush()
+            return
+        raise
 
 
 async def _image_result_upsert(
@@ -209,6 +258,9 @@ async def _image_result_upsert(
     side: str,
     raw_result: Dict[str, Any],
 ) -> None:
+    """
+    ✅ 并发安全 upsert（配合 image_ocr_result 唯一索引）
+    """
     stmt = select(ImageOcrResult).where(
         and_(
             ImageOcrResult.image_file_id == image_file_id,
@@ -235,29 +287,46 @@ async def _image_result_upsert(
         last_used_at=_now(),
     )
     db.add(obj)
-    await db.flush()
+
+    try:
+        async with db.begin_nested():
+            await db.flush()
+    except IntegrityError:
+        obj2 = (await db.execute(stmt)).scalar_one_or_none()
+        if obj2:
+            obj2.raw_result = raw_result
+            obj2.usage_count = int(obj2.usage_count or 0) + 1
+            obj2.last_used_at = _now()
+            await db.flush()
+            return
+        raise
 
 
 def _build_ocr_fetch_url(storage_key: str, image_file: Optional[ImageFile]) -> str:
     """
     给百度 OCR 用的“服务端可访问 URL”：
-    - 优先：ImageFile.url（如果你存的是可公网访问或带签名的 URL）
-    - 其次：BOS 签名 URL（最稳，适配私有 bucket）
+    - 优先：BOS 新签名 URL（最稳，避免 ImageFile.url 是过期签名）
+    - 其次：ImageFile.url（如果你存的是公网 URL / 仍有效签名）
     - 最后兜底：BOS 公网 URL（仅当 bucket 是 public 才能用）
     ⚠️ 绝不剥掉 query（签名通常在 query 里）
     """
+    sk = (storage_key or "").strip()
+
+    if sk and getattr(storage, "enabled", False):
+        try:
+            # 给百度抓取留足时间，避免过期
+            return storage.object_url_for_display(sk, expires_in=3600)
+        except Exception:
+            pass
+
     if image_file and (getattr(image_file, "url", "") or "").strip():
         return (getattr(image_file, "url", "") or "").strip()
 
-    if getattr(storage, "enabled", False):
+    if sk and getattr(storage, "enabled", False):
         try:
-            # 给百度抓取留足时间，避免过期
-            return storage.object_url_for_display(storage_key, expires_in=3600)
+            return storage.object_public_url(sk)
         except Exception:
-            try:
-                return storage.object_public_url(storage_key)
-            except Exception:
-                return ""
+            return ""
 
     return ""
 
@@ -279,7 +348,11 @@ async def _claim_task(db: AsyncSession, task_id: int) -> bool:
     ✅ DB 级抢占：只有 pending 且 active_scope_id 非空的任务能被抢到。
     防止同一任务被重复执行。
     """
-    values: Dict[str, Any] = {"status": "processing", "progress": 1, "error_message": None}
+    values: Dict[str, Any] = {
+        "status": "processing",
+        "progress": 1,
+        "error_message": None,
+    }
     # 不臆造字段：模型有 started_at 才写
     if hasattr(OcrTask, "started_at"):
         values["started_at"] = _now()
@@ -318,7 +391,13 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
 
     try:
         if task.scope_type != "order":
-            await _set_task(db, task, status="skipped", progress=100, error_message=f"不支持的 scope_type: {task.scope_type}")
+            await _set_task(
+                db,
+                task,
+                status="skipped",
+                progress=100,
+                error_message=f"不支持的 scope_type: {task.scope_type}",
+            )
             return
 
         order_id = int(task.scope_id)
@@ -370,7 +449,9 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
 
         logger.info("[ocr_worker] start task_id=%s order_id=%s total=%s", task_id, order_id, total)
 
-        for slot, img in slot_to_img.items():
+        # 固定遍历顺序，日志/结果更稳定（排查时省脑细胞）
+        for slot in sorted(slot_to_img.keys()):
+            img = slot_to_img[slot]
             api_type, side0 = SLOT_TO_OCR[slot]
             side = (side0 or "").strip()
             provider = "baidu"
@@ -384,7 +465,13 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
             image_file_id: Optional[int] = getattr(img, "image_file_id", None) or getattr(image_file, "id", None)
 
             try:
-                cached = await _cache_get(db, storage_key=storage_key, api_type=api_type, side=side, provider=provider)
+                cached = await _cache_get(
+                    db,
+                    storage_key=storage_key,
+                    api_type=api_type,
+                    side=side,
+                    provider=provider,
+                )
                 if cached is not None:
                     resp = cached
                 else:
@@ -436,7 +523,14 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                 ocr_raw[slot] = {"error_code": "worker_error", "error_msg": msg}
 
             done += 1
-            await _set_task(db, task, status="processing", progress=int(done * 90 / total), error_message=None)
+            # 处理中阶段占用 1~90，终态统一 100
+            await _set_task(
+                db,
+                task,
+                status="processing",
+                progress=int(done * 90 / total),
+                error_message=None,
+            )
 
         dyn = dict(getattr(order, "dynamic_data", None) or {})
         dyn = _merge_if_empty(dyn, extracted_all)
@@ -463,7 +557,7 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
     except Exception as e:
         tb = traceback.format_exc(limit=8)
         logger.error("[ocr_worker] failed task_id=%s err=%s\n%s", task_id, e, tb)
-        msg = str(e)
+        msg = str(e) or e.__class__.__name__
         if len(msg) > 500:
             msg = msg[:500] + "..."
         await _set_task(db, task, status="failed", progress=100, error_message=msg)

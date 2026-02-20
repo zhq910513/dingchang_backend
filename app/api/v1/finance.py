@@ -26,6 +26,15 @@
 导出修复（2026-02-19）：
 - 日期列仅输出 YYYY-MM-DD（不再带时分秒）
 - “应收/应付”与列表口径一致：应收=channel_total，应付=customer_total
+
+本次修复（2026-02-20）：
+- 修复旧兼容参数 first_register_date 的筛选逻辑（列表/汇总/导出）：
+  原逻辑把多字段/多格式条件按 AND 拼接，导致极难命中；
+  现改为单个 OR 条件（支持 YYYY-MM-DD / YYYYMMDD / 多字段兜底）
+
+本次补齐（2026-02-20）：
+- 财务“车型”字段口径补齐行驶证 OCR 字段 dl_brand_model（列表/搜索/导出）
+- 财务“车主”搜索兼容 id_name / dl_owner（列表/汇总/导出）
 """
 from __future__ import annotations
 
@@ -33,6 +42,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple, Set
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import anyio
 import requests
@@ -53,9 +63,27 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from zoneinfo import ZoneInfo
 
 from app.api.deps import get_current_user_with_role_and_teams
+from app.core.access_control import (
+    split_team_names_any as _ac_split_team_names_any,
+    pick_manager_id_from_salesperson as _ac_pick_manager_id_from_salesperson,
+    pick_manager_name_inline as _ac_pick_manager_name_inline,
+    normalize_team_names as _ac_normalize_team_names,
+    user_team_match_expr as _ac_user_team_match_expr,
+    order_salesperson_in_teams_expr as _ac_order_salesperson_in_teams_expr,
+    current_team_names_or_403 as _ac_current_team_names_or_403,
+    effective_team_filter_for_query as _ac_effective_team_filter_for_query,
+    salesperson_in_current_teams_or_403 as _ac_salesperson_in_current_teams_or_403,
+    require_team_for_non_super_admin as _ac_require_team_for_non_super_admin,
+    require_single_team_for_strict_roles as _ac_require_single_team_for_strict_roles,
+    allowed_teams_for_user as _ac_allowed_teams_for_user,
+    require_team_filter_allowed as _ac_require_team_filter_allowed,
+    ensure_user_in_teams as _ac_ensure_user_in_teams,
+    ensure_order_read_acl_by_salesperson_id as _ac_ensure_order_read_acl_by_salesperson_id,
+    ensure_order_write_acl_by_salesperson_id as _ac_ensure_order_write_acl_by_salesperson_id,
+    apply_orders_list_acl as _ac_apply_orders_list_acl,
+)
 from app.core.constants import (
     ROLE_FINANCE,
     ROLE_MANAGER,
@@ -65,20 +93,20 @@ from app.core.constants import (
     TEAM_NAMES,
 )
 from app.core.db import get_db, engine
+from app.models.channel_group import ChannelGroup
+from app.models.customer_group import CustomerGroup
+from app.models.image_file import ImageFile
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
-from app.models.user import User
-from app.models.customer_group import CustomerGroup
-from app.models.channel_group import ChannelGroup
-from app.models.image_file import ImageFile
 from app.models.role import Role
+from app.models.user import User
 from app.models.user_role import UserRole
-from app.schemas.order import OrderOut, OrderInfoOut
 from app.schemas.finance import (
     FinanceOrderOut,
     FinanceOrderListResponse,
     FinanceOrderStatusUpdate,
 )
+from app.schemas.order import OrderOut, OrderInfoOut
 from app.services.storage import StorageService
 from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
 
@@ -384,6 +412,39 @@ def _add_json_fuzzy_any(clauses: list, keys: List[str], value: Optional[str]):
         clauses.append(or_(*terms))
 
 
+def _add_first_register_date_legacy_filter(clauses: list, value: Optional[str]):
+    """
+    旧兼容参数 first_register_date 的模糊筛选（单值）：
+    - 支持 YYYY-MM-DD / YYYYMMDD 两种输入/存储格式混用
+    - 支持多个常见字段名兜底
+    - ✅ 关键：按 OR 组合，而不是多个 AND
+    """
+    v = (value or "").strip()
+    if not v:
+        return
+
+    v_dash = v.lower()
+    v_digits = v.replace("-", "").lower()
+
+    terms = []
+
+    # dl_register_date 可能存 YYYY-MM-DD 或 YYYYMMDD，两个都尝试
+    expr_dl = func.lower(_json_text_unquoted(Order.dynamic_data, "dl_register_date"))
+    terms.append(expr_dl.like(f"%{v_dash}%"))
+    if v_digits and v_digits != v_dash:
+        terms.append(expr_dl.like(f"%{v_digits}%"))
+
+    # 其他常见字段
+    for k in ("register_date", "first_register_date"):
+        expr = func.lower(_json_text_unquoted(Order.dynamic_data, k))
+        terms.append(expr.like(f"%{v_dash}%"))
+        if v_digits and v_digits != v_dash:
+            terms.append(expr.like(f"%{v_digits}%"))
+
+    if terms:
+        clauses.append(or_(*terms))
+
+
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
     s = (ymd or "").strip()
     if not s:
@@ -550,7 +611,9 @@ async def finance_list_customer_groups(
         stmt = stmt.where(getattr(CustomerGroup, "team_name").in_(list(current_team_names)))
 
     rows = (await db.execute(stmt)).scalars().all()
-    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_code_name(x) or _group_display_name(x) or "")) for x in rows])
+    return OptionListOut(
+        items=[OptionItem(id=int(x.id), group_name=str(_group_code_name(x) or _group_display_name(x) or "")) for x in rows]
+    )
 
 
 @router.get("/channel-groups", response_model=OptionListOut)
@@ -574,7 +637,9 @@ async def finance_list_channel_groups(
         stmt = stmt.where(getattr(ChannelGroup, "team_name").in_(list(current_team_names)))
 
     rows = (await db.execute(stmt)).scalars().all()
-    return OptionListOut(items=[OptionItem(id=int(x.id), group_name=str(_group_code_name(x) or _group_display_name(x) or "")) for x in rows])
+    return OptionListOut(
+        items=[OptionItem(id=int(x.id), group_name=str(_group_code_name(x) or _group_display_name(x) or "")) for x in rows]
+    )
 
 
 @router.get("/salespersons", response_model=SalespersonListOut)
@@ -814,8 +879,9 @@ async def finance_orders_summary(
             func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
             func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
             func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("noncar_amount"),
-            func.coalesce(func.sum(OrderInfo.customer_total), 0).label("receivable"),
-            func.coalesce(func.sum(OrderInfo.channel_total), 0).label("payable"),
+            # ✅ 与列表/导出口径统一：应收=channel_total，应付=customer_total
+            func.coalesce(func.sum(OrderInfo.channel_total), 0).label("receivable"),
+            func.coalesce(func.sum(OrderInfo.customer_total), 0).label("payable"),
             func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
             func.coalesce(func.sum(OrderInfo.channel_reward), 0).label("channel_reward"),
             func.coalesce(func.sum(OrderInfo.customer_reward), 0).label("customer_reward"),
@@ -867,7 +933,7 @@ async def finance_orders_summary(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy(clauses, "id_name", owner_name)
+        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
 
     # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
@@ -879,7 +945,7 @@ async def finance_orders_summary(
     if (id_number or "").strip():
         _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
@@ -890,12 +956,8 @@ async def finance_orders_summary(
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        v = (first_register_date or "").strip()
-        v2 = v.replace("-", "")
-        _add_json_fuzzy(clauses, "dl_register_date", v)
-        _add_json_fuzzy(clauses, "dl_register_date", v2)
-        _add_json_fuzzy(clauses, "register_date", v)
-        _add_json_fuzzy(clauses, "first_register_date", v)
+        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
+        _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
         d = _parse_ymd(insurance_expire_date)
@@ -1019,7 +1081,7 @@ async def list_finance_orders(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy(clauses, "id_name", owner_name)
+        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
 
     # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
@@ -1031,7 +1093,7 @@ async def list_finance_orders(
     if (id_number or "").strip():
         _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
@@ -1042,12 +1104,8 @@ async def list_finance_orders(
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        v = (first_register_date or "").strip()
-        v2 = v.replace("-", "")
-        _add_json_fuzzy(clauses, "dl_register_date", v)
-        _add_json_fuzzy(clauses, "dl_register_date", v2)
-        _add_json_fuzzy(clauses, "register_date", v)
-        _add_json_fuzzy(clauses, "first_register_date", v)
+        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
+        _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
         d = _parse_ymd(insurance_expire_date)
@@ -1096,14 +1154,24 @@ async def list_finance_orders(
         plate_no_val = (dd.get("dl_plate_no") or dd.get("plate_no") or "") if isinstance(dd, dict) else ""
         vin_val = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
         engine_no_val = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
-        vehicle_model_val = (dd.get("vehicle_model") or "") if isinstance(dd, dict) else ""
+
+        vehicle_model_val = ""
+        if isinstance(dd, dict):
+            vehicle_model_val = (
+                dd.get("vehicle_model")
+                or dd.get("dl_brand_model")
+                or dd.get("dl_vehicle_model")
+                or ""
+            )
 
         raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
         if raw_id_number is None and isinstance(dd, dict):
             raw_id_number = dd.get("dl_id_number")
         id_number_val = (str(raw_id_number).strip() if raw_id_number is not None else "")
 
-        owner = (dd.get("id_name") or "") if isinstance(dd, dict) else ""
+        owner = ""
+        if isinstance(dd, dict):
+            owner = str(dd.get("id_name") or dd.get("dl_owner") or "").strip()
 
         # ✅ 修复：初登日期展示与筛选/导出一致，按多个key兜底
         first_register_val = ""
@@ -1348,7 +1416,7 @@ async def finance_orders_export(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy(clauses, "id_name", owner_name)
+        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
 
     # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
@@ -1360,7 +1428,7 @@ async def finance_orders_export(
     if (id_number or "").strip():
         _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
@@ -1371,12 +1439,8 @@ async def finance_orders_export(
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        v = (first_register_date or "").strip()
-        v2 = v.replace("-", "")
-        _add_json_fuzzy(clauses, "dl_register_date", v)
-        _add_json_fuzzy(clauses, "dl_register_date", v2)
-        _add_json_fuzzy(clauses, "register_date", v)
-        _add_json_fuzzy(clauses, "first_register_date", v)
+        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
+        _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
         d = _parse_ymd(insurance_expire_date)
@@ -1484,7 +1548,11 @@ async def finance_orders_export(
             managers_by_id: Dict[int, User] = {}
             if manager_ids:
                 mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
-                managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
+                managers_by_id = {
+                    int(getattr(u, "id", 0) or 0): u
+                    for u in mgr_rows
+                    if getattr(u, "id", None) is not None
+                }
 
             for o in rows:
                 cg = getattr(o, "customer_group", None)
@@ -1501,11 +1569,11 @@ async def finance_orders_export(
                 market_val = (getattr(cg, "market", None) if cg else None) or "-"
                 salesperson_name = _user_display_name(sp) or "-"
 
-                owner = _extract_dd(dd, "id_name")
+                owner = _extract_dd(dd, "id_name", "dl_owner")
                 plate = _extract_dd(dd, "dl_plate_no", "plate_no")
                 vin_val = _extract_dd(dd, "vin", "dl_vin")
                 engine_no_val = _extract_dd(dd, "engine_no", "dl_engine_no")
-                vehicle_model_val = _extract_dd(dd, "vehicle_model", "dl_vehicle_model")
+                vehicle_model_val = _extract_dd(dd, "vehicle_model", "dl_brand_model", "dl_vehicle_model")
                 first_register = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
                 id_number_val = _extract_dd(dd, "id_number", "dl_id_number")
                 phone = str(getattr(info, "owner_phone", None) or "").strip()
@@ -2092,3 +2160,24 @@ async def finance_finalize_images(
 
     await db.commit()
     return FinanceFinalizeOut(ok=True, order_id=order_id)
+
+
+# === ACL shared overrides ===
+# 统一权限/团队阀门逻辑收敛到 app.core.access_control，以下别名覆盖历史同名局部实现。
+_split_team_names_any = _ac_split_team_names_any
+_pick_manager_id_from_salesperson = _ac_pick_manager_id_from_salesperson
+_pick_manager_name_inline = _ac_pick_manager_name_inline
+_normalize_team_names = _ac_normalize_team_names
+_user_team_match_expr = _ac_user_team_match_expr
+_order_salesperson_in_teams_expr = _ac_order_salesperson_in_teams_expr
+_current_team_names_or_403 = _ac_current_team_names_or_403
+_effective_team_filter_for_query = _ac_effective_team_filter_for_query
+_salesperson_in_current_teams_or_403 = _ac_salesperson_in_current_teams_or_403
+_require_team_for_non_super_admin = _ac_require_team_for_non_super_admin
+_require_single_team_for_strict_roles = _ac_require_single_team_for_strict_roles
+_allowed_teams_for_user = _ac_allowed_teams_for_user
+_require_team_filter_allowed = _ac_require_team_filter_allowed
+_ensure_user_in_teams = _ac_ensure_user_in_teams
+_ensure_order_read_acl_by_salesperson_id = _ac_ensure_order_read_acl_by_salesperson_id
+_ensure_order_write_acl_by_salesperson_id = _ac_ensure_order_write_acl_by_salesperson_id
+_apply_orders_list_acl = _ac_apply_orders_list_acl

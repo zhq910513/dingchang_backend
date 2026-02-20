@@ -32,7 +32,8 @@ class Order(Base):
     dynamic_data = Column(JSON, nullable=False, default=dict)
     ocr_raw_json = Column(JSON, nullable=False, default=dict)
 
-    # ✅ 与接口层口径对齐：DB 存北京时间 naive DATETIME（不要 timezone=True，避免被 SQLAlchemy/driver 误做时区换算）
+    # ✅ 与接口层口径对齐：DB 存北京时间 naive DATETIME
+    # - 不要 timezone=True，避免被 SQLAlchemy/driver 误做时区换算
     created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
     updated_at = Column(
         DateTime(timezone=False),

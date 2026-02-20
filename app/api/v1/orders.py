@@ -11,13 +11,32 @@ import anyio
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete, false as sql_false
+from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_current_user_with_role_and_teams
-from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET, TEAM_NAMES
+from app.core.access_control import (
+    split_team_names_any as _ac_split_team_names_any,
+    pick_manager_id_from_salesperson as _ac_pick_manager_id_from_salesperson,
+    pick_manager_name_inline as _ac_pick_manager_name_inline,
+    normalize_team_names as _ac_normalize_team_names,
+    user_team_match_expr as _ac_user_team_match_expr,
+    order_salesperson_in_teams_expr as _ac_order_salesperson_in_teams_expr,
+    current_team_names_or_403 as _ac_current_team_names_or_403,
+    effective_team_filter_for_query as _ac_effective_team_filter_for_query,
+    salesperson_in_current_teams_or_403 as _ac_salesperson_in_current_teams_or_403,
+    require_team_for_non_super_admin as _ac_require_team_for_non_super_admin,
+    require_single_team_for_strict_roles as _ac_require_single_team_for_strict_roles,
+    allowed_teams_for_user as _ac_allowed_teams_for_user,
+    require_team_filter_allowed as _ac_require_team_filter_allowed,
+    ensure_user_in_teams as _ac_ensure_user_in_teams,
+    ensure_order_read_acl_by_salesperson_id as _ac_ensure_order_read_acl_by_salesperson_id,
+    ensure_order_write_acl_by_salesperson_id as _ac_ensure_order_write_acl_by_salesperson_id,
+    apply_orders_list_acl as _ac_apply_orders_list_acl,
+)
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET
 from app.core.db import get_db, engine
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
@@ -389,308 +408,6 @@ def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
     return OrderInfoOut.from_orm(info)
 
 
-# ===========================
-# ✅ orders 域：回填团队/经理（与 finance 域口径对齐）
-# ===========================
-def _split_team_names_any(val) -> List[str]:
-    """
-    兼容：
-    - None -> []
-    - ["A","B"] / ("A","B") / {"A"} -> list
-    - "A,B" / "A，B" / "A|B" -> list
-    """
-    if val is None:
-        return []
-    if isinstance(val, (list, tuple, set)):
-        out = []
-        for x in val:
-            s = str(x or "").strip()
-            if s:
-                out.append(s)
-        seen = set()
-        uniq = []
-        for x in out:
-            if x in seen:
-                continue
-            seen.add(x)
-            uniq.append(x)
-        return uniq
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        for sep in [",", "，", "|", ";", "；", " "]:
-            if sep in s:
-                parts = [p.strip() for p in s.split(sep)]
-                parts = [p for p in parts if p]
-                if parts:
-                    seen = set()
-                    uniq = []
-                    for x in parts:
-                        if x in seen:
-                            continue
-                        seen.add(x)
-                        uniq.append(x)
-                    return uniq
-        return [s]
-    s2 = str(val or "").strip()
-    return [s2] if s2 else []
-
-
-def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
-    """
-    ✅ 只读字段推断：优先尝试常见 manager 字段名。
-    """
-    if not sp:
-        return None
-    for key in ("manager_id", "leader_id", "supervisor_id", "parent_id"):
-        try:
-            v = getattr(sp, key, None)
-        except Exception:
-            v = None
-        if v is None:
-            continue
-        try:
-            iv = int(v)
-            if iv > 0:
-                return iv
-        except Exception:
-            continue
-    return None
-
-
-def _pick_manager_name_inline(sp: Optional[User]) -> Optional[str]:
-    """
-    若 User 上直接有 manager_name/leader_name 等字符串字段，则直接用（无需额外查表）。
-    """
-    if not sp:
-        return None
-    for key in ("manager_name", "leader_name", "supervisor_name", "parent_name"):
-        try:
-            v = getattr(sp, key, None)
-        except Exception:
-            v = None
-        s = str(v or "").strip()
-        if s:
-            return s
-    return None
-
-
-# ===========================
-# ✅ 团队/角色 ACL（orders 域）
-# ===========================
-def _normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> Tuple[str, ...]:
-    if not team_names:
-        return tuple()
-    if isinstance(team_names, tuple):
-        return tuple([str(x or "").strip() for x in team_names if str(x or "").strip()])
-    return tuple([str(x or "").strip() for x in (team_names or []) if str(x or "").strip()])
-
-
-def _require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
-    if role_name == ROLE_SUPER_ADMIN:
-        return
-    tns = _normalize_team_names(team_names)
-    if not tns:
-        raise HTTPException(status_code=400, detail="当前账号未配置团队，无法访问该模块")
-    invalid = [t for t in tns if t not in TEAM_NAMES]
-    if invalid:
-        raise HTTPException(status_code=403, detail="当前账号团队非法（team_name）")
-
-
-def _require_single_team_for_strict_roles(role_name: Optional[str], team_names: Tuple[str, ...]) -> str:
-    """
-    ✅ 严格单团队角色：业务/财务/市场
-    - sales：本轮调整为“只能看自己的数据”，但仍要求账号团队配置为 1 个（数据治理一致性）
-    - finance/market：单团队（按 team_name 共享查看）
-    经理：允许多团队
-    """
-    _require_team_for_non_super_admin(role_name, team_names)
-    rn = role_name or ""
-    tns = _normalize_team_names(team_names)
-    if rn in (ROLE_SALES, ROLE_FINANCE, ROLE_MARKET):
-        if len(tns) != 1:
-            raise HTTPException(status_code=400, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
-        return tns[0]
-    return tns[0] if tns else ""
-
-
-def _allowed_teams_for_user(role_name: Optional[str], team_names: Tuple[str, ...]) -> Tuple[str, ...]:
-    """
-    ✅ 用于“团队筛选/团队下拉”的可选团队集合：
-    - super_admin：全部 TEAM_NAMES
-    - manager：其 team_names
-    - finance/market/sales：单团队（账号自身团队）
-    """
-    rn = role_name or ""
-    if rn == ROLE_SUPER_ADMIN:
-        return tuple([str(x) for x in (TEAM_NAMES or [])])
-    tns = _normalize_team_names(team_names)
-    _require_team_for_non_super_admin(role_name, tns)
-    if rn == ROLE_MANAGER:
-        return tns
-    if rn in (ROLE_FINANCE, ROLE_MARKET, ROLE_SALES):
-        my_team = _require_single_team_for_strict_roles(role_name, tns)
-        return (my_team,)
-    return tns
-
-
-def _require_team_filter_allowed(*, role_name: Optional[str], team_names: Tuple[str, ...], team_filter: str) -> None:
-    tf = str(team_filter or "").strip()
-    if not tf:
-        return
-    if tf not in TEAM_NAMES:
-        raise HTTPException(status_code=400, detail="team_name invalid")
-    allowed = set(_allowed_teams_for_user(role_name, team_names))
-    if tf not in allowed and (role_name or "") != ROLE_SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="No permission")
-
-
-def _user_team_match_expr(teams: Tuple[str, ...]):
-    """
-    ✅ 核心修复：兼容 user.team_name（旧单值）+ user.team_names（CSV 多值）
-    用于“按团队选出用户集合”。
-    """
-    tns = tuple([str(x or "").strip() for x in (teams or ()) if str(x or "").strip()])
-    if not tns:
-        return sql_false()
-
-    terms = [User.team_name.in_(list(tns))]
-
-    if hasattr(User, "team_names"):
-        for t in tns:
-            terms.append(User.team_names == t)
-            terms.append(User.team_names.like(f"{t},%"))
-            terms.append(User.team_names.like(f"%,{t},%"))
-            terms.append(User.team_names.like(f"%,{t}"))
-
-    return or_(*terms)
-
-
-async def _ensure_user_in_teams(db: AsyncSession, user_id: int, teams: Tuple[str, ...]) -> None:
-    stmt = select(User.id).where(and_(User.id == int(user_id), _user_team_match_expr(teams)))
-    ok = (await db.execute(stmt)).scalar_one_or_none()
-    if not ok:
-        raise HTTPException(status_code=403, detail="No permission")
-
-
-async def _ensure_order_read_acl_by_salesperson_id(
-    db: AsyncSession,
-    *,
-    salesperson_id: int,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-) -> None:
-    """
-    ✅ 读权限（列表/详情）：
-    - super_admin：全量
-    - manager：可读自己 team_names 范围内全部订单（按 salesperson 的 team_name/team_names）
-    - finance/market：可读自己 team_name 下全部订单
-    - sales：只能读自己的订单
-    """
-    rn = role_name or ""
-    if rn == ROLE_SUPER_ADMIN:
-        return
-
-    _require_team_for_non_super_admin(role_name, team_names)
-    tns = _normalize_team_names(team_names)
-
-    if rn == ROLE_SALES:
-        if int(salesperson_id) != int(current_user.id):
-            raise HTTPException(status_code=403, detail="No permission")
-        return
-
-    if rn == ROLE_MANAGER:
-        await _ensure_user_in_teams(db, int(salesperson_id), tns)
-        return
-
-    if rn in (ROLE_MARKET, ROLE_FINANCE):
-        my_team = _require_single_team_for_strict_roles(role_name, tns)
-        await _ensure_user_in_teams(db, int(salesperson_id), (my_team,))
-        return
-
-    raise HTTPException(status_code=403, detail="No permission")
-
-
-async def _ensure_order_write_acl_by_salesperson_id(
-    db: AsyncSession,
-    *,
-    salesperson_id: int,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-) -> None:
-    """
-    ✅ 写权限（创建/编辑/状态/上传等）：
-    - sales：只能写自己的订单
-    - manager：可写自己 team_names 范围内订单
-    - market/finance：写入口外层已拦截；这里保留防御（仍按团队判断）
-    """
-    rn = role_name or ""
-    if rn == ROLE_SUPER_ADMIN:
-        return
-
-    _require_team_for_non_super_admin(role_name, team_names)
-    tns = _normalize_team_names(team_names)
-
-    if rn == ROLE_SALES:
-        if int(salesperson_id) != int(current_user.id):
-            raise HTTPException(status_code=403, detail="No permission")
-        return
-
-    if rn == ROLE_MANAGER:
-        await _ensure_user_in_teams(db, int(salesperson_id), tns)
-        return
-
-    if rn in (ROLE_MARKET, ROLE_FINANCE):
-        my_team = _require_single_team_for_strict_roles(role_name, tns)
-        await _ensure_user_in_teams(db, int(salesperson_id), (my_team,))
-        return
-
-    raise HTTPException(status_code=403, detail="No permission")
-
-
-async def _apply_orders_list_acl(
-    db: AsyncSession,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-    clauses: List,
-) -> None:
-    """
-    ✅ 列表 ACL（团队共享 / sales 自己）：
-    - super_admin：全量
-    - manager：team_names 范围（按 salesperson 的 team_name/team_names）
-    - finance/market：单团队范围
-    - sales：只能看自己
-    """
-    rn = role_name or ""
-    if rn == ROLE_SUPER_ADMIN:
-        return
-
-    _require_team_for_non_super_admin(role_name, team_names)
-    tns = _normalize_team_names(team_names)
-
-    if rn == ROLE_SALES:
-        clauses.append(Order.salesperson_id == int(current_user.id))
-        return
-
-    if rn == ROLE_MANAGER:
-        team_user_ids = select(User.id).where(_user_team_match_expr(tns))
-        clauses.append(Order.salesperson_id.in_(team_user_ids))
-        return
-
-    if rn in (ROLE_MARKET, ROLE_FINANCE):
-        my_team = _require_single_team_for_strict_roles(role_name, tns)
-        team_user_ids = select(User.id).where(_user_team_match_expr((my_team,)))
-        clauses.append(Order.salesperson_id.in_(team_user_ids))
-        return
-
-    raise HTTPException(status_code=403, detail="No permission")
-
-
 async def _load_order_out(
     db: AsyncSession,
     order_id: int,
@@ -1036,7 +753,9 @@ async def list_salespersons(
         stmt = stmt.where(_user_team_match_expr((tf,)))
 
     rows = (await db.execute(stmt)).all()
-    return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
+    return SalespersonListOut(
+        items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows]
+    )
 
 
 # ===========================
@@ -1427,6 +1146,18 @@ def _parse_bj_date_span(start_ymd: str, end_ymd: str) -> Optional[Tuple[datetime
         return None
 
 
+def _json_date_expr_mysql(col, key: str):
+    """
+    ✅ MySQL/MariaDB：把 JSON 字段尽量解析成 DATE
+    - 兼容：YYYY-MM-DD / YYYY-M-D / YYYYMMDD
+    - 解析失败返回 NULL
+    """
+    raw = func.nullif(func.trim(_json_text_unquoted(col, key)), "")
+    d1 = func.str_to_date(raw, "%Y-%m-%d")
+    d2 = func.str_to_date(raw, "%Y%m%d")
+    return func.coalesce(d1, d2)
+
+
 def _add_json_date_range_any(
     clauses: list,
     *,
@@ -1449,6 +1180,18 @@ def _add_json_date_range_any(
 
     if e < s:
         raise HTTPException(status_code=400, detail="first_register_date_end must be >= first_register_date_start")
+
+    d = _dialect_name()
+    if "mysql" in d or "mariadb" in d:
+        s_date = datetime.strptime(s, "%Y-%m-%d").date()
+        e_date = datetime.strptime(e, "%Y-%m-%d").date()
+        or_terms = []
+        for k in keys:
+            dt_expr = _json_date_expr_mysql(Order.dynamic_data, k)
+            or_terms.append(and_(dt_expr.is_not(None), dt_expr >= s_date, dt_expr <= e_date))
+        if or_terms:
+            clauses.append(or_(*or_terms))
+        return
 
     s8 = s.replace("-", "")
     e8 = e.replace("-", "")
@@ -1569,8 +1312,12 @@ class OrderFinalizeOut(BaseModel):
 def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: str) -> None:
     """
     ✅ finalize 防御：校验 storage_key 归属 slot_key（避免跨槽引用/构造）。
-    - 若 storage.enabled 且存在 validate_b1_key：优先严格校验（需要 md5）
-    - 否则：至少保证 storage_key 以 "{slot_key}/" 开头
+
+    重要：StorageService(B1) 的物理目录是 prefix（cert/idcard/dl/backup），不是 slot_key。
+    - 若 storage.enabled 且存在 validate_b1_key：以 validate_b1_key 为唯一权威（同时校验 prefix + 路径结构 + md5）
+      - 此路径必须要求客户端提供 md5，否则拒绝（避免“无法严格校验却放行”）
+    - 若 BOS 未启用（storage.enabled=False）：无法严格校验 md5 结构
+      - 退化为：用 SLOT_PREFIX_MAP 推 prefix，至少保证 key 以 "{prefix}/" 开头，禁止跨槽
     """
     sk = str(slot_key or "").strip()
     key = str(storage_key or "").strip().lstrip("/")
@@ -1580,13 +1327,9 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
     if sk not in ALL_SLOTS:
         raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
 
-    # 兜底前缀校验（即便 BOS 未启用也不允许跨槽）
-    if not key.startswith(f"{sk}/"):
-        raise HTTPException(status_code=400, detail="storage_key does not belong to slot_key")
-
+    # ✅ 严格路径（BOS 启用时）：直接用 validate_b1_key
     if getattr(storage, "enabled", False) and hasattr(storage, "validate_b1_key"):
         m = str(md5_hex or "").strip().lower()
-        # 客户端若没给 md5，则无法做严格校验：直接拒绝，避免放水
         if not m:
             raise HTTPException(status_code=400, detail="md5 is required for finalize")
         try:
@@ -1595,6 +1338,18 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
             ok = False
         if not ok:
             raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
+        return
+
+    # ✅ 退化路径（BOS 未启用）：至少禁止跨槽（prefix 级别）
+    prefix_map = getattr(storage, "SLOT_PREFIX_MAP", {}) or {}
+    try:
+        prefix = str(prefix_map.get(sk, "") or "").strip()
+    except Exception:
+        prefix = ""
+    if not prefix:
+        raise HTTPException(status_code=400, detail="unknown slot_key")
+    if not key.startswith(prefix + "/"):
+        raise HTTPException(status_code=400, detail="storage_key does not belong to slot_key")
 
 
 @router.post("/finalize", response_model=OrderFinalizeOut)
@@ -1787,7 +1542,7 @@ async def finalize_order_upload(
 
 
 # -------------------------
-# 下面 list/get/create/update/status 等接口保持你原样（仅做 remark 口径对齐）
+# 下面 list/get/create/update/status 等接口
 # -------------------------
 
 @router.get("", response_model=OrderListResponse)
@@ -1803,19 +1558,19 @@ async def list_orders(
     created_date: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 单日，兼容历史）"),
     created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 起）"),
     created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（按北京时间过滤 created_at 止，包含当天）"),
+    # ✅ 兼容旧单日参数 + 新范围参数（与 finance 一致）
+    first_register_date: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期单日，兼容旧参数）"),
     first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期起，包含）"),
     first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD（初登日期止，包含）"),
     owner_name: Optional[str] = Query(None, description="车主姓名（身份证姓名 id_name）"),
-    id_number: Optional[str] = Query(None, description="身份证号（id_number）"),
+    id_number: Optional[str] = Query(None, description="身份证号（id_number / dl_id_number）"),
     plate_no: Optional[str] = Query(None, description="车牌号（dl_plate_no / plate_no）"),
     engine_no: Optional[str] = Query(None, description="发动机号（engine_no / dl_engine_no）"),
     vehicle_name: Optional[str] = Query(None, description="车辆名称（vehicle_brand_name / vehicle_name）"),
-    vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model）"),
+    vehicle_model: Optional[str] = Query(None, description="车辆型号（vehicle_model / dl_vehicle_model）"),
     vin: Optional[str] = Query(None, description="车架号（vin / dl_vin）"),
-
     # ✅ 订单备注唯一口径：order_info.remark
     remark: Optional[str] = Query(None, description="订单备注（order_info.remark）"),
-
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
@@ -1884,13 +1639,18 @@ async def list_orders(
             start_ymd=first_register_date_start,
             end_ymd=first_register_date_end,
         )
+    elif (first_register_date or "").strip():
+        v = (first_register_date or "").strip()
+        v2 = v.replace("-", "")
+        _add_json_fuzzy_any(clauses, keys=["dl_register_date", "register_date", "first_register_date"], value=v)
+        _add_json_fuzzy_any(clauses, keys=["dl_register_date", "register_date", "first_register_date"], value=v2)
 
     # ✅ 单 key：保持 AND
     _add_json_fuzzy(clauses, "id_name", owner_name)
-    _add_json_fuzzy(clauses, "id_number", id_number)
-    _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
 
-    # ✅ 多 key：改为 OR
+    # ✅ 多 key：改为 OR（与 finance 对齐）
+    _add_json_fuzzy_any(clauses, keys=["id_number", "dl_id_number"], value=id_number)
+    _add_json_fuzzy_any(clauses, keys=["vehicle_model", "dl_vehicle_model"], value=vehicle_model)
     _add_json_fuzzy_any(clauses, keys=["dl_plate_no", "plate_no"], value=plate_no)
     _add_json_fuzzy_any(clauses, keys=["engine_no", "dl_engine_no"], value=engine_no)
     _add_json_fuzzy_any(clauses, keys=["vin", "dl_vin"], value=vin)
@@ -2042,8 +1802,9 @@ async def create_order(
         status=payload.status or 0,
         audit_status=payload.audit_status or 0,
         is_finished=bool(payload.is_finished),
-        is_rebate=bool(payload.is_rebate),
-        is_paid=bool(payload.is_paid),
+        # ✅ orders 域不接受财务字段：创建时强制 false（避免 payload 不含字段导致 AttributeError）
+        is_rebate=False,
+        is_paid=False,
     )
     db.add(o)
     await db.flush()
@@ -2157,3 +1918,24 @@ async def update_order_status(
 
     await db.commit()
     return {"ok": True}
+
+
+# === ACL shared overrides ===
+# 统一权限/团队阀门逻辑收敛到 app.core.access_control，以下别名覆盖历史同名局部实现。
+_split_team_names_any = _ac_split_team_names_any
+_pick_manager_id_from_salesperson = _ac_pick_manager_id_from_salesperson
+_pick_manager_name_inline = _ac_pick_manager_name_inline
+_normalize_team_names = _ac_normalize_team_names
+_user_team_match_expr = _ac_user_team_match_expr
+_order_salesperson_in_teams_expr = _ac_order_salesperson_in_teams_expr
+_current_team_names_or_403 = _ac_current_team_names_or_403
+_effective_team_filter_for_query = _ac_effective_team_filter_for_query
+_salesperson_in_current_teams_or_403 = _ac_salesperson_in_current_teams_or_403
+_require_team_for_non_super_admin = _ac_require_team_for_non_super_admin
+_require_single_team_for_strict_roles = _ac_require_single_team_for_strict_roles
+_allowed_teams_for_user = _ac_allowed_teams_for_user
+_require_team_filter_allowed = _ac_require_team_filter_allowed
+_ensure_user_in_teams = _ac_ensure_user_in_teams
+_ensure_order_read_acl_by_salesperson_id = _ac_ensure_order_read_acl_by_salesperson_id
+_ensure_order_write_acl_by_salesperson_id = _ac_ensure_order_write_acl_by_salesperson_id
+_apply_orders_list_acl = _ac_apply_orders_list_acl
