@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import traceback
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -54,6 +55,30 @@ def _safe_str(v: Any) -> str:
     return str(v).strip()
 
 
+def _normalize_ymd(v: Any) -> str:
+    """
+    统一日期格式为 YYYY-MM-DD：
+    - 支持 YYYYMMDD -> YYYY-MM-DD
+    - 支持 YYYY-MM-DD
+    - '-', 空串, 非法值 -> ''
+    """
+    s = _safe_str(v)
+    if not s or s == "-":
+        return ""
+
+    if re.fullmatch(r"\d{8}", s):
+        s = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        try:
+            datetime.strptime(s, "%Y-%m-%d")
+            return s
+        except ValueError:
+            return ""
+
+    return ""
+
+
 def _clamp_progress(v: Any) -> int:
     try:
         n = int(v)
@@ -69,11 +94,12 @@ def _clamp_progress(v: Any) -> int:
 def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     """
     仅在目标字段为空时回填 OCR 提取值，避免覆盖人工修正值。
+    其中 '-' 视为空占位符，允许被正常值覆盖。
     """
     for k, v in (src or {}).items():
         if v is None:
             continue
-        if k not in dst or dst.get(k) in ("", None):
+        if k not in dst or _safe_str(dst.get(k)) in ("", "-"):
             dst[k] = v
     return dst
 
@@ -103,17 +129,38 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         x = wr.get(name) or {}
         return _safe_str(x.get("words") if isinstance(x, dict) else x)
 
+    # 原始 OCR 字段（保留，便于审计追溯）
+    dl_plate_no = g("号牌号码")
+    dl_owner = g("所有人")
+    dl_vin = g("车辆识别代号")
+    dl_engine_no = g("发动机号码")
+    dl_brand_model = g("品牌型号")
+    dl_vehicle_type = g("车辆类型")
+    dl_use_nature = g("使用性质")
+    dl_register_date = _normalize_ymd(g("注册日期"))  # ✅ 初登日期来源
+    dl_issue_date = _normalize_ymd(g("发证日期"))
+    dl_issuer_org = g("发证机关") or g("发证单位")
+
     out: Dict[str, Any] = {
-        "dl_plate_no": g("号牌号码"),
-        "dl_owner": g("所有人"),
-        "dl_vin": g("车辆识别代号"),
-        "dl_engine_no": g("发动机号码"),
-        "dl_brand_model": g("品牌型号"),
-        "dl_vehicle_type": g("车辆类型"),
-        "dl_use_nature": g("使用性质"),
-        "dl_register_date": g("注册日期"),
-        "dl_issue_date": g("发证日期"),
-        "dl_issuer_org": g("发证机关") or g("发证单位"),
+        # ===== 原始行驶证 OCR 字段（保留）=====
+        "dl_plate_no": dl_plate_no,
+        "dl_owner": dl_owner,
+        "dl_vin": dl_vin,
+        "dl_engine_no": dl_engine_no,
+        "dl_brand_model": dl_brand_model,
+        "dl_vehicle_type": dl_vehicle_type,
+        "dl_use_nature": dl_use_nature,
+        "dl_register_date": dl_register_date,
+        "dl_issue_date": dl_issue_date,
+        "dl_issuer_org": dl_issuer_org,
+
+        # ===== 标准化字段（给订单/财务/前端统一消费）=====
+        "plate_no": dl_plate_no,
+        "owner_name": dl_owner,
+        "vin": dl_vin,
+        "engine_no": dl_engine_no,
+        "vehicle_model": dl_brand_model,
+        "first_register_date": dl_register_date,  # ✅ 初登日期 = 行驶证注册日期
     }
     return {k: v for k, v in out.items() if v}
 
