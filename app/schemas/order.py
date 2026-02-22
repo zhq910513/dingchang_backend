@@ -76,6 +76,74 @@ def _clean_str_list(v) -> List[str]:
     return out
 
 
+def _clean_image_urls_out(v) -> Dict[str, Any]:
+    """
+    兼容订单详情 image_urls 的两种历史形态：
+    1) 新形态（推荐）：按卡槽字典
+       {
+         "id_card_front": "https://...",
+         "related": ["https://...", "..."],
+         "_all": ["https://...", "..."]
+       }
+    2) 旧形态：纯 URL 列表
+       ["https://...", "..."] -> 自动转为 {"_all": [...]}
+    """
+    if v is None:
+        return {}
+
+    # 兼容旧结构：list[str]
+    if isinstance(v, (list, tuple)):
+        arr = _clean_str_list(v)
+        return {"_all": arr} if arr else {}
+
+    # 新结构：dict
+    if isinstance(v, dict):
+        out: Dict[str, Any] = {}
+
+        for k, raw_val in v.items():
+            key = _to_str_or_empty(k)
+            if not key:
+                continue
+
+            # 单图字符串
+            if isinstance(raw_val, str):
+                s = _to_str_or_empty(raw_val)
+                if s:
+                    out[key] = s
+                continue
+
+            # 多图数组
+            if isinstance(raw_val, (list, tuple)):
+                arr = _clean_str_list(raw_val)
+                if arr:
+                    out[key] = arr
+                continue
+
+            # 其他类型兜底（避免脏数据把序列化搞崩）
+            s = _to_str_or_empty(raw_val)
+            if s:
+                out[key] = s
+
+        # 没有 _all 时自动补一个，方便老前端兜底
+        if "_all" not in out:
+            flat: List[str] = []
+            for val in out.values():
+                if isinstance(val, str):
+                    flat.append(val)
+                elif isinstance(val, list):
+                    for x in val:
+                        sx = _to_str_or_empty(x)
+                        if sx:
+                            flat.append(sx)
+            if flat:
+                out["_all"] = flat
+
+        return out
+
+    # 非 list/dict 的奇怪值直接兜底为空
+    return {}
+
+
 class OrmBaseModel(BaseModel):
     class Config:
         orm_mode = True
@@ -344,7 +412,8 @@ class OrderOut(OrmBaseModel):
     is_paid: bool = False
 
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
-    image_urls: List[str] = Field(default_factory=list)
+    # ✅ 修复：详情图片链接按卡槽返回（兼容旧 _all 列表）
+    image_urls: Dict[str, Any] = Field(default_factory=dict)
     images: List[OrderImageOut] = Field(default_factory=list)
 
     order_info: Optional[OrderInfoOut] = None
@@ -358,7 +427,7 @@ class OrderOut(OrmBaseModel):
 
     @validator("image_urls", pre=True, always=True)
     def _image_urls_clean(cls, v):
-        return _clean_str_list(v)
+        return _clean_image_urls_out(v)
 
     @validator("created_at", "updated_at", pre=True, always=True)
     def _order_dt_to_str(cls, v):
