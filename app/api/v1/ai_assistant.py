@@ -4,25 +4,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from app.api.deps import get_current_user_with_role_and_teams
 
-# 你现有 schema（如果字段名有差异，按你的文件微调）
 from app.schemas.ai_assistant import (
     AiChatRequest,
     AiChatResponse,
     AiHistoryResponse,
     AiSessionItem,
     AiSessionListResponse,
+    AiActionItem,
 )
 
-# 你现有 service（函数名按你项目里的实际名字对齐）
-# 这里用别名，避免和路由函数重名
 from app.services.ai_assistant_service import (
     list_sessions as _list_sessions,
-    get_or_create_session as _get_or_create_session,   # 若你没有这个函数，可删掉对应接口
+    get_or_create_session as _get_or_create_session,
     create_session as _create_session,
     delete_session as _delete_session,
     list_messages as _list_messages,
@@ -37,12 +35,21 @@ router = APIRouter(prefix="/ai-assistant", tags=["报价助手"])
 # -----------------------------
 def _uid_from_current_user(current_user: Any) -> int:
     """
-    兼容 dict / ORM / Pydantic 对象三种形态
+    兼容：
+    - dict
+    - ORM/Pydantic 对象（有 id）
+    - tuple/list（如 deps 返回 (user, primary, team_names, team_ids)）
     """
-    if isinstance(current_user, dict):
-        uid = current_user.get("id")
+    target = current_user
+
+    # ✅ 兼容 deps.get_current_user_with_role_and_teams() 返回 tuple
+    if isinstance(current_user, (tuple, list)) and current_user:
+        target = current_user[0]
+
+    if isinstance(target, dict):
+        uid = target.get("id")
     else:
-        uid = getattr(current_user, "id", None)
+        uid = getattr(target, "id", None)
 
     try:
         uid = int(uid)
@@ -75,6 +82,7 @@ def _to_session_item(row: Any) -> AiSessionItem:
         created_at=str(_pick(row, "created_at", default="") or ""),
         updated_at=str(_pick(row, "updated_at", default="") or ""),
         last_message_preview=_pick(row, "last_message_preview", default=None),
+        message_count=int(_pick(row, "message_count", default=0) or 0),
     )
 
 
@@ -99,7 +107,6 @@ async def list_ai_sessions(
 ):
     owner_user_id = _uid_from_current_user(current_user)
 
-    # ✅ 修复点：必须传 owner_user_id
     rows = _list_sessions(owner_user_id=owner_user_id) or []
 
     items = [_to_session_item(x) for x in rows]
@@ -121,7 +128,6 @@ async def create_ai_session(
         title=(body.title or "").strip() or None,
     )
 
-    # 保持返回宽松，前端兼容 r.data.data / r.data
     return {
         "ok": True,
         "data": {
@@ -164,13 +170,13 @@ async def get_ai_history(
 
     items: List[Dict[str, Any]] = []
     for m in rows:
-      # 兼容 service 返回 dict/对象
         items.append(
             {
                 "role": _pick(m, "role", default="assistant"),
                 "content": _pick(m, "content", "text", default="") or "",
                 "name": _pick(m, "name", default=None),
                 "metadata": _pick(m, "metadata", "meta", default=None),
+                "created_at": _pick(m, "created_at", default=None),
             }
         )
 
@@ -187,44 +193,72 @@ async def ai_chat(
 ):
     owner_user_id = _uid_from_current_user(current_user)
 
-    # 若前端没传 session_id，可在 service 层自动创建
-    # 也可改成先 create_session 再 send_message
+    # ✅ 使用 getattr 兼容 schema 未定义字段（保持最小改动，不扩 schema）
     result = _send_message(
         owner_user_id=owner_user_id,
         session_id=body.session_id,
         message=body.message,
         history=[x.model_dump() if hasattr(x, "model_dump") else dict(x) for x in (body.history or [])],
-        system_prompt=body.system_prompt,
-        model=body.model,
-        temperature=body.temperature,
-        max_tokens=body.max_tokens,
+        system_prompt=getattr(body, "system_prompt", None),
+        model=getattr(body, "model", None),
+        temperature=getattr(body, "temperature", None),
+        max_tokens=getattr(body, "max_tokens", None),
         stream=body.stream,
         context=body.context or {},
     )
 
-    # 兼容 service 不同返回结构
+    # 兼容 service 返回结构
     session_id = str(_pick(result, "session_id", default=body.session_id or ""))
     reply = str(_pick(result, "reply", "content", "text", default="") or "")
-    model_name = str(_pick(result, "model", default=body.model or "rule-engine"))
     usage = _pick(result, "usage", default=None)
 
+    intent = str(_pick(result, "intent", default="fallback") or "fallback")
+    trace_id = str(_pick(result, "trace_id", default="") or "")
+    confidence_raw = _pick(result, "confidence", default=0.0)
+    try:
+        confidence = float(confidence_raw)
+    except Exception:
+        confidence = 0.0
+
+    actions_raw = _pick(result, "actions", default=[]) or []
+    actions: List[AiActionItem] = []
+    if isinstance(actions_raw, list):
+        for a in actions_raw:
+            if isinstance(a, dict):
+                try:
+                    actions.append(AiActionItem(**a))
+                except Exception:
+                    # 宽松兜底，避免单个 action 异常拖垮响应
+                    actions.append(
+                        AiActionItem(
+                            type=str(a.get("type") or "suggest"),
+                            label=str(a.get("label") or ""),
+                        )
+                    )
+
     if not session_id:
-        # 如果 service 没回 session_id，尝试取“当前/新建会话”
+        # service 若未回 session_id，兜底取当前/新建会话
         if body.session_id:
             session_id = body.session_id
         else:
-            # 有的实现会有 get_or_create
             try:
                 s = _get_or_create_session(owner_user_id=owner_user_id)
                 session_id = str(_pick(s, "session_id", "id", default=""))
             except Exception:
                 session_id = "unknown"
 
+    if not trace_id:
+        # 再兜底一次，避免 schema 必填 trace_id 缺失
+        trace_id = "trace-missing"
+
     return AiChatResponse(
         ok=True,
         session_id=session_id,
         reply=reply or "已处理",
-        model=model_name,
+        intent=intent,
+        confidence=confidence,
+        actions=actions,
+        trace_id=trace_id,
         usage=usage,
     )
 

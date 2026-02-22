@@ -281,7 +281,12 @@ def _rule_reply(text: str) -> Tuple[str, Dict[str, Any]]:
 # 对外导出函数（给 API 层 import）
 # =============================
 
-def get_or_create_session(*, owner_user_id: str, session_id: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
+def get_or_create_session(
+    *,
+    owner_user_id: str,
+    session_id: Optional[str] = None,
+    title: Optional[str] = None,
+) -> Dict[str, Any]:
     return _store.get_or_create_session(owner_user_id=owner_user_id, session_id=session_id, title=title)
 
 
@@ -297,44 +302,114 @@ def delete_session(*, owner_user_id: str, session_id: str) -> bool:
     return _store.delete_session(owner_user_id=owner_user_id, session_id=session_id)
 
 
-def get_session_messages(*, owner_user_id: str, session_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+def get_session_messages(
+    *,
+    owner_user_id: str,
+    session_id: str,
+    cursor: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
     return _store.list_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
+
+
+# ✅ 兼容 API 路由导入名：返回纯消息列表（对齐 ai_assistant.py 的历史接口使用方式）
+def list_messages(
+    *,
+    owner_user_id: str,
+    session_id: str,
+    cursor: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    res = _store.list_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
+    items = res.get("items") if isinstance(res, dict) else None
+    if not isinstance(items, list):
+        return []
+    return items
 
 
 def send_message(
     *,
     owner_user_id: str,
-    session_id: str,
-    text: str,
+    session_id: Optional[str] = None,
+
+    # 路由当前调用风格（通用聊天壳）
+    message: Optional[str] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    stream: Optional[bool] = None,
+    context: Optional[Dict[str, Any]] = None,
+
+    # 规则引擎原有风格（兼容保留）
+    text: Optional[str] = None,
     client_msg_id: Optional[str] = None,
     page_context: Optional[Dict[str, Any]] = None,
-    use_stream: bool = False,
+    use_stream: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    """
+    兼容两套调用签名：
+    1) API 路由当前传参（message/context/stream/history...）
+    2) 旧规则引擎调用（text/page_context/use_stream）
+
+    未使用参数（history/system_prompt/model/temperature/max_tokens）先接住，避免 TypeError。
+    """
+    del history, system_prompt, temperature, max_tokens  # 当前规则版暂不使用，先显式忽略
+
+    # 统一参数名
+    final_text = _to_str(message if message is not None else text).strip()
+    final_context = context if isinstance(context, dict) else (page_context if isinstance(page_context, dict) else {})
+    final_stream = bool(stream if stream is not None else use_stream)
+
+    if not final_text:
+        raise ValueError("消息内容不能为空")
+
+    # ✅ 兼容“首次不传 session_id”：自动创建会话
+    sess = _store.get_or_create_session(owner_user_id=_to_str(owner_user_id), session_id=session_id)
+    real_session_id = _to_str(sess.get("session_id"))
+
     user_msg = _store.append_message(
         owner_user_id=owner_user_id,
-        session_id=session_id,
+        session_id=real_session_id,
         role="user",
-        content=text,
+        content=final_text,
         metadata={
             "status": "success",
             "intent": "user_input",
             "client_msg_id": client_msg_id,
-            "page_context": page_context or {},
-            "use_stream": bool(use_stream),
+            "page_context": final_context,
+            "use_stream": final_stream,
+            "model": _to_str(model, default="rule-engine") or "rule-engine",
         },
     )
 
-    reply_text, reply_meta = _rule_reply(text)
+    reply_text, reply_meta = _rule_reply(final_text)
 
     assistant_msg = _store.append_message(
         owner_user_id=owner_user_id,
-        session_id=session_id,
+        session_id=real_session_id,
         role="assistant",
         content=reply_text,
         metadata=reply_meta,
     )
 
+    meta = assistant_msg.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    # ✅ 返回兼容字段，供 API 层直接组 AiChatResponse
     return {
+        "session_id": real_session_id,
+        "reply": _to_str(assistant_msg.get("content")),
+        "intent": _to_str(meta.get("intent"), "chat") or "chat",
+        "trace_id": _to_str(meta.get("trace_id"), _new_id()[:16]) or _new_id()[:16],
+        "confidence": 1.0,
+        "actions": meta.get("actions") if isinstance(meta.get("actions"), list) else [],
+        "usage": None,
+        "model": _to_str(model, "rule-engine") or "rule-engine",
+
+        # 保留旧结构兼容
         "user_message": user_msg,
         "assistant_message": assistant_msg,
         "stream": None,
@@ -347,5 +422,6 @@ __all__ = [
     "list_sessions",
     "delete_session",
     "get_session_messages",
+    "list_messages",
     "send_message",
 ]
