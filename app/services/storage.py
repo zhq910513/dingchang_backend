@@ -188,20 +188,29 @@ class StorageService:
         timestamp: str,
         auth_expire_seconds: int = 1800,
     ) -> str:
+        """
+        ✅ 修复点：
+        signingKey 必须是 HMAC(secret_access_key, auth_prefix) 的“二进制结果”，
+        不能用 hexdigest 字符串再当 key（二次 HMAC 会签错）。
+        """
         auth_prefix = f"bce-auth-v1/{access_key_id}/{timestamp}/{int(auth_expire_seconds)}"
-        signing_key_hex = hmac.new(
+
+        # 1) signingKey = HMAC-SHA256(SK, auth_prefix) -> raw bytes
+        signing_key_bytes = hmac.new(
             secret_access_key.encode("utf-8"),
             auth_prefix.encode("utf-8"),
             hashlib.sha256,
-        ).hexdigest()
+        ).digest()
 
         canonical_uri = cls._uri_encode(path, encode_slash=False)
         canonical_qs = cls._canonical_query(query_params)
         canonical_hdrs = cls._canonical_headers(headers, signed_headers)
 
         canonical_request = "\n".join([method.upper(), canonical_uri, canonical_qs, canonical_hdrs])
+
+        # 2) signature = HMAC-SHA256(signing_key_bytes, canonical_request) -> hex
         signature = hmac.new(
-            signing_key_hex.encode("utf-8"),
+            signing_key_bytes,
             canonical_request.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
