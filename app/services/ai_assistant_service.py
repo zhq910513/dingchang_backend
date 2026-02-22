@@ -7,116 +7,76 @@ import os
 import threading
 import uuid
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# -----------------------------
-# 基础配置（北京时间）
-# -----------------------------
 TZ_BJ = timezone(timedelta(hours=8))
 
 
 def _now_iso() -> str:
-    # 统一北京时间，输出 ISO（前端 new Date 可直接解析）
     return datetime.now(TZ_BJ).isoformat()
 
 
-def _safe_str(v: Any, default: str = "") -> str:
+def _to_str(v: Any, default: str = "") -> str:
     if v is None:
-      return default
+        return default
     try:
-      return str(v)
+        return str(v)
     except Exception:
-      return default
+        return default
 
 
-def _uuid() -> str:
+def _new_id() -> str:
     return uuid.uuid4().hex
 
 
-@dataclass
-class _StoreConfig:
-    file_path: Path
-
-
-class QuoteAssistantStore:
+class _Store:
     """
-    轻量 JSON 持久化存储（先打通链路）
-    结构：
-    {
-      "sessions": {
-        "<session_id>": {
-          "session_id": "...",
-          "owner_user_id": "123",
-          "title": "...",
-          "created_at": "...",
-          "updated_at": "...",
-          "deleted": false,
-          "messages": [ ... ]
-        }
-      }
-    }
+    轻量 JSON 存储（先打通报价助手链路）
+    文件：storage/quote_assistant_sessions.json
     """
 
     def __init__(self) -> None:
         base_dir = Path(os.getenv("STORAGE_DIR", "storage"))
         base_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg = _StoreConfig(file_path=base_dir / "quote_assistant_sessions.json")
+        self._file = base_dir / "quote_assistant_sessions.json"
         self._lock = threading.RLock()
         self._data: Dict[str, Any] = {"sessions": {}}
         self._load()
 
-    # -----------------------------
-    # 文件读写
-    # -----------------------------
     def _load(self) -> None:
         with self._lock:
-            if not self.cfg.file_path.exists():
-                self._data = {"sessions": {}}
+            if not self._file.exists():
                 self._flush()
                 return
             try:
-                raw = self.cfg.file_path.read_text(encoding="utf-8")
-                obj = json.loads(raw) if raw.strip() else {}
+                text = self._file.read_text(encoding="utf-8")
+                obj = json.loads(text) if text.strip() else {}
                 if not isinstance(obj, dict):
                     obj = {}
-                if "sessions" not in obj or not isinstance(obj["sessions"], dict):
+                if not isinstance(obj.get("sessions"), dict):
                     obj["sessions"] = {}
                 self._data = obj
             except Exception:
-                # 文件坏了也别让服务起不来，降级重建
+                # 文件损坏时自动重建，避免服务起不来
                 self._data = {"sessions": {}}
                 self._flush()
 
     def _flush(self) -> None:
         with self._lock:
-            tmp = self.cfg.file_path.with_suffix(".tmp")
+            tmp = self._file.with_suffix(".tmp")
             tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self.cfg.file_path)
+            tmp.replace(self._file)
 
-    # -----------------------------
-    # Session
-    # -----------------------------
-    def get_session(self, *, owner_user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            s = self._data["sessions"].get(session_id)
-            if not s:
-                return None
-            if s.get("deleted"):
-                return None
-            if _safe_str(s.get("owner_user_id")) != _safe_str(owner_user_id):
-                return None
-            return deepcopy(s)
-
+    # -------- Session --------
     def create_session(self, *, owner_user_id: str, title: Optional[str] = None) -> Dict[str, Any]:
         now = _now_iso()
-        sid = _uuid()
+        sid = _new_id()
         row = {
             "session_id": sid,
-            "owner_user_id": _safe_str(owner_user_id),
-            "title": _safe_str(title, "新会话") or "新会话",
+            "owner_user_id": _to_str(owner_user_id),
+            "title": (_to_str(title).strip() or "新会话"),
             "created_at": now,
             "updated_at": now,
             "deleted": False,
@@ -126,6 +86,17 @@ class QuoteAssistantStore:
             self._data["sessions"][sid] = row
             self._flush()
         return deepcopy(row)
+
+    def get_session(self, *, owner_user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._data["sessions"].get(session_id)
+            if not row:
+                return None
+            if row.get("deleted"):
+                return None
+            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
+                return None
+            return deepcopy(row)
 
     def get_or_create_session(
         self,
@@ -141,49 +112,47 @@ class QuoteAssistantStore:
         return self.create_session(owner_user_id=owner_user_id, title=title)
 
     def list_sessions(self, *, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        owner = _safe_str(owner_user_id)
+        owner = _to_str(owner_user_id)
         with self._lock:
-            rows = []
+            rows: List[Dict[str, Any]] = []
             for s in self._data["sessions"].values():
                 if s.get("deleted"):
                     continue
-                if _safe_str(s.get("owner_user_id")) != owner:
+                if _to_str(s.get("owner_user_id")) != owner:
                     continue
-                msg_count = len(s.get("messages") or [])
-                last_msg_preview = ""
-                if msg_count:
-                    last = (s.get("messages") or [])[-1]
-                    last_msg_preview = _safe_str(last.get("content"))[:120]
+
+                msgs = s.get("messages") or []
+                preview = ""
+                if msgs:
+                    preview = _to_str(msgs[-1].get("content"))[:120]
+
                 rows.append(
                     {
                         "session_id": s.get("session_id"),
                         "title": s.get("title") or "新会话",
                         "created_at": s.get("created_at"),
                         "updated_at": s.get("updated_at"),
-                        "message_count": msg_count,
-                        "last_message_preview": last_msg_preview,
+                        "message_count": len(msgs),
+                        "last_message_preview": preview,
                     }
                 )
+
             rows.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
             return deepcopy(rows[: max(1, min(int(limit or 50), 200))])
 
     def delete_session(self, *, owner_user_id: str, session_id: str) -> bool:
         with self._lock:
-            s = self._data["sessions"].get(session_id)
-            if not s:
+            row = self._data["sessions"].get(session_id)
+            if not row or row.get("deleted"):
                 return False
-            if s.get("deleted"):
+            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
                 return False
-            if _safe_str(s.get("owner_user_id")) != _safe_str(owner_user_id):
-                return False
-            s["deleted"] = True
-            s["updated_at"] = _now_iso()
+            row["deleted"] = True
+            row["updated_at"] = _now_iso()
             self._flush()
         return True
 
-    # -----------------------------
-    # Messages
-    # -----------------------------
+    # -------- Messages --------
     def list_messages(
         self,
         *,
@@ -192,30 +161,28 @@ class QuoteAssistantStore:
         cursor: Optional[str] = None,
         limit: int = 50,
     ) -> Dict[str, Any]:
-        s = self.get_session(owner_user_id=owner_user_id, session_id=session_id)
-        if not s:
+        row = self.get_session(owner_user_id=owner_user_id, session_id=session_id)
+        if not row:
             raise ValueError("会话不存在或无权限访问")
 
-        items = s.get("messages") or []
-        # 前端当前是“全部刷新”为主，这里仍保留 cursor 兼容
+        msgs = row.get("messages") or []
         lim = max(1, min(int(limit or 50), 200))
 
-        # cursor 约定为 message_id（取更早消息）；先做兼容，不复杂化
         if cursor:
             idx = -1
-            for i, m in enumerate(items):
-                if _safe_str(m.get("id")) == _safe_str(cursor):
+            for i, m in enumerate(msgs):
+                if _to_str(m.get("id")) == _to_str(cursor):
                     idx = i
                     break
             if idx > 0:
-                sliced = items[max(0, idx - lim):idx]
-                next_cursor = sliced[0]["id"] if len(sliced) == lim and len(sliced) < idx else None
-                has_more = bool(next_cursor)
+                sliced = msgs[max(0, idx - lim): idx]
+                has_more = (idx - lim) > 0
+                next_cursor = sliced[0]["id"] if (has_more and sliced) else None
                 return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
 
-        sliced = items[-lim:]
-        has_more = len(items) > len(sliced)
-        next_cursor = sliced[0]["id"] if has_more and sliced else None
+        sliced = msgs[-lim:]
+        has_more = len(msgs) > len(sliced)
+        next_cursor = sliced[0]["id"] if (has_more and sliced) else None
         return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
 
     def append_message(
@@ -227,115 +194,93 @@ class QuoteAssistantStore:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        now = _now_iso()
         with self._lock:
-            s = self._data["sessions"].get(session_id)
-            if not s or s.get("deleted"):
+            row = self._data["sessions"].get(session_id)
+            if not row or row.get("deleted"):
                 raise ValueError("会话不存在")
-            if _safe_str(s.get("owner_user_id")) != _safe_str(owner_user_id):
+            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
                 raise ValueError("无权限访问该会话")
 
             msg = {
-                "id": _uuid(),
-                "role": role,
-                "content": _safe_str(content),
-                "created_at": now,
+                "id": _new_id(),
+                "role": _to_str(role),
+                "content": _to_str(content),
+                "created_at": _now_iso(),
                 "metadata": metadata or {},
             }
-            s.setdefault("messages", []).append(msg)
+            row.setdefault("messages", []).append(msg)
 
-            # 自动补标题（首条用户消息）
-            if (not s.get("title")) or s.get("title") == "新会话":
-                if role == "user":
-                    s["title"] = (_safe_str(content).strip() or "新会话")[:24]
+            # 首条用户消息自动生成标题
+            if (row.get("title") in (None, "", "新会话")) and msg["role"] == "user":
+                row["title"] = (msg["content"].strip() or "新会话")[:24]
 
-            s["updated_at"] = now
+            row["updated_at"] = msg["created_at"]
             self._flush()
             return deepcopy(msg)
 
 
-_store = QuoteAssistantStore()
+_store = _Store()
 
-# -----------------------------
-# 规则引擎（伪AI）
-# -----------------------------
-def _build_reply(text: str) -> Tuple[str, Dict[str, Any]]:
-    raw = _safe_str(text).strip()
-    low = raw.lower()
 
-    # 轻量平台报价指令识别：xxx报价
-    if raw.endswith("报价"):
-        platform = raw[:-2].strip() or "目标平台"
-        content = (
+def _rule_reply(text: str) -> Tuple[str, Dict[str, Any]]:
+    t = _to_str(text).strip()
+
+    if t.endswith("报价"):
+        platform = t[:-2].strip() or "目标平台"
+        return (
             f"已识别报价指令：{platform}报价\n"
-            f"我会按当前会话已上传资料进行报价准备（资料校验 → 字段提取 → 平台请求预留）。\n"
-            f"当前版本为规则引擎流程，平台实际报价接口可在 services 下按“一个平台一个文件”接入。"
+            "我会按当前会话材料执行：资料校验 → OCR结果汇总 → 平台报价服务（预留接口）。\n"
+            "当前版本已打通会话与规则链路，平台服务可按“一个平台一个文件”继续接入。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": _new_id()[:16],
+                "actions": [
+                    {"type": "suggest", "label": "查看当前材料状态"},
+                    {"type": "suggest", "label": f"{platform}报价"},
+                ],
+            },
         )
-        meta = {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": _uuid()[:16],
-            "actions": [
-                {"type": "suggest", "label": "查看当前材料状态"},
-                {"type": "suggest", "label": f"{platform}报价"},
-            ],
-        }
-        return content, meta
 
-    if ("查订单" in raw) or ("订单" in raw and "查" in raw):
-        content = (
-            "已识别为订单查询意图。\n"
-            "当前演示版先完成会话与规则链路打通；下一步可接入订单查询服务并返回结构化结果。"
+    if "查订单" in t:
+        return (
+            "已识别为订单查询意图。\n当前报价助手已打通会话链路；订单查询接口可在下一步接入。",
+            {
+                "status": "success",
+                "intent": "query_order",
+                "trace_id": _new_id()[:16],
+                "actions": [
+                    {"type": "suggest", "label": "太平洋报价"},
+                    {"type": "suggest", "label": "查看当前材料状态"},
+                ],
+            },
         )
-        meta = {
-            "status": "success",
-            "intent": "query_order",
-            "trace_id": _uuid()[:16],
-            "actions": [
-                {"type": "suggest", "label": "订单备注是什么意思"},
-                {"type": "suggest", "label": "太平洋报价"},
-            ],
-        }
-        return content, meta
 
-    if "订单备注" in raw:
-        content = "订单备注（remark）是订单侧备注字段，用于展示与沟通说明；按你既定规则，导出不包含该字段。"
-        meta = {
-            "status": "success",
-            "intent": "explain_field",
-            "trace_id": _uuid()[:16],
-        }
-        return content, meta
-
-    if raw in {"查看当前材料状态", "材料状态"}:
-        content = (
-            "当前为会话规则引擎演示版：材料上传与会话消息已打通。\n"
-            "如需展示“各槽位图片数量 / OCR完成状态 / 可报价平台列表”，可在下一步把材料汇总接口补上。"
+    if t in {"查看当前材料状态", "材料状态"}:
+        return (
+            "当前材料状态功能已预留：可展示各槽位图片数量、OCR状态、可报价平台。\n你上传图片后再发平台报价指令即可。",
+            {
+                "status": "success",
+                "intent": "material_status",
+                "trace_id": _new_id()[:16],
+            },
         )
-        meta = {"status": "success", "intent": "material_status", "trace_id": _uuid()[:16]}
-        return content, meta
 
-    # 默认回复
-    content = (
-        "已收到指令。\n"
-        "这是报价助手（规则引擎版），当前支持基础意图识别与会话记录。\n"
-        "你可以输入“太平洋报价”这类指令来触发报价流程。"
+    return (
+        "已收到指令。\n这是报价助手（规则引擎版），可先输入“太平洋报价”这类指令触发报价流程。",
+        {
+            "status": "success",
+            "intent": "chat",
+            "trace_id": _new_id()[:16],
+            "actions": [{"type": "suggest", "label": "太平洋报价"}],
+        },
     )
-    meta = {
-        "status": "success",
-        "intent": "chat",
-        "trace_id": _uuid()[:16],
-        "actions": [
-            {"type": "suggest", "label": "太平洋报价"},
-            {"type": "suggest", "label": "查订单"},
-        ],
-    }
-    return content, meta
 
 
-# -----------------------------
-# 对外导出（供 API 调用）
-# -----------------------------
+# =============================
+# 对外导出函数（给 API 层 import）
+# =============================
+
 def get_or_create_session(*, owner_user_id: str, session_id: Optional[str] = None, title: Optional[str] = None) -> Dict[str, Any]:
     return _store.get_or_create_session(owner_user_id=owner_user_id, session_id=session_id, title=title)
 
@@ -352,17 +297,11 @@ def delete_session(*, owner_user_id: str, session_id: str) -> bool:
     return _store.delete_session(owner_user_id=owner_user_id, session_id=session_id)
 
 
-def list_session_messages(
-    *,
-    owner_user_id: str,
-    session_id: str,
-    cursor: Optional[str] = None,
-    limit: int = 50,
-) -> Dict[str, Any]:
+def get_session_messages(*, owner_user_id: str, session_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
     return _store.list_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
 
 
-def send_session_message(
+def send_message(
     *,
     owner_user_id: str,
     session_id: str,
@@ -371,7 +310,6 @@ def send_session_message(
     page_context: Optional[Dict[str, Any]] = None,
     use_stream: bool = False,
 ) -> Dict[str, Any]:
-    # 先落用户消息
     user_msg = _store.append_message(
         owner_user_id=owner_user_id,
         session_id=session_id,
@@ -382,11 +320,12 @@ def send_session_message(
             "intent": "user_input",
             "client_msg_id": client_msg_id,
             "page_context": page_context or {},
+            "use_stream": bool(use_stream),
         },
     )
 
-    # 规则引擎回复
-    reply_text, reply_meta = _build_reply(text)
+    reply_text, reply_meta = _rule_reply(text)
+
     assistant_msg = _store.append_message(
         owner_user_id=owner_user_id,
         session_id=session_id,
@@ -398,21 +337,15 @@ def send_session_message(
     return {
         "user_message": user_msg,
         "assistant_message": assistant_msg,
-        "stream": None,  # 预留
+        "stream": None,
     }
 
 
-# ---- 兼容旧命名（你项目里 ai_assistant.py 可能用这些） ----
-def get_session_messages(*, owner_user_id: str, session_id: str, cursor: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
-    return list_session_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
-
-
-def send_message(*, owner_user_id: str, session_id: str, text: str, client_msg_id: Optional[str] = None, page_context: Optional[Dict[str, Any]] = None, use_stream: bool = False) -> Dict[str, Any]:
-    return send_session_message(
-        owner_user_id=owner_user_id,
-        session_id=session_id,
-        text=text,
-        client_msg_id=client_msg_id,
-        page_context=page_context,
-        use_stream=use_stream,
-    )
+__all__ = [
+    "get_or_create_session",
+    "create_session",
+    "list_sessions",
+    "delete_session",
+    "get_session_messages",
+    "send_message",
+]
