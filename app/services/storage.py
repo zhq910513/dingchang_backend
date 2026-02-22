@@ -4,10 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
-import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union, IO
@@ -16,6 +13,8 @@ from urllib.parse import quote
 import requests
 
 from app.core.config import settings
+from app.services.bce_auth import sign_bce_auth_v1
+from app.services.bce_sts import bce_sts_service
 
 
 @dataclass
@@ -60,10 +59,6 @@ class StorageService:
 
         # ✅ 展示用 URL 默认是否签名（从 Settings 读取，支持 .env）
         self.signed_get_url_enabled: bool = bool(getattr(settings, "BOS_SIGNED_GET_URL", True))
-
-        self._sts_lock = threading.Lock()
-        self._cached_sts: Optional[StsCredentials] = None
-        self._cached_sts_expire_at_ts: float = 0.0  # unix seconds
 
         self._http = requests.Session()
         self._http.trust_env = False
@@ -123,7 +118,6 @@ class StorageService:
 
         parts = k.split("/")
         # ✅ 严格：必须正好 4 段：prefix/ab/cd/md5.ext
-        # 否则 prefix/ab/cd/md5.ext/xxx 这种会“误过校验”
         if len(parts) != 4:
             return False
         if parts[0] != prefix:
@@ -135,7 +129,7 @@ class StorageService:
         return name.startswith(md5_hex)
 
     # -----------------------------
-    # STS AssumeRole（缓存）
+    # STS AssumeRole（缓存交给 bce_sts_service）
     # -----------------------------
     @staticmethod
     def _utc_timestamp() -> str:
@@ -147,76 +141,6 @@ class StorageService:
         if not encode_slash:
             safe += "/"
         return quote(s, safe=safe)
-
-    @classmethod
-    def _canonical_query(cls, params: Dict[str, Any]) -> str:
-        if not params:
-            return ""
-        items = []
-        for k, v in params.items():
-            if str(k).lower() == "authorization":
-                continue
-            k_enc = cls._uri_encode(str(k))
-            v_enc = cls._uri_encode("" if v is None else str(v))
-            items.append(f"{k_enc}={v_enc}")
-        items.sort()
-        return "&".join(items)
-
-    @classmethod
-    def _canonical_headers(cls, headers: Dict[str, str], signed_headers: list[str]) -> str:
-        lines = []
-        for h in signed_headers:
-            key = h.strip().lower()
-            val = (headers.get(key) or "").strip()
-            if not val:
-                continue
-            lines.append(f"{cls._uri_encode(key)}:{cls._uri_encode(val)}")
-        lines.sort()
-        return "\n".join(lines)
-
-    @classmethod
-    def _sign_bce_auth_v1(
-        cls,
-        *,
-        access_key_id: str,
-        secret_access_key: str,
-        method: str,
-        path: str,
-        query_params: Dict[str, Any],
-        headers: Dict[str, str],
-        signed_headers: list[str],
-        timestamp: str,
-        auth_expire_seconds: int = 1800,
-    ) -> str:
-        """
-        ✅ 修复点：
-        signingKey 必须是 HMAC(secret_access_key, auth_prefix) 的“二进制结果”，
-        不能用 hexdigest 字符串再当 key（二次 HMAC 会签错）。
-        """
-        auth_prefix = f"bce-auth-v1/{access_key_id}/{timestamp}/{int(auth_expire_seconds)}"
-
-        # 1) signingKey = HMAC-SHA256(SK, auth_prefix) -> raw bytes
-        signing_key_bytes = hmac.new(
-            secret_access_key.encode("utf-8"),
-            auth_prefix.encode("utf-8"),
-            hashlib.sha256,
-        ).digest()
-
-        canonical_uri = cls._uri_encode(path, encode_slash=False)
-        canonical_qs = cls._canonical_query(query_params)
-        canonical_hdrs = cls._canonical_headers(headers, signed_headers)
-
-        canonical_request = "\n".join([method.upper(), canonical_uri, canonical_qs, canonical_hdrs])
-
-        # 2) signature = HMAC-SHA256(signing_key_bytes, canonical_request) -> hex
-        signature = hmac.new(
-            signing_key_bytes,
-            canonical_request.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        signed_headers_str = ";".join([h.lower() for h in sorted(set(signed_headers))])
-        return f"{auth_prefix}/{signed_headers_str}/{signature}"
 
     def _require_bos(self) -> None:
         if not self.enabled:
@@ -230,117 +154,18 @@ class StorageService:
                 "STS 配置不完整：BOS_STS_ACCOUNT_ID / BOS_STS_ROLE_NAME / BOS_STS_ACCESS_KEY / BOS_STS_SECRET_KEY"
             )
 
-    # -----------------------------
-    # ✅ 推断 region + 构建 STS ACL
-    # -----------------------------
-    def _infer_region_from_vhost(self) -> str:
-        """
-        vhost 通常形如: {bucket}.{region}.bcebos.com
-        例如: dingchang.fwh.bcebos.com -> region = fwh
-        """
-        v = (self.vhost or "").strip().lower()
-        parts = [p for p in v.split(".") if p]
-        if len(parts) >= 4 and parts[0] == (self.bucket or "").strip().lower():
-            return parts[1]
-        raise RuntimeError(
-            f"无法从 BOS_VHOST 推断 region：vhost={self.vhost!r} bucket={self.bucket!r}。"
-            f"请确保 vhost 形如 {self.bucket}.<region>.bcebos.com"
-        )
-
-    def _build_sts_access_control_list(self) -> list[dict]:
-        """
-        给临时凭证绑定 BOS 权限（session policy）。
-        """
-        region = self._infer_region_from_vhost()
-        b = self.bucket
-        return [
-            {
-                "service": "bce:bos",
-                "region": region,
-                "effect": "Allow",
-                "resource": [
-                    b,
-                    f"{b}/*",
-                ],
-                "permission": ["READ", "LIST", "WRITE"],
-            }
-        ]
-
     def assume_role(self, *, duration_seconds: int = 900, force_refresh: bool = False) -> StsCredentials:
+        """
+        对外兼容旧接口：内部转调 bce_sts_service
+        """
         self._require_bos()
-
-        now = time.time()
-        if (not force_refresh) and self._cached_sts and (now + 120) < self._cached_sts_expire_at_ts:
-            return self._cached_sts
-
-        with self._sts_lock:
-            now = time.time()
-            if (not force_refresh) and self._cached_sts and (now + 120) < self._cached_sts_expire_at_ts:
-                return self._cached_sts
-
-            path = "/v1/credential"
-            url = f"https://{self.sts_host}{path}"
-            params = {
-                "assumeRole": "",
-                "accountId": self.sts_account_id,
-                "roleName": self.sts_role_name,
-                "durationSeconds": str(int(duration_seconds)),
-            }
-
-            body_obj = {"accessControlList": self._build_sts_access_control_list()}
-            body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            content_length = str(len(body_bytes))
-
-            x_bce_date = self._utc_timestamp()
-            headers_for_sign = {
-                "host": self.sts_host,
-                "content-type": "application/json",
-                "content-length": content_length,
-                "x-bce-date": x_bce_date,
-            }
-            signed_headers = ["host", "content-type", "content-length", "x-bce-date"]
-
-            authorization = self._sign_bce_auth_v1(
-                access_key_id=self.sts_ak,
-                secret_access_key=self.sts_sk,
-                method="POST",
-                path=path,
-                query_params=params,
-                headers=headers_for_sign,
-                signed_headers=signed_headers,
-                timestamp=x_bce_date,
-                auth_expire_seconds=1800,
-            )
-
-            headers = {
-                "Content-Type": "application/json",
-                "Content-Length": content_length,
-                "x-bce-date": x_bce_date,
-                "Authorization": authorization,
-            }
-
-            resp = self._http.post(url, params=params, headers=headers, data=body_bytes, timeout=20)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"STS AssumeRole 失败: HTTP {resp.status_code} {resp.text}")
-
-            data = resp.json()
-            cred = StsCredentials(
-                access_key_id=data["accessKeyId"],
-                secret_access_key=data["secretAccessKey"],
-                session_token=data["sessionToken"],
-                expiration=data.get("expiration", ""),
-            )
-
-            expire_ts = now + duration_seconds
-            try:
-                dt = datetime.strptime(cred.expiration, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                expire_ts = dt.timestamp()
-            except Exception:
-                pass
-
-            self._cached_sts = cred
-            self._cached_sts_expire_at_ts = expire_ts
-            return cred
+        cred = bce_sts_service.get_credentials(duration_seconds=duration_seconds, force_refresh=force_refresh)
+        return StsCredentials(
+            access_key_id=cred.access_key_id,
+            secret_access_key=cred.secret_access_key,
+            session_token=cred.session_token,
+            expiration=cred.expiration,
+        )
 
     # -----------------------------
     # ✅ BOS 服务端签名请求（HEAD/PUT）——供后端代传/去重使用
@@ -375,18 +200,18 @@ class StorageService:
         host = self.vhost
         ts = self._utc_timestamp()
 
-        # 注意：签名参与的 headers 用“全小写 key”
+        # 注意：签名参与的 headers 用小写 key
         headers_for_sign: Dict[str, str] = {
             "host": host,
             "x-bce-date": ts,
             "x-bce-security-token": cred.session_token,
         }
-        signed_headers = ["host", "x-bce-date", "x-bce-security-token"]
+        signed_headers = {"host", "x-bce-date", "x-bce-security-token"}
 
         ct = (content_type or "").strip()
         if ct:
             headers_for_sign["content-type"] = ct
-            signed_headers.append("content-type")
+            signed_headers.add("content-type")
 
         if extra_headers:
             for k, v in extra_headers.items():
@@ -396,21 +221,21 @@ class StorageService:
                 vv = (v or "").strip()
                 if vv:
                     headers_for_sign[kk] = vv
-                    signed_headers.append(kk)
+                    signed_headers.add(kk)
 
-        auth = self._sign_bce_auth_v1(
-            access_key_id=cred.access_key_id,
-            secret_access_key=cred.secret_access_key,
+        auth = sign_bce_auth_v1(
             method=method.upper(),
             path=path,
             query_params={},  # ✅ 服务端请求不走 query
-            headers=headers_for_sign,
+            headers_to_sign=headers_for_sign,
             signed_headers=signed_headers,
+            access_key_id=cred.access_key_id,
+            secret_access_key=cred.secret_access_key,
             timestamp=ts,
             auth_expire_seconds=int(auth_expire_seconds),
         )
 
-        # 发送给 BOS 的 headers（大小写无所谓，requests 会处理）
+        # 发给 BOS 的 headers（大小写无所谓）
         out = {
             "Authorization": auth,
             "x-bce-date": ts,
@@ -540,26 +365,24 @@ class StorageService:
 
         host = self.vhost
         path = "/" + k
-
         timestamp = self._utc_timestamp()
 
         query_params_for_sign = {
             "x-bce-security-token": cred.session_token,
         }
-
         headers_for_sign = {
             "host": host,
         }
-        signed_headers = ["host"]
+        signed_headers = {"host"}
 
-        auth = self._sign_bce_auth_v1(
-            access_key_id=cred.access_key_id,
-            secret_access_key=cred.secret_access_key,
+        auth = sign_bce_auth_v1(
             method="GET",
             path=path,
             query_params=query_params_for_sign,
-            headers=headers_for_sign,
+            headers_to_sign=headers_for_sign,
             signed_headers=signed_headers,
+            access_key_id=cred.access_key_id,
+            secret_access_key=cred.secret_access_key,
             timestamp=timestamp,
             auth_expire_seconds=int(expires_in),
         )

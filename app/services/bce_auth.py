@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -16,15 +16,28 @@ def uri_encode(s: str, *, encode_slash: bool = True) -> str:
 
 
 def canonical_query(params: Dict[str, Any]) -> str:
+    """
+    BCE canonical query:
+    - key/value 都要 RFC3986 编码
+    - 排序
+    - 跳过 authorization
+    - 关键修复：空值参数（如 assumeRole）必须编码为 `assumeRole`，不能写成 `assumeRole=`
+    """
     if not params:
         return ""
+
     items = []
     for k, v in params.items():
         if str(k).lower() == "authorization":
             continue
+
         k_enc = uri_encode(str(k))
-        v_enc = uri_encode("" if v is None else str(v))
-        items.append(f"{k_enc}={v_enc}")
+        if v is None or str(v) == "":
+            items.append(k_enc)
+        else:
+            v_enc = uri_encode(str(v))
+            items.append(f"{k_enc}={v_enc}")
+
     items.sort()
     return "&".join(items)
 
@@ -51,6 +64,7 @@ def canonical_headers(headers: Dict[str, Any], headers_to_sign: Optional[set[str
     for k in signed:
         if k in normalized:
             lines.append(f"{uri_encode(k)}:{uri_encode(normalized[k])}")
+
     return "\n".join(lines), ";".join(signed)
 
 
@@ -68,14 +82,18 @@ def sign_bce_auth_v1(
 ) -> str:
     """
     生成 bce-auth-v1 签名字符串（可用于 Header Authorization 或 QueryString authorization）
+
+    ✅ 关键修复：
+    signing_key 必须使用 HMAC(...).digest() 的原始字节，不能用 hexdigest 字符串。
     """
     auth_string_prefix = f"bce-auth-v1/{access_key_id}/{timestamp}/{int(auth_expire_seconds)}"
 
-    signing_key_hex = hmac.new(
+    # signing_key = HMAC-SHA256(SK, auth_string_prefix) -> raw bytes
+    signing_key = hmac.new(
         secret_access_key.encode("utf-8"),
         auth_string_prefix.encode("utf-8"),
         hashlib.sha256,
-    ).hexdigest()
+    ).digest()
 
     canonical_uri = uri_encode(path, encode_slash=False)
     cq = canonical_query(query_params)
@@ -84,7 +102,7 @@ def sign_bce_auth_v1(
     canonical_request = f"{method.upper()}\n{canonical_uri}\n{cq}\n{ch}"
 
     signature = hmac.new(
-        signing_key_hex.encode("utf-8"),
+        signing_key,
         canonical_request.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
