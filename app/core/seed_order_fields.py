@@ -17,13 +17,18 @@
 4) options 始终写 dict（{"items":[...] }）
 5) 预设列表默认展示列（extra.show_in_list）
 6) ✅ 预设财务列表默认展示列（extra.show_in_finance_list）
+
+并发幂等（✅ 本次修复重点）：
+- 多 worker 启动时，seed 可能并发执行，导致 UNIQUE(module, field_name) 冲突（1062）
+- 处理方式：flush 发生 1062 -> rollback -> 再 SELECT 已存在记录并返回（不让启动失败）
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, delete
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.field_config import FieldConfig, FieldGroup, FieldGroupField
@@ -45,6 +50,28 @@ def _merge_extra(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]
         out.update(patch)
     # ✅ 避免把空 dict 写进库里（更干净）
     return out or None
+
+
+def _is_mysql_duplicate_entry(e: Exception) -> bool:
+    """
+    pymysql.err.IntegrityError: (1062, "Duplicate entry ...")
+    SQLAlchemy 会把它包成 sqlalchemy.exc.IntegrityError
+    """
+    if not isinstance(e, IntegrityError):
+        return False
+
+    orig = getattr(e, "orig", None)
+    # orig 可能是 pymysql.err.IntegrityError，通常 args[0] == 1062
+    try:
+        args = getattr(orig, "args", None)
+        if isinstance(args, (list, tuple)) and len(args) >= 1 and int(args[0]) == 1062:
+            return True
+    except Exception:
+        pass
+
+    # 兜底：看字符串（不同驱动/版本下仍可能命中）
+    msg = str(e).lower()
+    return ("duplicate" in msg and "entry" in msg) or ("1062" in msg)
 
 
 async def _get_or_create_group(
@@ -71,8 +98,24 @@ async def _get_or_create_group(
         order_index=order_index,
     )
     db.add(obj)
-    await db.flush()
-    return obj
+
+    # ✅ 并发幂等：flush 遇到 1062 -> rollback -> 再查一次
+    try:
+        await db.flush()
+        return obj
+    except IntegrityError as e:
+        if not _is_mysql_duplicate_entry(e):
+            raise
+        await db.rollback()
+
+        obj2 = (await db.execute(q)).scalar_one_or_none()
+        if not obj2:
+            # 理论上不会发生：既然 duplicate 了，说明别人插入成功了
+            raise
+        obj2.group_name = group_name
+        obj2.order_index = order_index
+        # 不强制 flush：后续统一 commit
+        return obj2
 
 
 async def _get_or_create_field(
@@ -118,8 +161,28 @@ async def _get_or_create_field(
         extra=extra,
     )
     db.add(obj)
-    await db.flush()
-    return obj
+
+    # ✅ 并发幂等：flush 遇到 1062 -> rollback -> 再查一次并更新后返回
+    try:
+        await db.flush()
+        return obj
+    except IntegrityError as e:
+        if not _is_mysql_duplicate_entry(e):
+            raise
+        await db.rollback()
+
+        obj2 = (await db.execute(q)).scalar_one_or_none()
+        if not obj2:
+            raise
+        obj2.label = label
+        obj2.type = type_
+        obj2.required = required
+        obj2.visible = visible
+        obj2.editable = editable
+        obj2.sort = sort
+        obj2.options = options
+        obj2.extra = extra
+        return obj2
 
 
 async def _rebuild_group_links(
@@ -127,6 +190,8 @@ async def _rebuild_group_links(
     group_id: int,
     field_ids_in_order: List[int],
 ):
+    # 这里本质是“重建映射”，在并发 seed 下会互相覆盖，但我们已经在 main.py 加了锁；
+    # 同时 seed 本身又幂等，所以这里保持简单。
     await db.execute(delete(FieldGroupField).where(FieldGroupField.group_id == group_id))
     for idx, fid in enumerate(field_ids_in_order):
         db.add(FieldGroupField(group_id=group_id, field_id=fid, order_index=idx))
@@ -168,9 +233,6 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
 
     # -------------------------
     # ✅ 财务列表默认展示列（稳定 & 可控）
-    # 说明：
-    # - 财务页主列本来就有固定列：渠道群/客户群/业务员/财务状态
-    # - 动态字段建议精简：车辆型号、车架号、号牌号码（展开行仍可看更多）
     # -------------------------
     default_finance_order = [
         "vehicle_model",
