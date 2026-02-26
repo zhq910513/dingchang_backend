@@ -40,7 +40,6 @@ class Settings(BaseSettings):
     DB_PORT: int = Field(default=3306)
     DB_NAME: str = Field(default="order_system")
 
-    # ✅ 连接池参数（让 backend.env 生效）
     DB_POOL_SIZE: int = Field(default=20)
     DB_MAX_OVERFLOW: int = Field(default=20)
     DB_POOL_RECYCLE: int = Field(default=1800)
@@ -64,15 +63,10 @@ class Settings(BaseSettings):
     # Logging / Paths
     # -----------------------------
     LOG_LEVEL: str = Field(default="INFO")
-
-    # 运行期落盘目录（容器内）；建议通过 backend.env 配成 /app/storage /app/logs
     STORAGE_ROOT: str = Field(default="./storage")
     LOG_DIR: str = Field(default="./logs")
 
-    # ✅ 静态访问前缀（让你 backend.env 的 LOCAL_PUBLIC_PREFIX 生效）
     LOCAL_PUBLIC_PREFIX: str = Field(default="/static")
-
-    # ✅ 可选：静态目录单独指定；不填则回落到 STORAGE_ROOT
     LOCAL_STORAGE_ROOT: Optional[str] = Field(default=None)
 
     # -----------------------------
@@ -102,6 +96,19 @@ class Settings(BaseSettings):
     BAIDU_API_KEY: Optional[str] = Field(default=None)
     BAIDU_SECRET_KEY: Optional[str] = Field(default=None)
 
+    # -----------------------------
+    # ✅ 报价助手：平台模块配置（公共入口 + 开关 + 预留缓存）
+    # -----------------------------
+    # 平台请求超时/重试/缓存 TTL
+    AI_PLATFORM_TIMEOUT_SECONDS: int = Field(default=20)
+    AI_PLATFORM_RETRY_COUNT: int = Field(default=1)
+    AI_PLATFORM_CACHE_TTL_SECONDS: int = Field(default=300)
+
+    # ✅ 平台开关（按平台 code 大写命名）
+    # 例如：AI_PLATFORM_ENABLE_TP=true
+    # 当前先内置 STUB（用于公共入口跑通）
+    AI_PLATFORM_ENABLE_STUB: bool = Field(default=True)
+
     # ---------- 规范化 ----------
     if PYDANTIC_V2:
         @field_validator("ENV", mode="before")
@@ -115,7 +122,6 @@ class Settings(BaseSettings):
             return self
 
     else:
-
         @validator("ENV", pre=True)
         def _normalize_env(cls, v):
             return str(v or "dev").strip().lower()
@@ -204,7 +210,6 @@ class Settings(BaseSettings):
 
     @property
     def LOCAL_STORAGE_ROOT_PATH(self) -> Path:
-        # ✅ 优先 LOCAL_STORAGE_ROOT（若配置），否则回落 STORAGE_ROOT
         base = (self.LOCAL_STORAGE_ROOT or "").strip() or self.STORAGE_ROOT
         return Path(base).expanduser().resolve()
 

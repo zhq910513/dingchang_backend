@@ -20,19 +20,10 @@ class AiChatMessage(BaseModel):
 
 
 class AiChatRequest(BaseModel):
-    # 会话ID：前端首次不传，后端会自动生成
     session_id: Optional[str] = Field(None, description="会话ID", max_length=64)
-
-    # 用户输入（伪AI必须强控长度）
     message: str = Field(..., min_length=1, max_length=1000, description="用户消息")
-
-    # 可选：前端附加历史（通常可不传；后端有自己的会话历史）
     history: List[AiChatMessage] = Field(default_factory=list)
-
-    # 可选：页面上下文（业务场景、模块名、筛选条件等）
     context: Dict[str, Any] = Field(default_factory=dict)
-
-    # 流式标记
     stream: bool = False
 
 
@@ -60,6 +51,15 @@ class AiChatResponse(BaseModel):
     trace_id: str
     error: Optional[AiErrorInfo] = None
     usage: Optional[Dict[str, Any]] = None
+
+    # ✅ 统一结构化回传（前端按这个渲染，不猜字段）
+    # {
+    #   "result_status": "success|empty|invalid_command|need_more_info|not_ready|failed",
+    #   "message": "人性化说明",
+    #   "entities": {...},
+    #   "payload": {...}
+    # }
+    data: Optional[Dict[str, Any]] = None
 
 
 class AiSessionItem(BaseModel):

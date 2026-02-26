@@ -109,15 +109,39 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
 
     def g(name: str) -> str:
         x = wr.get(name) or {}
-        return _safe_str(x.get("words"))
+        if isinstance(x, dict):
+            return _safe_str(x.get("words"))
+        return _safe_str(x)
+
+    id_name = g("姓名")
+    id_number = g("公民身份号码")
+    id_address = g("住址")
+    id_birth_date = _normalize_ymd(g("出生")) or g("出生")
+    id_gender = g("性别")
+    id_ethnicity = g("民族")
+
+    id_issuer = g("签发机关")
+    id_validity = g("失效日期") or g("有效期限") or g("有效期")
+    id_valid_from = _normalize_ymd(g("签发日期")) or g("签发日期")
+    id_valid_to = _normalize_ymd(g("失效日期")) or g("失效日期")
 
     out: Dict[str, Any] = {
-        "id_name": g("姓名"),
-        "id_number": g("公民身份号码"),
-        "id_address": g("住址"),
-        "id_birth_date": g("出生"),
-        "id_gender": g("性别"),
-        "id_ethnicity": g("民族"),
+        # 新口径
+        "id_name": id_name,
+        "id_number": id_number,
+        "id_address": id_address,
+        "id_birth_date": id_birth_date,
+        "id_gender": id_gender,
+        "id_ethnicity": id_ethnicity,
+        "id_issuer": id_issuer,
+        "id_validity": id_validity,
+        # 兼容 slot_field_config 历史 key（避免详情卡槽空值）
+        "id_nation": id_ethnicity,
+        "id_birth": id_birth_date,
+        "id_issue_authority": id_issuer,
+        "id_valid_from": id_valid_from,
+        "id_valid_to": id_valid_to,
+        "id_valid_period": id_validity,
     }
     return {k: v for k, v in out.items() if v}
 
@@ -134,7 +158,7 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
     dl_owner = g("所有人")
     dl_vin = g("车辆识别代号")
     dl_engine_no = g("发动机号码")
-    dl_brand_model = g("品牌型号")
+    dl_vehicle_model = g("品牌型号")
     dl_vehicle_type = g("车辆类型")
     dl_use_nature = g("使用性质")
     dl_register_date = _normalize_ymd(g("注册日期"))  # ✅ 初登日期来源
@@ -147,9 +171,13 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         "dl_owner": dl_owner,
         "dl_vin": dl_vin,
         "dl_engine_no": dl_engine_no,
-        "dl_brand_model": dl_brand_model,
+        # ✅ 统一新口径
+        "dl_vehicle_model": dl_vehicle_model,
+        # ✅ 兼容旧脏/旧字段
+        "dl_brand_model": dl_vehicle_model,
         "dl_vehicle_type": dl_vehicle_type,
         "dl_use_nature": dl_use_nature,
+        "dl_use性质": dl_use_nature,  # 兼容历史脏 key（当前 slot_field_config 在读它）
         "dl_register_date": dl_register_date,
         "dl_issue_date": dl_issue_date,
         "dl_issuer_org": dl_issuer_org,
@@ -159,7 +187,7 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         "owner_name": dl_owner,
         "vin": dl_vin,
         "engine_no": dl_engine_no,
-        "vehicle_model": dl_brand_model,
+        "vehicle_model": dl_vehicle_model,
         "first_register_date": dl_register_date,  # ✅ 初登日期 = 行驶证注册日期
     }
     return {k: v for k, v in out.items() if v}
@@ -351,18 +379,20 @@ async def _image_result_upsert(
 
 def _build_ocr_fetch_url(storage_key: str, image_file: Optional[ImageFile]) -> str:
     """
-    给百度 OCR 用的“服务端可访问 URL”：
-    - 优先：BOS 新签名 URL（最稳，避免 ImageFile.url 是过期签名）
-    - 其次：ImageFile.url（如果你存的是公网 URL / 仍有效签名）
-    - 最后兜底：BOS 公网 URL（仅当 bucket 是 public 才能用）
-    ⚠️ 绝不剥掉 query（签名通常在 query 里）
+    给百度 OCR 用的“服务端可访问 URL”（严格模式）：
+    - 优先：BOS 新签名 URL（不允许静默降级公网直链）
+    - 其次：ImageFile.url（仅当明确已有可访问 URL）
+    - 最后：BOS 公网 URL（仅在你确实使用 public bucket 时才会成功）
+
+    ⚠️ 关键改动：
+    - object_url_for_display(..., allow_fallback_public=False)
+      防止签名失败被偷偷降级成直链，导致错误看起来像 OCR 403。
     """
     sk = (storage_key or "").strip()
 
     if sk and getattr(storage, "enabled", False):
         try:
-            # 给百度抓取留足时间，避免过期
-            return storage.object_url_for_display(sk, expires_in=3600)
+            return storage.object_url_for_display(sk, expires_in=3600, allow_fallback_public=False)
         except Exception:
             pass
 

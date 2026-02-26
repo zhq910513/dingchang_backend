@@ -14,6 +14,7 @@ import logging
 import hashlib
 import hmac
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +32,16 @@ from app.schemas.auth import LoginRequest, LoginResponse, LoginUserOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+BJ_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now_bj_naive() -> datetime:
+    """
+    ✅ 全局时间口径对齐：
+    - DB 存北京时间 naive DATETIME（timezone=False）
+    """
+    return datetime.now(BJ_TZ).replace(tzinfo=None)
 
 
 def _is_legacy_password_hash(hashed: str) -> bool:
@@ -139,12 +150,13 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
         except Exception:
             pass
 
-    # 创建 session
+    # 创建 session（✅ 北京时间 naive DATETIME）
     token = generate_session_token()
+    now_bj = _now_bj_naive()
     sess = UserSession(
         user_id=user.id,
         session_token=token,
-        last_active_at=datetime.utcnow(),
+        last_active_at=now_bj,
         expired=0,
     )
     db.add(sess)

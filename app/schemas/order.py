@@ -14,6 +14,24 @@ from pydantic import BaseModel, Field, validator
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 
+# =========================
+# ✅ 卡槽配置（schema 侧输出骨架）
+# =========================
+# 说明：
+# - key: 前端/接口统一槽位名
+# - multi: 是否多图槽
+# - ocr: 是否 OCR 槽（仅供前端/UI 参考；后端实际是否创建 OCR 任务由 orders.py 决定）
+# - required: 是否“业务上常用主槽”（这里只做结构标识，不做校验）
+IMAGE_SLOT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "vehicle_cert": {"multi": False, "ocr": True, "required": True},
+    "idcard_front": {"multi": False, "ocr": True, "required": True},
+    "idcard_back": {"multi": False, "ocr": True, "required": False},
+    "driving_license_main": {"multi": False, "ocr": True, "required": True},
+    "driving_license_sub": {"multi": False, "ocr": True, "required": False},
+    "related": {"multi": True, "ocr": False, "required": False},
+}
+
+
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
         return None
@@ -76,72 +94,178 @@ def _clean_str_list(v) -> List[str]:
     return out
 
 
+def _slot_skeleton() -> Dict[str, Any]:
+    """
+    ✅ 生成统一 image_urls 输出骨架（前端可以稳定渲染，不用猜字段）
+    单图槽：
+      {
+        "vehicle_cert": {"slot_key":"vehicle_cert","multi":False,"ocr":True,"required":True,"url":None,"urls":[]}
+      }
+    多图槽：
+      {
+        "related": {"slot_key":"related","multi":True,"ocr":False,"required":False,"url":None,"urls":[...]}
+      }
+
+    兼容保留：
+    - "_all": ["..."] （老前端兜底）
+    """
+    out: Dict[str, Any] = {}
+    for sk, conf in IMAGE_SLOT_CONFIG.items():
+        out[sk] = {
+            "slot_key": sk,
+            "multi": bool(conf.get("multi", False)),
+            "ocr": bool(conf.get("ocr", False)),
+            "required": bool(conf.get("required", False)),
+            "url": None,      # 单图槽主图（多图槽通常为 None）
+            "urls": [],       # 多图槽/统一兜底列表
+        }
+    out["_all"] = []
+    return out
+
+
+def _append_all_unique(all_list: List[str], vals: List[str]) -> None:
+    seen = set(all_list)
+    for x in vals:
+        s = _to_str_or_empty(x)
+        if s and s not in seen:
+            all_list.append(s)
+            seen.add(s)
+
+
 def _clean_image_urls_out(v) -> Dict[str, Any]:
     """
-    兼容订单详情 image_urls 的两种历史形态：
-    1) 新形态（推荐）：按卡槽字典
-       {
-         "id_card_front": "https://...",
-         "related": ["https://...", "..."],
-         "_all": ["https://...", "..."]
-       }
-    2) 旧形态：纯 URL 列表
-       ["https://...", "..."] -> 自动转为 {"_all": [...]}
+    ✅ 统一 image_urls 输出为“按卡槽完整结构（配置化）”
+    兼容输入历史形态：
+    1) 旧：list[str]
+       ["u1","u2"] -> 填充到 _all，related.urls 也会同步一份（便于前端兜底）
+    2) 旧：dict[str, str/list]
+       {"idcard_front":"u1","related":["u2"]} -> 自动映射到新结构
+    3) 新（如果后端未来直接输出 slot object）：
+       {"idcard_front":{"url":"u1","urls":["u1"]...}, ...} -> 也能容忍并清洗
     """
-    if v is None:
-        return {}
+    out = _slot_skeleton()
 
-    # 兼容旧结构：list[str]
+    if v is None:
+        return out
+
+    # 兼容旧结构：纯 URL 列表
     if isinstance(v, (list, tuple)):
         arr = _clean_str_list(v)
-        return {"_all": arr} if arr else {}
+        if arr:
+            out["_all"] = arr
+            # 旧前端常把全量图当 related，用 related 做兜底不亏
+            if "related" in out:
+                out["related"]["urls"] = list(arr)
+        return out
 
-    # 新结构：dict
-    if isinstance(v, dict):
-        out: Dict[str, Any] = {}
+    # 非 dict 直接返回骨架
+    if not isinstance(v, dict):
+        return out
 
-        for k, raw_val in v.items():
-            key = _to_str_or_empty(k)
-            if not key:
-                continue
+    # 遍历输入 key，写入对应槽
+    for raw_k, raw_val in v.items():
+        key = _to_str_or_empty(raw_k)
+        if not key:
+            continue
 
-            # 单图字符串
+        if key == "_all":
+            arr = _clean_str_list(raw_val if isinstance(raw_val, (list, tuple)) else [raw_val])
+            if arr:
+                out["_all"] = arr
+            continue
+
+        # 如果是“未知槽”，尽量塞进 _all（防脏数据丢失）
+        if key not in IMAGE_SLOT_CONFIG:
             if isinstance(raw_val, str):
                 s = _to_str_or_empty(raw_val)
                 if s:
-                    out[key] = s
+                    _append_all_unique(out["_all"], [s])
+            elif isinstance(raw_val, (list, tuple)):
+                _append_all_unique(out["_all"], _clean_str_list(raw_val))
+            elif isinstance(raw_val, dict):
+                # 尝试读 url/urls
+                s1 = _to_str_or_empty(raw_val.get("url"))
+                arr1 = _clean_str_list(raw_val.get("urls"))
+                vals = ([s1] if s1 else []) + arr1
+                _append_all_unique(out["_all"], vals)
+            else:
+                s = _to_str_or_empty(raw_val)
+                if s:
+                    _append_all_unique(out["_all"], [s])
+            continue
+
+        slot_obj = out[key]
+        is_multi = bool(slot_obj.get("multi", False))
+
+        # 兼容新形态 slot object
+        if isinstance(raw_val, dict):
+            s_url = _to_str_or_none(raw_val.get("url"))
+            arr_urls = _clean_str_list(raw_val.get("urls"))
+
+            if is_multi:
+                vals = arr_urls[:]
+                if s_url and s_url not in vals:
+                    vals.insert(0, s_url)
+                slot_obj["urls"] = vals
+                slot_obj["url"] = vals[0] if vals else None
+            else:
+                final_url = s_url or (arr_urls[0] if arr_urls else None)
+                slot_obj["url"] = final_url
+                slot_obj["urls"] = [final_url] if final_url else []
+
+            _append_all_unique(out["_all"], slot_obj["urls"])
+            continue
+
+        # 旧形态：单图字符串
+        if isinstance(raw_val, str):
+            s = _to_str_or_none(raw_val)
+            if not s:
                 continue
+            if is_multi:
+                slot_obj["urls"] = [s]
+                slot_obj["url"] = s
+            else:
+                slot_obj["url"] = s
+                slot_obj["urls"] = [s]
+            _append_all_unique(out["_all"], [s])
+            continue
 
-            # 多图数组
-            if isinstance(raw_val, (list, tuple)):
-                arr = _clean_str_list(raw_val)
-                if arr:
-                    out[key] = arr
+        # 旧形态：多图数组
+        if isinstance(raw_val, (list, tuple)):
+            arr = _clean_str_list(raw_val)
+            if not arr:
                 continue
+            if is_multi:
+                slot_obj["urls"] = arr
+                slot_obj["url"] = arr[0]
+            else:
+                # 单图槽只取最后一张（与 finalize 非 multi 槽保留最后一张一致）
+                last = arr[-1]
+                slot_obj["url"] = last
+                slot_obj["urls"] = [last]
+            _append_all_unique(out["_all"], slot_obj["urls"])
+            continue
 
-            # 其他类型兜底（避免脏数据把序列化搞崩）
-            s = _to_str_or_empty(raw_val)
-            if s:
-                out[key] = s
+        # 其他脏类型兜底
+        s = _to_str_or_none(raw_val)
+        if s:
+            if is_multi:
+                slot_obj["urls"] = [s]
+                slot_obj["url"] = s
+            else:
+                slot_obj["url"] = s
+                slot_obj["urls"] = [s]
+            _append_all_unique(out["_all"], [s])
 
-        # 没有 _all 时自动补一个，方便老前端兜底
-        if "_all" not in out:
-            flat: List[str] = []
-            for val in out.values():
-                if isinstance(val, str):
-                    flat.append(val)
-                elif isinstance(val, list):
-                    for x in val:
-                        sx = _to_str_or_empty(x)
-                        if sx:
-                            flat.append(sx)
-            if flat:
-                out["_all"] = flat
+    # 如果 _all 为空，但各槽有值，回填一次（保险）
+    if not out["_all"]:
+        vals: List[str] = []
+        for sk in IMAGE_SLOT_CONFIG.keys():
+            so = out.get(sk) or {}
+            vals.extend(_clean_str_list(so.get("urls")))
+        out["_all"] = vals
 
-        return out
-
-    # 非 list/dict 的奇怪值直接兜底为空
-    return {}
+    return out
 
 
 class OrmBaseModel(BaseModel):
@@ -412,7 +536,7 @@ class OrderOut(OrmBaseModel):
     is_paid: bool = False
 
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
-    # ✅ 修复：详情图片链接按卡槽返回（兼容旧 _all 列表）
+    # ✅ 配置化结构输出（兼容保留 _all）
     image_urls: Dict[str, Any] = Field(default_factory=dict)
     images: List[OrderImageOut] = Field(default_factory=list)
 

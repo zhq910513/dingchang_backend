@@ -19,7 +19,8 @@ class FinanceRecord(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     # ✅ 一单一条财务记录（强约束，方便后续做金额/备注）
-    order_id = Column(Integer, ForeignKey("order.id"), nullable=False, index=True, unique=True)
+    # 唯一约束统一放到 __table_args__，避免重复定义
+    order_id = Column(Integer, ForeignKey("order.id"), nullable=False, index=True)
 
     supplier_id = Column(Integer, nullable=True, index=True)
 

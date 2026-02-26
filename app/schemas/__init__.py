@@ -17,6 +17,9 @@ from .customer_channel import *  # noqa
 from .field_config import *  # noqa
 from .finance import *  # noqa
 
+# ✅ ai_assistant（报价助手专项）
+from .ai_assistant import *  # noqa
+
 # order（带容错）
 try:
     from .order import (  # noqa

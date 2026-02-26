@@ -7,14 +7,14 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
 
-class OrmBaseModel(BaseModel):
-    class Config:
-        orm_mode = True
-        anystr_strip_whitespace = True
+class FinanceOrderStatusUpdate(BaseModel):
+    is_paid: Optional[bool] = None
+    is_rebate: Optional[bool] = None
 
 
-class FinanceOrderOut(OrmBaseModel):
+class FinanceOrderOut(BaseModel):
     id: int
+
     col_01_date: Optional[str] = None
     col_02_channel: Optional[str] = None
     col_03_customer: Optional[str] = None
@@ -32,45 +32,49 @@ class FinanceOrderOut(OrmBaseModel):
     col_15_compulsory_amount: Optional[float] = None
     col_16_tax_amount: Optional[float] = None
     col_17_noncar_amount: Optional[float] = None
+
+    # 渠道点位（补齐商业后补点位）
     col_18_ch_commercial_point: Optional[float] = None
-    col_19_ch_compulsory_point: Optional[float] = None
-    col_20_ch_tax_point: Optional[float] = None
-    col_21_ch_noncar_point: Optional[float] = None
-    col_22_cu_commercial_point: Optional[float] = None
-    col_23_cu_compulsory_point: Optional[float] = None
-    col_24_cu_tax_point: Optional[float] = None
-    col_25_cu_noncar_point: Optional[float] = None
-    col_26_receivable: Optional[float] = None
-    col_27_payable: Optional[float] = None
-    col_28_profit: Optional[float] = None
-    col_29_is_paid: bool = False
-    col_30_is_rebate: bool = False
-    col_31_channel_reward: Optional[float] = None
-    col_32_customer_reward: Optional[float] = None
+    col_19_ch_commercial_supplement_point: Optional[float] = None
+    col_20_ch_compulsory_point: Optional[float] = None
+    col_21_ch_tax_point: Optional[float] = None
+    col_22_ch_noncar_point: Optional[float] = None
 
-    # ✅ 新增：订单备注（仅列表/详情展示，导出不带）
+    # 客户点位（补齐商业后补点位）
+    col_23_cu_commercial_point: Optional[float] = None
+    col_24_cu_commercial_supplement_point: Optional[float] = None
+    col_25_cu_compulsory_point: Optional[float] = None
+    col_26_cu_tax_point: Optional[float] = None
+    col_27_cu_noncar_point: Optional[float] = None
+
+    # 汇总 / 状态 / 奖励（列号顺延）
+    col_28_receivable: Optional[float] = None
+    col_29_payable: Optional[float] = None
+    col_30_profit: Optional[float] = None
+    col_31_is_paid: bool = False
+    col_32_is_rebate: bool = False
+    col_33_channel_reward: Optional[float] = None
+    col_34_customer_reward: Optional[float] = None
+
+    # ✅ 列表展示用，导出不带
     remark: Optional[str] = None
-
-    manager_id: Optional[int] = None
-    manager_name: Optional[str] = None
-    team_name: Optional[str] = None
-    team_names: List[str] = Field(default_factory=list)
 
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
     salesperson_id: Optional[int] = None
     salesperson_name: Optional[str] = None
+    manager_id: Optional[int] = None
+    manager_name: Optional[str] = None
+
+    team_name: Optional[str] = None
+    team_names: List[str] = Field(default_factory=list)
 
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
+
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
 
-class FinanceOrderListResponse(OrmBaseModel):
-    total: int = 0
+class FinanceOrderListResponse(BaseModel):
+    total: int
     items: List[FinanceOrderOut] = Field(default_factory=list)
-
-
-class FinanceOrderStatusUpdate(OrmBaseModel):
-    is_rebate: Optional[bool] = None
-    is_paid: Optional[bool] = None

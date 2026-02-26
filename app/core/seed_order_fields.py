@@ -182,8 +182,6 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
     def _finance_extra(field_name: str, width: int = 160) -> Dict[str, Any]:
         if field_name not in default_finance_index:
             return {}
-        # ✅ 复用 ui_default_list_order（前端 financeFields 也按它排序）
-        # 这里让 finance 的顺序“与订单默认列同源”，避免两套 order 编号冲突
         return {
             "show_in_finance_list": True,
             "finance_list_width": width,
@@ -282,7 +280,7 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         {"name": "dl_owner", "label": "所有人", "type": "text", "extra": _patch_extra("dl_owner", {"list_width": 120})},
         {"name": "dl_address", "label": "住址", "type": "text"},
         {"name": "dl_use_nature", "label": "使用性质", "type": "text"},
-        {"name": "dl_brand_model", "label": "品牌型号", "type": "text"},
+        {"name": "dl_vehicle_model", "label": "品牌型号", "type": "text"},
         {"name": "dl_vin", "label": "车辆识别代码", "type": "text"},
         {"name": "dl_engine_no", "label": "发动机号码", "type": "text"},
         {"name": "dl_register_date", "label": "注册日期", "type": "date"},

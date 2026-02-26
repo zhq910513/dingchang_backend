@@ -7,6 +7,10 @@
 - 使用 session_token 作为登录态标识
 - expired: 0=有效, 1=手动过期
 - 在线判断会结合 last_active_at + 全局 SESSION_TIMEOUT_SECONDS
+
+时间口径：
+- 统一使用 naive DATETIME（与全局其它表一致）
+- DB 会话时区由启动时 SET time_zone 控制（当前项目为北京时间）
 """
 
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Index
@@ -26,9 +30,9 @@ class UserSession(Base):
     # unique 本身会隐式创建索引，不再额外 index=True
     session_token = Column(String(255), unique=True, nullable=False)
 
-    # ✅ 与其它表对齐：timezone=True
-    last_active_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # ✅ 与全局其它表对齐：naive DATETIME（timezone=False）
+    last_active_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
     # 0 有效，1 手动过期
     expired = Column(Integer, default=0, nullable=False)

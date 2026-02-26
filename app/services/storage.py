@@ -394,11 +394,20 @@ class StorageService:
         return f"https://{host}{path}?{self._urlencode_rfc3986(q)}"
 
     # ✅ 统一出口（展示用/返回给前端用）
-    def object_url_for_display(self, storage_key: str, *, signed: Optional[bool] = None, expires_in: int = 900) -> str:
+    def object_url_for_display(
+        self,
+        storage_key: str,
+        *,
+        signed: Optional[bool] = None,
+        expires_in: int = 900,
+        allow_fallback_public: bool = True,
+    ) -> str:
         """
         返回“用于展示/接口返回”的 URL：
         - signed=None：跟随 settings.BOS_SIGNED_GET_URL（支持 .env）
-        - signed=True：返回签名 URL（失败则降级直链）
+        - signed=True：返回签名 URL
+            * allow_fallback_public=True  -> 签名失败时降级直链
+            * allow_fallback_public=False -> 签名失败直接抛错（给 OCR 严格使用）
         - signed=False：返回直链
         """
         if signed is None:
@@ -410,4 +419,6 @@ class StorageService:
         try:
             return self.generate_signed_get_url(storage_key=storage_key, expires_in=int(expires_in))
         except Exception:
+            if not allow_fallback_public:
+                raise
             return self.object_public_url(storage_key)

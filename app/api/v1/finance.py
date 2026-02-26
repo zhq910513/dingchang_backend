@@ -9,8 +9,8 @@
 
 补齐：
 - /finance/orders 支持 created_date_start / created_date_end（按北京时间过滤 created_at，包含结束日）
-- /finance/orders 支持 first_register_date_start / first_register_date_end（按 dynamic_data 常见字段范围过滤，包含结束日）
-- 保留旧参数 created_date / first_register_date 兼容（单日）
+- /finance/orders 支持 first_register_date_start / first_register_date_end（按 dynamic_data 当前字段 dl_register_date 范围过滤，包含结束日）
+- 保留旧参数 created_date / first_register_date 兼容（单日/模糊），但字段口径仅使用当前字段
 
 本轮：
 - 团队隔离（支持经理多团队）
@@ -27,14 +27,9 @@
 - 日期列仅输出 YYYY-MM-DD（不再带时分秒）
 - “应收/应付”与列表口径一致：应收=channel_total，应付=customer_total
 
-本次修复（2026-02-20）：
-- 修复旧兼容参数 first_register_date 的筛选逻辑（列表/汇总/导出）：
-  原逻辑把多字段/多格式条件按 AND 拼接，导致极难命中；
-  现改为单个 OR 条件（支持 YYYY-MM-DD / YYYYMMDD / 多字段兜底）
-
-本次补齐（2026-02-20）：
-- 财务“车型”字段口径补齐行驶证 OCR 字段 dl_brand_model（列表/搜索/导出）
-- 财务“车主”搜索兼容 id_name / dl_owner（列表/汇总/导出）
+本次清理（2026-02-24）：
+- 清理财务侧旧字段兜底，统一只使用当前 OCR 字段口径：
+  dl_owner / dl_plate_no / dl_vin / dl_engine_no / dl_id_number / dl_vehicle_model / dl_register_date
 """
 from __future__ import annotations
 
@@ -58,7 +53,6 @@ from sqlalchemy import (
     String,
     delete,
     distinct,
-    false as sql_false,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,7 +84,6 @@ from app.core.constants import (
     ROLE_SUPER_ADMIN,
     ROLE_SALES,
     ROLE_MARKET,
-    TEAM_NAMES,
 )
 from app.core.db import get_db, engine
 from app.models.channel_group import ChannelGroup
@@ -135,122 +128,7 @@ def _ensure_finance_export_access(role_name: Optional[str]) -> None:
     _ensure_finance_write_access(role_name)
 
 
-def _normalize_team_names(team_names: Tuple[str, ...] | List[str] | None) -> Tuple[str, ...]:
-    if not team_names:
-        return tuple()
-    if isinstance(team_names, tuple):
-        arr = [str(x or "").strip() for x in team_names]
-    else:
-        arr = [str(x or "").strip() for x in team_names]
-    arr = [x for x in arr if x]
-    return tuple(sorted(set(arr)))
-
-
-def _current_team_names_or_403(
-    *,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-) -> Optional[Tuple[str, ...]]:
-    if role_name == ROLE_SUPER_ADMIN:
-        return None
-
-    tns = _normalize_team_names(team_names)
-    if not tns:
-        raise HTTPException(status_code=403, detail="当前账号未绑定团队（team_name/team_names）")
-
-    invalid = [t for t in tns if t not in TEAM_NAMES]
-    if invalid:
-        raise HTTPException(status_code=403, detail="当前账号团队非法（team_name/team_names）")
-
-    if role_name in (ROLE_FINANCE, ROLE_MARKET):
-        if len(tns) != 1:
-            raise HTTPException(status_code=403, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
-        return (tns[0],)
-
-    if role_name == ROLE_MANAGER:
-        return tuple(tns)
-
-    raise HTTPException(status_code=403, detail="No permission")
-
-
-def _parse_query_team_names(team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
-    arr: List[str] = []
-    s = (team_name or "").strip()
-    if s:
-        arr.append(s)
-    if team_names:
-        for x in team_names:
-            sx = str(x or "").strip()
-            if sx:
-                arr.append(sx)
-    return _normalize_team_names(arr)
-
-
-def _effective_team_filter_for_query(
-    *,
-    role_name: Optional[str],
-    current_team_names: Optional[Tuple[str, ...]],
-    team_name: Optional[str],
-    team_names: Optional[Tuple[str, ...]],
-) -> Optional[Tuple[str, ...]]:
-    requested = _parse_query_team_names(team_name, team_names)
-
-    if requested:
-        invalid = [t for t in requested if t not in TEAM_NAMES]
-        if invalid:
-            raise HTTPException(status_code=400, detail="team_name/team_names 非法")
-
-    if role_name == ROLE_SUPER_ADMIN:
-        return requested or None
-
-    allowed = current_team_names or tuple()
-    if not requested:
-        return allowed
-
-    eff = tuple(sorted(set(allowed) & set(requested)))
-    if not eff:
-        raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
-
-    if role_name in (ROLE_FINANCE, ROLE_MARKET):
-        if len(allowed) == 1 and eff != allowed:
-            raise HTTPException(status_code=403, detail="跨团队筛选被拒绝")
-        return allowed
-
-    if role_name == ROLE_MANAGER:
-        return eff
-
-    return allowed
-
-
-def _user_team_match_expr(teams: Tuple[str, ...]):
-    tns = tuple([str(x or "").strip() for x in (teams or ()) if str(x or "").strip()])
-    if not tns:
-        return sql_false()
-
-    terms = [User.team_name.in_(list(tns))]
-
-    if hasattr(User, "team_names"):
-        for t in tns:
-            terms.append(User.team_names == t)
-            terms.append(User.team_names.like(f"{t},%"))
-            terms.append(User.team_names.like(f"%,{t},%"))
-            terms.append(User.team_names.like(f"%,{t}"))
-
-    return or_(*terms)
-
-
-def _order_salesperson_in_teams_expr(team_names: Tuple[str, ...]):
-    team_user_ids = select(User.id).where(_user_team_match_expr(team_names))
-    return Order.salesperson_id.in_(team_user_ids)
-
-
 def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
-    """
-    与 orders 域 schemas/order.py 的 _fmt_dt 同口径：
-    - DB DATETIME 若为 naive：直接格式化输出（禁止无脑 +8）
-    - 若被错误贴了 UTC tzinfo（offset=0）：去 tzinfo 再格式化（避免 +8）
-    - 其它 aware：兜底转 Asia/Shanghai 再格式化（极少见）
-    """
     if not dt:
         return None
 
@@ -271,10 +149,6 @@ def _fmt_dt(dt: Optional[datetime]) -> Optional[str]:
 
 
 def _fmt_date_only(dt: Optional[datetime]) -> Optional[str]:
-    """
-    ✅ 导出专用：仅输出 YYYY-MM-DD
-    - 跟 _fmt_dt 一样的防 tz 兜底，但只保留日期
-    """
     s = _fmt_dt(dt)
     if not s:
         return None
@@ -389,14 +263,6 @@ def _digits8_expr(expr):
     return func.substr(e, 1, 8)
 
 
-def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
-    v = (value or "").strip()
-    if not v:
-        return
-    expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
-    clauses.append(expr.like(f"%{v.lower()}%"))
-
-
 def _add_json_fuzzy_any(clauses: list, keys: List[str], value: Optional[str]):
     v = (value or "").strip()
     if not v:
@@ -414,10 +280,8 @@ def _add_json_fuzzy_any(clauses: list, keys: List[str], value: Optional[str]):
 
 def _add_first_register_date_legacy_filter(clauses: list, value: Optional[str]):
     """
-    旧兼容参数 first_register_date 的模糊筛选（单值）：
-    - 支持 YYYY-MM-DD / YYYYMMDD 两种输入/存储格式混用
-    - 支持多个常见字段名兜底
-    - ✅ 关键：按 OR 组合，而不是多个 AND
+    兼容旧参数名 first_register_date，但字段口径仅认当前字段 dl_register_date
+    支持输入 YYYY-MM-DD 或 YYYYMMDD 模糊匹配。
     """
     v = (value or "").strip()
     if not v:
@@ -426,23 +290,12 @@ def _add_first_register_date_legacy_filter(clauses: list, value: Optional[str]):
     v_dash = v.lower()
     v_digits = v.replace("-", "").lower()
 
-    terms = []
-
-    # dl_register_date 可能存 YYYY-MM-DD 或 YYYYMMDD，两个都尝试
     expr_dl = func.lower(_json_text_unquoted(Order.dynamic_data, "dl_register_date"))
-    terms.append(expr_dl.like(f"%{v_dash}%"))
+    terms = [expr_dl.like(f"%{v_dash}%")]
     if v_digits and v_digits != v_dash:
         terms.append(expr_dl.like(f"%{v_digits}%"))
 
-    # 其他常见字段
-    for k in ("register_date", "first_register_date"):
-        expr = func.lower(_json_text_unquoted(Order.dynamic_data, k))
-        terms.append(expr.like(f"%{v_dash}%"))
-        if v_digits and v_digits != v_dash:
-            terms.append(expr.like(f"%{v_digits}%"))
-
-    if terms:
-        clauses.append(or_(*terms))
+    clauses.append(or_(*terms))
 
 
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
@@ -484,11 +337,6 @@ def _parse_ymd(ymd: str) -> Optional[datetime]:
 
 
 def _json_date_expr_mysql(col, key: str):
-    """
-    ✅ MySQL/MariaDB：把 JSON 字段尽量解析成 DATE
-    - 兼容：YYYY-MM-DD / YYYY-M-D（STR_TO_DATE 允许）/ YYYYMMDD
-    - 解析失败返回 NULL（不会抛错）
-    """
     raw = func.nullif(func.trim(_json_text_unquoted(col, key)), "")
     d1 = func.str_to_date(raw, "%Y-%m-%d")
     d2 = func.str_to_date(raw, "%Y%m%d")
@@ -521,7 +369,6 @@ def _add_json_date_range_any(
 
     d = _dialect_name()
 
-    # ✅ 优先：MySQL/MariaDB 用 STR_TO_DATE 做稳健解析（兼容 YYYY-M-D / YYYYMMDD）
     if "mysql" in d or "mariadb" in d:
         s_date = datetime.strptime(s, "%Y-%m-%d").date()
         e_date = datetime.strptime(e, "%Y-%m-%d").date()
@@ -533,7 +380,6 @@ def _add_json_date_range_any(
             clauses.append(or_(*or_terms))
         return
 
-    # 其他方言：保持原有 digits8 字符串比较（默认数据为 YYYYMMDD / YYYY-MM-DD）
     s8 = s.replace("-", "")
     e8 = e.replace("-", "")
     if len(s8) != 8 or len(e8) != 8:
@@ -598,7 +444,7 @@ async def finance_list_customer_groups(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     stmt = select(CustomerGroup).order_by(CustomerGroup.id.asc())
 
@@ -624,7 +470,7 @@ async def finance_list_channel_groups(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
 
@@ -650,7 +496,7 @@ async def finance_list_salespersons(
 ):
     _user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     stmt = (
         select(distinct(User.id).label("id"), User.username, User.real_name)
@@ -663,105 +509,10 @@ async def finance_list_salespersons(
     )
 
     if current_team_names is not None:
-        stmt = stmt.where(_user_team_match_expr(current_team_names))
+        stmt = stmt.where(_ac_user_team_match_expr(current_team_names))
 
     rows = (await db.execute(stmt)).all()
     return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
-
-
-def _split_team_names_any(val) -> List[str]:
-    if val is None:
-        return []
-    if isinstance(val, (list, tuple, set)):
-        out = []
-        for x in val:
-            s = str(x or "").strip()
-            if s:
-                out.append(s)
-        seen = set()
-        uniq = []
-        for x in out:
-            if x in seen:
-                continue
-            seen.add(x)
-            uniq.append(x)
-        return uniq
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return []
-        for sep in [",", "，", "|", ";", "；", " "]:
-            if sep in s:
-                parts = [p.strip() for p in s.split(sep)]
-                parts = [p for p in parts if p]
-                if parts:
-                    seen = set()
-                    uniq = []
-                    for x in parts:
-                        if x in seen:
-                            continue
-                        seen.add(x)
-                        uniq.append(x)
-                    return uniq
-        return [s]
-    s2 = str(val or "").strip()
-    return [s2] if s2 else []
-
-
-async def _salesperson_in_current_teams_or_403(
-    *,
-    salesperson: Optional[User],
-    current_team_names: Optional[Tuple[str, ...]],
-) -> None:
-    if current_team_names is None:
-        return
-    allowed = set(current_team_names)
-
-    sp = salesperson
-    team_name_val = (getattr(sp, "team_name", None) or "").strip() if sp else ""
-    team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
-
-    if not team_names_val and team_name_val:
-        team_names_val = [team_name_val]
-
-    if not team_names_val:
-        raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
-
-    if not (set(team_names_val) & allowed):
-        raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
-
-
-def _pick_manager_id_from_salesperson(sp: Optional[User]) -> Optional[int]:
-    if not sp:
-        return None
-    for key in ("manager_id", "leader_id", "supervisor_id", "parent_id"):
-        try:
-            v = getattr(sp, key, None)
-        except Exception:
-            v = None
-        if v is None:
-            continue
-        try:
-            iv = int(v)
-            if iv > 0:
-                return iv
-        except Exception:
-            continue
-    return None
-
-
-def _pick_manager_name_inline(sp: Optional[User]) -> Optional[str]:
-    if not sp:
-        return None
-    for key in ("manager_name", "leader_name", "supervisor_name", "parent_name"):
-        try:
-            v = getattr(sp, key, None)
-        except Exception:
-            v = None
-        s = str(v or "").strip()
-        if s:
-            return s
-    return None
 
 
 async def _load_finance_order_out(
@@ -789,7 +540,7 @@ async def _load_finance_order_out(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be viewed in finance")
 
-    await _salesperson_in_current_teams_or_403(
+    await _ac_salesperson_in_current_teams_or_403(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=current_team_names,
     )
@@ -843,14 +594,13 @@ async def finance_orders_summary(
     market: Optional[str] = Query(None, description="市场（模糊）"),
     owner_name: Optional[str] = Query(None, description="车主（模糊）"),
     insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
-    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
+    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数名，字段口径仅 dl_register_date）"),
     first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
     team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
-    # ✅ 新增：搜索栏常用字段
     salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
     plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
     vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
@@ -863,8 +613,8 @@ async def finance_orders_summary(
     _current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
-    effective_team_names = _effective_team_filter_for_query(
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=user_team_names)
+    effective_team_names = _ac_effective_team_filter_for_query(
         role_name=role_name,
         current_team_names=current_team_names,
         team_name=team_name,
@@ -879,7 +629,6 @@ async def finance_orders_summary(
             func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
             func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
             func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("noncar_amount"),
-            # ✅ 与列表/导出口径统一：应收=channel_total，应付=customer_total
             func.coalesce(func.sum(OrderInfo.channel_total), 0).label("receivable"),
             func.coalesce(func.sum(OrderInfo.customer_total), 0).label("payable"),
             func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
@@ -892,7 +641,7 @@ async def finance_orders_summary(
     )
 
     if effective_team_names is not None:
-        clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
+        clauses.append(_ac_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -933,30 +682,28 @@ async def finance_orders_summary(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
+        _add_json_fuzzy_any(clauses, ["dl_owner"], owner_name)
 
-    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+        _add_json_fuzzy_any(clauses, ["dl_plate_no"], plate_no)
     if (vin or "").strip():
-        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+        _add_json_fuzzy_any(clauses, ["dl_vin"], vin)
     if (engine_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+        _add_json_fuzzy_any(clauses, ["dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
             clauses,
-            keys=["dl_register_date", "register_date", "first_register_date"],
+            keys=["dl_register_date"],
             start_ymd=first_register_date_start,
             end_ymd=first_register_date_end,
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
         _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
@@ -996,14 +743,13 @@ async def list_finance_orders(
     market: Optional[str] = Query(None, description="市场（模糊）"),
     owner_name: Optional[str] = Query(None, description="车主（模糊）"),
     insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
-    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
+    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数名，字段口径仅 dl_register_date）"),
     first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
     team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
-    # ✅ 新增：搜索栏常用字段
     salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
     plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
     vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
@@ -1016,8 +762,8 @@ async def list_finance_orders(
     _current_user, role_name, user_team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
-    effective_team_names = _effective_team_filter_for_query(
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=user_team_names)
+    effective_team_names = _ac_effective_team_filter_for_query(
         role_name=role_name,
         current_team_names=current_team_names,
         team_name=team_name,
@@ -1039,7 +785,7 @@ async def list_finance_orders(
     clauses: list = []
 
     if effective_team_names is not None:
-        clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
+        clauses.append(_ac_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -1081,30 +827,28 @@ async def list_finance_orders(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
+        _add_json_fuzzy_any(clauses, ["dl_owner"], owner_name)
 
-    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+        _add_json_fuzzy_any(clauses, ["dl_plate_no"], plate_no)
     if (vin or "").strip():
-        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+        _add_json_fuzzy_any(clauses, ["dl_vin"], vin)
     if (engine_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+        _add_json_fuzzy_any(clauses, ["dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
             clauses,
-            keys=["dl_register_date", "register_date", "first_register_date"],
+            keys=["dl_register_date"],
             start_ymd=first_register_date_start,
             end_ymd=first_register_date_end,
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
         _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
@@ -1132,7 +876,7 @@ async def list_finance_orders(
         if not sp:
             continue
 
-        mid = _pick_manager_id_from_salesperson(sp)
+        mid = _ac_pick_manager_id_from_salesperson(sp)
         if mid:
             salesperson_to_manager_id[int(getattr(sp, "id", 0) or 0)] = mid
             manager_ids.add(mid)
@@ -1151,56 +895,44 @@ async def list_finance_orders(
 
         dd = getattr(o, "dynamic_data", None) or {}
 
-        plate_no_val = (dd.get("dl_plate_no") or dd.get("plate_no") or "") if isinstance(dd, dict) else ""
-        vin_val = (dd.get("vin") or dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
-        engine_no_val = (dd.get("engine_no") or dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
+        plate_no_val = (dd.get("dl_plate_no") or "") if isinstance(dd, dict) else ""
+        vin_val = (dd.get("dl_vin") or "") if isinstance(dd, dict) else ""
+        engine_no_val = (dd.get("dl_engine_no") or "") if isinstance(dd, dict) else ""
+        vehicle_model_val = (dd.get("dl_vehicle_model") or "") if isinstance(dd, dict) else ""
 
-        vehicle_model_val = ""
-        if isinstance(dd, dict):
-            vehicle_model_val = (
-                dd.get("vehicle_model")
-                or dd.get("dl_brand_model")
-                or dd.get("dl_vehicle_model")
-                or ""
-            )
-
-        raw_id_number = dd.get("id_number") if isinstance(dd, dict) else ""
-        if raw_id_number is None and isinstance(dd, dict):
-            raw_id_number = dd.get("dl_id_number")
+        raw_id_number = dd.get("dl_id_number") if isinstance(dd, dict) else ""
         id_number_val = (str(raw_id_number).strip() if raw_id_number is not None else "")
 
         owner = ""
         if isinstance(dd, dict):
-            owner = str(dd.get("id_name") or dd.get("dl_owner") or "").strip()
+            owner = str(dd.get("dl_owner") or "").strip()
 
-        # ✅ 修复：初登日期展示与筛选/导出一致，按多个key兜底
         first_register_val = ""
         if isinstance(dd, dict):
-            first_register_val = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
+            first_register_val = _extract_dd(dd, "dl_register_date")
 
         team_name_val = None
         team_names_val: List[str] = []
         if sp:
-            team_name_val = (getattr(sp, "team_name", None) or None)
-            team_names_val = _split_team_names_any(getattr(sp, "team_names", None))
+            team_name_val = getattr(sp, "team_name", None) or None
+            team_names_val = _ac_split_team_names_any(getattr(sp, "team_names", None))
             if not team_names_val and team_name_val:
                 team_names_val = [str(team_name_val).strip()] if str(team_name_val).strip() else []
 
         manager_id_val = None
         manager_name_val = None
         if sp:
-            inline_name = _pick_manager_name_inline(sp)
+            inline_name = _ac_pick_manager_name_inline(sp)
             if inline_name:
                 manager_name_val = inline_name
 
             sp_id_int = int(getattr(sp, "id", 0) or 0)
-            mid = salesperson_to_manager_id.get(sp_id_int) or _pick_manager_id_from_salesperson(sp)
+            mid = salesperson_to_manager_id.get(sp_id_int) or _ac_pick_manager_id_from_salesperson(sp)
             if mid:
                 manager_id_val = int(mid)
                 if not manager_name_val:
                     manager_name_val = _user_display_name(managers_by_id.get(int(mid)))
 
-        # ✅ 新增：订单备注（order_info.remark），仅用于列表/详情展示；导出不包含
         remark_val = None
         if info is not None:
             rv = getattr(info, "remark", None)
@@ -1210,7 +942,7 @@ async def list_finance_orders(
         items.append(
             FinanceOrderOut(
                 id=int(o.id),
-                col_01_date=_fmt_dt(getattr(o, "created_at", None)),
+                col_01_date=_fmt_date_only(getattr(o, "created_at", None)),
                 col_02_channel=_group_code_name(ch),
                 col_03_customer=_group_code_name(cg),
                 col_04_market=getattr(cg, "market", None) if cg else None,
@@ -1235,22 +967,31 @@ async def list_finance_orders(
                 col_15_compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)) if info else None,
                 col_16_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)) if info else None,
                 col_17_noncar_amount=_to_float(getattr(info, "non_vehicle_amount", None)) if info else None,
+
                 col_18_ch_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)) if info else None,
-                col_19_ch_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)) if info else None,
-                col_20_ch_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)) if info else None,
-                col_21_ch_noncar_point=_to_float(getattr(info, "channel_non_vehicle_point", None)) if info else None,
-                col_22_cu_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)) if info else None,
-                col_23_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
-                col_24_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
-                col_25_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
-                col_26_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
-                col_27_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
-                col_28_profit=_to_float(getattr(info, "profit", None)) if info else None,
-                col_29_is_paid=bool(getattr(o, "is_paid", False)),
-                col_30_is_rebate=bool(getattr(o, "is_rebate", False)),
-                col_31_channel_reward=_to_float(getattr(info, "channel_reward", None)) if info else None,
-                col_32_customer_reward=_to_float(getattr(info, "customer_reward", None)) if info else None,
-                # ✅ 新增：备注（列表展示）
+                col_19_ch_commercial_supplement_point=_to_float(
+                    getattr(info, "channel_commercial_supplement_point", None)
+                ) if info else None,
+                col_20_ch_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)) if info else None,
+                col_21_ch_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)) if info else None,
+                col_22_ch_noncar_point=_to_float(getattr(info, "channel_non_vehicle_point", None)) if info else None,
+
+                col_23_cu_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)) if info else None,
+                col_24_cu_commercial_supplement_point=_to_float(
+                    getattr(info, "customer_commercial_supplement_point", None)
+                ) if info else None,
+                col_25_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
+                col_26_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
+                col_27_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
+
+                col_28_receivable=_to_float(getattr(info, "channel_total", None)) if info else None,
+                col_29_payable=_to_float(getattr(info, "customer_total", None)) if info else None,
+                col_30_profit=_to_float(getattr(info, "profit", None)) if info else None,
+                col_31_is_paid=bool(getattr(o, "is_paid", False)),
+                col_32_is_rebate=bool(getattr(o, "is_rebate", False)),
+                col_33_channel_reward=_to_float(getattr(info, "channel_reward", None)) if info else None,
+                col_34_customer_reward=_to_float(getattr(info, "customer_reward", None)) if info else None,
+
                 remark=remark_val,
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
@@ -1260,7 +1001,7 @@ async def list_finance_orders(
                 manager_name=manager_name_val,
                 team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
                 team_names=team_names_val,
-                dynamic_data=dd,
+                dynamic_data=dd if isinstance(dd, dict) else {},
                 created_at=_fmt_dt(getattr(o, "created_at", None)),
                 updated_at=_fmt_dt(getattr(o, "updated_at", None)),
             )
@@ -1328,7 +1069,6 @@ def _now_shanghai_stamp() -> str:
         return datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 
-# ✅ 关键修复：静态路由 /orders/export 必须在动态路由 /orders/{order_id:int} 之前
 @router.get("/orders/export")
 async def finance_orders_export(
     order_id: Optional[int] = Query(None, description="精确订单ID"),
@@ -1340,14 +1080,13 @@ async def finance_orders_export(
     market: Optional[str] = Query(None, description="市场（模糊）"),
     owner_name: Optional[str] = Query(None, description="车主（模糊）"),
     insurance_expire_date: Optional[str] = Query(None, description="保险到期日 YYYY-MM-DD"),
-    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数：模糊/单日）"),
+    first_register_date: Optional[str] = Query(None, description="初登日期 YYYY-MM-DD（兼容旧参数名，字段口径仅 dl_register_date）"),
     first_register_date_start: Optional[str] = Query(None, description="初登日期起 YYYY-MM-DD（包含）"),
     first_register_date_end: Optional[str] = Query(None, description="初登日期止 YYYY-MM-DD（包含）"),
     is_paid: Optional[bool] = Query(None, description="是否回款"),
     is_rebate: Optional[bool] = Query(None, description="是否返点"),
     team_name: Optional[str] = Query(None, description="按团队筛选"),
     team_names: Optional[Tuple[str, ...]] = Query(None, description="按多团队筛选（可重复 team_names=xxx）"),
-    # ✅ 新增：搜索栏常用字段
     salesperson_id: Optional[int] = Query(None, description="业务员ID（精确）"),
     plate_no: Optional[str] = Query(None, description="车牌号（模糊）"),
     vin: Optional[str] = Query(None, description="车架号VIN（模糊）"),
@@ -1361,19 +1100,18 @@ async def finance_orders_export(
     _ensure_finance_access(role_name)
     _ensure_finance_export_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=user_team_names)
-    effective_team_names = _effective_team_filter_for_query(
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=user_team_names)
+    effective_team_names = _ac_effective_team_filter_for_query(
         role_name=role_name,
         current_team_names=current_team_names,
         team_name=team_name,
         team_names=team_names,
     )
 
-    # ✅ 不带任何参数时：导出全部“已完成订单”（再叠加 team 权限约束）
     clauses: list = [Order.is_finished.is_(True)]
 
     if effective_team_names is not None:
-        clauses.append(_order_salesperson_in_teams_expr(effective_team_names))
+        clauses.append(_ac_order_salesperson_in_teams_expr(effective_team_names))
 
     if order_id is not None:
         clauses.append(Order.id == int(order_id))
@@ -1416,30 +1154,28 @@ async def finance_orders_export(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_name", "dl_owner"], owner_name)
+        _add_json_fuzzy_any(clauses, ["dl_owner"], owner_name)
 
-    # ✅ 新增：搜索栏字段（dynamic_data 模糊）
     if (plate_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["dl_plate_no", "plate_no"], plate_no)
+        _add_json_fuzzy_any(clauses, ["dl_plate_no"], plate_no)
     if (vin or "").strip():
-        _add_json_fuzzy_any(clauses, ["vin", "dl_vin"], vin)
+        _add_json_fuzzy_any(clauses, ["dl_vin"], vin)
     if (engine_no or "").strip():
-        _add_json_fuzzy_any(clauses, ["engine_no", "dl_engine_no"], engine_no)
+        _add_json_fuzzy_any(clauses, ["dl_engine_no"], engine_no)
     if (id_number or "").strip():
-        _add_json_fuzzy_any(clauses, ["id_number", "dl_id_number"], id_number)
+        _add_json_fuzzy_any(clauses, ["dl_id_number"], id_number)
     if (vehicle_model or "").strip():
-        _add_json_fuzzy_any(clauses, ["vehicle_model", "dl_brand_model", "dl_vehicle_model"], vehicle_model)
+        _add_json_fuzzy_any(clauses, ["dl_vehicle_model"], vehicle_model)
 
     if first_register_date_start or first_register_date_end:
         _add_json_date_range_any(
             clauses,
-            keys=["dl_register_date", "register_date", "first_register_date"],
+            keys=["dl_register_date"],
             start_ymd=first_register_date_start,
             end_ymd=first_register_date_end,
             err_prefix="first_register_date",
         )
     elif (first_register_date or "").strip():
-        # ✅ 修复：旧兼容单值筛选必须按 OR 组合，不能拆成多个 AND
         _add_first_register_date_legacy_filter(clauses, first_register_date)
 
     if (insurance_expire_date or "").strip():
@@ -1483,7 +1219,6 @@ async def finance_orders_export(
         "应收",
         "应付",
         "利润",
-        # ✅ 调整：所属团队在所属经理前
         "所属团队",
         "所属经理",
         "是否回款",
@@ -1538,7 +1273,7 @@ async def finance_orders_export(
                 sp = getattr(o, "salesperson", None)
                 if not sp:
                     continue
-                mid = _pick_manager_id_from_salesperson(sp)
+                mid = _ac_pick_manager_id_from_salesperson(sp)
                 if mid:
                     sid = int(getattr(sp, "id", 0) or 0)
                     if sid > 0:
@@ -1562,20 +1297,19 @@ async def finance_orders_export(
                 dd = getattr(o, "dynamic_data", None) or {}
                 dd = dd if isinstance(dd, dict) else {}
 
-                # ✅ 修复1：日期只要 YYYY-MM-DD
                 created_at = _fmt_date_only(getattr(o, "created_at", None)) or "-"
                 channel_name = _group_code_name(ch) or "-"
                 customer_name = _group_code_name(cg) or "-"
                 market_val = (getattr(cg, "market", None) if cg else None) or "-"
                 salesperson_name = _user_display_name(sp) or "-"
 
-                owner = _extract_dd(dd, "id_name", "dl_owner")
-                plate = _extract_dd(dd, "dl_plate_no", "plate_no")
-                vin_val = _extract_dd(dd, "vin", "dl_vin")
-                engine_no_val = _extract_dd(dd, "engine_no", "dl_engine_no")
-                vehicle_model_val = _extract_dd(dd, "vehicle_model", "dl_brand_model", "dl_vehicle_model")
-                first_register = _extract_dd(dd, "dl_register_date", "register_date", "first_register_date")
-                id_number_val = _extract_dd(dd, "id_number", "dl_id_number")
+                owner = _extract_dd(dd, "dl_owner")
+                plate = _extract_dd(dd, "dl_plate_no")
+                vin_val = _extract_dd(dd, "dl_vin")
+                engine_no_val = _extract_dd(dd, "dl_engine_no")
+                vehicle_model_val = _extract_dd(dd, "dl_vehicle_model")
+                first_register = _extract_dd(dd, "dl_register_date")
+                id_number_val = _extract_dd(dd, "dl_id_number")
                 phone = str(getattr(info, "owner_phone", None) or "").strip()
 
                 insurance_expire = "-"
@@ -1604,24 +1338,22 @@ async def finance_orders_export(
                 cu_nc_p = _fmt_point_export(getattr(info, "customer_non_vehicle_point", None) if info else None)
                 cu_reward = _fmt_money_export(getattr(info, "customer_reward", None) if info else None)
 
-                # ✅ 修复2：导出口径与列表一致：应收=channel_total，应付=customer_total
                 receivable = _fmt_money_export(getattr(info, "channel_total", None) if info else None)
                 payable = _fmt_money_export(getattr(info, "customer_total", None) if info else None)
-
                 profit = _fmt_money_export(getattr(info, "profit", None) if info else None)
 
                 manager_name = "-"
                 if sp:
-                    inline_name = _pick_manager_name_inline(sp)
+                    inline_name = _ac_pick_manager_name_inline(sp)
                     if inline_name:
                         manager_name = inline_name
                     else:
                         sid = int(getattr(sp, "id", 0) or 0)
-                        mid = salesperson_to_manager_id.get(sid) or _pick_manager_id_from_salesperson(sp)
+                        mid = salesperson_to_manager_id.get(sid) or _ac_pick_manager_id_from_salesperson(sp)
                         if mid:
                             manager_name = _user_display_name(managers_by_id.get(int(mid))) or "-"
 
-                team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
+                team_names_val = _ac_split_team_names_any(getattr(sp, "team_names", None)) if sp else []
                 team_name_val = str(getattr(sp, "team_name", None) or "").strip() if sp else ""
                 team_display = _join_teams_export(team_names_val, team_name_val or None)
 
@@ -1662,14 +1394,12 @@ async def finance_orders_export(
                     receivable,
                     payable,
                     profit,
-                    # ✅ 调整：团队在经理前
                     team_display,
                     manager_name,
                     paid,
                     rebate,
                 ]
 
-                # ✅ Excel 文本保护列（避免科学计数/去前导0）
                 text_cols = {6, 8, 9, 11, 12, 13}
 
                 tds = []
@@ -1695,7 +1425,6 @@ async def finance_orders_export(
     )
 
 
-# ✅ 加固：仅匹配整数，避免 /orders/export 这类静态路径被吞
 @router.get("/orders/{order_id:int}", response_model=OrderOut)
 async def get_finance_order_detail(
     order_id: int,
@@ -1704,7 +1433,7 @@ async def get_finance_order_detail(
 ):
     _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    tns = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
     return await _load_finance_order_out(db, order_id, current_team_names=tns)
 
 
@@ -1718,7 +1447,7 @@ async def update_finance_order_status(
     _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     _ensure_finance_write_access(role_name)
-    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    tns = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     o = (
         await db.execute(
@@ -1733,7 +1462,7 @@ async def update_finance_order_status(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
-    await _salesperson_in_current_teams_or_403(
+    await _ac_salesperson_in_current_teams_or_403(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=tns,
     )
@@ -1756,7 +1485,7 @@ async def return_finance_order_to_unfinished(
     _current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
     _ensure_finance_write_access(role_name)
-    tns = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    tns = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     o = (
         await db.execute(
@@ -1771,7 +1500,7 @@ async def return_finance_order_to_unfinished(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Order is already unfinished")
 
-    await _salesperson_in_current_teams_or_403(
+    await _ac_salesperson_in_current_teams_or_403(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=tns,
     )
@@ -1882,7 +1611,7 @@ async def _ensure_order_finished_for_finance(
     if not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
-    await _salesperson_in_current_teams_or_403(
+    await _ac_salesperson_in_current_teams_or_403(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=current_team_names,
     )
@@ -1903,7 +1632,7 @@ async def finance_bos_upload_proxy(
     _ensure_finance_access(role_name)
     _ensure_finance_write_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     if not storage.enabled:
         raise HTTPException(status_code=400, detail="BOS 未启用（BOS_ENABLED=false）")
@@ -2071,7 +1800,7 @@ async def finance_finalize_images(
     _ensure_finance_access(role_name)
     _ensure_finance_write_access(role_name)
 
-    current_team_names = _current_team_names_or_403(role_name=role_name, team_names=team_names)
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
 
     order_id = int(payload.order_id)
     _ = await _ensure_order_finished_for_finance(db, order_id, current_team_names=current_team_names)
@@ -2163,7 +1892,6 @@ async def finance_finalize_images(
 
 
 # === ACL shared overrides ===
-# 统一权限/团队阀门逻辑收敛到 app.core.access_control，以下别名覆盖历史同名局部实现。
 _split_team_names_any = _ac_split_team_names_any
 _pick_manager_id_from_salesperson = _ac_pick_manager_id_from_salesperson
 _pick_manager_name_inline = _ac_pick_manager_name_inline
