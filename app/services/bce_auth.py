@@ -16,6 +16,13 @@ def uri_encode(s: str, *, encode_slash: bool = True) -> str:
 
 
 def canonical_query(params: Dict[str, Any]) -> str:
+    """
+    BCE canonical query（与线上稳定版本一致）：
+    - key/value 都要 RFC3986 编码
+    - 排序
+    - 跳过 authorization
+    - 空值参数仍然必须表现为 `k=`（不能省略 `=`），否则与实际请求 querystring 不一致导致签名不匹配
+    """
     if not params:
         return ""
     items = []
@@ -68,6 +75,10 @@ def sign_bce_auth_v1(
 ) -> str:
     """
     生成 bce-auth-v1 签名字符串（可用于 Header Authorization 或 QueryString authorization）
+
+    ⚠️ 这里保持与已验证可用版本一致：
+    - signing_key 使用 HMAC(...).hexdigest() 的十六进制字符串，再作为二次 HMAC 的 key（bytes）
+    - 不做“优化式改写”，避免线上签名行为漂移
     """
     auth_string_prefix = f"bce-auth-v1/{access_key_id}/{timestamp}/{int(auth_expire_seconds)}"
 
