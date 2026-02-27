@@ -126,7 +126,7 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
     id_valid_to = _normalize_ymd(g("失效日期")) or g("失效日期")
 
     out: Dict[str, Any] = {
-        # 新口径
+        # ===== 标准字段 =====
         "id_name": id_name,
         "id_number": id_number,
         "id_address": id_address,
@@ -135,7 +135,12 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
         "id_ethnicity": id_ethnicity,
         "id_issuer": id_issuer,
         "id_validity": id_validity,
-        # 兼容 slot_field_config 历史 key（避免详情卡槽空值）
+
+        # ===== 财务口径（严格：接口只读 dl_*，这里同步镜像写入，避免新增数据再脏）=====
+        # 仅在 _merge_if_empty 中目标为空时才会写入，不覆盖已有 dl_id_number
+        "dl_id_number": id_number,
+
+        # ===== 兼容 slot_field_config 历史 key（用于详情卡槽展示）=====
         "id_nation": id_ethnicity,
         "id_birth": id_birth_date,
         "id_issue_authority": id_issuer,
@@ -199,13 +204,24 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
     def g(name: str) -> str:
         return _safe_str(wr.get(name))
 
+    vehicle_model = g("CarModel") or g("VehicleModel")
+    vin = g("VinNo") or g("VIN")
+    engine_no = g("EngineNo")
+
     out: Dict[str, Any] = {
-        "vehicle_model": g("CarModel") or g("VehicleModel"),
-        "vin": g("VinNo") or g("VIN"),
-        "engine_no": g("EngineNo"),
+        # ===== 合格证标准字段 =====
+        "vehicle_model": vehicle_model,
+        "vin": vin,
+        "engine_no": engine_no,
         "approved_passenger_count": g("SeatingCapacity") or g("LimitPassenger"),
         "vehicle_brand_name": g("CarBrand") or g("BrandModel"),
         "manufacturer_name": g("Manufacturer"),
+
+        # ===== 财务口径（严格：接口只读 dl_*，这里同步镜像写入，避免新增数据再脏）=====
+        # 不写 dl_register_date：合格证不保证提供“行驶证注册日期/初登日期”的等价证据
+        "dl_vehicle_model": vehicle_model,
+        "dl_vin": vin,
+        "dl_engine_no": engine_no,
     }
     return {k: v for k, v in out.items() if v}
 

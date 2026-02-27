@@ -62,6 +62,7 @@ from app.schemas.order import (
     OrderInfoOut,
 )
 from app.services.storage import StorageService
+from app.services.order_detail_builder import load_order_detail_blocks
 from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -348,272 +349,6 @@ def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
     if not info:
         return None
     return OrderInfoOut.from_orm(info)
-
-
-def _slot_title(slot_key: str) -> str:
-    return get_slot_title(slot_key)
-
-
-def _to_json_value(v: Any) -> Any:
-    if isinstance(v, Decimal):
-        return float(v)
-    if isinstance(v, datetime):
-        return v.strftime("%Y-%m-%d %H:%M:%S")
-    return v
-
-
-def _fmt_dt(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    if isinstance(v, datetime):
-        return v.strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        return str(v)
-    except Exception:
-        return None
-
-
-def _field_item(key: str, label: str, value: Any) -> Dict[str, Any]:
-    return {"key": str(key), "label": str(label), "value": _to_json_value(value)}
-
-
-def _build_images_by_slot(order_images: List[OrderImage]) -> Dict[str, List[Dict[str, Any]]]:
-    by_slot: Dict[str, List[Dict[str, Any]]] = {}
-    for oi in (order_images or []):
-        sk = str(getattr(oi, "slot_key", "") or "").strip() or "unknown"
-        imf = getattr(oi, "image_file", None)
-        row = {
-            "id": int(getattr(oi, "id", 0) or 0) if getattr(oi, "id", None) is not None else None,
-            "slot_key": sk,
-            "storage_key": getattr(oi, "storage_key", None),
-            "image_url": getattr(oi, "image_url", None) or getattr(imf, "url", None),
-            "image_file_id": int(getattr(oi, "image_file_id", 0) or 0)
-            if getattr(oi, "image_file_id", None) is not None
-            else None,
-            "created_at": _fmt_dt(getattr(oi, "created_at", None)),
-            "image_file": None,
-        }
-        if imf:
-            row["image_file"] = {
-                "id": int(getattr(imf, "id", 0) or 0) if getattr(imf, "id", None) is not None else None,
-                "sha256": getattr(imf, "sha256", None),
-                "storage_key": getattr(imf, "storage_key", None),
-                "original_name": getattr(imf, "original_name", None),
-                "content_type": getattr(imf, "content_type", None),
-                "url": getattr(imf, "url", None),
-                "size": int(getattr(imf, "size", 0) or 0) if getattr(imf, "size", None) is not None else None,
-                "created_at": _fmt_dt(getattr(imf, "created_at", None)),
-                "updated_at": _fmt_dt(getattr(imf, "updated_at", None)),
-            }
-        by_slot.setdefault(sk, []).append(row)
-
-    for k, arr in by_slot.items():
-        by_slot[k] = sorted(arr, key=lambda x: (x.get("id") is None, x.get("id") or 0))
-    return by_slot
-
-
-def _slot_fields_from_dynamic(slot_key: str, dynamic_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    d = dynamic_data or {}
-    defs = get_slot_field_defs(slot_key)
-
-    out: List[Dict[str, Any]] = []
-    for f in defs:
-        source_key = str(f.get("source_key") or "").strip()
-        if not source_key:
-            continue
-        key = str(f.get("key") or source_key)
-        label = str(f.get("label") or key)
-        out.append(_field_item(key, label, d.get(source_key)))
-    return out
-
-
-def _build_order_detail_sections(
-    o: Order, *, manager_id_val: Optional[int], manager_name_val: Optional[str]
-) -> Dict[str, Any]:
-    cg = getattr(o, "customer_group", None)
-    chg = getattr(o, "channel_group", None)
-    sp = getattr(o, "salesperson", None)
-    info = getattr(o, "order_info", None)
-    dyn = getattr(o, "dynamic_data", None) or {}
-
-    team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
-    team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
-    if not team_names_val and team_name_val and str(team_name_val).strip():
-        team_names_val = [str(team_name_val).strip()]
-
-    ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
-    images_by_slot = _build_images_by_slot(getattr(o, "images", None) or [])
-
-    channel_fields: List[Dict[str, Any]] = [
-        _field_item("channel_group_id", "渠道组ID", getattr(o, "channel_group_id", None)),
-        _field_item("channel_group_name", "渠道组", _group_code_name(chg)),
-    ]
-    if chg is not None:
-        if hasattr(chg, "channel_code"):
-            channel_fields.append(_field_item("channel_code", "渠道编码", getattr(chg, "channel_code", None)))
-        if hasattr(chg, "channel_name"):
-            channel_fields.append(_field_item("channel_name", "渠道名称", getattr(chg, "channel_name", None)))
-
-    customer_fields: List[Dict[str, Any]] = [
-        _field_item("customer_group_id", "客户组ID", getattr(o, "customer_group_id", None)),
-        _field_item("customer_group_name", "客户组", _group_code_name(cg)),
-        _field_item("customer_group_market", "客户渠道市场", getattr(cg, "market", None) if cg else None),
-        _field_item("salesperson_id", "业务员ID", getattr(o, "salesperson_id", None)),
-        _field_item("salesperson_name", "业务员", _user_display_name(sp)),
-        _field_item("manager_id", "经理ID", manager_id_val),
-        _field_item("manager_name", "经理", manager_name_val),
-        _field_item(
-            "team_name",
-            "团队",
-            (str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
-        ),
-        _field_item("team_names", "团队列表", team_names_val),
-    ]
-    if cg is not None:
-        if hasattr(cg, "customer_code"):
-            customer_fields.append(_field_item("customer_code", "客户编码", getattr(cg, "customer_code", None)))
-        if hasattr(cg, "customer_name"):
-            customer_fields.append(_field_item("customer_name", "客户名称", getattr(cg, "customer_name", None)))
-
-    order_fields: List[Dict[str, Any]] = [
-        _field_item("id", "订单ID", getattr(o, "id", None)),
-        _field_item("created_by", "创建人ID", getattr(o, "created_by", None)),
-        _field_item("is_finished", "已完成", bool(getattr(o, "is_finished", False))),
-        _field_item("is_rebate", "已返点", bool(getattr(o, "is_rebate", False))),
-        _field_item("is_paid", "已回款", bool(getattr(o, "is_paid", False))),
-        _field_item("created_at", "创建时间", _fmt_dt(getattr(o, "created_at", None))),
-        _field_item("updated_at", "更新时间", _fmt_dt(getattr(o, "updated_at", None))),
-    ]
-
-    if info is not None:
-        order_info_keys = [
-            ("insurance_expire_date", "保险到期日"),
-            ("owner_phone", "车主电话"),
-            ("remark", "订单备注"),
-            ("commercial_amount", "商业险保费"),
-            ("commercial_after_amount", "商业险折后保费"),
-            ("compulsory_amount", "交强险保费"),
-            ("vehicle_tax_amount", "车船税"),
-            ("non_vehicle_amount", "非车险保费"),
-            ("premium_total", "保费合计"),
-            ("channel_commercial_point", "渠道商业险点位"),
-            ("channel_commercial_supplement_point", "渠道商业险补充点位"),
-            ("channel_compulsory_point", "渠道交强险点位"),
-            ("channel_vehicle_tax_point", "渠道车船税点位"),
-            ("channel_non_vehicle_point", "渠道非车险点位"),
-            ("channel_reward", "渠道奖励"),
-            ("channel_total", "渠道应收"),
-            ("customer_commercial_point", "客户商业险点位"),
-            ("customer_commercial_supplement_point", "客户商业险补充点位"),
-            ("customer_compulsory_point", "客户交强险点位"),
-            ("customer_vehicle_tax_point", "客户车船税点位"),
-            ("customer_non_vehicle_point", "客户非车险点位"),
-            ("customer_reward", "客户奖励"),
-            ("customer_total", "客户应付"),
-            ("profit", "利润"),
-        ]
-        for k, label in order_info_keys:
-            if hasattr(info, k):
-                order_fields.append(_field_item(k, label, getattr(info, k, None)))
-
-    slot_sections: Dict[str, Any] = {}
-    ordered_slots = list(ORDERED_SLOT_KEYS)
-    for unknown_sk in images_by_slot.keys():
-        if unknown_sk not in ordered_slots:
-            ordered_slots.append(unknown_sk)
-
-    for sk in ordered_slots:
-        slot_sections[sk] = {
-            "slot_key": sk,
-            "title": _slot_title(sk),
-            "fields": _slot_fields_from_dynamic(sk, dyn),
-            "images": images_by_slot.get(sk, []),
-        }
-
-    return {
-        "channel": {"key": "channel", "title": "渠道信息", "fields": channel_fields, "images": []},
-        "customer": {"key": "customer", "title": "客户信息", "fields": customer_fields, "images": []},
-        "order_info": {"key": "order_info", "title": "订单信息", "fields": order_fields, "images": []},
-        "slots": slot_sections,
-    }
-
-
-async def _load_order_detail_blocks(
-    db: AsyncSession,
-    order_id: int,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-) -> Dict[str, Any]:
-    stmt = (
-        select(Order)
-        .where(Order.id == order_id)
-        .options(
-            selectinload(Order.creator),
-            selectinload(Order.salesperson),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
-        )
-    )
-    o = (await db.execute(stmt)).scalars().first()
-    if not o:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    await _ensure_order_read_acl_by_salesperson_id(
-        db,
-        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
-        current_user=current_user,
-        role_name=role_name,
-        team_names=team_names,
-    )
-
-    sp = getattr(o, "salesperson", None)
-    manager_id_val = None
-    manager_name_val = None
-    if sp:
-        manager_name_val = _pick_manager_name_inline(sp)
-        mid = _pick_manager_id_from_salesperson(sp)
-        if mid:
-            manager_id_val = int(mid)
-            if not manager_name_val:
-                mgr = (await db.execute(select(User).where(User.id == int(mid)))).scalars().first()
-                manager_name_val = _user_display_name(mgr)
-
-    sections = _build_order_detail_sections(o, manager_id_val=manager_id_val, manager_name_val=manager_name_val)
-
-    team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
-    team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
-    if not team_names_val and team_name_val and str(team_name_val).strip():
-        team_names_val = [str(team_name_val).strip()]
-
-    cg = getattr(o, "customer_group", None)
-
-    return {
-        "id": int(getattr(o, "id", 0) or 0),
-        "base": {
-            "created_by": getattr(o, "created_by", None),
-            "salesperson_id": getattr(o, "salesperson_id", None),
-            "salesperson_name": _user_display_name(sp),
-            "customer_group_id": getattr(o, "customer_group_id", None),
-            "channel_group_id": getattr(o, "channel_group_id", None),
-            "customer_group_name": _group_code_name(cg),
-            "channel_group_name": _group_code_name(getattr(o, "channel_group", None)),
-            "customer_group_market": getattr(cg, "market", None) if cg else None,
-            "manager_id": manager_id_val,
-            "manager_name": manager_name_val,
-            "team_name": (str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
-            "team_names": team_names_val,
-            "is_finished": bool(getattr(o, "is_finished", False)),
-            "is_rebate": bool(getattr(o, "is_rebate", False)),
-            "is_paid": bool(getattr(o, "is_paid", False)),
-            "created_at": _fmt_dt(getattr(o, "created_at", None)),
-            "updated_at": _fmt_dt(getattr(o, "updated_at", None)),
-        },
-        "sections": sections,
-    }
 
 
 async def _load_order_out(
@@ -1585,7 +1320,12 @@ async def finalize_order_upload(
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        _validate_storage_key_by_config(slot_key=slot_key, storage_key=storage_key, md5_hex=(im.md5 or "").strip(), require_md5=True)
+        _validate_storage_key_by_config(
+            slot_key=slot_key,
+            storage_key=storage_key,
+            md5_hex=(im.md5 or "").strip(),
+            require_md5=True,
+        )
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
         url = (im.url or "").strip()
@@ -1752,7 +1492,9 @@ async def ai_bind_order_images(
     for sk in touched_slots:
         if sk in MULTI_SLOTS:
             if sk in clear_slots:
-                await db.execute(delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk)))
+                await db.execute(
+                    delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk))
+                )
         else:
             await db.execute(delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk)))
 
@@ -1764,7 +1506,12 @@ async def ai_bind_order_images(
         storage_key = (im.storage_key or "").strip().lstrip("/")
         md5_hex = (im.md5 or "").strip().lower()
 
-        _validate_storage_key_by_config(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex, require_md5=getattr(storage, "enabled", False))
+        _validate_storage_key_by_config(
+            slot_key=slot_key,
+            storage_key=storage_key,
+            md5_hex=md5_hex,
+            require_md5=getattr(storage, "enabled", False),
+        )
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
         url = (im.url or "").strip()
@@ -1786,7 +1533,11 @@ async def ai_bind_order_images(
         )
 
         exists_stmt = select(OrderImage.id).where(
-            and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == slot_key, OrderImage.storage_key == storage_key)
+            and_(
+                OrderImage.order_id == int(order_id),
+                OrderImage.slot_key == slot_key,
+                OrderImage.storage_key == storage_key,
+            )
         )
         exists_id = (await db.execute(exists_stmt)).scalar_one_or_none()
         if exists_id:
@@ -1834,11 +1585,6 @@ async def ai_bind_order_images(
     return AiBindImagesOut(ok=True, order_id=int(order_id), bound_count=int(bound_count), ocr_task_id=ocr_task_id, ocr_status=ocr_status)
 
 
-# ======= 下面的 list/get/create/update/status 与你原文件一致（未为报价助手做无关改动） =======
-# （你之前已经贴过完整内容，我这里保持一致，不再额外引入兼容字段/猜结构）
-# 注意：此处开始就是你原本的 list_orders/get_order_detail/create_order/update_order_detail/update_order_status 逻辑
-# 为避免“我在这里手滑改到业务”，我直接沿用你贴过的原实现（这也是你要求的：只动报价助手闭环相关部分）。
-
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
     page: int = Query(1, ge=1),
@@ -1866,7 +1612,6 @@ async def list_orders(
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    # ✅ 这里完全沿用你贴过的原实现（与你上条“完整 orders.py”一致）
     current_user, role_name, team_names, _team_ids = user_with_role
     tns = _normalize_team_names(team_names)
 
@@ -2051,7 +1796,17 @@ async def get_order_detail(
 
     _ensure_orders_access(role_name)
     _require_team_for_non_super_admin(role_name, tns)
-    return await _load_order_detail_blocks(db, order_id, current_user=user, role_name=role_name, team_names=tns)
+
+    # ✅ 严谨同构：统一走共享详情构建器
+    return await load_order_detail_blocks(
+        db,
+        int(order_id),
+        current_user=user,
+        role_name=role_name,
+        team_names=tns,
+        storage=storage,
+        enforce_read_acl=True,
+    )
 
 
 @router.post("", response_model=OrderOut)
