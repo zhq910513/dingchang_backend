@@ -29,8 +29,8 @@ class Order(Base):
     status = Column(Integer, nullable=False, default=0)
     audit_status = Column(Integer, nullable=False, default=0)
 
-    dynamic_data = Column(JSON, nullable=False, default=dict)
-    ocr_raw_json = Column(JSON, nullable=False, default=dict)
+    dynamic_data = Column(JSON, nullable=False)
+    ocr_raw_json = Column(JSON, nullable=False)
 
     # ✅ 与接口层口径对齐：DB 存北京时间 naive DATETIME
     # - 不要 timezone=True，避免被 SQLAlchemy/driver 误做时区换算
