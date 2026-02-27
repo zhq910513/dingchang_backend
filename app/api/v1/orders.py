@@ -38,11 +38,6 @@ from app.core.access_control import (
 )
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET
 from app.core.db import get_db, engine
-from app.core.slot_field_config import (
-    ORDERED_SLOT_KEYS,
-    get_slot_field_defs,
-    get_slot_title,
-)
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
 from app.models.image_file import ImageFile
@@ -1204,7 +1199,6 @@ def _validate_storage_key_by_config(*, slot_key: str, storage_key: str, md5_hex:
             if not ok:
                 raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
             return
-        # storage enabled 且 require_md5=False 且 md5 为空：允许继续（极端兼容）
         return
 
     prefix_map = getattr(storage, "SLOT_PREFIX_MAP", {}) or {}
@@ -1320,12 +1314,7 @@ async def finalize_order_upload(
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        _validate_storage_key_by_config(
-            slot_key=slot_key,
-            storage_key=storage_key,
-            md5_hex=(im.md5 or "").strip(),
-            require_md5=True,
-        )
+        _validate_storage_key_by_config(slot_key=slot_key, storage_key=storage_key, md5_hex=(im.md5 or "").strip(), require_md5=True)
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
         url = (im.url or "").strip()
@@ -1347,24 +1336,21 @@ async def finalize_order_upload(
         )
 
         exists_stmt = select(OrderImage.id).where(
-            and_(
-                OrderImage.order_id == order_id,
-                OrderImage.slot_key == slot_key,
-                OrderImage.storage_key == storage_key,
-            )
+            and_(OrderImage.order_id == order_id, OrderImage.slot_key == slot_key, OrderImage.storage_key == storage_key)
         )
         exists_id = (await db.execute(exists_stmt)).scalar_one_or_none()
         if exists_id:
             continue
 
-        oi = OrderImage(
-            order_id=order_id,
-            slot_key=slot_key,
-            storage_key=storage_key,
-            image_url=url or "",
-            image_file_id=imf.id,
+        db.add(
+            OrderImage(
+                order_id=order_id,
+                slot_key=slot_key,
+                storage_key=storage_key,
+                image_url=url or "",
+                image_file_id=imf.id,
+            )
         )
-        db.add(oi)
 
     info = (await db.execute(select(OrderInfo).where(OrderInfo.order_id == order_id))).scalar_one_or_none()
     if not info:
@@ -1492,9 +1478,7 @@ async def ai_bind_order_images(
     for sk in touched_slots:
         if sk in MULTI_SLOTS:
             if sk in clear_slots:
-                await db.execute(
-                    delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk))
-                )
+                await db.execute(delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk)))
         else:
             await db.execute(delete(OrderImage).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == sk)))
 
@@ -1506,12 +1490,7 @@ async def ai_bind_order_images(
         storage_key = (im.storage_key or "").strip().lstrip("/")
         md5_hex = (im.md5 or "").strip().lower()
 
-        _validate_storage_key_by_config(
-            slot_key=slot_key,
-            storage_key=storage_key,
-            md5_hex=md5_hex,
-            require_md5=getattr(storage, "enabled", False),
-        )
+        _validate_storage_key_by_config(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex, require_md5=getattr(storage, "enabled", False))
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
         url = (im.url or "").strip()
@@ -1532,26 +1511,12 @@ async def ai_bind_order_images(
             md5=md5_hex,
         )
 
-        exists_stmt = select(OrderImage.id).where(
-            and_(
-                OrderImage.order_id == int(order_id),
-                OrderImage.slot_key == slot_key,
-                OrderImage.storage_key == storage_key,
-            )
-        )
+        exists_stmt = select(OrderImage.id).where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key == slot_key, OrderImage.storage_key == storage_key))
         exists_id = (await db.execute(exists_stmt)).scalar_one_or_none()
         if exists_id:
             continue
 
-        db.add(
-            OrderImage(
-                order_id=int(order_id),
-                slot_key=slot_key,
-                storage_key=storage_key,
-                image_url=url or "",
-                image_file_id=imf.id,
-            )
-        )
+        db.add(OrderImage(order_id=int(order_id), slot_key=slot_key, storage_key=storage_key, image_url=url or "", image_file_id=imf.id))
         bound_count += 1
 
     ocr_task_id: Optional[int] = None
@@ -1559,23 +1524,13 @@ async def ai_bind_order_images(
     if bool(getattr(payload, "trigger_ocr", True)) and has_ocr_images:
         try:
             async with db.begin_nested():
-                task = OcrTask(
-                    scope_type="order",
-                    scope_id=int(order_id),
-                    active_scope_id=int(order_id),
-                    status="pending",
-                    progress=0,
-                )
+                task = OcrTask(scope_type="order", scope_id=int(order_id), active_scope_id=int(order_id), status="pending", progress=0)
                 db.add(task)
                 await db.flush()
                 ocr_task_id = int(task.id)
                 ocr_status = str(task.status)
         except IntegrityError:
-            exist_stmt = (
-                select(OcrTask)
-                .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == int(order_id)))
-                .order_by(OcrTask.id.desc())
-            )
+            exist_stmt = select(OcrTask).where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == int(order_id))).order_by(OcrTask.id.desc())
             exist_task = (await db.execute(exist_stmt)).scalars().first()
             if exist_task:
                 ocr_task_id = int(exist_task.id)
@@ -1679,16 +1634,8 @@ async def list_orders(
     elif (first_register_date or "").strip():
         v = (first_register_date or "").strip()
         v2 = v.replace("-", "")
-        _add_json_fuzzy_any(
-            clauses,
-            keys=["dl_first_register_date", "dl_register_date", "register_date", "first_register_date"],
-            value=v,
-        )
-        _add_json_fuzzy_any(
-            clauses,
-            keys=["dl_first_register_date", "dl_register_date", "register_date", "first_register_date"],
-            value=v2,
-        )
+        _add_json_fuzzy_any(clauses, keys=["dl_first_register_date", "dl_register_date", "register_date", "first_register_date"], value=v)
+        _add_json_fuzzy_any(clauses, keys=["dl_first_register_date", "dl_register_date", "register_date", "first_register_date"], value=v2)
 
     _add_json_fuzzy_any(clauses, keys=["id_name", "dl_owner", "owner_name"], value=owner_name)
     _add_json_fuzzy_any(clauses, keys=["id_number", "dl_id_number"], value=id_number)
@@ -1797,7 +1744,6 @@ async def get_order_detail(
     _ensure_orders_access(role_name)
     _require_team_for_non_super_admin(role_name, tns)
 
-    # ✅ 严谨同构：统一走共享详情构建器
     return await load_order_detail_blocks(
         db,
         int(order_id),

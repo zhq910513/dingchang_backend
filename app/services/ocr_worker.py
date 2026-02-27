@@ -23,6 +23,7 @@ from app.models.ocr_image_cache import OcrImageCache
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.services.baidu_ocr import call_ocr, OcrNotConfigured
+from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
 from app.services.storage import StorageService
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,6 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
         "id_validity": id_validity,
 
         # ===== 财务口径（严格：接口只读 dl_*，这里同步镜像写入，避免新增数据再脏）=====
-        # 仅在 _merge_if_empty 中目标为空时才会写入，不覆盖已有 dl_id_number
         "dl_id_number": id_number,
 
         # ===== 兼容 slot_field_config 历史 key（用于详情卡槽展示）=====
@@ -158,7 +158,6 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         x = wr.get(name) or {}
         return _safe_str(x.get("words") if isinstance(x, dict) else x)
 
-    # 原始 OCR 字段（保留，便于审计追溯）
     dl_plate_no = g("号牌号码")
     dl_owner = g("所有人")
     dl_vin = g("车辆识别代号")
@@ -166,7 +165,7 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
     dl_vehicle_model = g("品牌型号")
     dl_vehicle_type = g("车辆类型")
     dl_use_nature = g("使用性质")
-    dl_register_date = _normalize_ymd(g("注册日期"))  # ✅ 初登日期来源
+    dl_register_date = _normalize_ymd(g("注册日期"))
     dl_issue_date = _normalize_ymd(g("发证日期"))
     dl_issuer_org = g("发证机关") or g("发证单位")
 
@@ -176,13 +175,11 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         "dl_owner": dl_owner,
         "dl_vin": dl_vin,
         "dl_engine_no": dl_engine_no,
-        # ✅ 统一新口径
         "dl_vehicle_model": dl_vehicle_model,
-        # ✅ 兼容旧脏/旧字段
         "dl_brand_model": dl_vehicle_model,
         "dl_vehicle_type": dl_vehicle_type,
         "dl_use_nature": dl_use_nature,
-        "dl_use性质": dl_use_nature,  # 兼容历史脏 key（当前 slot_field_config 在读它）
+        "dl_use性质": dl_use_nature,
         "dl_register_date": dl_register_date,
         "dl_issue_date": dl_issue_date,
         "dl_issuer_org": dl_issuer_org,
@@ -193,7 +190,7 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         "vin": dl_vin,
         "engine_no": dl_engine_no,
         "vehicle_model": dl_vehicle_model,
-        "first_register_date": dl_register_date,  # ✅ 初登日期 = 行驶证注册日期
+        "first_register_date": dl_register_date,
     }
     return {k: v for k, v in out.items() if v}
 
@@ -209,7 +206,6 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
     engine_no = g("EngineNo")
 
     out: Dict[str, Any] = {
-        # ===== 合格证标准字段 =====
         "vehicle_model": vehicle_model,
         "vin": vin,
         "engine_no": engine_no,
@@ -217,8 +213,7 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
         "vehicle_brand_name": g("CarBrand") or g("BrandModel"),
         "manufacturer_name": g("Manufacturer"),
 
-        # ===== 财务口径（严格：接口只读 dl_*，这里同步镜像写入，避免新增数据再脏）=====
-        # 不写 dl_register_date：合格证不保证提供“行驶证注册日期/初登日期”的等价证据
+        # 财务口径镜像
         "dl_vehicle_model": vehicle_model,
         "dl_vin": vin,
         "dl_engine_no": engine_no,
@@ -237,7 +232,6 @@ def _extract_by_type(api_type: str, resp: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_baidu_error(resp: Dict[str, Any]) -> bool:
-    # 百度常见：error_code 为数字或字符串，成功一般没有 error_code
     return isinstance(resp, dict) and resp.get("error_code") not in (None, "", 0, "0")
 
 
@@ -249,12 +243,6 @@ async def _set_task(
     progress: int,
     error_message: Optional[str] = None,
 ) -> None:
-    """
-    统一任务状态落库：
-    - progress 强制 0~100
-    - 终态自动清 active_scope_id + 写 finished_at
-    - 非终态清理 finished_at，避免脏状态残留
-    """
     task.status = str(status or "").strip() or "failed"
     task.progress = _clamp_progress(progress)
     task.error_message = error_message
@@ -299,11 +287,6 @@ async def _cache_put(
     provider: str,
     result: Dict[str, Any],
 ) -> None:
-    """
-    ✅ 并发安全 upsert（应用层兜底）：
-    - 正常先查后写
-    - 若并发撞唯一键，回查并覆盖 result
-    """
     stmt = select(OcrImageCache).where(
         and_(
             OcrImageCache.storage_key == storage_key,
@@ -349,9 +332,6 @@ async def _image_result_upsert(
     side: str,
     raw_result: Dict[str, Any],
 ) -> None:
-    """
-    ✅ 并发安全 upsert（配合 image_ocr_result 唯一索引）
-    """
     stmt = select(ImageOcrResult).where(
         and_(
             ImageOcrResult.image_file_id == image_file_id,
@@ -396,19 +376,22 @@ async def _image_result_upsert(
 def _build_ocr_fetch_url(storage_key: str, image_file: Optional[ImageFile]) -> str:
     """
     给百度 OCR 用的“服务端可访问 URL”（严格模式）：
-    - 优先：BOS 新签名 URL（不允许静默降级公网直链）
-    - 其次：ImageFile.url（仅当明确已有可访问 URL）
-    - 最后：BOS 公网 URL（仅在你确实使用 public bucket 时才会成功）
+    - 优先：BOS 新签名 URL
+    - 其次：ImageFile.url（若已有）
+    - 最后：BOS 公网 URL（仅当确实可用）
 
-    ⚠️ 关键改动：
-    - object_url_for_display(..., allow_fallback_public=False)
-      防止签名失败被偷偷降级成直链，导致错误看起来像 OCR 403。
+    ✅ 兼容：storage.object_url_for_display 是否支持 allow_fallback_public 参数（不支持也不炸）
     """
     sk = (storage_key or "").strip()
 
     if sk and getattr(storage, "enabled", False):
         try:
-            return storage.object_url_for_display(sk, expires_in=3600, allow_fallback_public=False)
+            # 先尝试严格参数
+            try:
+                return storage.object_url_for_display(sk, expires_in=3600, allow_fallback_public=False)
+            except TypeError:
+                # 旧版本不支持 allow_fallback_public
+                return storage.object_url_for_display(sk, expires_in=3600)
         except Exception:
             pass
 
@@ -425,9 +408,6 @@ def _build_ocr_fetch_url(storage_key: str, image_file: Optional[ImageFile]) -> s
 
 
 async def run_ocr_task(task_id: int) -> None:
-    """
-    供 BackgroundTasks / poller 调用的入口。
-    """
     try:
         async for db in get_db():
             await _run_ocr_task_in_db(db, task_id)
@@ -437,16 +417,11 @@ async def run_ocr_task(task_id: int) -> None:
 
 
 async def _claim_task(db: AsyncSession, task_id: int) -> bool:
-    """
-    ✅ DB 级抢占：只有 pending 且 active_scope_id 非空的任务能被抢到。
-    防止同一任务被重复执行。
-    """
     values: Dict[str, Any] = {
         "status": "processing",
         "progress": 1,
         "error_message": None,
     }
-    # 不臆造字段：模型有 started_at 才写
     if hasattr(OcrTask, "started_at"):
         values["started_at"] = _now()
 
@@ -505,7 +480,6 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
             await _set_task(db, task, status="failed", progress=100, error_message=f"订单不存在: {order_id}")
             return
 
-        # ✅ 同一 slot 多张图：取最新（OrderImage.id 最大）
         slot_to_img: Dict[str, OrderImage] = {}
         for img in (getattr(order, "images", None) or []):
             slot = getattr(img, "slot_key", None)
@@ -542,7 +516,6 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
 
         logger.info("[ocr_worker] start task_id=%s order_id=%s total=%s", task_id, order_id, total)
 
-        # 固定遍历顺序，日志/结果更稳定（排查时省脑细胞）
         for slot in sorted(slot_to_img.keys()):
             img = slot_to_img[slot]
             api_type, side0 = SLOT_TO_OCR[slot]
@@ -616,7 +589,6 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                 ocr_raw[slot] = {"error_code": "worker_error", "error_msg": msg}
 
             done += 1
-            # 处理中阶段占用 1~90，终态统一 100
             await _set_task(
                 db,
                 task,
@@ -625,8 +597,13 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                 error_message=None,
             )
 
+        # =========================
+        # ✅ 写库前：合并 + 强制清洗
+        # =========================
         dyn = dict(getattr(order, "dynamic_data", None) or {})
         dyn = _merge_if_empty(dyn, extracted_all)
+        dyn = clean_dynamic_data_for_ocr(dyn)
+
         order.dynamic_data = dyn
         order.ocr_raw_json = ocr_raw
         await db.commit()

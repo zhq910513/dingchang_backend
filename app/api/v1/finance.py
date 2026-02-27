@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Tuple, Set
+from typing import Optional, List, Dict, Tuple, Set, Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -99,9 +99,8 @@ from app.schemas.finance import (
     FinanceOrderListResponse,
     FinanceOrderStatusUpdate,
 )
-from app.schemas.order import OrderOut, OrderInfoOut
 from app.services.storage import StorageService
-from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
+from app.services.order_detail_builder import load_order_detail_blocks
 
 router = APIRouter(prefix="/finance", tags=["finance"])
 
@@ -203,12 +202,6 @@ def _group_code_name(g) -> Optional[str]:
 
     fallback = _group_display_name(g)
     return str(fallback).strip() if fallback is not None and str(fallback).strip() else None
-
-
-def _order_info_out(info: Optional[OrderInfo]) -> Optional[OrderInfoOut]:
-    if not info:
-        return None
-    return OrderInfoOut.from_orm(info)
 
 
 def _dialect_name() -> str:
@@ -515,25 +508,25 @@ async def finance_list_salespersons(
     return SalespersonListOut(items=[SalespersonItem(id=int(r.id), username=str(r.username), real_name=r.real_name) for r in rows])
 
 
-async def _load_finance_order_out(
+async def _ensure_finance_order_viewable(
     db: AsyncSession,
     order_id: int,
     *,
     current_team_names: Optional[Tuple[str, ...]],
-) -> OrderOut:
-    stmt = (
-        select(Order)
-        .where(Order.id == int(order_id))
-        .options(
-            selectinload(Order.creator),
-            selectinload(Order.salesperson),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
+) -> Order:
+    """
+    ✅ 财务详情专用：先校验
+    - 订单存在
+    - 必须 finished
+    - 必须在当前团队可见范围内（super_admin => current_team_names=None，放行）
+    """
+    o = (
+        await db.execute(
+            select(Order)
+            .where(Order.id == int(order_id))
+            .options(selectinload(Order.salesperson))
         )
-    )
-    o = (await db.execute(stmt)).scalars().first()
+    ).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -544,30 +537,7 @@ async def _load_finance_order_out(
         salesperson=getattr(o, "salesperson", None),
         current_team_names=current_team_names,
     )
-
-    ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
-
-    info = getattr(o, "order_info", None)
-
-    return OrderOut(
-        id=o.id,
-        created_by=o.created_by,
-        salesperson_id=o.salesperson_id,
-        customer_group_id=o.customer_group_id,
-        channel_group_id=o.channel_group_id,
-        is_finished=bool(o.is_finished),
-        is_rebate=bool(getattr(o, "is_rebate", False)),
-        is_paid=bool(getattr(o, "is_paid", False)),
-        dynamic_data=o.dynamic_data or {},
-        image_urls=safe_image_urls(o, storage),
-        images=getattr(o, "images", None) or [],
-        created_at=getattr(o, "created_at", None),
-        updated_at=getattr(o, "updated_at", None),
-        customer_group_name=_group_code_name(getattr(o, "customer_group", None)),
-        channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
-        salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
-        order_info=_order_info_out(info),
-    )
+    return o
 
 
 class FinanceOrdersSummaryOut(BaseModel):
@@ -969,17 +939,13 @@ async def list_finance_orders(
                 col_17_noncar_amount=_to_float(getattr(info, "non_vehicle_amount", None)) if info else None,
 
                 col_18_ch_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)) if info else None,
-                col_19_ch_commercial_supplement_point=_to_float(
-                    getattr(info, "channel_commercial_supplement_point", None)
-                ) if info else None,
+                col_19_ch_commercial_supplement_point=_to_float(getattr(info, "channel_commercial_supplement_point", None)) if info else None,
                 col_20_ch_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)) if info else None,
                 col_21_ch_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)) if info else None,
                 col_22_ch_noncar_point=_to_float(getattr(info, "channel_non_vehicle_point", None)) if info else None,
 
                 col_23_cu_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)) if info else None,
-                col_24_cu_commercial_supplement_point=_to_float(
-                    getattr(info, "customer_commercial_supplement_point", None)
-                ) if info else None,
+                col_24_cu_commercial_supplement_point=_to_float(getattr(info, "customer_commercial_supplement_point", None)) if info else None,
                 col_25_cu_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)) if info else None,
                 col_26_cu_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)) if info else None,
                 col_27_cu_noncar_point=_to_float(getattr(info, "customer_non_vehicle_point", None)) if info else None,
@@ -1186,43 +1152,11 @@ async def finance_orders_export(
         need_join_info = True
 
     headers = [
-        "日期",
-        "渠道",
-        "客户",
-        "市场",
-        "业务员",
-        "车主",
-        "车牌",
-        "保险到期日",
-        "车架号",
-        "发动机号",
-        "车型",
-        "初登日期",
-        "身份证号",
-        "电话",
-        "商业金额",
-        "交强金额",
-        "车船税金额",
-        "非车金额",
-        "渠道商业点位",
-        "渠道商业后补点位",
-        "渠道交强点位",
-        "渠道车船税点位",
-        "渠道非车点位",
-        "渠道奖励",
-        "客户商业点位",
-        "客户商业后补点位",
-        "客户交强点位",
-        "客户车船税点位",
-        "客户非车点位",
-        "客户奖励",
-        "应收",
-        "应付",
-        "利润",
-        "所属团队",
-        "所属经理",
-        "是否回款",
-        "是否返点",
+        "日期", "渠道", "客户", "市场", "业务员", "车主", "车牌", "保险到期日", "车架号", "发动机号", "车型", "初登日期", "身份证号", "电话",
+        "商业金额", "交强金额", "车船税金额", "非车金额",
+        "渠道商业点位", "渠道商业后补点位", "渠道交强点位", "渠道车船税点位", "渠道非车点位", "渠道奖励",
+        "客户商业点位", "客户商业后补点位", "客户交强点位", "客户车船税点位", "客户非车点位", "客户奖励",
+        "应收", "应付", "利润", "所属团队", "所属经理", "是否回款", "是否返点",
     ]
 
     base_stmt = (
@@ -1283,11 +1217,7 @@ async def finance_orders_export(
             managers_by_id: Dict[int, User] = {}
             if manager_ids:
                 mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
-                managers_by_id = {
-                    int(getattr(u, "id", 0) or 0): u
-                    for u in mgr_rows
-                    if getattr(u, "id", None) is not None
-                }
+                managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
 
             for o in rows:
                 cg = getattr(o, "customer_group", None)
@@ -1361,43 +1291,13 @@ async def finance_orders_export(
                 rebate = "是" if bool(getattr(o, "is_rebate", False)) else "否"
 
                 cols = [
-                    created_at,
-                    channel_name,
-                    customer_name,
-                    market_val,
-                    salesperson_name,
-                    owner or "-",
-                    plate or "-",
-                    insurance_expire,
-                    vin_val or "-",
-                    engine_no_val or "-",
-                    vehicle_model_val or "-",
-                    first_register or "-",
-                    id_number_val or "-",
-                    phone or "-",
-                    cm,
-                    jq,
-                    tax,
-                    nc,
-                    ch_cm_p,
-                    ch_cm_sup_p,
-                    ch_jq_p,
-                    ch_tax_p,
-                    ch_nc_p,
-                    ch_reward,
-                    cu_cm_p,
-                    cu_cm_sup_p,
-                    cu_jq_p,
-                    cu_tax_p,
-                    cu_nc_p,
-                    cu_reward,
-                    receivable,
-                    payable,
-                    profit,
-                    team_display,
-                    manager_name,
-                    paid,
-                    rebate,
+                    created_at, channel_name, customer_name, market_val, salesperson_name,
+                    owner or "-", plate or "-", insurance_expire, vin_val or "-", engine_no_val or "-",
+                    vehicle_model_val or "-", first_register or "-", id_number_val or "-", phone or "-",
+                    cm, jq, tax, nc,
+                    ch_cm_p, ch_cm_sup_p, ch_jq_p, ch_tax_p, ch_nc_p, ch_reward,
+                    cu_cm_p, cu_cm_sup_p, cu_jq_p, cu_tax_p, cu_nc_p, cu_reward,
+                    receivable, payable, profit, team_display, manager_name, paid, rebate,
                 ]
 
                 text_cols = {6, 8, 9, 11, 12, 13}
@@ -1425,16 +1325,34 @@ async def finance_orders_export(
     )
 
 
-@router.get("/orders/{order_id:int}", response_model=OrderOut)
+@router.get("/orders/{order_id:int}", response_model=Dict[str, Any])
 async def get_finance_order_detail(
     order_id: int,
     db: AsyncSession = Depends(get_db),
     user_with_role=Depends(get_current_user_with_role_and_teams),
 ):
-    _current_user, role_name, team_names, _team_ids = user_with_role
+    """
+    ✅ 财务详情：完全同构订单详情（{id, base, sections}）
+    - 先做 finance 的 finished + 团队校验
+    - 再复用 order_detail_builder 输出 blocks
+    """
+    current_user, role_name, team_names, _team_ids = user_with_role
     _ensure_finance_access(role_name)
-    tns = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
-    return await _load_finance_order_out(db, order_id, current_team_names=tns)
+
+    current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=team_names)
+
+    _ = await _ensure_finance_order_viewable(db, int(order_id), current_team_names=current_team_names)
+
+    # ✅ 同构输出：复用 builder（注意：ACL 已在上面严格校验，所以这里 enforce_read_acl=False）
+    return await load_order_detail_blocks(
+        db,
+        int(order_id),
+        current_user=current_user,
+        role_name=role_name,
+        team_names=_ac_normalize_team_names(team_names),
+        storage=storage,
+        enforce_read_acl=False,
+    )
 
 
 @router.patch("/orders/{order_id:int}/status")

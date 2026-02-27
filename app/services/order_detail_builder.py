@@ -75,10 +75,22 @@ def _group_code_name(g) -> Optional[str]:
 
 
 def _slot_title(slot_key: str) -> str:
-    return get_slot_title(slot_key)
+    """
+    ✅ 防炸：历史脏数据/未知 slot_key 也必须能渲染（不抛异常）
+    """
+    sk = str(slot_key or "").strip()
+    if not sk:
+        return "unknown"
+    try:
+        t = get_slot_title(sk)
+        ts = str(t or "").strip()
+        return ts or sk
+    except Exception:
+        return sk
 
 
 def _to_json_value(v: Any) -> Any:
+    # FastAPI 的 jsonable_encoder 也能处理 Decimal/date/datetime，但这里先做最常见的显式转换更稳
     if isinstance(v, Decimal):
         return float(v)
     if isinstance(v, datetime):
@@ -137,16 +149,26 @@ def _build_images_by_slot(order_images: List[OrderImage]) -> Dict[str, List[Dict
 
 
 def _slot_fields_from_dynamic(slot_key: str, dynamic_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    ✅ 防炸：未知 slot_key / 配置缺失时，返回空字段列表（不抛异常）
+    """
     d = dynamic_data or {}
-    defs = get_slot_field_defs(slot_key)
+    try:
+        defs = get_slot_field_defs(slot_key)
+        defs = defs or []
+    except Exception:
+        defs = []
 
     out: List[Dict[str, Any]] = []
     for f in defs:
-        source_key = str(f.get("source_key") or "").strip()
+        try:
+            source_key = str((f or {}).get("source_key") or "").strip()
+        except Exception:
+            source_key = ""
         if not source_key:
             continue
-        key = str(f.get("key") or source_key)
-        label = str(f.get("label") or key)
+        key = str((f or {}).get("key") or source_key)
+        label = str((f or {}).get("label") or key)
         out.append(_field_item(key, label, d.get(source_key)))
     return out
 
@@ -304,7 +326,9 @@ async def build_order_detail_blocks_from_order(
     sp = getattr(o, "salesperson", None)
     manager_id_val, manager_name_val = await _resolve_manager_info(db, sp)
 
-    sections = build_order_detail_sections(o, manager_id_val=manager_id_val, manager_name_val=manager_name_val, storage=storage)
+    sections = build_order_detail_sections(
+        o, manager_id_val=manager_id_val, manager_name_val=manager_name_val, storage=storage
+    )
 
     team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
     team_names_val = split_team_names_any(getattr(sp, "team_names", None)) if sp else []
