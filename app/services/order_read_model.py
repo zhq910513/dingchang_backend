@@ -21,12 +21,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 
-
 def _maybe_selectinload(model, attr_name: str):
-    """Return selectinload(model.<attr>) if exists, else None."""
-    if hasattr(model, attr_name):
-        return selectinload(getattr(model, attr_name))
+    """Return selectinload(model.attr) if attr exists, else None."""
+    try:
+        if hasattr(model, attr_name):
+            return selectinload(getattr(model, attr_name))
+    except Exception:
+        return None
     return None
+
+def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, child_attr: str):
+    """Return selectinload(parent.attr).selectinload(child.attr) if both attrs exist; else best-effort."""
+    try:
+        if hasattr(parent_model, parent_attr) and hasattr(child_model, child_attr):
+            return selectinload(getattr(parent_model, parent_attr)).selectinload(getattr(child_model, child_attr))
+        if hasattr(parent_model, parent_attr):
+            return selectinload(getattr(parent_model, parent_attr))
+    except Exception:
+        return None
+    return None
+
 
 from app.models.order import Order, OrderImage
 from app.models.user import User
@@ -41,17 +55,19 @@ from app.core.access_control import (
 
 
 def preload_options():
-    """统一的 Order 列表预加载清单（orders / finance 必须一致）。"""
-    opts = [
-        selectinload(Order.salesperson),
-        selectinload(Order.customer_group),
-        selectinload(Order.channel_group),
-        selectinload(Order.order_info),
-        selectinload(Order.images).selectinload(OrderImage.image_file),
-    ]
-    creator_opt = _maybe_selectinload(Order, "creator")
-    if creator_opt is not None:
-        opts.insert(0, creator_opt)
+    """统一的 Order 列表预加载清单（orders / finance 共用）。
+
+    ✅ models 冻结时可能不存在 relationship（只有 *_id 外键列）。
+    这里做防守式预加载：有就 preload，没有就跳过，避免 AttributeError。
+    """
+    opts = []
+    for name in ("creator", "salesperson", "customer_group", "channel_group", "order_info"):
+        opt = _maybe_selectinload(Order, name)
+        if opt is not None:
+            opts.append(opt)
+    opt_img = _maybe_selectinload_nested(Order, "images", OrderImage, "image_file")
+    if opt_img is not None:
+        opts.append(opt_img)
     return tuple(opts)
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:

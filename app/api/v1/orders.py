@@ -16,6 +16,28 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+
+def _maybe_selectinload(model, attr_name: str):
+    """Return selectinload(model.attr) if attr exists, else None."""
+    try:
+        if hasattr(model, attr_name):
+            return selectinload(getattr(model, attr_name))
+    except Exception:
+        return None
+    return None
+
+def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, child_attr: str):
+    """Return selectinload(parent.attr).selectinload(child.attr) if both attrs exist; else best-effort."""
+    try:
+        if hasattr(parent_model, parent_attr) and hasattr(child_model, child_attr):
+            return selectinload(getattr(parent_model, parent_attr)).selectinload(getattr(child_model, child_attr))
+        if hasattr(parent_model, parent_attr):
+            return selectinload(getattr(parent_model, parent_attr))
+    except Exception:
+        return None
+    return None
+
+
 from app.api.deps import get_current_user_with_role_and_teams
 from app.core.access_control import (
     split_team_names_any as _ac_split_team_names_any,
@@ -373,14 +395,14 @@ async def _load_order_out(
     stmt = (
         select(Order)
         .where(Order.id == order_id)
-        .options(
-            selectinload(Order.creator),
-            selectinload(Order.salesperson),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
-        )
+        .options(*tuple([x for x in [
+            _maybe_selectinload(Order, "creator"),
+            _maybe_selectinload(Order, "salesperson"),
+            _maybe_selectinload(Order, "customer_group"),
+            _maybe_selectinload(Order, "channel_group"),
+            _maybe_selectinload(Order, "order_info"),
+            _maybe_selectinload_nested(Order, "images", OrderImage, "image_file"),
+        ] if x is not None]))
     )
     o = (await db.execute(stmt)).scalars().first()
     if not o:
@@ -1674,7 +1696,7 @@ async def list_orders(
 
     items: List[OrderOut] = await _rm_orders_to_out_list(db, rows, storage=storage)
 
-    return OrderListResponse(meta=_build_list_meta(role_name=role_name), total=total, items=items)
+    return OrderListResponse(meta=_build_list_meta(role_name), total=total, items=items)
 
 
 @router.get("/{order_id:int}", response_model=Dict[str, Any])

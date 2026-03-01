@@ -11,6 +11,28 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+
+def _maybe_selectinload(model, attr_name: str):
+    """Return selectinload(model.attr) if attr exists, else None."""
+    try:
+        if hasattr(model, attr_name):
+            return selectinload(getattr(model, attr_name))
+    except Exception:
+        return None
+    return None
+
+def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, child_attr: str):
+    """Return selectinload(parent.attr).selectinload(child.attr) if both attrs exist; else best-effort."""
+    try:
+        if hasattr(parent_model, parent_attr) and hasattr(child_model, child_attr):
+            return selectinload(getattr(parent_model, parent_attr)).selectinload(getattr(child_model, child_attr))
+        if hasattr(parent_model, parent_attr):
+            return selectinload(getattr(parent_model, parent_attr))
+    except Exception:
+        return None
+    return None
+
+
 from app.core.access_control import (
     ensure_order_read_acl_by_salesperson_id,
     pick_manager_id_from_salesperson,
@@ -174,22 +196,19 @@ def _slot_fields_from_dynamic(slot_key: str, dynamic_data: Dict[str, Any]) -> Li
 
 
 async def fetch_order_with_relations(db: AsyncSession, order_id: int) -> Optional[Order]:
-    opts = [
-        selectinload(Order.salesperson),
-        selectinload(Order.customer_group),
-        selectinload(Order.channel_group),
-        selectinload(Order.order_info),
-        selectinload(Order.images).selectinload(OrderImage.image_file),
-    ]
-    if hasattr(Order, "creator"):
-        opts.insert(0, selectinload(getattr(Order, "creator")))
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
-        .options(*tuple(opts))
+        .options(*tuple([x for x in [
+            _maybe_selectinload(Order, "creator"),
+            _maybe_selectinload(Order, "salesperson"),
+            _maybe_selectinload(Order, "customer_group"),
+            _maybe_selectinload(Order, "channel_group"),
+            _maybe_selectinload(Order, "order_info"),
+            _maybe_selectinload_nested(Order, "images", OrderImage, "image_file"),
+        ] if x is not None]))
     )
     return (await db.execute(stmt)).scalars().first()
-
 
 
 async def _resolve_manager_info(db: AsyncSession, salesperson: Optional[User]) -> Tuple[Optional[int], Optional[str]]:
