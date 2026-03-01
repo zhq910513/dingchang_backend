@@ -32,7 +32,6 @@ def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, chil
         return None
     return None
 
-
 from app.core.access_control import (
     ensure_order_read_acl_by_salesperson_id,
     pick_manager_id_from_salesperson,

@@ -41,7 +41,6 @@ def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, chil
         return None
     return None
 
-
 from app.models.order import Order, OrderImage
 from app.models.user import User
 from app.schemas.order import OrderOut, OrderInfoOut
