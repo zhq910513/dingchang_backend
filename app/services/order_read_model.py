@@ -20,33 +20,39 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-
-def _maybe_selectinload(model, attr_name: str):
-    """Return selectinload(model.attr) if attr exists, else None."""
-    try:
-        if hasattr(model, attr_name):
-            return selectinload(getattr(model, attr_name))
-    except Exception:
-        return None
-    return None
-
-def _maybe_selectinload_nested(parent_model, parent_attr: str, child_model, child_attr: str):
-    """Return selectinload(parent.attr).selectinload(child.attr) if both attrs exist; else best-effort."""
-    try:
-        if hasattr(parent_model, parent_attr) and hasattr(child_model, child_attr):
-            return selectinload(getattr(parent_model, parent_attr)).selectinload(getattr(child_model, child_attr))
-        if hasattr(parent_model, parent_attr):
-            return selectinload(getattr(parent_model, parent_attr))
-    except Exception:
-        return None
-    return None
-
-
 from app.models.order import Order, OrderImage
 from app.models.user import User
 from app.schemas.order import OrderOut, OrderInfoOut
 from app.services.storage import StorageService
 from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
+
+
+def _normalize_image_urls(v):
+    """OrderOut.image_urls expects list.
+
+    safe_image_urls historically may return dict(slot->url) or list.
+    在 models/schemas 冻结下，这里做严格类型归一化，避免 Pydantic ValidationError。
+    """
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    if isinstance(v, dict):
+        # 保持稳定顺序：按 key 排序
+        out = []
+        for k in sorted(v.keys(), key=lambda x: str(x)):
+            u = v.get(k)
+            if u is None:
+                continue
+            s = str(u).strip()
+            if s:
+                out.append(s)
+        return out
+    # fallback: single string/other
+    s = str(v).strip()
+    return [s] if s else []
 from app.core.access_control import (
     split_team_names_any as _ac_split_team_names_any,
     pick_manager_id_from_salesperson as _ac_pick_manager_id_from_salesperson,
@@ -55,20 +61,16 @@ from app.core.access_control import (
 
 
 def preload_options():
-    """统一的 Order 列表预加载清单（orders / finance 共用）。
+    """统一的 Order 列表预加载清单（orders / finance 必须一致）。"""
+    return (
+        selectinload(Order.creator),
+        selectinload(Order.salesperson),
+        selectinload(Order.customer_group),
+        selectinload(Order.channel_group),
+        selectinload(Order.order_info),
+        selectinload(Order.images).selectinload(OrderImage.image_file),
+    )
 
-    ✅ models 冻结时可能不存在 relationship（只有 *_id 外键列）。
-    这里做防守式预加载：有就 preload，没有就跳过，避免 AttributeError。
-    """
-    opts = []
-    for name in ("creator", "salesperson", "customer_group", "channel_group", "order_info"):
-        opt = _maybe_selectinload(Order, name)
-        if opt is not None:
-            opts.append(opt)
-    opt_img = _maybe_selectinload_nested(Order, "images", OrderImage, "image_file")
-    if opt_img is not None:
-        opts.append(opt_img)
-    return tuple(opts)
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:
     if not u:
@@ -193,7 +195,7 @@ def to_order_out(
         is_rebate=bool(getattr(o, "is_rebate", False)),
         is_paid=bool(getattr(o, "is_paid", False)),
         dynamic_data=o.dynamic_data or {},
-        image_urls=safe_image_urls(o, storage),
+        image_urls=_normalize_image_urls(safe_image_urls(o, storage)),
         images=getattr(o, "images", None) or [],
         created_at=getattr(o, "created_at", None),
         updated_at=getattr(o, "updated_at", None),
