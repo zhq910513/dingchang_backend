@@ -55,9 +55,11 @@ from app.schemas.order import (
     OrderStatusUpdate,
     OrderInfoIn,
     OrderInfoOut,
+    OrderListMeta,
 )
 from app.services.storage import StorageService
 from app.services.order_detail_builder import load_order_detail_blocks
+from app.services.order_read_model import preload_options as _rm_preload_options, orders_to_out_list as _rm_orders_to_out_list
 from app.utils.order_image_urls import ensure_display_urls_for_order_images, safe_image_urls
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -75,6 +77,20 @@ ALL_SLOTS = OCR_SLOTS | NON_OCR_SLOTS
 
 # 多图槽
 MULTI_SLOTS = {"related"}
+
+def _build_list_meta(*, role_name: str) -> OrderListMeta:
+    rn = str(role_name or "")
+    # orders侧：业务字段可编辑范围由后端ACL+接口限制决定；这里仅给前端“UI能力提示”
+    caps = {
+        "can_edit_paid": False,
+        "can_edit_rebate": False,
+        "can_return_to_unfinished": False,
+        "can_download": True,
+        "can_mark_finished": rn in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_MARKET),
+        "can_reopen": rn in (ROLE_SUPER_ADMIN, ROLE_MANAGER),
+        "image_slots_writable": ["vehicle_cert","idcard_front","idcard_back","driving_license_main","driving_license_sub","related"],
+    }
+    return OrderListMeta(source="orders", capabilities=caps)
 
 
 def _ensure_orders_access(role_name: Optional[str], *, allow_finance: bool = False) -> None:
@@ -1579,14 +1595,7 @@ async def list_orders(
 
     stmt = (
         select(Order)
-        .options(
-            selectinload(Order.creator),
-            selectinload(Order.salesperson),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
-        )
+        .options(*_rm_preload_options())
     )
     count_stmt = select(func.count(Order.id))
 
@@ -1663,73 +1672,9 @@ async def list_orders(
     total = (await db.execute(count_stmt)).scalar_one()
     rows = (await db.execute(stmt)).scalars().all()
 
-    manager_ids: Set[int] = set()
-    salesperson_to_manager_id: Dict[int, int] = {}
+    items: List[OrderOut] = await _rm_orders_to_out_list(db, rows, storage=storage)
 
-    for o in rows:
-        sp = getattr(o, "salesperson", None)
-        if not sp:
-            continue
-        mid = _pick_manager_id_from_salesperson(sp)
-        if mid:
-            salesperson_to_manager_id[int(getattr(sp, "id", 0) or 0)] = int(mid)
-            manager_ids.add(int(mid))
-
-    managers_by_id: Dict[int, User] = {}
-    if manager_ids:
-        mgr_rows = (await db.execute(select(User).where(User.id.in_(list(manager_ids))))).scalars().all()
-        managers_by_id = {int(getattr(u, "id", 0) or 0): u for u in mgr_rows if getattr(u, "id", None) is not None}
-
-    items: List[OrderOut] = []
-    for o in rows:
-        ensure_display_urls_for_order_images(getattr(o, "images", None) or [], storage)
-        cg = getattr(o, "customer_group", None)
-        sp = getattr(o, "salesperson", None)
-
-        team_name_val = (getattr(sp, "team_name", None) or None) if sp else None
-        team_names_val = _split_team_names_any(getattr(sp, "team_names", None)) if sp else []
-        if not team_names_val and team_name_val and str(team_name_val).strip():
-            team_names_val = [str(team_name_val).strip()]
-
-        manager_id_val = None
-        manager_name_val = None
-        if sp:
-            manager_name_val = _pick_manager_name_inline(sp)
-            sp_id_int = int(getattr(sp, "id", 0) or 0)
-            mid = salesperson_to_manager_id.get(sp_id_int) or _pick_manager_id_from_salesperson(sp)
-            if mid:
-                manager_id_val = int(mid)
-                if not manager_name_val:
-                    manager_name_val = _user_display_name(managers_by_id.get(int(mid)))
-
-        items.append(
-            OrderOut(
-                id=o.id,
-                created_by=o.created_by,
-                salesperson_id=o.salesperson_id,
-                customer_group_id=o.customer_group_id,
-                channel_group_id=o.channel_group_id,
-                manager_id=manager_id_val,
-                manager_name=manager_name_val,
-                team_name=(str(team_name_val).strip() if team_name_val is not None and str(team_name_val).strip() else None),
-                team_names=team_names_val,
-                is_finished=bool(o.is_finished),
-                is_rebate=bool(getattr(o, "is_rebate", False)),
-                is_paid=bool(getattr(o, "is_paid", False)),
-                dynamic_data=o.dynamic_data or {},
-                image_urls=safe_image_urls(o, storage),
-                images=getattr(o, "images", None) or [],
-                created_at=getattr(o, "created_at", None),
-                updated_at=getattr(o, "updated_at", None),
-                customer_group_name=_group_code_name(cg),
-                channel_group_name=_group_code_name(getattr(o, "channel_group", None)),
-                salesperson_name=_user_display_name(getattr(o, "salesperson", None)),
-                customer_group_market=getattr(cg, "market", None) if cg else None,
-                order_info=_order_info_out(getattr(o, "order_info", None)),
-            )
-        )
-
-    return OrderListResponse(total=total, items=items)
+    return OrderListResponse(meta=_build_orders_list_meta(role_name), total=total, items=items)
 
 
 @router.get("/{order_id:int}", response_model=Dict[str, Any])

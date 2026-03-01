@@ -3,9 +3,13 @@
 """
 数据库与 Redis 连接管理
 
-新增能力（启动期可用）：
+能力：
 - Schema 校验日志：打印 DB 现有表 / Model 表 / 缺失表 / 多余表 / 缺失列
 - 只增不删：仅允许新增缺失列（ALTER TABLE ADD COLUMN），不允许删列/改列/改类型
+
+注意：
+- 本模块的 schema 自愈逻辑是“增量补齐”（additive），不会修改已有列定义（例如 updated_at 的 ON UPDATE 等），
+  列定义差异需要通过 DBA/迁移脚本或显式变更来完成。
 """
 from __future__ import annotations
 
@@ -68,27 +72,17 @@ redis: Optional[object] = None
 
 
 def load_all_models() -> None:
-    modules = [
-        "app.models.user",
-        "app.models.role",
-        "app.models.user_role",
-        "app.models.customer_group",
-        "app.models.channel_group",
-        "app.models.field_config",
-        "app.models.image_file",
-        "app.models.image_ocr_result",
-        "app.models.ocr_task",
-        "app.models.ocr_image_cache",
-        "app.models.order_info",
-        "app.models.order",
-        "app.models.finance",
-        "app.models.session",
-    ]
-    for m in modules:
-        try:
-            importlib.import_module(m)
-        except Exception as e:
-            logger.warning("Model module import skipped: %s (%s)", m, e)
+    """
+    启动期导入 ORM 模型，确保 Base.metadata 完整。
+
+    ✅ 强制收口：只导入一次 app.models 聚合模块（由 app/models/__init__.py 统一 import 全部模型）。
+    - 避免历史遗留的 “app.models.field_group / field_group_field / order_image 拆分文件” 导入造成警告噪声
+    - 避免多处维护模型清单导致漏表/漏列
+    """
+    try:
+        importlib.import_module("app.models")
+    except Exception as e:
+        logger.warning("Model module import skipped: %s (%s)", "app.models", e)
 
 
 async def get_db():
@@ -245,10 +239,8 @@ async def ensure_schema_additive_on_startup(
 
             # --- phase 2: create missing tables (optional) ---
             if add_tables:
-                # create_all 自带 checkfirst=True 逻辑
                 before_set = set(db_tables)
                 Base.metadata.create_all(bind=sync_conn)
-                # refresh inspector
                 insp2 = inspect(sync_conn)
                 after_tables = sorted(insp2.get_table_names())
                 created = sorted(list(set(after_tables) - before_set))
@@ -258,7 +250,6 @@ async def ensure_schema_additive_on_startup(
 
             # --- phase 3: add missing columns (optional) ---
             if add_columns:
-                # refresh missing columns after create_all
                 missing_cols2 = _diff_missing_columns(sync_conn)
                 if missing_cols2:
                     for tn, cols in missing_cols2.items():
@@ -279,11 +270,9 @@ async def ensure_schema_additive_on_startup(
                                 logger.info("[schema_apply] added_column=%s.%s", tn, cn)
                             except Exception as e:
                                 if _is_duplicate_column_error(e):
-                                    # 幂等：并发启动或重复执行，视为成功
                                     logger.warning("[schema_apply] duplicate_column_ignored=%s.%s (%s)", tn, cn, e)
                                     continue
                                 raise
-
                 else:
                     logger.info("[schema_apply] add_columns enabled but no missing columns")
 

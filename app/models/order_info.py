@@ -1,83 +1,54 @@
-# app/models/order_info.py
 # encoding: utf-8
 from __future__ import annotations
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, Numeric, String, text, UniqueConstraint
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-
+from sqlalchemy import Column, Integer, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint, Index, text
 from app.core.db import Base
 
 
 class OrderInfo(Base):
     __tablename__ = "order_info"
 
-    id = Column(Integer, primary_key=True, index=True)
-
-    # ✅ 一单一条（强约束）
-    # - 避免同时叠 index/unique/UniqueConstraint/Index 导致重复 index 名
-    # - 这里用 UniqueConstraint 显式命名，更利于迁移/对比稳定
+    id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(Integer, ForeignKey("order.id", ondelete="CASCADE"), nullable=False)
 
-    __table_args__ = (
-        UniqueConstraint("order_id", name="uq_order_info_order_id"),
-    )
-
-    # ✅ 反向关系
-    order = relationship("Order", back_populates="order_info", lazy="selectin")
-
-    # Row 1
     insurance_expire_date = Column(Date, nullable=True)
     owner_phone = Column(String(32), nullable=True)
 
-    # ✅ 订单备注（唯一口径：remark）
-    # - 前端使用：row.order_info.remark
-    # - finance 下载不需要：finance 导出不选此字段即可
-    remark = Column(String(1024), nullable=True, default=None)
+    commercial_amount = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    compulsory_amount = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    vehicle_tax_amount = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    non_vehicle_amount = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    premium_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
 
-    # ✅ 金额类：DB 级默认值，避免旧数据/直写SQL出现 NULL
-    commercial_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-    compulsory_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-    vehicle_tax_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-    non_vehicle_amount = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
+    channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    channel_reward = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    channel_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
 
-    premium_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
+    customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"))
+    customer_reward = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
+    customer_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
 
-    # Row 2 渠道点位（允许负数）
-    channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
+    profit = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"))
 
-    # ✅ 渠道-商业后补点位（允许负数）
-    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-
-    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    channel_reward = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-
-    channel_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-
-    # Row 3 客户/产品点位（允许负数）
-    customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-
-    # ✅ 客户-商业后补点位（允许负数）
-    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-
-    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("0"))
-    customer_reward = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-
-    customer_total = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-
-    # Row 4 利润
-    profit = Column(Numeric(18, 2), nullable=False, server_default=text("0"))
-
-    # ✅ 方案 A 对齐：DB 存“北京时间 naive DATETIME”
-    # - 不使用 timezone=True，避免驱动/方言把 tzinfo 搞出来导致展示 +8 的坑
-    created_at = Column(DateTime(timezone=False), server_default=func.current_timestamp(), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     updated_at = Column(
         DateTime(timezone=False),
-        server_default=func.current_timestamp(),
-        onupdate=func.current_timestamp(),
         nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+    )
+
+    remark = Column(String(1024), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("order_id", name="order_id"),
+        Index("ix_order_info_id", "id"),
     )

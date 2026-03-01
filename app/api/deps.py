@@ -16,14 +16,19 @@
 ✅ 关键修复：
 - _extract_teams_from_user 不再“命中第一个字段就 break”，改为多来源 union 合并。
   避免：User 同时存在 team_names="" 与 team_name="A"，结果团队被抽成空的严重问题。
+
+✅ 时间口径修复（2026-03-01）：
+- DB 全局约定：北京时间 naive DATETIME
+- session 的 last_active_at / timeout 计算：统一按北京时间 naive 处理（不再用 UTC naive）
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional, Tuple, List
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select, update, inspect
@@ -45,11 +50,10 @@ from app.models.user_role import UserRole
 
 logger = logging.getLogger(__name__)
 
-# ✅ 心跳写库节流：默认 30s 写一次（生产强烈建议开启）
-# 设为 0 可恢复“每请求更新”
+BJ_TZ = ZoneInfo("Asia/Shanghai")
+
 SESSION_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("SESSION_HEARTBEAT_INTERVAL_SECONDS", "30") or "30")
 
-# ✅ 主角色优先级（数值越小优先级越高）
 _ROLE_PRIORITY = {
     ROLE_SUPER_ADMIN: 0,
     ROLE_MANAGER: 10,
@@ -60,11 +64,6 @@ _ROLE_PRIORITY = {
 
 
 def _pick_primary_role(role_names: Tuple[str, ...]) -> Optional[str]:
-    """
-    ✅ 选主角色：
-    - 优先按业务优先级（避免 manager+sales 被当成 sales）
-    - 若都不在优先级表中：回退到 role_names[0]（保持兼容旧逻辑的稳定性）
-    """
     if not role_names:
         return None
     known = [r for r in role_names if r in _ROLE_PRIORITY]
@@ -73,22 +72,21 @@ def _pick_primary_role(role_names: Tuple[str, ...]) -> Optional[str]:
     return role_names[0]
 
 
-def _utcnow_naive() -> datetime:
-    """
-    统一返回 UTC naive datetime，避免 tzinfo 写入 MySQL DATETIME 带来不确定性。
-    """
-    return datetime.utcnow()
+def _now_bj_naive() -> datetime:
+    # ✅ 北京时间 naive DATETIME
+    return datetime.now(BJ_TZ).replace(tzinfo=None)
 
 
-def _to_utc_naive(dt: datetime) -> datetime:
-    """
-    兼容 DB 返回 naive/aware 两种情况：
-    - naive：按 UTC 解释（与当前项目其他地方的 datetime.utcnow() 存储一致）
-    - aware：转成 UTC 后去 tzinfo
-    """
+def _to_bj_naive(dt: datetime) -> datetime:
+    # ✅ 兼容 DB 返回 naive/aware 两种情况：
+    # - naive：按北京时间解释（项目约定）
+    # - aware：转到 Asia/Shanghai 后去 tzinfo
     if dt.tzinfo is None:
         return dt
-    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    try:
+        return dt.astimezone(BJ_TZ).replace(tzinfo=None)
+    except Exception:
+        return dt.replace(tzinfo=None)
 
 
 def _safe_int(v: object, default: int) -> int:
@@ -100,9 +98,6 @@ def _safe_int(v: object, default: int) -> int:
 
 
 def _get_redis():
-    """
-    惰性获取 redis（若项目未启用，返回 None）
-    """
     try:
         from app.core.db import redis  # type: ignore
         return redis
@@ -111,13 +106,6 @@ def _get_redis():
 
 
 def _as_list(v: Any) -> List[Any]:
-    """
-    将各种输入归一成 list：
-    - None -> []
-    - str: 若包含逗号，按逗号切；否则单元素
-    - set/tuple/list -> list(...)
-    - 其它 -> [v]
-    """
     if v is None:
         return []
     if isinstance(v, list):
@@ -145,7 +133,6 @@ def _normalize_team_names(raw: Any) -> Tuple[str, ...]:
         if not s:
             continue
         out.append(s)
-    # 去重 + 稳定排序（避免响应漂移）
     return tuple(sorted(set(out)))
 
 
@@ -165,27 +152,13 @@ def _normalize_team_ids(raw: Any) -> Tuple[int, ...]:
             out.append(int(s))
         except Exception:
             continue
-    # 去重 + 稳定排序
     return tuple(sorted(set(out)))
 
 
 def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
-    """
-    从 user 对象上“尽力抽取”团队信息（不做业务判断）：
-    支持字段/形态（任一存在即可）：
-    - team_ids / team_id_list / teams_ids / teamIds / teamIdList
-    - team_names / team_name_list / teamNames / teamNameList
-    - team_id / team_name（旧版单团队）
-    - teams（relationship，元素可能有 id/name/team_id/team_name 属性）
-
-    ✅ 关键优化：
-    - 多来源 union 合并：不会因为某个字段存在但为空（如 team_names=""）而“提前 break”导致漏 team_name。
-    - 对 relationship: teams 仅在“已加载”情况下读取，避免 Async SQLAlchemy 懒加载触发 greenlet 错误。
-    """
     team_ids_set: set[int] = set()
     team_names_set: set[str] = set()
 
-    # 1) ids：多来源合并
     id_candidates = [
         "team_ids",
         "team_id_list",
@@ -203,7 +176,6 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
         for tid in _normalize_team_ids(raw):
             team_ids_set.add(int(tid))
 
-    # 2) names：多来源合并（重点：team_names 为空也不会遮蔽 team_name）
     name_candidates = [
         "team_names",
         "team_name_list",
@@ -220,7 +192,6 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
         for tn in _normalize_team_names(raw):
             team_names_set.add(str(tn))
 
-    # 3) relationship: teams（仅作为补充；且仅在已加载时读取）
     rel = None
     try:
         st = inspect(user)
@@ -286,10 +257,10 @@ async def get_current_session(
     if ttl <= 0:
         ttl = 7200
 
-    now = _utcnow_naive()
-    last_active_utc = _to_utc_naive(last_active_at)
+    now = _now_bj_naive()
+    last_active_bj = _to_bj_naive(last_active_at)
 
-    if now - last_active_utc > timedelta(seconds=ttl):
+    if now - last_active_bj > timedelta(seconds=ttl):
         try:
             await db.execute(
                 update(UserSession)
@@ -319,7 +290,7 @@ async def get_current_session(
     try:
         need_touch = True
         if hb > 0:
-            need_touch = (now - last_active_utc) > timedelta(seconds=hb)
+            need_touch = (now - last_active_bj) > timedelta(seconds=hb)
 
         if need_touch:
             await db.execute(
@@ -370,12 +341,6 @@ async def get_current_user_with_roles(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str], Tuple[str, ...]]:
-    """
-    返回：
-    - user
-    - primary_role_name：✅ 按业务优先级选主角色
-    - role_names：该用户的全部角色（按 Role.id 升序）
-    """
     stmt = (
         select(Role.id, Role.role_name)
         .join(UserRole, UserRole.role_id == Role.id)
@@ -401,11 +366,6 @@ async def get_current_user_with_role_and_team(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str], Optional[str]]:
-    """
-    ✅ 兼容旧：返回 user + 主角色 + team_name（单值）
-    - 若 user 具备多团队信息：取稳定排序后的第一个 team_name（用于旧接口的“默认团队”语义）
-    - 新接口请用 get_current_user_with_role_and_teams()
-    """
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     _team_ids, team_names = _extract_teams_from_user(user)
     team_name = team_names[0] if team_names else None
@@ -416,11 +376,6 @@ async def get_current_user_with_role_and_teams(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str], Tuple[str, ...], Tuple[int, ...]]:
-    """
-    ✅ 新增：返回 user + 主角色 + team_names + team_ids
-    - 用于后续“按团队隔离数据”统一依赖
-    - 本文件不判断谁是经理/谁能多选，只负责把 user 上的团队信息抽取出来
-    """
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     team_ids, team_names = _extract_teams_from_user(user)
     return user, primary, team_names, team_ids
@@ -430,15 +385,6 @@ async def get_current_user_scope(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    ✅ 新增：统一返回“访问范围”字典，后续 API 可直接用它做过滤
-    返回字段（稳定）：
-    - user
-    - primary_role
-    - roles
-    - team_names
-    - team_ids
-    """
     user, primary, roles = await get_current_user_with_roles(user=user, db=db)
     team_ids, team_names = _extract_teams_from_user(user)
     return {

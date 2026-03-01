@@ -1,11 +1,9 @@
+# app/utils/__init__.py
 # encoding: utf-8
 """
-@author: The King
-@project: dingchang_backend
-@file: __init__.py
-@time: 2025/12/8 22:26
+工具包聚合导出
 """
 
-from .time import utcnow, now_str
+from .time import now_bj, now_str
 
-__all__ = ["utcnow", "now_str"]
+__all__ = ["now_bj", "now_str"]

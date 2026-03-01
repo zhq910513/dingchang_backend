@@ -23,6 +23,7 @@ from app.core.db import get_db
 from app.core.constants import ROLE_SUPER_ADMIN, ROLE_MANAGER
 from app.models.field_config import FieldConfig, FieldGroup, FieldGroupField
 from app.api.deps import get_current_user_with_role
+from app.schemas.field_config import FieldConfigOut, FieldConfigListOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/field-config", tags=["field-config"])
@@ -100,6 +101,24 @@ class FieldGroupConfigOut(BaseModel):
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def _to_field_config_out(x: FieldConfig) -> FieldConfigOut:
+    return FieldConfigOut(
+        id=int(getattr(x, "id", 0) or 0),
+        module=str(getattr(x, "module", "") or ""),
+        field_name=str(getattr(x, "field_name", "") or ""),
+        label=str(getattr(x, "label", "") or ""),
+        type=str(getattr(x, "type", "") or ""),
+        required=int(bool(getattr(x, "required", False))),
+        visible=int(bool(getattr(x, "visible", True))),
+        editable=int(bool(getattr(x, "editable", True))),
+        sort=int(getattr(x, "sort", 0) or 0),
+        options=getattr(x, "options", None),
+        validators=getattr(x, "validators", None),
+        extra=getattr(x, "extra", None),
+        view_roles=getattr(x, "view_roles", None),
+        edit_roles=getattr(x, "edit_roles", None),
+    )
 
 
 def _is_editable_for_role(

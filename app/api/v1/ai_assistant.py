@@ -2,27 +2,29 @@
 # encoding: utf-8
 from __future__ import annotations
 
+"""
+报价助手 API（Schema 已冻结）：
+- app.schemas.ai_assistant.AiChatIn / AiChatOut
+- app.schemas.ai_assistant.AiSessionListOut / AiSessionItem
+
+注意：
+- 保留 /sessions /chat /health
+- /sessions/{id}/history 作为调试辅助，不强制 schema（返回 dict）
+"""
+
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.deps import get_current_user_with_role_and_teams
-from app.schemas.ai_assistant import (
-    AiActionItem,
-    AiChatRequest,
-    AiChatResponse,
-    AiHistoryResponse,
-    AiSessionItem,
-    AiSessionListResponse,
-)
+from app.schemas.ai_assistant import AiChatIn, AiChatOut, AiSessionItem, AiSessionListOut
 from app.services.ai_assistant_service import (
     list_sessions as _list_sessions,
-    get_or_create_session as _get_or_create_session,
     create_session as _create_session,
     delete_session as _delete_session,
     list_messages as _list_messages,
-    send_message as _send_message,  # ✅ async
+    send_message as _send_message,  # async
 )
 
 router = APIRouter(prefix="/ai-assistant", tags=["报价助手"])
@@ -65,11 +67,8 @@ def _pick(obj: Any, *keys: str, default=None):
 def _to_session_item(row: Any) -> AiSessionItem:
     return AiSessionItem(
         session_id=str(_pick(row, "session_id", "id", default="")),
-        title=str(_pick(row, "title", default="新会话") or "新会话"),
-        created_at=str(_pick(row, "created_at", default="") or ""),
-        updated_at=str(_pick(row, "updated_at", default="") or ""),
-        last_message_preview=_pick(row, "last_message_preview", default=None),
-        message_count=int(_pick(row, "message_count", default=0) or 0),
+        title=str(_pick(row, "title", default="") or ""),
+        updated_at=str(_pick(row, "updated_at", default="") or "") or None,
     )
 
 
@@ -82,14 +81,14 @@ class DeleteSessionResponse(BaseModel):
     session_id: str
 
 
-@router.get("/sessions", response_model=AiSessionListResponse)
+@router.get("/sessions", response_model=AiSessionListOut)
 async def list_ai_sessions(
     current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
     rows = _list_sessions(owner_user_id=owner_user_id) or []
     items = [_to_session_item(x) for x in rows]
-    return AiSessionListResponse(total=len(items), items=items)
+    return AiSessionListOut(total=len(items), items=items)
 
 
 @router.post("/sessions")
@@ -103,9 +102,8 @@ async def create_ai_session(
         "ok": True,
         "data": {
             "session_id": str(_pick(row, "session_id", "id", default="")),
-            "title": _pick(row, "title", default="新会话"),
-            "created_at": str(_pick(row, "created_at", default="") or ""),
-            "updated_at": str(_pick(row, "updated_at", default="") or ""),
+            "title": str(_pick(row, "title", default="") or ""),
+            "updated_at": str(_pick(row, "updated_at", default="") or "") or None,
         },
     }
 
@@ -122,7 +120,7 @@ async def delete_ai_session(
     return DeleteSessionResponse(ok=True, session_id=session_id)
 
 
-@router.get("/sessions/{session_id}/history", response_model=AiHistoryResponse)
+@router.get("/sessions/{session_id}/history")
 async def get_ai_history(
     session_id: str,
     current_user=Depends(get_current_user_with_role_and_teams),
@@ -136,81 +134,35 @@ async def get_ai_history(
             {
                 "role": _pick(m, "role", default="assistant"),
                 "content": _pick(m, "content", "text", default="") or "",
-                "name": _pick(m, "name", default=None),
-                "metadata": _pick(m, "metadata", "meta", default=None),
                 "created_at": _pick(m, "created_at", default=None),
             }
         )
 
-    return AiHistoryResponse(session_id=session_id, items=items)
+    return {"session_id": session_id, "items": items}
 
 
-@router.post("/chat", response_model=AiChatResponse)
+@router.post("/chat", response_model=AiChatOut)
 async def ai_chat(
-    body: AiChatRequest,
+    body: AiChatIn,
     current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
 
-    result = await _send_message(  # ✅ async
+    result = await _send_message(
         owner_user_id=owner_user_id,
-        session_id=body.session_id,
+        session_id=None,
         message=body.message,
-        history=[x.model_dump() if hasattr(x, "model_dump") else dict(x) for x in (body.history or [])],
-        system_prompt=getattr(body, "system_prompt", None),
-        model=getattr(body, "model", None),
-        temperature=getattr(body, "temperature", None),
-        max_tokens=getattr(body, "max_tokens", None),
-        stream=body.stream,
-        context=body.context or {},
+        history=[],
+        system_prompt=None,
+        model=None,
+        temperature=None,
+        max_tokens=None,
+        stream=False,
+        context={"order_id": body.order_id, "images": body.images},
     )
 
-    session_id = str(_pick(result, "session_id", default=body.session_id or ""))
     reply = str(_pick(result, "reply", "content", "text", default="") or "")
-    usage = _pick(result, "usage", default=None)
-
-    intent = str(_pick(result, "intent", default="fallback") or "fallback")
-    trace_id = str(_pick(result, "trace_id", default="") or "")
-    confidence_raw = _pick(result, "confidence", default=0.0)
-    try:
-        confidence = float(confidence_raw)
-    except Exception:
-        confidence = 0.0
-
-    actions_raw = _pick(result, "actions", default=[]) or []
-    actions: List[AiActionItem] = []
-    if isinstance(actions_raw, list):
-        for a in actions_raw:
-            if isinstance(a, dict):
-                try:
-                    actions.append(AiActionItem(**a))
-                except Exception:
-                    actions.append(AiActionItem(type=str(a.get("type") or "suggest"), label=str(a.get("label") or "")))
-
-    if not session_id:
-        if body.session_id:
-            session_id = body.session_id
-        else:
-            try:
-                s = _get_or_create_session(owner_user_id=owner_user_id)
-                session_id = str(_pick(s, "session_id", "id", default=""))
-            except Exception:
-                session_id = "unknown"
-
-    if not trace_id:
-        trace_id = "trace-missing"
-
-    return AiChatResponse(
-        ok=True,
-        session_id=session_id,
-        reply=reply or "已处理",
-        intent=intent,
-        confidence=confidence,
-        actions=actions,
-        trace_id=trace_id,
-        usage=usage,
-        data=_pick(result, "data", default=None),  # ✅ 结构化结果
-    )
+    return AiChatOut(reply=reply or "已处理", ok=True)
 
 
 @router.get("/health")

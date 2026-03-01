@@ -39,7 +39,7 @@ from app.models.role import Role
 from app.models.session import UserSession
 from app.models.user import User
 from app.models.user_role import UserRole
-from app.schemas.user import UserCreate, UserSimple
+from app.schemas.user import UserOut, UserListOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/users", tags=["users"])
@@ -192,6 +192,15 @@ def _ensure_manage_permission(
         raise HTTPException(status_code=400, detail="禁止删除 super_admin 账号")
 
 
+class UserCreateIn(BaseModel):
+    username: str
+    password: str
+    role_id: int
+    real_name: Optional[str] = None
+    team_name: Optional[str] = None
+    team_names: Optional[str] = None
+
+
 class UserUpdateIn(BaseModel):
     """
     编辑用户入参（不允许改 role_id；如需改角色请走单独策略，不在本轮范围）
@@ -208,7 +217,7 @@ class UserUpdateIn(BaseModel):
     manager_id: Optional[int] = None
 
 
-@router.get("/me", response_model=UserSimple)
+@router.get("/me", response_model=UserOut)
 async def get_me(
     db: AsyncSession = Depends(get_db),
     user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
@@ -222,7 +231,7 @@ async def get_me(
     u, role_name = user_role
     teams = _user_team_names(u)
 
-    return UserSimple(
+    return UserOut(
         id=int(u.id),
         username=str(u.username),
         real_name=getattr(u, "real_name", None),
@@ -233,7 +242,7 @@ async def get_me(
     )
 
 
-@router.get("/managers", response_model=List[UserSimple])
+@router.get("/managers", response_model=List[UserOut])
 async def list_managers(
     status: int = Query(1, description="默认仅返回启用账号"),
     db: AsyncSession = Depends(get_db),
@@ -259,14 +268,14 @@ async def list_managers(
         stmt = stmt.where(User.status == int(status))
 
     rows = (await db.execute(stmt)).all()
-    out: List[UserSimple] = []
+    out: List[UserOut] = []
     for r in rows:
         teams = _normalize_team_list(
             _split_csv(getattr(r, "team_names", None))
             + ([getattr(r, "team_name", None)] if getattr(r, "team_name", None) else [])
         )
         out.append(
-            UserSimple(
+            UserOut(
                 id=int(r.id),
                 username=str(r.username),
                 real_name=r.real_name,
@@ -281,7 +290,7 @@ async def list_managers(
 
 @router.post("", status_code=201)
 async def create_user(
-    payload: UserCreate,
+    payload: UserCreateIn,
     db: AsyncSession = Depends(get_db),
     user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
 ):
@@ -397,7 +406,7 @@ async def create_user(
     return {"id": int(new_user.id)}
 
 
-@router.get("/children", response_model=List[UserSimple])
+@router.get("/children", response_model=List[UserOut])
 async def list_children_users(
     db: AsyncSession = Depends(get_db),
     user_role: Tuple[User, Optional[str]] = Depends(get_current_user_with_role),
@@ -439,7 +448,7 @@ async def list_children_users(
     now = datetime.now()
     ttl = int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200) or 7200)
 
-    out: List[UserSimple] = []
+    out: List[UserOut] = []
     for r in rows:
         sess = session_map.get(int(r.id))
         online = False
@@ -456,7 +465,7 @@ async def list_children_users(
         )
 
         out.append(
-            UserSimple(
+            UserOut(
                 id=int(r.id),
                 username=str(r.username),
                 real_name=r.real_name,

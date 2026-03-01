@@ -1,21 +1,7 @@
-# app/models/session.py
 # encoding: utf-8
-"""
-用户会话模型
+from __future__ import annotations
 
-说明：
-- 使用 session_token 作为登录态标识
-- expired: 0=有效, 1=手动过期
-- 在线判断会结合 last_active_at + 全局 SESSION_TIMEOUT_SECONDS
-
-时间口径：
-- 统一使用 naive DATETIME（与全局其它表一致）
-- DB 会话时区由启动时 SET time_zone 控制（当前项目为北京时间）
-"""
-
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Index
-from sqlalchemy.sql import func
-
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Index, text
 from app.core.db import Base
 
 
@@ -23,26 +9,15 @@ class UserSession(Base):
     __tablename__ = "user_session"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-
-    # 对齐 user.id 类型
     user_id = Column(Integer, ForeignKey("user.id"), nullable=False)
+    session_token = Column(String(255), nullable=False)
 
-    # unique 本身会隐式创建索引，不再额外 index=True
-    session_token = Column(String(255), unique=True, nullable=False)
+    last_active_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
-    # ✅ 与全局其它表对齐：naive DATETIME（timezone=False）
-    last_active_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
-    created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
-
-    # 0 有效，1 手动过期
-    expired = Column(Integer, default=0, nullable=False)
+    expired = Column(Integer, nullable=False)
 
     __table_args__ = (
+        UniqueConstraint("session_token", name="session_token"),
         Index("ix_user_session_user_expired", "user_id", "expired"),
     )
-
-    def __repr__(self) -> str:
-        return (
-            f"<UserSession id={self.id} user_id={self.user_id} "
-            f"expired={self.expired}>"
-        )

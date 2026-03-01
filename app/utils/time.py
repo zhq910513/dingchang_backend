@@ -1,18 +1,25 @@
+# app/utils/time.py
 # encoding: utf-8
 """
-@author: The King
-@project: dingchang_backend
-@file: time.py
-@time: 2025/12/8 22:37
+时间工具（全局口径：北京时间 Asia/Shanghai，返回 naive datetime）
+
+说明：
+- DB 存 naive DATETIME（北京时间）
+- 业务侧统一用北京时间，避免 UTC/时区换算导致前端展示偏移
 """
 
-from datetime import datetime, timezone
+from __future__ import annotations
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 
-def utcnow() -> datetime:
-    # 统一返回 naive UTC 时间（用于 DB）
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def now_bj() -> datetime:
+    """返回北京时间 naive datetime（tzinfo=None）"""
+    return datetime.now(_BJ_TZ).replace(tzinfo=None)
 
 
 def now_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
-    return utcnow().strftime(fmt)
+    return now_bj().strftime(fmt)
