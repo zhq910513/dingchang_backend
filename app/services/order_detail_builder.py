@@ -174,19 +174,22 @@ def _slot_fields_from_dynamic(slot_key: str, dynamic_data: Dict[str, Any]) -> Li
 
 
 async def fetch_order_with_relations(db: AsyncSession, order_id: int) -> Optional[Order]:
+    opts = [
+        selectinload(Order.salesperson),
+        selectinload(Order.customer_group),
+        selectinload(Order.channel_group),
+        selectinload(Order.order_info),
+        selectinload(Order.images).selectinload(OrderImage.image_file),
+    ]
+    if hasattr(Order, "creator"):
+        opts.insert(0, selectinload(getattr(Order, "creator")))
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
-        .options(
-            selectinload(Order.creator),
-            selectinload(Order.salesperson),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
-        )
+        .options(*tuple(opts))
     )
     return (await db.execute(stmt)).scalars().first()
+
 
 
 async def _resolve_manager_info(db: AsyncSession, salesperson: Optional[User]) -> Tuple[Optional[int], Optional[str]]:

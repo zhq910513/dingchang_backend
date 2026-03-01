@@ -20,6 +20,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+
+
+def _maybe_selectinload(model, attr_name: str):
+    """Return selectinload(model.<attr>) if exists, else None."""
+    if hasattr(model, attr_name):
+        return selectinload(getattr(model, attr_name))
+    return None
+
 from app.models.order import Order, OrderImage
 from app.models.user import User
 from app.schemas.order import OrderOut, OrderInfoOut
@@ -34,15 +42,17 @@ from app.core.access_control import (
 
 def preload_options():
     """统一的 Order 列表预加载清单（orders / finance 必须一致）。"""
-    return (
-        selectinload(Order.creator),
+    opts = [
         selectinload(Order.salesperson),
         selectinload(Order.customer_group),
         selectinload(Order.channel_group),
         selectinload(Order.order_info),
         selectinload(Order.images).selectinload(OrderImage.image_file),
-    )
-
+    ]
+    creator_opt = _maybe_selectinload(Order, "creator")
+    if creator_opt is not None:
+        opts.insert(0, creator_opt)
+    return tuple(opts)
 
 def _user_display_name(u: Optional[User]) -> Optional[str]:
     if not u:

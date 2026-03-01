@@ -1674,7 +1674,7 @@ async def list_orders(
 
     items: List[OrderOut] = await _rm_orders_to_out_list(db, rows, storage=storage)
 
-    return OrderListResponse(meta=_build_orders_list_meta(role_name), total=total, items=items)
+    return OrderListResponse(meta=_build_list_meta(role_name=role_name), total=total, items=items)
 
 
 @router.get("/{order_id:int}", response_model=Dict[str, Any])
