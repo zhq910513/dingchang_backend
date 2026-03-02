@@ -1,36 +1,92 @@
+# app/models/channel_group.py
 # encoding: utf-8
 from __future__ import annotations
 
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint, Computed, Index, text
+from sqlalchemy import Column, Computed, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.types import JSON
+
 from app.core.db import Base
 
 
 class ChannelGroup(Base):
+    """
+    渠道组表
+
+    说明：
+    - team_name：历史归属/标记字段（可空；生产 DDL 参与唯一键）
+    - contacts：联系方式（JSON，结构由业务层定义；NOT NULL）
+    - deleted_at + is_deleted：软删除标记（is_deleted 为 generated column）
+    """
+
     __tablename__ = "channel_group"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        comment="主键ID",
+    )
 
-    team_name = Column(String(32), nullable=True)
+    team_name = Column(
+        String(32),
+        nullable=True,
+        comment="团队名称（历史归属/标记，可空；参与唯一键）",
+    )
 
-    channel_code = Column(String(64), nullable=False)
-    channel_name = Column(String(128), nullable=False)
+    channel_code = Column(
+        String(64),
+        nullable=False,
+        comment="渠道代码（必填）",
+    )
+    channel_name = Column(
+        String(128),
+        nullable=False,
+        comment="渠道名称（必填）",
+    )
 
-    region = Column(String(128), nullable=True)
+    region = Column(
+        String(128),
+        nullable=True,
+        comment="归属地区/区域（可空）",
+    )
 
-    created_by = Column(Integer, ForeignKey("user.id"), nullable=True)
+    created_by = Column(
+        Integer,
+        ForeignKey("user.id"),
+        nullable=True,
+        comment="创建人用户ID（FK -> user.id，可空）",
+    )
 
-    contacts = Column(JSON, nullable=False)
+    contacts = Column(
+        JSON,
+        nullable=False,
+        comment="联系方式（JSON，结构由业务层定义，NOT NULL）",
+    )
 
-    deleted_at = Column(DateTime(timezone=False), nullable=True)
-    is_deleted = Column(Integer, Computed("(deleted_at is not null)", persisted=True), nullable=False)
+    deleted_at = Column(
+        DateTime(timezone=False),
+        nullable=True,
+        comment="删除时间（软删除标记，可空；非空表示已删除）",
+    )
+    is_deleted = Column(
+        Integer,
+        Computed("(deleted_at is not null)", persisted=True),
+        nullable=False,
+        comment="是否已删除（generated column：deleted_at 非空为 1）",
+    )
 
-    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="创建时间（北京时间 naive DATETIME）",
+    )
     updated_at = Column(
         DateTime(timezone=False),
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP"),
         server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="更新时间（北京时间 naive DATETIME）",
     )
 
     __table_args__ = (

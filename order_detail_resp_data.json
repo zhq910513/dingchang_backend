@@ -1,0 +1,93 @@
+{
+  "total": 1,
+  "items": [
+    {
+      "id": 2385,
+      "created_by": 17,
+      "salesperson_id": 17,
+      "customer_group_id": 61,
+      "channel_group_id": 52,
+      "manager_id": null,
+      "manager_name": null,
+      "team_name": null,
+      "team_names": [],
+      "is_finished": true,
+      "is_rebate": false,
+      "is_paid": false,
+      "dynamic_data": {
+        "vin": "",
+        "dl_vin": "LSGKB52H3PV007383",
+        "id_name": "詹步南",
+        "dl_owner": "詹步南",
+        "id_birth": "",
+        "plate_no": "",
+        "engine_no": "",
+        "id_gender": "",
+        "id_issuer": "庐山市公安局",
+        "id_nation": "",
+        "id_number": "360427196611291216",
+        "id_address": "",
+        "owner_name": "",
+        "dl_plate_no": "赣GZ6N69",
+        "id_valid_to": "",
+        "id_validity": "长期",
+        "owner_phone": "",
+        "dl_engine_no": "222903373",
+        "dl_id_number": "",
+        "dl_use性质": "非营运",
+        "id_ethnicity": "汉",
+        "vehicle_name": "",
+        "dl_issue_date": "",
+        "dl_issuer_org": "江西省九江市公安局交通警察支队",
+        "dl_use_nature": "非营运",
+        "id_birth_date": "1966-11-29",
+        "id_valid_from": "",
+        "register_date": "",
+        "vehicle_model": "",
+        "dl_brand_model": "雪佛兰牌SGM7152LBAB",
+        "dl_vehicle_type": "小型轿车",
+        "id_valid_period": "",
+        "dl_register_date": "2023-06-12",
+        "dl_vehicle_model": "雪佛兰牌SGM7152LBAB",
+        "id_issue_authority": "",
+        "vehicle_brand_name": "",
+        "first_register_date": ""
+      },
+      "image_urls": [
+        "{'slot_key': 'driving_license_main', 'title': '行驶证主页', 'multi': False, 'ocr': True, 'images': []}",
+        "{'slot_key': 'driving_license_sub', 'title': '行驶证副页', 'multi': False, 'ocr': True, 'images': []}",
+        "{'slot_key': 'idcard_back', 'title': '身份证背面', 'multi': False, 'ocr': True, 'images': []}",
+        "{'slot_key': 'idcard_front', 'title': '身份证正面', 'multi': False, 'ocr': True, 'images': []}",
+        "{'slot_key': 'related', 'title': '相关图片', 'multi': True, 'ocr': False, 'images': []}",
+        "{'slot_key': 'vehicle_cert', 'title': '车辆合格证', 'multi': False, 'ocr': True, 'images': []}"
+      ],
+      "images": [],
+      "created_at": "2026-03-01T21:25:51",
+      "updated_at": "2026-03-01T21:29:37",
+      "customer_group_name": null,
+      "channel_group_name": null,
+      "salesperson_name": null,
+      "customer_group_market": null,
+      "order_info": null
+    }
+  ],
+  "meta": {
+    "source": "orders",
+    "capabilities": {
+      "can_edit_paid": false,
+      "can_edit_rebate": false,
+      "can_return_to_unfinished": false,
+      "can_download": true,
+      "can_mark_finished": true,
+      "can_reopen": true,
+      "image_slots_writable": [
+        "vehicle_cert",
+        "idcard_front",
+        "idcard_back",
+        "driving_license_main",
+        "driving_license_sub",
+        "related"
+      ]
+    }
+  }
+}
