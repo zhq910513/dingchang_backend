@@ -1,11 +1,14 @@
 # encoding: utf-8
 """
-MODEL FREEZE (DDL-locked)
+MODEL PACKAGE (Redesigned, first-deploy mode)
 
-This package is frozen to match the production MySQL DDL extracted via SHOW CREATE TABLE
-(order_system_schema_show_create.txt, 19 base tables).
+说明：
+- 本目录包含项目所有 ORM Model 定义（与 MySQL DDL 对齐，适用于首次部署 create_all）。
+- 额外包含“订单事实层”新表：order_slot_result / order_fact（用于卡槽识别事实与订单级投影）。
+- 全字段均提供中文注释（Column.comment），便于审计与维护。
 
-DO NOT modify model definitions unless the production DDL changes.
+注意：
+- 若后续你再次启用“DDL 锁定/生产对齐”，可将新增表导入改为按开关控制。
 """
 
 from app.models.role import Role  # noqa: F401
@@ -25,5 +28,30 @@ from app.models.ocr_task import OcrTask  # noqa: F401
 
 from app.models.order import Order, OrderImage  # noqa: F401
 from app.models.order_info import OrderInfo  # noqa: F401
-
 from app.models.finance import FinanceRecord  # noqa: F401
+
+# 新增事实层（首次部署可直接建表）
+from app.models.order_slot_result import OrderSlotResult  # noqa: F401
+from app.models.order_fact import OrderFact  # noqa: F401
+
+__all__ = [
+    "Role",
+    "User",
+    "UserRole",
+    "UserSession",
+    "CustomerGroup",
+    "ChannelGroup",
+    "FieldConfig",
+    "FieldGroup",
+    "FieldGroupField",
+    "ImageFile",
+    "ImageOcrResult",
+    "OcrImageCache",
+    "OcrTask",
+    "Order",
+    "OrderImage",
+    "OrderInfo",
+    "FinanceRecord",
+    "OrderSlotResult",
+    "OrderFact",
+]
