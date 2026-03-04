@@ -16,7 +16,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 from sqlalchemy import event, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -44,33 +44,11 @@ engine: AsyncEngine = create_async_engine(
     pool_recycle=int(getattr(settings, "DB_POOL_RECYCLE", 1800) or 1800),
 )
 
+# ✅ AsyncSession factory（统一入口，避免散落 SessionLocal / SessionMaker 命名）
+async_session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
 
 @event.listens_for(engine.sync_engine, "connect")
-def _on_connect_set_time_zone(dbapi_connection, connection_record) -> None:  # noqa: ARG001
-    if not DB_SET_TIME_ZONE_ENABLED:
-        return
-    try:
-        cursor = dbapi_connection.cursor()
-        try:
-            cursor.execute(f"SET time_zone = '{DB_TIME_ZONE}'")
-        finally:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("SET time_zone failed (tz=%s): %s", DB_TIME_ZONE, e)
-
-
-async_session_factory = sessionmaker(
-    bind=engine,
-    expire_on_commit=False,
-    class_=AsyncSession,
-)
-
-redis: Optional[object] = None
-
-
 def load_all_models() -> None:
     """
     启动期导入 ORM 模型，确保 Base.metadata 完整。
@@ -101,7 +79,8 @@ def _is_duplicate_column_error(e: Exception) -> bool:
     msg = (str(e) or "").lower()
     # MySQL: "Duplicate column name"
     # PostgreSQL: "duplicate column" / "already exists"
-    return ("duplicate column" in msg) or ("already exists" in msg and "column" in msg) or ("duplicate column name" in msg)
+    return ("duplicate column" in msg) or ("already exists" in msg and "column" in msg) or (
+                "duplicate column name" in msg)
 
 
 def _quote_ident(conn, name: str) -> str:
@@ -188,11 +167,11 @@ def _is_unsafe_notnull_without_default(col) -> bool:
 
 
 async def ensure_schema_additive_on_startup(
-    *,
-    add_tables: bool,
-    add_columns: bool,
-    log_details: bool = True,
-    strict_add_columns: bool = True,
+        *,
+        add_tables: bool,
+        add_columns: bool,
+        log_details: bool = True,
+        strict_add_columns: bool = True,
 ) -> Dict[str, object]:
     """
     启动期 schema 处理：
@@ -208,9 +187,9 @@ async def ensure_schema_additive_on_startup(
         "model_tables": [],
         "missing_tables": [],
         "extra_tables": [],
-        "missing_columns": {},   # table -> [col...]
-        "added_columns": [],     # ["table.col", ...]
-        "created_tables": [],    # ["table", ...]
+        "missing_columns": {},  # table -> [col...]
+        "added_columns": [],  # ["table.col", ...]
+        "created_tables": [],  # ["table", ...]
     }
 
     async with engine.begin() as conn:
@@ -229,8 +208,10 @@ async def ensure_schema_additive_on_startup(
             if log_details:
                 logger.info("[schema_check] db_tables=%s", ",".join(db_tables) if db_tables else "-")
                 logger.info("[schema_check] model_tables=%s", ",".join(model_tables) if model_tables else "-")
-                logger.info("[schema_check] missing_tables(in_db)=%s", ",".join(missing_tables) if missing_tables else "-")
-                logger.info("[schema_check] extra_tables(in_db_not_in_model)=%s", ",".join(extra_tables) if extra_tables else "-")
+                logger.info("[schema_check] missing_tables(in_db)=%s",
+                            ",".join(missing_tables) if missing_tables else "-")
+                logger.info("[schema_check] extra_tables(in_db_not_in_model)=%s",
+                            ",".join(extra_tables) if extra_tables else "-")
                 if missing_cols:
                     for tn, cols in missing_cols.items():
                         logger.info("[schema_check] missing_columns table=%s cols=%s", tn, ",".join(cols))

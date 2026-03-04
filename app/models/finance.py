@@ -25,7 +25,8 @@ class FinanceRecord(Base):
     actual_amount = Column(Numeric(18, 2), nullable=True, comment="实收金额（元，可空）")
     note = Column(String(255), nullable=True, comment="财务备注（可空）")
 
-    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="创建时间")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+                        comment="创建时间")
     updated_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
                         server_onupdate=text("CURRENT_TIMESTAMP"), comment="更新时间")
 

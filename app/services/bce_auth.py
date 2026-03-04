@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -62,16 +62,16 @@ def canonical_headers(headers: Dict[str, Any], headers_to_sign: Optional[set[str
 
 
 def sign_bce_auth_v1(
-    *,
-    method: str,
-    path: str,
-    query_params: Dict[str, Any],
-    headers_to_sign: Dict[str, Any],
-    signed_headers: Optional[set[str]],
-    access_key_id: str,
-    secret_access_key: str,
-    timestamp: str,
-    auth_expire_seconds: int = 1800,
+        *,
+        method: str,
+        path: str,
+        query_params: Dict[str, Any],
+        headers_to_sign: Dict[str, Any],
+        signed_headers: Optional[set[str]],
+        access_key_id: str,
+        secret_access_key: str,
+        timestamp: str,
+        auth_expire_seconds: int = 1800,
 ) -> str:
     """
     生成 bce-auth-v1 签名字符串（可用于 Header Authorization 或 QueryString authorization）

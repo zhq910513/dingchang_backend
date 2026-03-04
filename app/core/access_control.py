@@ -98,9 +98,9 @@ def normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> T
 # 报价助手（AI Assistant / 报价助手）统一权限阀门
 # =========================
 def require_ai_assistant_access(
-    *,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...] = tuple(),
+        *,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...] = tuple(),
 ) -> None:
     """
     报价助手统一访问权限（当前阶段收口策略）：
@@ -115,17 +115,6 @@ def require_ai_assistant_access(
     if rn == ROLE_SUPER_ADMIN:
         return
     raise HTTPException(status_code=403, detail="报价助手当前仅超级管理员可用")
-
-
-def require_ai_assistant_write_access(
-    *,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...] = tuple(),
-) -> None:
-    """
-    报价助手写权限阀门（当前与读权限一致，预留后续分级）
-    """
-    require_ai_assistant_access(role_name=role_name, team_names=team_names)
 
 
 def require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
@@ -157,7 +146,7 @@ def allowed_teams_for_user(role_name: Optional[str], team_names: Tuple[str, ...]
     if role_name == ROLE_MANAGER:
         return tns
     if role_name in (ROLE_FINANCE, ROLE_MARKET, ROLE_SALES):
-        return (require_single_team_for_strict_roles(role_name, tns),)
+        return require_single_team_for_strict_roles(role_name, tns),
     return tns
 
 

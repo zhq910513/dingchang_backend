@@ -15,7 +15,6 @@ import hashlib
 import hmac
 import os
 import secrets
-from datetime import datetime, timedelta
 from typing import Tuple
 
 from .config import settings
@@ -26,6 +25,7 @@ _PBKDF2_PREFIX = "pbkdf2_sha256"
 # 迭代次数：建议线上 >= 260000（可按机器性能调）
 _PASSWORD_HASH_ITERATIONS = int(os.getenv("PASSWORD_HASH_ITERATIONS", "260000") or "260000")
 _SALT_BYTES = int(os.getenv("PASSWORD_HASH_SALT_BYTES", "16") or "16")
+
 
 # 可选 pepper：用 SECRET_KEY 作为额外“全局密钥”（不落库）
 # 这样就算攻击者拿到数据库，也缺少 pepper 会更难爆破
@@ -120,10 +120,3 @@ def generate_session_token() -> str:
     生成会话 token
     """
     return secrets.token_urlsafe(32)
-
-
-def get_expire_time() -> datetime:
-    """
-    计算会话过期时间（与现有逻辑保持一致：UTC naive）
-    """
-    return datetime.utcnow() + timedelta(seconds=settings.SESSION_TIMEOUT_SECONDS)

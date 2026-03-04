@@ -106,6 +106,7 @@ def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """从身份证 OCR 结果提取标准字段（不写任何 dl_* / 历史别名）。"""
     wr = resp.get("words_result") or {}
 
     def g(name: str) -> str:
@@ -114,6 +115,7 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
             return _safe_str(x.get("words"))
         return _safe_str(x)
 
+    # front
     id_name = g("姓名")
     id_number = g("公民身份号码")
     id_address = g("住址")
@@ -121,13 +123,13 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
     id_gender = g("性别")
     id_ethnicity = g("民族")
 
+    # back
     id_issuer = g("签发机关")
-    id_validity = g("失效日期") or g("有效期限") or g("有效期")
-    id_valid_from = _normalize_ymd(g("签发日期")) or g("签发日期")
-    id_valid_to = _normalize_ymd(g("失效日期")) or g("失效日期")
+    id_validity = g("有效期限") or g("有效期") or g("失效日期")
+    id_valid_from = _normalize_ymd(g("签发日期"))
+    id_valid_to = _normalize_ymd(g("失效日期"))
 
     out: Dict[str, Any] = {
-        # ===== 标准字段 =====
         "id_name": id_name,
         "id_number": id_number,
         "id_address": id_address,
@@ -135,67 +137,49 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
         "id_gender": id_gender,
         "id_ethnicity": id_ethnicity,
         "id_issuer": id_issuer,
-        "id_validity": id_validity,
-
-        # ===== 财务口径（严格：接口只读 dl_*，这里同步镜像写入，避免新增数据再脏）=====
-        "dl_id_number": id_number,
-
-        # ===== 兼容 slot_field_config 历史 key（用于详情卡槽展示）=====
-        "id_nation": id_ethnicity,
-        "id_birth": id_birth_date,
-        "id_issue_authority": id_issuer,
         "id_valid_from": id_valid_from,
         "id_valid_to": id_valid_to,
-        "id_valid_period": id_validity,
+        "id_validity": id_validity,
     }
-    return {k: v for k, v in out.items() if v}
+    return {k: v for k, v in out.items() if _safe_str(v)}
 
 
 def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """从行驶证 OCR 结果提取标准字段（不写任何 dl_* / 历史别名）。"""
     wr = resp.get("words_result") or {}
 
     def g(name: str) -> str:
         x = wr.get(name) or {}
         return _safe_str(x.get("words") if isinstance(x, dict) else x)
 
-    dl_plate_no = g("号牌号码")
-    dl_owner = g("所有人")
-    dl_vin = g("车辆识别代号")
-    dl_engine_no = g("发动机号码")
-    dl_vehicle_model = g("品牌型号")
-    dl_vehicle_type = g("车辆类型")
-    dl_use_nature = g("使用性质")
-    dl_register_date = _normalize_ymd(g("注册日期"))
-    dl_issue_date = _normalize_ymd(g("发证日期"))
-    dl_issuer_org = g("发证机关") or g("发证单位")
+    plate_no = g("号牌号码")
+    owner_name = g("所有人")
+    vin = g("车辆识别代号")
+    engine_no = g("发动机号码")
+    vehicle_model = g("品牌型号")
+    vehicle_type = g("车辆类型")
+    use_nature = g("使用性质")
+    first_register_date = _normalize_ymd(g("注册日期"))
+    issue_date = _normalize_ymd(g("发证日期"))
+    issuer_org = g("发证机关") or g("发证单位")
 
     out: Dict[str, Any] = {
-        # ===== 原始行驶证 OCR 字段（保留）=====
-        "dl_plate_no": dl_plate_no,
-        "dl_owner": dl_owner,
-        "dl_vin": dl_vin,
-        "dl_engine_no": dl_engine_no,
-        "dl_vehicle_model": dl_vehicle_model,
-        "dl_brand_model": dl_vehicle_model,
-        "dl_vehicle_type": dl_vehicle_type,
-        "dl_use_nature": dl_use_nature,
-        "dl_use性质": dl_use_nature,
-        "dl_register_date": dl_register_date,
-        "dl_issue_date": dl_issue_date,
-        "dl_issuer_org": dl_issuer_org,
-
-        # ===== 标准化字段（给订单/财务/前端统一消费）=====
-        "plate_no": dl_plate_no,
-        "owner_name": dl_owner,
-        "vin": dl_vin,
-        "engine_no": dl_engine_no,
-        "vehicle_model": dl_vehicle_model,
-        "first_register_date": dl_register_date,
+        "plate_no": plate_no,
+        "owner_name": owner_name,
+        "vin": vin,
+        "engine_no": engine_no,
+        "vehicle_model": vehicle_model,
+        "vehicle_type": vehicle_type,
+        "use_nature": use_nature,
+        "first_register_date": first_register_date,
+        "issue_date": issue_date,
+        "issuer_org": issuer_org,
     }
-    return {k: v for k, v in out.items() if v}
+    return {k: v for k, v in out.items() if _safe_str(v)}
 
 
 def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """从车辆合格证 OCR 结果提取标准字段（不写任何 dl_* 镜像）。"""
     wr = resp.get("words_result") or {}
 
     def g(name: str) -> str:
@@ -212,13 +196,8 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
         "approved_passenger_count": g("SeatingCapacity") or g("LimitPassenger"),
         "vehicle_brand_name": g("CarBrand") or g("BrandModel"),
         "manufacturer_name": g("Manufacturer"),
-
-        # 财务口径镜像
-        "dl_vehicle_model": vehicle_model,
-        "dl_vin": vin,
-        "dl_engine_no": engine_no,
     }
-    return {k: v for k, v in out.items() if v}
+    return {k: v for k, v in out.items() if _safe_str(v)}
 
 
 def _extract_by_type(api_type: str, resp: Dict[str, Any]) -> Dict[str, Any]:
@@ -236,12 +215,12 @@ def _is_baidu_error(resp: Dict[str, Any]) -> bool:
 
 
 async def _set_task(
-    db: AsyncSession,
-    task: OcrTask,
-    *,
-    status: str,
-    progress: int,
-    error_message: Optional[str] = None,
+        db: AsyncSession,
+        task: OcrTask,
+        *,
+        status: str,
+        progress: int,
+        error_message: Optional[str] = None,
 ) -> None:
     task.status = str(status or "").strip() or "failed"
     task.progress = _clamp_progress(progress)
@@ -259,12 +238,12 @@ async def _set_task(
 
 
 async def _cache_get(
-    db: AsyncSession,
-    *,
-    storage_key: str,
-    api_type: str,
-    side: str,
-    provider: str = "baidu",
+        db: AsyncSession,
+        *,
+        storage_key: str,
+        api_type: str,
+        side: str,
+        provider: str = "baidu",
 ) -> Optional[Dict[str, Any]]:
     stmt = select(OcrImageCache).where(
         and_(
@@ -279,13 +258,13 @@ async def _cache_get(
 
 
 async def _cache_put(
-    db: AsyncSession,
-    *,
-    storage_key: str,
-    api_type: str,
-    side: str,
-    provider: str,
-    result: Dict[str, Any],
+        db: AsyncSession,
+        *,
+        storage_key: str,
+        api_type: str,
+        side: str,
+        provider: str,
+        result: Dict[str, Any],
 ) -> None:
     stmt = select(OcrImageCache).where(
         and_(
@@ -324,13 +303,13 @@ async def _cache_put(
 
 
 async def _image_result_upsert(
-    db: AsyncSession,
-    *,
-    image_file_id: int,
-    provider: str,
-    api_type: str,
-    side: str,
-    raw_result: Dict[str, Any],
+        db: AsyncSession,
+        *,
+        image_file_id: int,
+        provider: str,
+        api_type: str,
+        side: str,
+        raw_result: Dict[str, Any],
 ) -> None:
     stmt = select(ImageOcrResult).where(
         and_(

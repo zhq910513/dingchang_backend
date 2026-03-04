@@ -5,13 +5,13 @@ API v1 router aggregator
 
 from fastapi import APIRouter
 
-from .auth import router as auth_router
-from .users import router as users_router
-from .orders import router as orders_router
-from .finance import router as finance_router
-from .field_config import router as field_config_router
-from .customer_channel import router as customer_channel_router  # ✅ /customer-groups /channel-groups
 from app.api.v1 import ai_assistant  # ✅ 新增
+from .auth import router as auth_router
+from .customer_channel import router as customer_channel_router  # ✅ /customer-groups /channel-groups
+from .field_config import router as field_config_router
+from .finance import router as finance_router
+from .orders import router as orders_router
+from .users import router as users_router
 
 router = APIRouter()
 

@@ -83,7 +83,7 @@ class DeleteSessionResponse(BaseModel):
 
 @router.get("/sessions", response_model=AiSessionListOut)
 async def list_ai_sessions(
-    current_user=Depends(get_current_user_with_role_and_teams),
+        current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
     rows = _list_sessions(owner_user_id=owner_user_id) or []
@@ -93,8 +93,8 @@ async def list_ai_sessions(
 
 @router.post("/sessions")
 async def create_ai_session(
-    body: CreateSessionRequest,
-    current_user=Depends(get_current_user_with_role_and_teams),
+        body: CreateSessionRequest,
+        current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
     row = _create_session(owner_user_id=owner_user_id, title=(body.title or "").strip() or None)
@@ -110,8 +110,8 @@ async def create_ai_session(
 
 @router.delete("/sessions/{session_id}", response_model=DeleteSessionResponse)
 async def delete_ai_session(
-    session_id: str,
-    current_user=Depends(get_current_user_with_role_and_teams),
+        session_id: str,
+        current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
     ok = _delete_session(session_id=session_id, owner_user_id=owner_user_id)
@@ -122,8 +122,8 @@ async def delete_ai_session(
 
 @router.get("/sessions/{session_id}/history")
 async def get_ai_history(
-    session_id: str,
-    current_user=Depends(get_current_user_with_role_and_teams),
+        session_id: str,
+        current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
     rows = _list_messages(session_id=session_id, owner_user_id=owner_user_id) or []
@@ -143,8 +143,8 @@ async def get_ai_history(
 
 @router.post("/chat", response_model=AiChatOut)
 async def ai_chat(
-    body: AiChatIn,
-    current_user=Depends(get_current_user_with_role_and_teams),
+        body: AiChatIn,
+        current_user=Depends(get_current_user_with_role_and_teams),
 ):
     owner_user_id = _uid_from_current_user(current_user)
 

@@ -6,7 +6,6 @@ from typing import Dict, List, Optional
 
 from app.services.ai_platforms.base import AiPlatformAdapter, StubPlatformAdapter
 
-
 # ✅ 注册中心：后续每接一个平台，只要在这里 register
 _REGISTRY: Dict[str, AiPlatformAdapter] = {}
 
@@ -42,7 +41,6 @@ def list_enabled_adapters() -> List[AiPlatformAdapter]:
 
 # ✅ 默认注册一个 STUB（用于公共入口先跑通）
 register_adapter(StubPlatformAdapter())
-
 
 __all__ = [
     "AiPlatformAdapter",

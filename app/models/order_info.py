@@ -26,25 +26,36 @@ class OrderInfo(Base):
     non_vehicle_amount = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="非车险金额（元）")
     premium_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="总保费（元）")
 
-    channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="渠道商业险点位")
-    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="渠道商业险补点点位")
-    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="渠道交强险点位")
-    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="渠道车船税点位")
-    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="渠道非车险点位")
+    channel_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                      comment="渠道商业险点位")
+    channel_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                                 comment="渠道商业险补点点位")
+    channel_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                      comment="渠道交强险点位")
+    channel_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                       comment="渠道车船税点位")
+    channel_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                       comment="渠道非车险点位")
     channel_reward = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="渠道返利金额（元）")
     channel_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="渠道合计金额（元）")
 
-    customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="客户商业险点位")
-    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="客户商业险补点点位")
-    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="客户交强险点位")
-    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="客户车船税点位")
-    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"), comment="客户非车险点位")
+    customer_commercial_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                       comment="客户商业险点位")
+    customer_commercial_supplement_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                                  comment="客户商业险补点点位")
+    customer_compulsory_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                       comment="客户交强险点位")
+    customer_vehicle_tax_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                        comment="客户车船税点位")
+    customer_non_vehicle_point = Column(Numeric(10, 4), nullable=False, server_default=text("'0.0000'"),
+                                        comment="客户非车险点位")
     customer_reward = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="客户返利金额（元）")
     customer_total = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="客户合计金额（元）")
 
     profit = Column(Numeric(18, 2), nullable=False, server_default=text("'0.00'"), comment="利润（元）")
 
-    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="创建时间")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
+                        comment="创建时间")
     updated_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
                         server_onupdate=text("CURRENT_TIMESTAMP"), comment="更新时间")
 

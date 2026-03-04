@@ -31,7 +31,8 @@ class OcrImageCache(Base):
                         comment="更新时间（北京时间 naive DATETIME）")
 
     __table_args__ = (
-        UniqueConstraint("storage_key", "api_type", "side", "provider", name="uq_ocr_image_cache_key_type_side_provider"),
+        UniqueConstraint("storage_key", "api_type", "side", "provider",
+                         name="uq_ocr_image_cache_key_type_side_provider"),
         Index("ix_ocr_image_cache_storage_key", "storage_key"),
         Index("ix_ocr_image_cache_created_at", "created_at"),
         Index("ix_ocr_image_cache_sha256", "sha256"),

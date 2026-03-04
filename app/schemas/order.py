@@ -1,163 +1,132 @@
 # encoding: utf-8
 from __future__ import annotations
 
-from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from app.schemas._base import OrmBaseModel
 
+# =========================
+# Slot Images（唯一真源契约）
+# =========================
+
+class SlotImageItemOut(BaseModel):
+    """卡槽图片条目（字段固定，不多不少）"""
+    order_image_id: int
+    image_file_id: Optional[int] = None
+    storage_key: str = ""
+    url: str = ""
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SlotImageNodeOut(BaseModel):
+    """卡槽节点（字段固定，不多不少）"""
+    slot_key: str
+    title: str
+    multi: bool = False
+    ocr: bool = False
+    images: List[SlotImageItemOut] = Field(default_factory=list)
+
+
+# 为了避免上游代码 import 炸裂，保留旧类名，但其字段已对齐到新契约（不再输出旧字段 id/image_url/image_file）
+class OrderImageOut(SlotImageItemOut):
+    """（弃用）历史类名保留，但字段已收口为 SlotImageItemOut。"""
+    pass
+
+
+# =========================
+# Order Info（扩展信息）
+# =========================
 
 class OrderInfoIn(BaseModel):
-    insurance_expire_date: Optional[date] = None
-    owner_phone: Optional[str] = None
+    """订单扩展信息入参（最小化：只保留 remark，其余走 dynamic_data/事实层）。"""
     remark: Optional[str] = None
 
-    commercial_amount: Optional[Any] = None
-    compulsory_amount: Optional[Any] = None
-    vehicle_tax_amount: Optional[Any] = None
-    non_vehicle_amount: Optional[Any] = None
 
-    channel_commercial_point: Optional[Any] = None
-    channel_commercial_supplement_point: Optional[Any] = None
-    channel_compulsory_point: Optional[Any] = None
-    channel_vehicle_tax_point: Optional[Any] = None
-    channel_non_vehicle_point: Optional[Any] = None
-    channel_reward: Optional[Any] = None
-
-    customer_commercial_point: Optional[Any] = None
-    customer_commercial_supplement_point: Optional[Any] = None
-    customer_compulsory_point: Optional[Any] = None
-    customer_vehicle_tax_point: Optional[Any] = None
-    customer_non_vehicle_point: Optional[Any] = None
-    customer_reward: Optional[Any] = None
-
-
-class OrderInfoOut(OrmBaseModel):
-    id: int
-    order_id: int
-
-    insurance_expire_date: Optional[date] = None
-    owner_phone: Optional[str] = None
+class OrderInfoOut(BaseModel):
+    """订单扩展信息出参（最小化）。"""
     remark: Optional[str] = None
 
-    commercial_amount: Any = 0
-    compulsory_amount: Any = 0
-    vehicle_tax_amount: Any = 0
-    non_vehicle_amount: Any = 0
-    premium_total: Any = 0
 
-    channel_commercial_point: Any = 0
-    channel_commercial_supplement_point: Any = 0
-    channel_compulsory_point: Any = 0
-    channel_vehicle_tax_point: Any = 0
-    channel_non_vehicle_point: Any = 0
-    channel_reward: Any = 0
-    channel_total: Any = 0
+# =========================
+# Order（主对象）
+# =========================
 
-    customer_commercial_point: Any = 0
-    customer_commercial_supplement_point: Any = 0
-    customer_compulsory_point: Any = 0
-    customer_vehicle_tax_point: Any = 0
-    customer_non_vehicle_point: Any = 0
-    customer_reward: Any = 0
-    customer_total: Any = 0
-
-    profit: Any = 0
-
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class OrderImageOut(OrmBaseModel):
-    id: int
-    order_id: int
-    slot_key: str
-    storage_key: str
-    image_url: str = ""
-    image_file_id: Optional[int] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class OrderOut(BaseModel):
-    # core
-    id: int
-    created_by: int
-    salesperson_id: int
+class OrderCreate(BaseModel):
+    """创建订单（新表口径）"""
+    module: str = "order"
+    created_by: Optional[int] = None
+    salesperson_id: Optional[int] = None
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
 
-    # derived
-    manager_id: Optional[int] = None
-    manager_name: Optional[str] = None
-    team_name: Optional[str] = None
-    team_names: List[str] = Field(default_factory=list)
+    status: int = 0
+    audit_status: int = 0
 
-    # flags
+    # ✅ 新口径：dynamic_data / ocr_raw_json 允许为空对象，但不做任何旧键回填
+    dynamic_data: Dict[str, Any] = Field(default_factory=dict)
+    ocr_raw_json: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OrderUpdate(BaseModel):
+    """更新订单（仅允许更新明确字段；其余通过事实层/业务专用接口）"""
+    is_finished: Optional[bool] = None
+    status: Optional[int] = None
+    audit_status: Optional[int] = None
+    dynamic_data: Optional[Dict[str, Any]] = None
+    ocr_raw_json: Optional[Dict[str, Any]] = None
+
+
+class OrderStatusUpdate(BaseModel):
+    is_finished: Optional[bool] = None
+    status: Optional[int] = None
+    audit_status: Optional[int] = None
+
+
+class OrderOut(BaseModel):
+    id: int
+    module: str
+
+    created_by: int
+    salesperson_id: int
+
+    customer_group_id: Optional[int] = None
+    channel_group_id: Optional[int] = None
+
     is_finished: bool = False
     is_rebate: bool = False
     is_paid: bool = False
 
-    # data
+    status: int = 0
+    audit_status: int = 0
+
     dynamic_data: Dict[str, Any] = Field(default_factory=dict)
+    ocr_raw_json: Dict[str, Any] = Field(default_factory=dict)
 
-    image_urls: List[str] = Field(default_factory=list)
-    images: List[OrderImageOut] = Field(default_factory=list)
+    # ✅ 唯一图片结构：slot_images（按 slot_field_config 的固定契约）
+    slot_images: List[SlotImageNodeOut] = Field(default_factory=list)
 
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-    # display
-    customer_group_name: Optional[str] = None
-    channel_group_name: Optional[str] = None
-    salesperson_name: Optional[str] = None
-    customer_group_market: Optional[str] = None
-
+    # 扩展信息（如后端已实现 1:1）
     order_info: Optional[OrderInfoOut] = None
+
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class OrderListItemOut(OrderOut):
+    """列表项（当前与 OrderOut 一致，保持单一口径）"""
+    pass
 
 
 class OrderListMeta(BaseModel):
+    """列表元信息（UI 能力提示等）"""
     source: str = "orders"
     capabilities: Dict[str, Any] = Field(default_factory=dict)
 
 
 class OrderListResponse(BaseModel):
-    total: int
+    """订单列表响应（与 API 输出一致）"""
+    meta: Optional[OrderListMeta] = None
+    total: int = 0
     items: List[OrderOut] = Field(default_factory=list)
-    meta: OrderListMeta = Field(default_factory=OrderListMeta)
-
-
-class OrderCreate(BaseModel):
-    module: str = "order"
-    dynamic_data: Dict[str, Any] = Field(default_factory=dict)
-    ocr_raw_json: Dict[str, Any] = Field(default_factory=dict)
-
-    customer_group_id: Optional[int] = None
-    channel_group_id: Optional[int] = None
-    salesperson_id: Optional[int] = None
-
-    status: int = 0
-    audit_status: int = 0
-    is_finished: bool = False
-
-    order_info: Optional[OrderInfoIn] = None
-
-
-class OrderUpdate(BaseModel):
-    customer_group_id: Optional[int] = None
-    channel_group_id: Optional[int] = None
-    salesperson_id: Optional[int] = None
-    dynamic_data: Optional[Dict[str, Any]] = None
-    order_info: Optional[OrderInfoIn] = None
-
-
-class OrderStatusUpdate(BaseModel):
-    is_finished: Optional[bool] = None
-    is_rebate: Optional[bool] = None
-    is_paid: Optional[bool] = None
-
-
-class OrderInfoPatch(BaseModel):
-    order_info: Optional[OrderInfoIn] = None

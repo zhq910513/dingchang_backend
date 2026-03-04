@@ -20,10 +20,9 @@ from app.core.db import get_db
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
-from app.services.storage import StorageService
-
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
+from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
 storage = StorageService()
@@ -112,11 +111,11 @@ def _mk_action(label: str, type_: str = "suggest", target: Optional[str] = None,
 
 
 def _mk_data(
-    *,
-    result_status: str,
-    message: str,
-    entities: Optional[Dict[str, Any]] = None,
-    payload: Optional[Dict[str, Any]] = None,
+        *,
+        result_status: str,
+        message: str,
+        entities: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "result_status": result_status,
@@ -193,11 +192,11 @@ class _Store:
             return deepcopy(row)
 
     def get_or_create_session(
-        self,
-        *,
-        owner_user_id: str,
-        session_id: Optional[str] = None,
-        title: Optional[str] = None,
+            self,
+            *,
+            owner_user_id: str,
+            session_id: Optional[str] = None,
+            title: Optional[str] = None,
     ) -> Dict[str, Any]:
         if session_id:
             found = self.get_session(owner_user_id=owner_user_id, session_id=session_id)
@@ -242,12 +241,12 @@ class _Store:
         return True
 
     def list_messages(
-        self,
-        *,
-        owner_user_id: str,
-        session_id: str,
-        cursor: Optional[str] = None,
-        limit: int = 50,
+            self,
+            *,
+            owner_user_id: str,
+            session_id: str,
+            cursor: Optional[str] = None,
+            limit: int = 50,
     ) -> Dict[str, Any]:
         row = self.get_session(owner_user_id=owner_user_id, session_id=session_id)
         if not row:
@@ -274,13 +273,13 @@ class _Store:
         return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
 
     def append_message(
-        self,
-        *,
-        owner_user_id: str,
-        session_id: str,
-        role: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
+            self,
+            *,
+            owner_user_id: str,
+            session_id: str,
+            role: str,
+            content: str,
+            metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             row = self._data["sessions"].get(session_id)
@@ -307,7 +306,6 @@ class _Store:
 
 
 _store = _Store()
-
 
 # =============================
 # 指令理解（规则引擎）
@@ -472,12 +470,12 @@ async def _db_get_order_by_id(db: AsyncSession, order_id: int) -> Optional[Order
 
 
 async def _db_find_order(
-    db: AsyncSession,
-    *,
-    order_id: Optional[int],
-    plate_no: Optional[str],
-    owner_phone: Optional[str],
-    owner_name: Optional[str],
+        db: AsyncSession,
+        *,
+        order_id: Optional[int],
+        plate_no: Optional[str],
+        owner_phone: Optional[str],
+        owner_name: Optional[str],
 ) -> Optional[Order]:
     if order_id:
         return await _db_get_order_by_id(db, int(order_id))
@@ -758,13 +756,15 @@ def _help_reply() -> Tuple[str, Dict[str, Any]]:
     }
 
 
-async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str, Any]) -> Tuple[
+    str, Dict[str, Any]]:
     order_id = _safe_int(ctx.get("order_id"), 0) or _safe_int(entities.get("order_id"), 0) or None
     plate_no = _to_str(ctx.get("plate_no") or entities.get("plate_no")).strip() or None
     owner_phone = _to_str(ctx.get("owner_phone") or entities.get("owner_phone")).strip() or None
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
-    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
+                                 owner_name=owner_name)
     if not order:
         return (
             "当前没有可展示的材料状态（未定位到订单）。你可以先发：查订单123 或 查订单 赣B12345，然后再查看材料状态。",
@@ -826,7 +826,8 @@ async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities
     )
 
 
-async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str, Any]) -> Tuple[
+    str, Dict[str, Any]]:
     task_id = _safe_int(entities.get("task_id"), 0) or None
 
     if not task_id:
@@ -835,7 +836,8 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
         owner_phone = _to_str(ctx.get("owner_phone") or entities.get("owner_phone")).strip() or None
         owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
-        order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+        order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
+                                     owner_name=owner_name)
         if not order:
             return (
                 "已识别为OCR任务查询，但你没提供任务号，也没定位到订单。你可以发：查OCR任务 123 或 查订单123 再查OCR状态。",
@@ -984,7 +986,8 @@ async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
-    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
+                                 owner_name=owner_name)
     if not order:
         return (
             "没查到符合条件的订单。你可以换个条件再试试（订单号/车牌/手机号）。",
@@ -1168,7 +1171,8 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
     owner_phone = _to_str(ctx.get("owner_phone") or entities.get("owner_phone")).strip() or None
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
-    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
+                                 owner_name=owner_name)
     if not order:
         return (
             f"已识别报价指令：{platform_name}报价，但当前未定位到订单。你可以先发：查订单123 / 查订单 赣B12345，再执行报价。",
@@ -1180,7 +1184,8 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
                     result_status=RESULT_NEED_MORE,
                     message="报价缺少订单定位信息",
                     entities=entities,
-                    payload={"quote_request": {"platform_name": platform_name, "platform_code": platform_code, "accepted": False, "reason": "order_not_found"}},
+                    payload={"quote_request": {"platform_name": platform_name, "platform_code": platform_code,
+                                               "accepted": False, "reason": "order_not_found"}},
                 ),
                 "actions": [_mk_action("查订单 10086"), _mk_action("查看当前材料状态")],
             },
@@ -1241,7 +1246,8 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
                         }
                     },
                 ),
-                "actions": [_mk_action("OCR任务状态"), _mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+                "actions": [_mk_action("OCR任务状态"), _mk_action("查看当前材料状态"),
+                            _mk_action(f"{platform_name}报价")],
             },
         )
 
@@ -1417,10 +1423,10 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any]) -> Tuple[str, Dict[str,
 # 对外导出函数（给 API 层 import）
 # =============================
 def get_or_create_session(
-    *,
-    owner_user_id: str,
-    session_id: Optional[str] = None,
-    title: Optional[str] = None,
+        *,
+        owner_user_id: str,
+        session_id: Optional[str] = None,
+        title: Optional[str] = None,
 ) -> Dict[str, Any]:
     return _store.get_or_create_session(owner_user_id=owner_user_id, session_id=session_id, title=title)
 
@@ -1438,21 +1444,21 @@ def delete_session(*, owner_user_id: str, session_id: str) -> bool:
 
 
 def get_session_messages(
-    *,
-    owner_user_id: str,
-    session_id: str,
-    cursor: Optional[str] = None,
-    limit: int = 50,
+        *,
+        owner_user_id: str,
+        session_id: str,
+        cursor: Optional[str] = None,
+        limit: int = 50,
 ) -> Dict[str, Any]:
     return _store.list_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
 
 
 def list_messages(
-    *,
-    owner_user_id: str,
-    session_id: str,
-    cursor: Optional[str] = None,
-    limit: int = 50,
+        *,
+        owner_user_id: str,
+        session_id: str,
+        cursor: Optional[str] = None,
+        limit: int = 50,
 ) -> List[Dict[str, Any]]:
     res = _store.list_messages(owner_user_id=owner_user_id, session_id=session_id, cursor=cursor, limit=limit)
     items = res.get("items") if isinstance(res, dict) else None
@@ -1462,21 +1468,21 @@ def list_messages(
 
 
 async def send_message(
-    *,
-    owner_user_id: str,
-    session_id: Optional[str] = None,
-    message: Optional[str] = None,
-    history: Optional[List[Dict[str, Any]]] = None,
-    system_prompt: Optional[str] = None,
-    model: Optional[str] = None,
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    stream: Optional[bool] = None,
-    context: Optional[Dict[str, Any]] = None,
-    text: Optional[str] = None,
-    client_msg_id: Optional[str] = None,
-    page_context: Optional[Dict[str, Any]] = None,
-    use_stream: Optional[bool] = None,
+        *,
+        owner_user_id: str,
+        session_id: Optional[str] = None,
+        message: Optional[str] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        stream: Optional[bool] = None,
+        context: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+        client_msg_id: Optional[str] = None,
+        page_context: Optional[Dict[str, Any]] = None,
+        use_stream: Optional[bool] = None,
 ) -> Dict[str, Any]:
     del history, system_prompt, temperature, max_tokens
 

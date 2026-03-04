@@ -117,6 +117,7 @@ class MemoryCacheBackend(CacheBackend):
     """
     兜底：进程内缓存（开发/无 Redis）
     """
+
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
@@ -148,10 +149,6 @@ def get_cache_backend() -> CacheBackend:
     except Exception:
         pass
     return MemoryCacheBackend()
-
-
-def build_platform_auth_cache_key(platform_code: str, account_id: str) -> str:
-    return f"ai:platform_auth:{platform_code}:{account_id}"
 
 
 def build_quote_cache_key(platform_code: str, material_hash: str) -> str:
@@ -206,11 +203,11 @@ class AiPlatformAdapter(abc.ABC):
         return int(getattr(settings, "AI_PLATFORM_CACHE_TTL_SECONDS", 300) or 300)
 
     async def quote(
-        self,
-        *,
-        ctx: QuoteContext,
-        material_payload: Dict[str, Any],
-        use_cache: bool = True,
+            self,
+            *,
+            ctx: QuoteContext,
+            material_payload: Dict[str, Any],
+            use_cache: bool = True,
     ) -> QuoteResult:
         """
         ✅ 统一报价入口（带缓存 + 统一错误结构）
@@ -354,7 +351,8 @@ class AiPlatformAdapter(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any], raw_response: Dict[str, Any]) -> Dict[str, Any]:
+    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+                                     raw_response: Dict[str, Any]) -> Dict[str, Any]:
         """
         将 raw_response 转换为标准化摘要 quote_result（便于前端展示）
         """
@@ -383,7 +381,8 @@ class StubPlatformAdapter(AiPlatformAdapter):
     async def do_quote(self, *, ctx: QuoteContext, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"stub": True, "message": "platform adapter not implemented"}
 
-    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any], raw_response: Dict[str, Any]) -> Dict[str, Any]:
+    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+                                     raw_response: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "status": "stub",
             "message": "平台报价接口未接入",

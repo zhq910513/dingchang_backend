@@ -76,8 +76,10 @@ class Order(Base):
     channel_group = relationship("ChannelGroup", back_populates="orders", lazy="selectin", doc="渠道组")
 
     # 关系：订单扩展
-    order_info = relationship("OrderInfo", back_populates="order", uselist=False, lazy="selectin", doc="订单信息扩展（1:1）")
-    finance_record = relationship("FinanceRecord", back_populates="order", uselist=False, lazy="selectin", doc="财务记录（1:1）")
+    order_info = relationship("OrderInfo", back_populates="order", uselist=False, lazy="selectin",
+                              doc="订单信息扩展（1:1）")
+    finance_record = relationship("FinanceRecord", back_populates="order", uselist=False, lazy="selectin",
+                                  doc="财务记录（1:1）")
 
     # 关系：图片
     images = relationship("OrderImage", back_populates="order", lazy="selectin", doc="订单图片列表")

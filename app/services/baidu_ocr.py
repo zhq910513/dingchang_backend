@@ -159,12 +159,12 @@ def _extract_baidu_error(data: Dict[str, Any]) -> tuple[int, str]:
 
 
 def _call_ocr_once(
-    *,
-    api_type: str,
-    image_url: str,
-    side: Optional[str],
-    detect_direction: bool,
-    access_token: str,
+        *,
+        api_type: str,
+        image_url: str,
+        side: Optional[str],
+        detect_direction: bool,
+        access_token: str,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"url": image_url}
 
@@ -208,10 +208,10 @@ def _call_ocr_once(
 
 
 def call_ocr(
-    api_type: str,
-    image_url: str,
-    side: Optional[str] = None,
-    detect_direction: bool = True,
+        api_type: str,
+        image_url: str,
+        side: Optional[str] = None,
+        detect_direction: bool = True,
 ) -> Dict[str, Any]:
     """
     ✅ 当前方案：只允许百度通过 URL 抓取图片（BOS/公网可访问链接）

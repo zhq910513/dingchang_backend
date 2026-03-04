@@ -19,7 +19,3 @@ _BJ_TZ = ZoneInfo("Asia/Shanghai")
 def now_bj() -> datetime:
     """返回北京时间 naive datetime（tzinfo=None）"""
     return datetime.now(_BJ_TZ).replace(tzinfo=None)
-
-
-def now_str(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
-    return now_bj().strftime(fmt)

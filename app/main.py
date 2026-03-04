@@ -7,12 +7,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1 import router as v1_router
 from app.core.config import settings
@@ -49,7 +48,6 @@ OCR_POLL_BATCH_SIZE = int(os.getenv("OCR_POLL_BATCH_SIZE", "3") or "3")
 
 DB_TIME_ZONE = os.getenv("DB_TIME_ZONE", "+08:00")
 DB_SET_TIME_ZONE_ENABLED = os.getenv("DB_SET_TIME_ZONE_ENABLED", "1") == "1"
-
 
 # ========= Redis 分布式锁（启动单例守卫） =========
 LOCK_SEED_KEY = os.getenv("STARTUP_LOCK_SEED_KEY", "dingchang:startup:seed")
@@ -300,30 +298,6 @@ except Exception as e:
 
 
 @app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start = time.perf_counter()
-    response = await call_next(request)
-    response.headers["X-Process-Time"] = f"{time.perf_counter() - start:.6f}"
-    return response
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
-
-@app.exception_handler(StarletteHTTPException)
-async def starlette_http_exception_handler(request: Request, exc: StarletteHTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception("Unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": "服务器内部错误"})
-
-
-@app.get("/api/health")
 async def health():
     db_ok = True
     redis_ok = True

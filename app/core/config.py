@@ -137,11 +137,13 @@ class Settings(BaseSettings):
                 if bool(values.get("BOS_ENABLED", True)):
                     for k in ("BOS_STS_ACCOUNT_ID", "BOS_STS_ACCESS_KEY", "BOS_STS_SECRET_KEY"):
                         if _is_placeholder(values.get(k)):
-                            raise ValueError(f"{k} must be set via environment variables in prod when BOS_ENABLED=true.")
+                            raise ValueError(
+                                f"{k} must be set via environment variables in prod when BOS_ENABLED=true.")
                 if bool(values.get("BAIDU_OCR_ENABLED", True)):
                     for k in ("BAIDU_API_KEY", "BAIDU_SECRET_KEY"):
                         if _is_placeholder(values.get(k)):
-                            raise ValueError(f"{k} must be set via environment variables in prod when BAIDU_OCR_ENABLED=true.")
+                            raise ValueError(
+                                f"{k} must be set via environment variables in prod when BAIDU_OCR_ENABLED=true.")
             return values
 
     def _validate_required_for_env(self) -> None:

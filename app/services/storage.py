@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union, IO
@@ -183,14 +181,14 @@ class StorageService:
         return url, path
 
     def _bos_signed_headers(
-        self,
-        *,
-        cred: StsCredentials,
-        method: str,
-        path: str,
-        content_type: Optional[str] = None,
-        extra_headers: Optional[Dict[str, str]] = None,
-        auth_expire_seconds: int = 1800,
+            self,
+            *,
+            cred: StsCredentials,
+            method: str,
+            path: str,
+            content_type: Optional[str] = None,
+            extra_headers: Optional[Dict[str, str]] = None,
+            auth_expire_seconds: int = 1800,
     ) -> Dict[str, str]:
         """
         构造 BOS 请求头（Authorization + x-bce-date + x-bce-security-token + 可选 Content-Type）
@@ -252,11 +250,11 @@ class StorageService:
         return out
 
     def head_object(
-        self,
-        storage_key: str,
-        *,
-        timeout: Tuple[int, int] = (10, 60),
-        auth_expire_seconds: int = 1800,
+            self,
+            storage_key: str,
+            *,
+            timeout: Tuple[int, int] = (10, 60),
+            auth_expire_seconds: int = 1800,
     ) -> Tuple[bool, str]:
         """
         服务端 HEAD：用于判断对象是否存在 + 读取 ETag
@@ -284,13 +282,13 @@ class StorageService:
         raise RuntimeError(f"BOS HEAD failed: status={r.status_code} request_id={rid} debug_id={dbg}")
 
     def put_object(
-        self,
-        storage_key: str,
-        *,
-        data: Union[bytes, IO[bytes], Any],
-        content_type: str,
-        timeout: Tuple[int, int] = (10, 180),
-        auth_expire_seconds: int = 1800,
+            self,
+            storage_key: str,
+            *,
+            data: Union[bytes, IO[bytes], Any],
+            content_type: str,
+            timeout: Tuple[int, int] = (10, 180),
+            auth_expire_seconds: int = 1800,
     ) -> str:
         """
         服务端 PUT：上传对象
@@ -395,12 +393,12 @@ class StorageService:
 
     # ✅ 统一出口（展示用/返回给前端用）
     def object_url_for_display(
-        self,
-        storage_key: str,
-        *,
-        signed: Optional[bool] = None,
-        expires_in: int = 900,
-        allow_fallback_public: bool = True,
+            self,
+            storage_key: str,
+            *,
+            signed: Optional[bool] = None,
+            expires_in: int = 900,
+            allow_fallback_public: bool = True,
     ) -> str:
         """
         返回“用于展示/接口返回”的 URL：

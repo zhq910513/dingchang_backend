@@ -2,60 +2,82 @@
 # encoding: utf-8
 from __future__ import annotations
 
+"""订单图片卡槽输出（唯一口径）
+
+- 只产出 schemas.order.SlotImageNodeOut / SlotImageItemOut 所需字段
+- 不再输出旧结构（slot -> url list / image_urls 等）
+- 不做任何历史字段兼容（dl_* 等）
+
+输出结构（固定字段，不多不少）：
+slot_images: List[{
+  slot_key, title, multi, ocr,
+  images: List[{order_image_id, image_file_id, storage_key, url, created_at, updated_at}]
+}]
+"""
+
 from typing import Any, Dict, List
 
-from app.core.slot_field_config import ordered_slot_keys, slot_is_multi_image, slot_title
-from app.models.order import OrderImage
-from app.services.storage import StorageService
+from app.core.slot_field_config import ordered_slot_keys, slot_is_multi_image, slot_title, slot_is_ocr
+from typing import Protocol, runtime_checkable
 
 
-# 走 OCR 的卡槽（与订单模块口径一致）
-_OCR_SLOTS = {
-    "vehicle_cert",
-    "idcard_front",
-    "idcard_back",
-    "driving_license_main",
-    "driving_license_sub",
-}
+@runtime_checkable
+class _StorageProto(Protocol):
+    enabled: bool
+
+    def object_url_for_display(self, key: str, expires_in: int = 3600) -> str: ...
+
+    def object_public_url(self, key: str) -> str: ...
 
 
-def order_image_storage_key(im: OrderImage) -> str:
-    sk = (getattr(im, "storage_key", "") or "").strip().lstrip("/")
+def _norm_str(v: Any) -> str:
+    return (str(v or "").strip()) if v is not None else ""
+
+
+def _storage_key_for_order_image(im: Any) -> str:
+    sk = _norm_str(getattr(im, "storage_key", "")).lstrip("/")
     if sk:
         return sk
     imf = getattr(im, "image_file", None)
-    sk2 = (getattr(imf, "storage_key", "") or "").strip().lstrip("/")
+    sk2 = _norm_str(getattr(imf, "storage_key", "")).lstrip("/")
     return sk2
 
 
-def display_url_for_order_image(im: OrderImage, storage: StorageService) -> str:
-    """
-    生成可展示 URL：
-    - storage.enabled=True：优先签名 URL（短有效期），失败再尝试 public url
-    - 否则回退到 OrderImage.image_url / ImageFile.url
-    """
-    sk = order_image_storage_key(im)
-    if sk and getattr(storage, "enabled", False):
+def _display_url_for_storage_key(storage_key: str, storage: _StorageProto) -> str:
+    if not storage_key:
+        return ""
+    if not getattr(storage, "enabled", False):
+        return ""
+    # 优先签名 URL（短有效期），失败再尝试 public url
+    try:
+        return storage.object_url_for_display(storage_key, expires_in=60 * 60)
+    except Exception:
         try:
-            return storage.object_url_for_display(sk, expires_in=60 * 60)
+            return storage.object_public_url(storage_key)
         except Exception:
-            try:
-                return storage.object_public_url(sk)
-            except Exception:
-                pass
+            return ""
 
-    url = (getattr(im, "image_url", "") or "").strip()
+
+def _display_url_for_order_image(im: Any, storage: _StorageProto) -> str:
+    sk = _storage_key_for_order_image(im)
+    u = _display_url_for_storage_key(sk, storage)
+    if u:
+        return u
+
+    url = _norm_str(getattr(im, "image_url", ""))
     if url:
         return url
+
     imf = getattr(im, "image_file", None)
-    url2 = (getattr(imf, "url", "") or "").strip()
+    url2 = _norm_str(getattr(imf, "url", ""))
     return url2
 
 
-def ensure_display_urls_for_order_images(images: List[OrderImage], storage: StorageService) -> None:
-    """
-    批量回填 image_url：
-    - 同批次缓存：相同 storage_key 仅签一次（列表页性能/稳定性）
+def ensure_display_urls_for_order_images(images: List[Any], storage: _StorageProto) -> None:
+    """批量回填 Any.image_url（性能优化 + 列表稳定性）
+
+    - 同批次缓存：相同 storage_key 只签一次
+    - 仅回填 image_url 字段，不写 DB（由上游自行 commit）
     """
     if not images:
         return
@@ -63,109 +85,90 @@ def ensure_display_urls_for_order_images(images: List[OrderImage], storage: Stor
     cache: Dict[str, str] = {}
 
     for im in images:
-        sk = order_image_storage_key(im)
+        sk = _storage_key_for_order_image(im)
 
-        # 有 storage_key 且缓存命中：直接复用
         if sk and sk in cache:
             if cache[sk]:
-                im.image_url = cache[sk]
+                try:
+                    im.image_url = cache[sk]
+                except Exception:
+                    pass
             continue
 
-        # 正常生成
-        u = display_url_for_order_image(im, storage)
+        u = _display_url_for_order_image(im, storage)
 
-        # 写回 + 进缓存（仅对有 storage_key 的情况缓存）
         if u:
-            im.image_url = u
+            try:
+                im.image_url = u
+            except Exception:
+                pass
         if sk:
             cache[sk] = u or ""
 
 
-def _is_ocr_slot(slot_key: str) -> bool:
-    return str(slot_key or "").strip() in _OCR_SLOTS
-
-
-def _slot_meta(slot_key: str) -> Dict[str, Any]:
-    sk = str(slot_key or "").strip()
-    return {
-        "slot_key": sk,
-        "title": slot_title(sk),
-        "multi": bool(slot_is_multi_image(sk)),
-        "ocr": _is_ocr_slot(sk),
-        "images": [],
-    }
-
-
-def safe_image_urls(order: Any, storage: StorageService) -> Dict[str, Any]:
-    """
-    标准卡槽输出（不返回兼容 _all / slot->string 映射）
-
-    返回示例：
-    {
-      "vehicle_cert": {
-        "slot_key": "vehicle_cert",
-        "title": "车辆合格证",
-        "multi": false,
-        "ocr": true,
-        "images": ["https://..."]
-      },
-      "related": {
-        "slot_key": "related",
-        "title": "相关图片",
-        "multi": true,
-        "ocr": false,
-        "images": ["https://...", "https://..."]
-      }
-    }
+def build_slot_images(order: Any, storage: _StorageProto) -> List[Dict[str, Any]]:
+    """构造订单 slot_images（唯一输出口径，对齐 schemas）
 
     规则：
     - 固定按 slot_field_config 的顺序输出卡槽骨架（即使无图也返回空 images）
     - 未知 slot（脏数据/未来扩展）兜底追加到末尾
-    - 所有槽位统一 images 数组口径（单图槽也是数组，前端按 multi 渲染）
+    - 单图槽收口：仅保留最后一张（与覆盖语义一致）
+    - images 条目字段固定：order_image_id/image_file_id/storage_key/url/created_at/updated_at
     """
-    imgs = getattr(order, "images", None) or []
+    imgs: List[Any] = getattr(order, "images", None) or []
     ensure_display_urls_for_order_images(imgs, storage)
 
-    out: Dict[str, Any] = {}
+    nodes: List[Dict[str, Any]] = []
+    node_map: Dict[str, Dict[str, Any]] = {}
 
-    # 1) 先按配置生成固定骨架（标准输出）
-    known_slot_keys: List[str] = ordered_slot_keys()
-    for sk in known_slot_keys:
-        sks = str(sk or "").strip()
+    # 1) 固定骨架
+    for sk in ordered_slot_keys():
+        sks = _norm_str(sk)
         if not sks:
             continue
-        out[sks] = _slot_meta(sks)
+        node = {
+            "slot_key": sks,
+            "title": slot_title(sks),
+            "multi": bool(slot_is_multi_image(sks)),
+            "ocr": bool(slot_is_ocr(sks)),
+            "images": [],
+        }
+        nodes.append(node)
+        node_map[sks] = node
 
-    # 2) 填充图片；未知 slot 兜底追加
+    # 2) 填充图片
     for im in imgs:
-        url = (getattr(im, "image_url", None) or "").strip()
-        if not url:
-            continue
+        slot_key = _norm_str(getattr(im, "slot_key", None) or getattr(im, "slot", None) or "") or "unknown"
+        if slot_key not in node_map:
+            node = {
+                "slot_key": slot_key,
+                "title": slot_title(slot_key),
+                "multi": bool(slot_is_multi_image(slot_key)),
+                "ocr": bool(slot_is_ocr(slot_key)),
+                "images": [],
+            }
+            nodes.append(node)
+            node_map[slot_key] = node
 
-        slot_key = (getattr(im, "slot_key", None) or getattr(im, "slot", None) or "").strip()
-        if not slot_key:
-            slot_key = "unknown"
+        item = {
+            "order_image_id": getattr(im, "id", None),
+            "image_file_id": getattr(im, "image_file_id", None),
+            "storage_key": _storage_key_for_order_image(im),
+            "url": _norm_str(getattr(im, "image_url", "")),
+            "created_at": _norm_str(getattr(im, "created_at", None)),
+            "updated_at": _norm_str(getattr(im, "updated_at", None)),
+        }
+        # 允许 url 为空（由上游决定是否进一步补齐），但条目仍应存在以便审计
+        node_map[slot_key]["images"].append(item)
 
-        if slot_key not in out:
-            out[slot_key] = _slot_meta(slot_key)
-
-        arr = out[slot_key].get("images")
-        if not isinstance(arr, list):
-            out[slot_key]["images"] = []
-            arr = out[slot_key]["images"]
-        arr.append(url)
-
-    # 3) 单图槽收口：只保留最后一张（与 finalize 覆盖语义一致）
-    for sk, node in out.items():
+    # 3) 单图槽收口：只保留最后一张
+    for node in nodes:
         if not isinstance(node, dict):
             continue
         if bool(node.get("multi", False)):
             continue
         arr = node.get("images")
-        if not isinstance(arr, list):
-            node["images"] = []
-            continue
-        if len(arr) > 1:
+        if isinstance(arr, list) and len(arr) > 1:
             node["images"] = [arr[-1]]
 
-    return out
+    return nodes

@@ -12,6 +12,7 @@
 """
 
 import os
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +20,6 @@ from app.core.security import hash_password
 from app.models.role import Role
 from app.models.user import User
 from app.models.user_role import UserRole
-
 
 ROLE_SEEDS = [
     (1, "super_admin", "系统超级管理员"),

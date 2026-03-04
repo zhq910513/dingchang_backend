@@ -31,10 +31,9 @@ from typing import Any, Optional, Tuple, List
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select, update, inspect
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import get_db
 from app.core.config import settings
 from app.core.constants import (
     ROLE_SUPER_ADMIN,
@@ -43,9 +42,10 @@ from app.core.constants import (
     ROLE_MARKET,
     ROLE_SALES,
 )
+from app.core.db import get_db
+from app.models.role import Role
 from app.models.session import UserSession
 from app.models.user import User
-from app.models.role import Role
 from app.models.user_role import UserRole
 
 logger = logging.getLogger(__name__)
@@ -136,102 +136,36 @@ def _normalize_team_names(raw: Any) -> Tuple[str, ...]:
     return tuple(sorted(set(out)))
 
 
-def _normalize_team_ids(raw: Any) -> Tuple[int, ...]:
-    items = _as_list(raw)
-    out: List[int] = []
-    for x in items:
-        try:
-            if isinstance(x, bool):
-                continue
-            if isinstance(x, int):
-                out.append(int(x))
-                continue
-            s = str(x).strip()
-            if not s:
-                continue
-            out.append(int(s))
-        except Exception:
-            continue
-    return tuple(sorted(set(out)))
-
-
 def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
-    team_ids_set: set[int] = set()
+    """
+    团队抽取（新口径）：
+
+    - 只认 models 冻结字段：
+        * user.team_name：默认/落点团队（单值）
+        * user.team_names：可访问团队集合（CSV 字符串）
+    - 不再兼容其它历史字段形态（team_ids/team_id_list/...）
+    """
     team_names_set: set[str] = set()
+    team_name = (getattr(user, "team_name", None) or "").strip()
+    if team_name:
+        team_names_set.add(team_name)
 
-    id_candidates = [
-        "team_ids",
-        "team_id_list",
-        "teams_ids",
-        "teamIds",
-        "teamIdList",
-        "team_id",
-    ]
-    for k in id_candidates:
-        if not hasattr(user, k):
-            continue
-        raw = getattr(user, k, None)
-        if raw is None:
-            continue
-        for tid in _normalize_team_ids(raw):
-            team_ids_set.add(int(tid))
+    raw_team_names = (getattr(user, "team_names", None) or "").strip()
+    if raw_team_names:
+        for t in raw_team_names.split(","):
+            t = (t or "").strip()
+            if t:
+                team_names_set.add(t)
 
-    name_candidates = [
-        "team_names",
-        "team_name_list",
-        "teamNames",
-        "teamNameList",
-        "team_name",
-    ]
-    for k in name_candidates:
-        if not hasattr(user, k):
-            continue
-        raw = getattr(user, k, None)
-        if raw is None:
-            continue
-        for tn in _normalize_team_names(raw):
-            team_names_set.add(str(tn))
-
-    rel = None
-    try:
-        st = inspect(user)
-        if hasattr(st, "unloaded") and "teams" not in st.unloaded:
-            rel = getattr(user, "teams", None)
-    except Exception:
-        rel = None
-
-    if rel:
-        try:
-            for t in list(rel):  # type: ignore
-                tid = None
-                for k in ("id", "team_id", "teamId"):
-                    if hasattr(t, k):
-                        tid = getattr(t, k, None)
-                        if tid is not None:
-                            break
-
-                tname = None
-                for k in ("name", "team_name", "teamName"):
-                    if hasattr(t, k):
-                        tname = getattr(t, k, None)
-                        if tname is not None:
-                            break
-
-                for x in _normalize_team_ids(tid):
-                    team_ids_set.add(int(x))
-                for x in _normalize_team_names(tname):
-                    team_names_set.add(str(x))
-        except Exception:
-            pass
-
-    team_ids = tuple(sorted(team_ids_set))
-    team_names = tuple(sorted(team_names_set))
+    # 当前体系 team_ids 暂不使用（保持空元组）
+    team_ids: Tuple[int, ...] = tuple()
+    team_names: Tuple[str, ...] = tuple(sorted(team_names_set))
     return team_ids, team_names
 
 
 async def get_current_session(
-    db: AsyncSession = Depends(get_db),
-    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+        db: AsyncSession = Depends(get_db),
+        x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> UserSession:
     token = (x_session_token or "").strip()
     if not token:
@@ -320,8 +254,8 @@ async def get_current_session(
 
 
 async def get_current_user(
-    sess: UserSession = Depends(get_current_session),
-    db: AsyncSession = Depends(get_db),
+        sess: UserSession = Depends(get_current_session),
+        db: AsyncSession = Depends(get_db),
 ) -> User:
     uid = int(getattr(sess, "user_id", 0) or 0)
     if uid <= 0:
@@ -338,8 +272,8 @@ async def get_current_user(
 
 
 async def get_current_user_with_roles(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str], Tuple[str, ...]]:
     stmt = (
         select(Role.id, Role.role_name)
@@ -355,42 +289,17 @@ async def get_current_user_with_roles(
 
 
 async def get_current_user_with_role(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str]]:
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     return user, primary
 
 
-async def get_current_user_with_role_and_team(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> Tuple[User, Optional[str], Optional[str]]:
-    user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
-    _team_ids, team_names = _extract_teams_from_user(user)
-    team_name = team_names[0] if team_names else None
-    return user, primary, team_name
-
-
 async def get_current_user_with_role_and_teams(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
 ) -> Tuple[User, Optional[str], Tuple[str, ...], Tuple[int, ...]]:
     user, primary, _roles = await get_current_user_with_roles(user=user, db=db)
     team_ids, team_names = _extract_teams_from_user(user)
     return user, primary, team_names, team_ids
-
-
-async def get_current_user_scope(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    user, primary, roles = await get_current_user_with_roles(user=user, db=db)
-    team_ids, team_names = _extract_teams_from_user(user)
-    return {
-        "user": user,
-        "primary_role": primary,
-        "roles": roles,
-        "team_names": team_names,
-        "team_ids": team_ids,
-    }

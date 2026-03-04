@@ -75,11 +75,11 @@ def _is_mysql_duplicate_entry(e: Exception) -> bool:
 
 
 async def _get_or_create_group(
-    db: AsyncSession,
-    module: str,
-    group_key: str,
-    group_name: str,
-    order_index: int,
+        db: AsyncSession,
+        module: str,
+        group_key: str,
+        group_name: str,
+        order_index: int,
 ) -> FieldGroup:
     q = select(FieldGroup).where(
         FieldGroup.module == module,
@@ -119,17 +119,17 @@ async def _get_or_create_group(
 
 
 async def _get_or_create_field(
-    db: AsyncSession,
-    module: str,
-    field_name: str,
-    label: str,
-    type_: str = "text",
-    required: bool = False,
-    visible: bool = True,
-    editable: bool = True,
-    sort: int = 0,
-    options: Optional[Dict[str, Any]] = None,
-    extra: Optional[Dict[str, Any]] = None,
+        db: AsyncSession,
+        module: str,
+        field_name: str,
+        label: str,
+        type_: str = "text",
+        required: bool = False,
+        visible: bool = True,
+        editable: bool = True,
+        sort: int = 0,
+        options: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
 ) -> FieldConfig:
     q = select(FieldConfig).where(
         FieldConfig.module == module,
@@ -186,9 +186,9 @@ async def _get_or_create_field(
 
 
 async def _rebuild_group_links(
-    db: AsyncSession,
-    group_id: int,
-    field_ids_in_order: List[int],
+        db: AsyncSession,
+        group_id: int,
+        field_ids_in_order: List[int],
 ):
     # 这里本质是“重建映射”，在并发 seed 下会互相覆盖，但我们已经在 main.py 加了锁；
     # 同时 seed 本身又幂等，所以这里保持简单。
@@ -216,8 +216,8 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         "approved_passenger_count",
         "id_name",
         "id_number",
-        "dl_plate_no",
-        "dl_owner",
+        "plate_no",
+        "owner_name",
     ]
     default_list_index = {k: i for i, k in enumerate(default_list_order)}
 
@@ -237,7 +237,7 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
     default_finance_order = [
         "vehicle_model",
         "vin",
-        "dl_plate_no",
+        "plate_no",
     ]
     default_finance_index = {k: i for i, k in enumerate(default_finance_order)}
 
@@ -262,8 +262,10 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         {"name": "manufacturer_name", "label": "车辆制造企业名称", "type": "text"},
 
         {"name": "vehicle_brand_name", "label": "车辆品牌/车辆名称", "type": "text"},
-        {"name": "vehicle_model", "label": "车辆型号", "type": "text", "extra": _patch_extra("vehicle_model", {"list_width": 180, "finance_list_width": 180})},
-        {"name": "vin", "label": "车辆识别代号/车架号", "type": "text", "extra": _patch_extra("vin", {"list_width": 210, "finance_list_width": 210})},
+        {"name": "vehicle_model", "label": "车辆型号", "type": "text",
+         "extra": _patch_extra("vehicle_model", {"list_width": 180, "finance_list_width": 180})},
+        {"name": "vin", "label": "车辆识别代号/车架号", "type": "text",
+         "extra": _patch_extra("vin", {"list_width": 210, "finance_list_width": 210})},
 
         {"name": "body_color", "label": "车身颜色", "type": "text"},
 
@@ -271,7 +273,8 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         {"name": "chassis_cert_no", "label": "底盘合格证编号", "type": "text"},
 
         {"name": "engine_model", "label": "发动机型号", "type": "text"},
-        {"name": "engine_no", "label": "发动机号", "type": "text", "extra": _patch_extra("engine_no", {"list_width": 180})},
+        {"name": "engine_no", "label": "发动机号", "type": "text",
+         "extra": _patch_extra("engine_no", {"list_width": 180})},
 
         {"name": "fuel_type", "label": "燃料种类", "type": "text"},
         {"name": "displacement_and_power", "label": "排量和功率(mL/kW)", "type": "text"},
@@ -305,7 +308,8 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         {"name": "semi_trailer_weight", "label": "半挂车鞍座最大允许总质量(kg)", "type": "text"},
 
         {"name": "cab_passenger_count", "label": "驾驶室准乘人数(人)", "type": "text"},
-        {"name": "approved_passenger_count", "label": "额定载客(人)", "type": "text", "extra": _patch_extra("approved_passenger_count", {"list_width": 150})},
+        {"name": "approved_passenger_count", "label": "额定载客(人)", "type": "text",
+         "extra": _patch_extra("approved_passenger_count", {"list_width": 150})},
 
         {"name": "max_design_speed", "label": "最高设计车速(km/h)", "type": "text"},
         {"name": "manufacture_date", "label": "车辆制造日期", "type": "date"},
@@ -328,7 +332,8 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         {"name": "id_ethnicity", "label": "民族", "type": "text"},
         {"name": "id_birth_date", "label": "出生日期", "type": "date"},
         {"name": "id_address", "label": "住址", "type": "text"},
-        {"name": "id_number", "label": "身份证号码", "type": "text", "extra": _patch_extra("id_number", {"list_width": 190})},
+        {"name": "id_number", "label": "身份证号码", "type": "text",
+         "extra": _patch_extra("id_number", {"list_width": 190})},
         {"name": "id_issuer", "label": "签发机关", "type": "text"},
         {"name": "id_validity", "label": "有效期限", "type": "text"},
     ]
@@ -337,17 +342,18 @@ def build_seed_spec() -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
     # 行驶证信息（主页）
     # -------------------------
     driving_fields = [
-        {"name": "dl_plate_no", "label": "号牌号码", "type": "text", "extra": _patch_extra("dl_plate_no", {"list_width": 120, "finance_list_width": 140})},
-        {"name": "dl_vehicle_type", "label": "车辆类型", "type": "text"},
-        {"name": "dl_owner", "label": "所有人", "type": "text", "extra": _patch_extra("dl_owner", {"list_width": 120})},
-        {"name": "dl_address", "label": "住址", "type": "text"},
-        {"name": "dl_use_nature", "label": "使用性质", "type": "text"},
-        {"name": "dl_vehicle_model", "label": "品牌型号", "type": "text"},
-        {"name": "dl_vin", "label": "车辆识别代码", "type": "text"},
-        {"name": "dl_engine_no", "label": "发动机号码", "type": "text"},
-        {"name": "dl_register_date", "label": "注册日期", "type": "date"},
-        {"name": "dl_issue_date", "label": "发证日期", "type": "date"},
-        {"name": "dl_issuer_org", "label": "发证机关", "type": "text"},
+        {"name": "plate_no", "label": "号牌号码", "type": "text",
+         "extra": _patch_extra("plate_no", {"list_width": 120, "finance_list_width": 140})},
+        {"name": "vehicle_type", "label": "车辆类型", "type": "text"},
+        {"name": "owner_name", "label": "所有人", "type": "text",
+         "extra": _patch_extra("owner_name", {"list_width": 120})},
+        {"name": "use_nature", "label": "使用性质", "type": "text"},
+        {"name": "vehicle_model", "label": "品牌型号", "type": "text"},
+        {"name": "vin", "label": "车辆识别代码", "type": "text"},
+        {"name": "engine_no", "label": "发动机号码", "type": "text"},
+        {"name": "first_register_date", "label": "注册日期", "type": "date"},
+        {"name": "issue_date", "label": "发证日期", "type": "date"},
+        {"name": "issuer_org", "label": "发证机关", "type": "text"},
     ]
 
     # -------------------------

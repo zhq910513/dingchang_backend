@@ -10,8 +10,8 @@
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
 from .config import settings

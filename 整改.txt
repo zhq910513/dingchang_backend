@@ -27,11 +27,3 @@ image_urls（如需保留）只能由 flatten(slot_images) 投影生成，禁止
 列表/详情字段一致：列表=详情投影；核心字段从 order_fact（或过渡期由组合器生成）。
 
 dynamic_data 输出阶段强制规范化：仅输出固定字段集（不带 dl_*），缺失则用 order_fact 或 slot 事实回填。
-
-四、数据清洗与回填（一次性）
-
-从 order.ocr_raw_json（优先）回填 order_slot_result 与 order_fact。
-
-用 order_fact 回写/重建 order.dynamic_data（只写固定字段），清除旧键/脏键。
-
-验收：/orders 与 /orders/{id} 200；核心字段不再“规范键空但旧键有值”；image_urls 永远纯 URL list；slot_images 结构稳定。
