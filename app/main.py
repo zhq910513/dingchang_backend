@@ -298,30 +298,39 @@ except Exception as e:
 
 
 @app.middleware("http")
-async def health():
-    db_ok = True
-    redis_ok = True
+async def health(request, call_next):
+    """
+    ✅ 只处理 /api/health
+    - 其它路径必须 call_next 放行，否则会把所有接口都“短路”成健康检查
+    - middleware 签名必须是 (request, call_next)，否则会触发 TypeError
+    """
+    path = (request.url.path or "").rstrip("/")
+    if path == "/api/health":
+        db_ok = True
+        redis_ok = True
 
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-    except Exception:
-        db_ok = False
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        except Exception:
+            db_ok = False
 
-    try:
-        from app.core.db import redis  # type: ignore
+        try:
+            from app.core.db import redis  # type: ignore
 
-        if redis:
-            await redis.ping()
-    except Exception:
-        redis_ok = False
+            if redis:
+                await redis.ping()
+        except Exception:
+            redis_ok = False
 
-    ok = db_ok and redis_ok
-    status_code = 200 if ok else 503
-    return JSONResponse(
-        status_code=status_code,
-        content={"ok": ok, "db": db_ok, "redis": redis_ok, "env": getattr(settings, "ENV", None)},
-    )
+        ok = db_ok and redis_ok
+        status_code = 200 if ok else 503
+        return JSONResponse(
+            status_code=status_code,
+            content={"ok": ok, "db": db_ok, "redis": redis_ok, "env": getattr(settings, "ENV", None)},
+        )
+
+    return await call_next(request)
 
 
 app.include_router(v1_router, prefix="/api")
