@@ -47,19 +47,34 @@ engine: AsyncEngine = create_async_engine(
 # ✅ AsyncSession factory（统一入口，避免散落 SessionLocal / SessionMaker 命名）
 async_session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+# ✅ models 导入仅执行一次（connect 事件会随连接触发，必须防重入）
+_models_loaded = False
+
 
 @event.listens_for(engine.sync_engine, "connect")
-def load_all_models() -> None:
+def load_all_models(*args, **kwargs) -> None:
     """
     启动期导入 ORM 模型，确保 Base.metadata 完整。
+
+    重要：
+    - 本函数被注册为 SQLAlchemy connect 事件回调，事件会传入 (dbapi_connection, connection_record) 等参数；
+      因此必须使用 (*args, **kwargs) 兼容事件签名，避免启动期 TypeError。
+    - 同时本模块内 ensure_schema_additive_on_startup() 也会显式调用本函数，因此也要兼容“无参调用”。
 
     ✅ 强制收口：只导入一次 app.models 聚合模块（由 app/models/__init__.py 统一 import 全部模型）。
     - 避免历史遗留的 “app.models.field_group / field_group_field / order_image 拆分文件” 导入造成警告噪声
     - 避免多处维护模型清单导致漏表/漏列
     """
+    global _models_loaded
+    if _models_loaded:
+        return
+
     try:
         importlib.import_module("app.models")
+        _models_loaded = True
     except Exception as e:
+        # 这里保持“软失败”：避免因为某个模型导入异常导致服务直接起不来；
+        # 但 schema_check 可能会因此不完整，日志里会体现。
         logger.warning("Model module import skipped: %s (%s)", "app.models", e)
 
 
@@ -80,7 +95,8 @@ def _is_duplicate_column_error(e: Exception) -> bool:
     # MySQL: "Duplicate column name"
     # PostgreSQL: "duplicate column" / "already exists"
     return ("duplicate column" in msg) or ("already exists" in msg and "column" in msg) or (
-                "duplicate column name" in msg)
+            "duplicate column name" in msg
+    )
 
 
 def _quote_ident(conn, name: str) -> str:
@@ -180,6 +196,7 @@ async def ensure_schema_additive_on_startup(
     - add_columns=True 时：仅对缺失列执行 ALTER TABLE ADD COLUMN
     - 不做删表/删列/改列/改类型
     """
+    # 确保 Base.metadata 完整（即使 connect 事件未触发，这里也强制导入一次）
     load_all_models()
 
     result: Dict[str, object] = {
@@ -193,6 +210,7 @@ async def ensure_schema_additive_on_startup(
     }
 
     async with engine.begin() as conn:
+
         def _sync_work(sync_conn):
             # --- phase 1: inspect before any change ---
             db_tables, missing_tables, extra_tables = _diff_tables(sync_conn)
@@ -208,10 +226,14 @@ async def ensure_schema_additive_on_startup(
             if log_details:
                 logger.info("[schema_check] db_tables=%s", ",".join(db_tables) if db_tables else "-")
                 logger.info("[schema_check] model_tables=%s", ",".join(model_tables) if model_tables else "-")
-                logger.info("[schema_check] missing_tables(in_db)=%s",
-                            ",".join(missing_tables) if missing_tables else "-")
-                logger.info("[schema_check] extra_tables(in_db_not_in_model)=%s",
-                            ",".join(extra_tables) if extra_tables else "-")
+                logger.info(
+                    "[schema_check] missing_tables(in_db)=%s",
+                    ",".join(missing_tables) if missing_tables else "-",
+                )
+                logger.info(
+                    "[schema_check] extra_tables(in_db_not_in_model)=%s",
+                    ",".join(extra_tables) if extra_tables else "-",
+                )
                 if missing_cols:
                     for tn, cols in missing_cols.items():
                         logger.info("[schema_check] missing_columns table=%s cols=%s", tn, ",".join(cols))
@@ -326,3 +348,4 @@ async def close_redis():
                     await res
         finally:
             redis = None
+           
