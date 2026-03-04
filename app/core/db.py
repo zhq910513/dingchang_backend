@@ -348,4 +348,3 @@ async def close_redis():
                     await res
         finally:
             redis = None
-           

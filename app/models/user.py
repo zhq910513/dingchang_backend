@@ -27,23 +27,52 @@ class User(Base):
 
     status = Column(Integer, nullable=False, comment="账号状态（int 枚举；通常 1=启用）")
 
-    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
-                        comment="创建时间（北京时间 naive DATETIME）")
-    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
-                        server_onupdate=text("CURRENT_TIMESTAMP"),
-                        comment="更新时间（北京时间 naive DATETIME）")
+    created_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="创建时间（北京时间 naive DATETIME）",
+    )
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="更新时间（北京时间 naive DATETIME）",
+    )
 
     # 关系：自关联（上级/下级）
-    parent = relationship("User", remote_side=[id], lazy="selectin", doc="上级用户（自关联）")
-    children = relationship("User", lazy="selectin", doc="下级用户列表（自关联）")
+    parent = relationship(
+        "User",
+        remote_side=[id],
+        back_populates="children",
+        lazy="selectin",
+        doc="上级用户（自关联）",
+    )
+    children = relationship(
+        "User",
+        back_populates="parent",
+        lazy="selectin",
+        doc="下级用户列表（自关联）",
+    )
 
-    # 关系：用户角色（多对多）
+    # 关系：用户角色（桥表实体）
+    user_roles = relationship(
+        "UserRole",
+        back_populates="user",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        doc="用户-角色桥表记录（显式关联实体）",
+    )
+
+    # 关系：用户角色（多对多快捷访问）
     roles = relationship(
         "Role",
         secondary="user_role_new",
         back_populates="users",
         lazy="selectin",
-        doc="用户拥有的角色列表（多对多）",
+        overlaps="user_roles,user,role,users,roles",
+        doc="用户拥有的角色列表（多对多快捷访问）",
     )
 
     # 关系：会话

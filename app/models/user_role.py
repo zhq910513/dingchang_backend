@@ -17,8 +17,21 @@ class UserRole(Base):
     user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="用户ID（FK -> user.id）")
     role_id = Column(Integer, ForeignKey("role_new.id"), nullable=False, comment="角色ID（FK -> role.id）")
 
-    user = relationship("User", lazy="selectin", doc="关联用户")
-    role = relationship("Role", lazy="selectin", doc="关联角色")
+    # 显式关联实体：和 User.user_roles / Role.user_roles 绑定成一组
+    user = relationship(
+        "User",
+        back_populates="user_roles",
+        lazy="selectin",
+        overlaps="roles,users",
+        doc="关联用户",
+    )
+    role = relationship(
+        "Role",
+        back_populates="user_roles",
+        lazy="selectin",
+        overlaps="roles,users",
+        doc="关联角色",
+    )
 
     __table_args__ = (
         UniqueConstraint("user_id", "role_id", name="uq_user_role"),

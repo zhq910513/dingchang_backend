@@ -17,15 +17,23 @@ class Role(Base):
     role_name = Column(String(50), nullable=False, comment="角色名称（唯一标识）")
     description = Column(String(200), nullable=True, comment="角色描述（可空）")
 
-    # 关系：角色下的用户（多对多）
+    # 关系：角色-用户桥表记录（显式关联实体）
+    user_roles = relationship(
+        "UserRole",
+        back_populates="role",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        doc="角色-用户桥表记录（显式关联实体）",
+    )
+
+    # 关系：角色下的用户（多对多快捷访问）
     users = relationship(
         "User",
         secondary="user_role_new",
         back_populates="roles",
         lazy="selectin",
-        doc="拥有该角色的用户列表（多对多）",
+        overlaps="user_roles,user,role,users,roles",
+        doc="拥有该角色的用户列表（多对多快捷访问）",
     )
 
-    __table_args__ = (
-        UniqueConstraint("role_name", name="role_name"),
-    )
+    __table_args__ = (UniqueConstraint("role_name", name="role_name"),)
