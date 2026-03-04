@@ -15,13 +15,24 @@ class UserSession(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="主键ID")
     user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="用户ID（FK -> user.id）")
+
+    # ✅ 注意：字段名是 session_token（不是 token）
     session_token = Column(String(255), nullable=False, comment="会话Token（唯一，用于鉴权）")
 
-    last_active_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
-                            comment="最后活跃时间（北京时间 naive DATETIME）")
-    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
-                        comment="创建时间（北京时间 naive DATETIME）")
+    last_active_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="最后活跃时间（北京时间 naive DATETIME）",
+    )
+    created_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        comment="创建时间（北京时间 naive DATETIME）",
+    )
 
+    # 0=未过期 1=过期（由业务控制）
     expired = Column(Integer, nullable=False, comment="是否过期（0=未过期，1=过期）")
 
     user = relationship("User", back_populates="sessions", lazy="selectin", doc="所属用户")

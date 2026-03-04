@@ -13,26 +13,27 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from typing import Tuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import generate_session_token, verify_password
-from app.models.user import User
-from app.models.session import UserSession
-from app.models.user_role import UserRole
 from app.models.role import Role
+from app.models.session import UserSession
+from app.models.user import User
+from app.models.user_role import UserRole
 
 logger = logging.getLogger(__name__)
 _BJ = ZoneInfo("Asia/Shanghai")
 
 
 async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
-    User, str, UserSession, list[str], list[str], str]:
+    User, str, UserSession, list[str], list[str], str
+]:
     """
-    返回：(user, token, session_row, team_names(list), team_name(default))
+    返回：(user, token, session_row, role_names, team_names(list), team_name(default))
     team_names/team_name 语义：
     - team_names：可访问团队集合（权限范围）
     - team_name：默认/落点团队（单值）
@@ -48,19 +49,19 @@ async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
     now = datetime.now(_BJ).replace(tzinfo=None)
     token = generate_session_token()
 
-    # upsert session（同一用户允许多 session：按你项目原逻辑，这里创建新 session）
+    # ✅ 新表口径：UserSession 字段为 session_token/expired，无 expired_at
     sess = UserSession(
         user_id=user.id,
-        token=token,
+        session_token=token,
         created_at=now,
         last_active_at=now,
-        expired_at=None,
+        expired=0,
     )
     db.add(sess)
 
-    # role names
+    # role names（Role 字段名按 role_new.role_name）
     role_q = (
-        select(Role.name)
+        select(Role.role_name)
         .select_from(UserRole)
         .join(Role, Role.id == UserRole.role_id)
         .where(UserRole.user_id == user.id)
@@ -86,9 +87,12 @@ async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
 async def logout(*, db: AsyncSession, token: str) -> None:
     if not token:
         return
-    q = select(UserSession).where(UserSession.token == token)
+
+    # ✅ 字段名是 session_token（不是 token）
+    q = select(UserSession).where(UserSession.session_token == token)
     sess = (await db.execute(q)).scalars().first()
     if not sess:
         return
+
     await db.delete(sess)
     await db.commit()
