@@ -6,39 +6,28 @@ v1 - 用户 / 账号管理（API 薄壳）
 原则：
 - Schemas 为接口真源：app.schemas.user
 - 业务规则全部下沉到 services.users_service
+
+承重墙（2026-03-05）：
+- deps 只返回 CurrentUserContext（不再解包 tuple）
+- API 不自定义入参模型（schemas 约束 API）
+- 不兼容旧字段：display_name/phone 等字段已在 service 层禁用，本层不再接收/透传
 """
 
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.api.deps import get_current_user_with_role
+from app.api.deps import CurrentUserContext, get_current_user_with_role
 from app.core.db import get_db
 from app.schemas.user import UserOut, UserListOut
-from app.services.users_service import list_users as _list_users, create_user as _create_user, \
-    update_user as _update_user, delete_user as _delete_user
+from app.services.users_service import (
+    list_users as _list_users,
+    create_user as _create_user,
+    update_user as _update_user,
+    delete_user as _delete_user,
+)
 
 router = APIRouter(prefix="/users", tags=["users"])
-
-
-class UserCreateIn(BaseModel):
-    username: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=6)
-    display_name: str = ""
-    phone: str = ""
-    role: str = Field(..., description="角色：super_admin/manager/sales/finance/market")
-    team_name: Optional[str] = None
-    team_names: Optional[str] = None
-
-
-class UserUpdateIn(BaseModel):
-    display_name: Optional[str] = None
-    phone: Optional[str] = None
-    password: Optional[str] = None
-    team_name: Optional[str] = None
-    team_names: Optional[str] = None
 
 
 @router.get("", response_model=UserListOut)
@@ -46,29 +35,35 @@ async def list_users(
         keyword: Optional[str] = Query(None),
         role: Optional[str] = Query(None),
         db: AsyncSession = Depends(get_db),
-        me=Depends(get_current_user_with_role),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
-    user, main_role, _teams = me
     rows = await _list_users(db=db, keyword=keyword, role=role)
     items = [UserOut.from_orm(r) for r in rows]
     return UserListOut(total=len(items), items=items)
 
 
 @router.post("", response_model=UserOut)
-async def create_user(data: UserCreateIn, db: AsyncSession = Depends(get_db), me=Depends(get_current_user_with_role)):
-    user, main_role, _teams = me
+async def create_user(
+        username: str = Query(..., min_length=1),
+        password: str = Query(..., min_length=6),
+        role_name: str = Query(..., description="角色：super_admin/manager/sales/finance/market"),
+        team_name: Optional[str] = Query(None),
+        team_names: Optional[str] = Query(None),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+):
     try:
         row = await _create_user(
             db=db,
-            current_user=user,
-            current_role=main_role,
-            username=data.username,
-            password=data.password,
-            display_name=data.display_name or "",
-            phone=data.phone or "",
-            role_name=data.role,
-            team_name=data.team_name,
-            team_names=data.team_names,
+            current_user=ctx.user,
+            current_role=ctx.primary_role or "",
+            username=username,
+            password=password,
+            display_name="",  # service 不支持旧字段：固定空
+            phone="",  # service 不支持旧字段：固定空
+            role_name=role_name,
+            team_name=team_name,
+            team_names=team_names,
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -77,21 +72,26 @@ async def create_user(data: UserCreateIn, db: AsyncSession = Depends(get_db), me
     return UserOut.from_orm(row)
 
 
-@router.put("/{user_id:int}", response_model=UserOut)
-async def update_user(user_id: int, data: UserUpdateIn, db: AsyncSession = Depends(get_db),
-                      me=Depends(get_current_user_with_role)):
-    user, main_role, _teams = me
+@router.put("/{user_id}", response_model=UserOut)
+async def update_user(
+        user_id: int,
+        password: Optional[str] = Query(None),
+        team_name: Optional[str] = Query(None),
+        team_names: Optional[str] = Query(None),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+):
     try:
         row = await _update_user(
             db=db,
-            current_user=user,
-            current_role=main_role,
+            current_user=ctx.user,
+            current_role=ctx.primary_role or "",
             user_id=user_id,
-            display_name=data.display_name,
-            phone=data.phone,
-            password=data.password,
-            team_name=data.team_name,
-            team_names=data.team_names,
+            display_name=None,  # service 不支持旧字段
+            phone=None,  # service 不支持旧字段
+            password=password,
+            team_name=team_name,
+            team_names=team_names,
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -100,11 +100,15 @@ async def update_user(user_id: int, data: UserUpdateIn, db: AsyncSession = Depen
     return UserOut.from_orm(row)
 
 
-@router.delete("/{user_id:int}")
-async def delete_user(user_id: int, db: AsyncSession = Depends(get_db), me=Depends(get_current_user_with_role)):
-    user, main_role, _teams = me
+@router.delete("/{user_id}")
+async def delete_user(
+        user_id: int,
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+):
     try:
-        await _delete_user(db=db, current_user=user, current_role=main_role, user_id=user_id)
+        await _delete_user(db=db, current_user=ctx.user, current_role=ctx.primary_role or "", user_id=user_id)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     return {"ok": True}
+

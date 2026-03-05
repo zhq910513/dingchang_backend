@@ -1,9 +1,9 @@
+# app/schemas/order.py
 # encoding: utf-8
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
 from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
 
 
 # =========================
@@ -48,6 +48,12 @@ class OrderInfoOut(BaseModel):
     """订单扩展信息出参（最小化）。"""
     remark: Optional[str] = None
 
+    # ✅ 兼容 Pydantic v1/v2：允许 from_orm/from_attributes
+    model_config = {"from_attributes": True}
+
+    class Config:
+        orm_mode = True
+
 
 # =========================
 # Order（主对象）
@@ -70,18 +76,28 @@ class OrderCreate(BaseModel):
 
 
 class OrderUpdate(BaseModel):
-    """更新订单（仅允许更新明确字段；其余通过事实层/业务专用接口）"""
-    is_finished: Optional[bool] = None
+    """
+    更新订单（仅允许更新明确字段；其余通过事实层/业务专用接口）
+
+    重要：
+    - is_finished 不在这里更新，只允许走 /orders/{id}/status
+    """
+    salesperson_id: Optional[int] = None
+    customer_group_id: Optional[int] = None
+    channel_group_id: Optional[int] = None
+
     status: Optional[int] = None
     audit_status: Optional[int] = None
     dynamic_data: Optional[Dict[str, Any]] = None
     ocr_raw_json: Optional[Dict[str, Any]] = None
 
+    # ✅ 订单扩展信息（目前只允许 remark）
+    order_info: Optional[OrderInfoIn] = None
+
 
 class OrderStatusUpdate(BaseModel):
+    """订单状态更新（收口：只允许维护 is_finished）"""
     is_finished: Optional[bool] = None
-    status: Optional[int] = None
-    audit_status: Optional[int] = None
 
 
 class OrderOut(BaseModel):
@@ -114,9 +130,25 @@ class OrderOut(BaseModel):
     updated_at: Optional[str] = None
 
 
-class OrderListItemOut(OrderOut):
-    """列表项（当前与 OrderOut 一致，保持单一口径）"""
-    pass
+class OrderListItemOut(BaseModel):
+    """
+    列表项（精简专用 schema）
+
+    说明：
+    - 列表项不强制等同 OrderOut，避免 read_model 输出精简字段时 schema 校验必炸
+    - 详情仍以 OrderOut 为准
+    """
+    id: int
+
+    customer_group_id: Optional[int] = None
+    channel_group_id: Optional[int] = None
+
+    is_finished: bool = False
+    status: int = 0
+    audit_status: int = 0
+
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class OrderListMeta(BaseModel):
@@ -129,4 +161,4 @@ class OrderListResponse(BaseModel):
     """订单列表响应（与 API 输出一致）"""
     meta: Optional[OrderListMeta] = None
     total: int = 0
-    items: List[OrderOut] = Field(default_factory=list)
+    items: List[OrderListItemOut] = Field(default_factory=list)
