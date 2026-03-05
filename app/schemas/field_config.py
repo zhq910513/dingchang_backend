@@ -1,7 +1,8 @@
+# app/schemas/field_config.py
 # encoding: utf-8
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,32 @@ class FieldConfigOut(BaseModel):
     extra: Optional[Any] = None
     view_roles: Optional[Any] = None
     edit_roles: Optional[Any] = None
+
+    class Config:
+        orm_mode = True
+
+
+class FieldConfigUpsertIn(BaseModel):
+    """
+    Upsert 入参（body）
+
+    注意：
+    - module / field_name 由 path 提供（避免 body 重复与冲突）
+    """
+    label: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1)
+
+    options: Optional[Any] = None
+    validators: Optional[Dict[str, Any]] = None
+    extra: Optional[Dict[str, Any]] = None
+
+    required: bool = False
+    visible: bool = True
+    editable: bool = True
+    sort: int = 0
+
+    view_roles: Optional[List[str]] = None
+    edit_roles: Optional[List[str]] = None
 
 
 class FieldConfigListOut(BaseModel):

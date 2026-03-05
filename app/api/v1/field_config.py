@@ -1,3 +1,4 @@
+# app/api/v1/field_config.py
 # encoding: utf-8
 """
 字段配置相关接口（API 薄壳）
@@ -5,55 +6,54 @@
 原则：
 - Schemas 为真源：app.schemas.field_config
 - 业务逻辑下沉到 services.field_config_service
+
+承重墙（2026-03-05）：
+- deps 统一返回 CurrentUserContext（不再解包 tuple）
+- API 不自定义入参模型（schemas 约束 API）
+- upsert 必须显式携带 module（FieldConfig.module NOT NULL 且唯一键依赖 module）
 """
 
-from typing import Any, Dict, Optional
-
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user_with_role
+from app.api.deps import CurrentUserContext, get_current_user_with_role
 from app.core.constants import ROLE_SUPER_ADMIN, ROLE_MANAGER
 from app.core.db import get_db
-from app.schemas.field_config import FieldConfigOut, FieldConfigListOut
-from app.services.field_config_service import list_field_configs as _list_field_configs, \
-    upsert_field_config as _upsert_field_config
+from app.schemas.field_config import FieldConfigOut, FieldConfigListOut, FieldConfigUpsertIn
+from app.services.field_config_service import (
+    list_field_configs as _list_field_configs,
+    upsert_field_config as _upsert_field_config,
+)
 
 router = APIRouter(prefix="/field-config", tags=["field-config"])
 
 
-class FieldConfigUpsertIn(BaseModel):
-    label: str = Field(..., min_length=1)
-    type: str = Field(..., min_length=1)
-    options: Optional[list[Any]] = None
-    validators: Optional[Dict[str, Any]] = None
-    extra: Optional[Dict[str, Any]] = None
-    required: bool = False
-    visible: bool = True
-    editable: bool = True
-    sort: int = 0
-    view_roles: Optional[list[str]] = None
-    edit_roles: Optional[list[str]] = None
-
-
 @router.get("", response_model=FieldConfigListOut)
-async def list_configs(db: AsyncSession = Depends(get_db), me=Depends(get_current_user_with_role)):
-    _user, _role, _teams = me
+async def list_configs(
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+):
     rows = await _list_field_configs(db=db)
     items = [FieldConfigOut.from_orm(r) for r in rows]
     return FieldConfigListOut(items=items)
 
 
-@router.put("/{field_name}", response_model=FieldConfigOut)
-async def upsert(field_name: str, data: FieldConfigUpsertIn, db: AsyncSession = Depends(get_db),
-                 me=Depends(get_current_user_with_role)):
-    _user, role, _teams = me
+@router.put("/{module}/{field_name}", response_model=FieldConfigOut)
+async def upsert(
+        module: str,
+        field_name: str,
+        data: FieldConfigUpsertIn,
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+):
+    role = ctx.primary_role or ""
     if role not in {ROLE_SUPER_ADMIN, ROLE_MANAGER}:
         raise HTTPException(status_code=403, detail="无权限")
+
     row = await _upsert_field_config(
         db=db,
-        field_name=field_name,
+        module=str(module).strip(),
+        field_name=str(field_name).strip(),
         label=data.label,
         type=data.type,
         options=data.options,
