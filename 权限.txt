@@ -1,0 +1,88 @@
+SUPER_ADMIN（超管）
+可做动作
+
+查看财务订单列表：GET /finance/orders
+
+查看财务汇总：GET /finance/orders/summary
+
+导出财务订单：GET /finance/orders/export
+
+查看订单详情：GET /finance/orders/{order_id:int}
+
+更新订单财务状态（回款/返点）：PATCH /finance/orders/{order_id:int}/status
+
+退回订单为未完成（并清回款/返点）：POST /finance/orders/{order_id:int}/return
+
+下拉筛选数据（只读）
+
+客户组：GET /finance/customer-groups
+
+渠道组：GET /finance/channel-groups
+
+业务员列表：GET /finance/salespersons
+
+BOS（代传链路）
+
+取临时凭证：GET /finance/bos-sts
+
+代传文件：POST /finance/bos-upload
+
+finalize 落库关联图片：POST /finance/finalize
+
+关键规则
+
+可跨团队查询：team_name / team_names 允许指定任意合法团队；不传则全量（None）。
+
+MANAGER（经理，多团队）
+可做动作
+
+同 SUPER_ADMIN 的全部动作（权限上 finance.py 允许 manager 进入 finance、写入、导出）。
+
+但查询/操作范围受团队约束：只能在自己所属团队集合内筛选。
+
+关键规则
+
+可多团队筛选，但只能筛自己拥有的团队交集：
+team_name/team_names 若请求了不属于自己的团队 → 403
+
+订单详情/更新/退回：会校验该订单的 salesperson 是否属于经理的团队集合（跨团队拒绝）。
+
+FINANCE（财务，单团队）
+可做动作
+
+查看：/finance/orders、/finance/orders/summary、/finance/orders/{id}
+
+导出：/finance/orders/export
+
+更新状态：PATCH /finance/orders/{id}/status
+
+退回未完成：POST /finance/orders/{id}/return
+
+下拉筛选只读：customer-groups / channel-groups / salespersons
+
+BOS 代传 + finalize：bos-sts / bos-upload / finalize
+
+关键规则
+
+必须且只能属于 1 个团队（否则 403）
+
+所有查询/导出/写入都强制锁在该团队（即使传了别的 team_names 也会被拒绝）
+
+MARKET（市场，单团队，只读）
+可做动作
+
+只读查看类
+    GET /finance/orders
+    GET /finance/orders/summary
+    GET /finance/orders/{id}
+    下拉筛选（只读）/finance/customer-groups、/finance/channel-groups、/finance/salespersons
+
+不可做动作
+    不能导出（export 会走 _ensure_finance_write_access，market 不在允许列表）
+    不能更新状态（status）
+    不能退回订单
+    不能 BOS 代传/ finalize
+
+SALES（销售）
+    权限结论
+        禁止访问 finance 域：任何 /finance/* 直接 403（Sales has no permission to access finance）
