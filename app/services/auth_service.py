@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
+
 from app.core.security import generate_session_token, verify_password
 from app.models.role import Role
 from app.models.session import UserSession
@@ -26,6 +28,15 @@ from app.models.user import User
 from app.models.user_role import UserRole
 
 logger = logging.getLogger(__name__)
+
+_ROLE_PRIORITY = {
+    ROLE_SUPER_ADMIN: 0,
+    ROLE_MANAGER: 10,
+    ROLE_FINANCE: 20,
+    ROLE_MARKET: 30,
+    ROLE_SALES: 40,
+}
+
 _BJ = ZoneInfo("Asia/Shanghai")
 
 
@@ -67,6 +78,7 @@ async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
         .where(UserRole.user_id == user.id)
     )
     role_names = list((await db.execute(role_q)).scalars().all())
+    role_names.sort(key=lambda x: _ROLE_PRIORITY.get(x, 9999))
 
     # teams normalize: only team_name + team_names (CSV) per hard rule
     team_name = (getattr(user, "team_name", None) or "").strip() or None

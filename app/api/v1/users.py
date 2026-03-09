@@ -19,7 +19,7 @@ from typing import Optional
 
 from app.api.deps import CurrentUserContext, get_current_user_with_role
 from app.core.db import get_db
-from app.schemas.user import UserOut, UserListOut
+from app.schemas.user import UserCreateIn, UserListOut, UserOut, UserUpdateIn
 from app.services.users_service import (
     list_users as _list_users,
     create_user as _create_user,
@@ -35,7 +35,6 @@ async def list_users(
         keyword: Optional[str] = Query(None),
         role: Optional[str] = Query(None),
         db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
     rows = await _list_users(db=db, keyword=keyword, role=role)
     items = [UserOut.from_orm(r) for r in rows]
@@ -44,27 +43,20 @@ async def list_users(
 
 @router.post("", response_model=UserOut)
 async def create_user(
-        username: str = Query(..., min_length=1),
-        password: str = Query(..., min_length=6),
-        role_name: str = Query(..., description="角色：super_admin/manager/sales/finance/market"),
-        team_name: Optional[str] = Query(None),
-        team_names: Optional[str] = Query(None),
+        payload: UserCreateIn,
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role),
-):
+) -> UserOut:
     try:
-        row = await _create_user(
-            db=db,
-            current_user=ctx.user,
-            current_role=ctx.primary_role or "",
-            username=username,
-            password=password,
-            display_name="",  # service 不支持旧字段：固定空
-            phone="",  # service 不支持旧字段：固定空
-            role_name=role_name,
-            team_name=team_name,
-            team_names=team_names,
-        )
+            row = await _create_user(
+        db=db,
+        current_role=ctx.primary_role or "",
+        username=payload.username,
+        password=payload.password,
+        role_name=payload.role_name,
+        team_name=payload.team_name,
+        team_names=payload.team_names,
+    )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
@@ -75,24 +67,19 @@ async def create_user(
 @router.put("/{user_id}", response_model=UserOut)
 async def update_user(
         user_id: int,
-        password: Optional[str] = Query(None),
-        team_name: Optional[str] = Query(None),
-        team_names: Optional[str] = Query(None),
+        payload: UserUpdateIn,
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role),
-):
+) -> UserOut:
     try:
-        row = await _update_user(
-            db=db,
-            current_user=ctx.user,
-            current_role=ctx.primary_role or "",
-            user_id=user_id,
-            display_name=None,  # service 不支持旧字段
-            phone=None,  # service 不支持旧字段
-            password=password,
-            team_name=team_name,
-            team_names=team_names,
-        )
+            row = await _update_user(
+        db=db,
+        current_role=ctx.primary_role or "",
+        user_id=int(user_id),
+        password=payload.password,
+        team_name=payload.team_name,
+        team_names=payload.team_names,
+    )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:

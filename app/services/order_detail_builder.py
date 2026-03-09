@@ -11,10 +11,11 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from typing import Optional
 
 from app.models.order import Order, OrderImage
 
@@ -52,15 +53,7 @@ async def fetch_order_with_relations(db: AsyncSession, order_id: int) -> Optiona
         .options(
             *tuple(
                 [
-                    x
-                    for x in [
-                    _maybe_selectinload(Order, "creator"),
-                    _maybe_selectinload(Order, "salesperson"),
-                    _maybe_selectinload(Order, "customer_group"),
-                    _maybe_selectinload(Order, "channel_group"),
-                    _maybe_selectinload(Order, "order_info"),
-                    _maybe_selectinload_nested(Order, "images", OrderImage, "image_file"),
-                ]
+                    x for x in [_maybe_selectinload(Order, "creator"), _maybe_selectinload(Order, "salesperson"), _maybe_selectinload(Order, "customer_group"), _maybe_selectinload(Order, "channel_group"), _maybe_selectinload(Order, "order_info"), _maybe_selectinload_nested(Order, "images", OrderImage, "image_file"), ]
                     if x is not None
                 ]
             )

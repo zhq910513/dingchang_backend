@@ -31,7 +31,6 @@ router = APIRouter(prefix="/field-config", tags=["field-config"])
 @router.get("", response_model=FieldConfigListOut)
 async def list_configs(
         db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
     rows = await _list_field_configs(db=db)
     items = [FieldConfigOut.from_orm(r) for r in rows]

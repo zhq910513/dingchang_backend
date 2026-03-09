@@ -2,298 +2,235 @@
 # encoding: utf-8
 from __future__ import annotations
 
-"""
-用户/账号管理服务（新表口径 / API 薄壳）
+"""用户/账号管理服务（新表口径 / API 薄壳）
 
-承重墙（2026-03-05）：
-- 只允许使用冻结 models 中已确认存在的字段：
+承重墙（冻结口径）：
+- 只允许使用已确认存在的字段：
     User: id, username, password_hash, status, team_name, team_names, created_at, updated_at
     Role: id, role_name
     UserRole: user_id, role_id
-- 不兼容旧字段/旧逻辑：display_name/phone/created_by 等若上游仍传入 -> 直接报错（强制上游对齐）
+- 不兼容旧字段/旧逻辑：display_name/phone/created_by 等一律禁止出现在入参中
 """
 
 import logging
 from datetime import datetime
+from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
-from typing import Optional, Sequence, List
 
-from sqlalchemy import select, func, delete
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
+    ROLE_FINANCE,
+    ROLE_MANAGER,
+    ROLE_MARKET,
+    ROLE_SALES,
+    ROLE_SUPER_ADMIN,
+    TEAM_NAMES,
+)
+from app.core.security import hash_password
+from app.models.role import Role
+from app.models.user import User
+from app.models.user_role import UserRole
+
+logger = logging.getLogger(__name__)
+
+_BJ = ZoneInfo("Asia/Shanghai")
+_ALLOWED_ROLES = {
     ROLE_SUPER_ADMIN,
     ROLE_MANAGER,
     ROLE_SALES,
     ROLE_FINANCE,
     ROLE_MARKET,
-)
-from app.core.security import hash_password
-from app.models.user import User
-from app.models.user_role import UserRole
-from app.models.role import Role
-
-logger = logging.getLogger(__name__)
-_BJ = ZoneInfo("Asia/Shanghai")
+}
 
 
 def _now_bj_naive() -> datetime:
     return datetime.now(_BJ).replace(tzinfo=None)
 
 
-def _split_csv(v: Optional[str]) -> List[str]:
-    s = (v or "").strip()
+def _normalize_team_names_csv(team_names: Optional[str]) -> str:
+    """把 team_names 输入标准化为稳定 CSV：去空、去重、排序。"""
+    if team_names is None:
+        return ""
+    s = str(team_names).strip()
     if not s:
-        return []
-    return [x.strip() for x in s.split(",") if x and x.strip()]
+        return ""
+    parts = [x.strip() for x in s.split(",") if x and x.strip()]
+    return ",".join(sorted(set(parts)))
 
 
-def _normalize_team_name(v: Optional[str]) -> Optional[str]:
-    s = (v or "").strip()
-    return s or None
+def _validate_team_names(team_name: Optional[str], team_names_csv: str) -> None:
+    """校验 team_name + team_names_csv 都在白名单内。"""
+    names: list[str] = [x.strip() for x in team_names_csv.split(",") if x and x.strip()]
+    if team_name:
+        names.append(team_name.strip())
+
+    for n in names:
+        if n and n not in TEAM_NAMES:
+            raise ValueError(f"非法团队：{n}")
 
 
-def _normalize_team_names_csv(v: Optional[str]) -> str:
-    # team_names 是 CSV 字符串存储（冻结口径）
-    items = _split_csv(v)
-    # 去重并稳定排序（审计友好）
-    items = sorted(set(items))
-    return ",".join(items)
+def _require_super_admin(current_role: str) -> None:
+    if current_role != ROLE_SUPER_ADMIN:
+        raise PermissionError("仅超级管理员可操作用户管理")
 
 
-async def _get_role_id(db: AsyncSession, role_name: str) -> int:
-    # ✅ 冻结字段：Role.role_name
-    rid = (await db.execute(select(Role.id).where(Role.role_name == role_name))).scalars().first()
-    if not rid:
-        raise ValueError(f"角色不存在: {role_name}")
-    return int(rid)
-
-
-async def _get_user_primary_role(db: AsyncSession, user_id: int) -> Optional[str]:
-    # 不在此处猜“主角色优先级”，这里只取一个 role_name 用于少数校验
-    r = (
-        await db.execute(
-            select(Role.role_name)
-            .select_from(UserRole)
-            .join(Role, Role.id == UserRole.role_id)
-            .where(UserRole.user_id == int(user_id))
-            .order_by(Role.id.asc())
-        )
-    ).scalars().first()
-    return str(r) if r else None
+def _validate_password(password: str) -> str:
+    p = str(password)
+    if len(p) < 6:
+        raise ValueError("password 长度至少 6")
+    return p
 
 
 async def list_users(
-        *,
-        db: AsyncSession,
-        keyword: Optional[str] = None,
-        role: Optional[str] = None,
+    *,
+    db: AsyncSession,
+    keyword: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> Sequence[User]:
-    """
-    列表查询（冻结口径）：
-    - keyword 仅匹配 username（不再猜 display_name 等不存在列）
-    - role 通过 Role.role_name 过滤
-    """
-    q = select(User)
+    stmt = select(User)
 
     if keyword:
         like = f"%{keyword.strip()}%"
-        q = q.where(User.username.like(like))
+        stmt = stmt.where(User.username.like(like))
 
     if role:
-        q = (
-            q.join(UserRole, UserRole.user_id == User.id)
+        r = str(role).strip()
+        stmt = (
+            stmt.join(UserRole, UserRole.user_id == User.id)
             .join(Role, Role.id == UserRole.role_id)
-            .where(Role.role_name == role)
+            .where(Role.role_name == r)
         )
 
-    q = q.order_by(User.id.desc())
-    return list((await db.execute(q)).scalars().all())
+    stmt = stmt.order_by(User.id.desc())
+    return (await db.execute(stmt)).scalars().all()
 
 
 async def create_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        username: str,
-        password: str,
-        display_name: str = "",
-        phone: str = "",
-        role_name: str,
-        team_name: Optional[str] = None,
-        team_names: Optional[str] = None,
-        created_by: Optional[int] = None,
+    *,
+    db: AsyncSession,
+    current_role: str,
+    username: str,
+    password: str,
+    role_name: str,
+    team_name: Optional[str] = None,
+    team_names: Optional[str] = None,
 ) -> User:
-    """
-    创建用户（冻结口径）
+    _require_super_admin(current_role)
 
-    承重墙：
-    - User model 不包含 display_name/phone/created_by（按你此前审查结论）
-    - 若上游仍传入这些字段（非空），直接报错，强制 API/schemas 对齐 models
-    """
-    if (display_name or "").strip():
-        raise ValueError("不支持字段: display_name（请对齐 models/schemas）")
-    if (phone or "").strip():
-        raise ValueError("不支持字段: phone（请对齐 models/schemas）")
-    if created_by is not None:
-        raise ValueError("不支持字段: created_by（请对齐 models/schemas）")
+    uname = str(username).strip()
+    if not uname:
+        raise ValueError("username is required")
+
+    p = _validate_password(password)
+
+    rname = str(role_name).strip()
+    if rname not in _ALLOWED_ROLES:
+        raise ValueError("role_name 不合法")
+
+    tn = (str(team_name).strip() if team_name else None) or None
+    tns_csv = _normalize_team_names_csv(team_names)
+    _validate_team_names(tn, tns_csv)
 
     now = _now_bj_naive()
-
-    # 权限约束（不依赖不存在字段）
-    if current_role == ROLE_MANAGER:
-        if role_name not in {ROLE_SALES, ROLE_FINANCE, ROLE_MARKET}:
-            raise PermissionError("manager 只能创建 sales/finance/market 子账号")
-        # manager 创建子账号：必须指定 team_name 且在 manager 可见团队内
-        mgr_team_name = _normalize_team_name(getattr(current_user, "team_name", None))
-        mgr_team_names = _split_csv(getattr(current_user, "team_names", None))
-        mgr_scope = set(mgr_team_names)
-        if mgr_team_name:
-            mgr_scope.add(mgr_team_name)
-
-        child_team = _normalize_team_name(team_name)
-        if not child_team:
-            raise ValueError("子账号必须指定 team_name")
-        if mgr_scope and child_team not in mgr_scope:
-            raise PermissionError("子账号 team_name 不在经理团队范围内")
-
-        team_name = child_team
-        team_names = ""  # 子账号不设置 team_names（冻结语义）
-
-    elif current_role == ROLE_SUPER_ADMIN:
-        # super_admin 创建 manager：可指定 team_names，若 team_name 未给，取 team_names 第一个
-        if role_name == ROLE_MANAGER:
-            tn_csv = _normalize_team_names_csv(team_names)
-            if tn_csv and not _normalize_team_name(team_name):
-                first = _split_csv(tn_csv)[0]
-                team_name = first
-            team_names = tn_csv
-        else:
-            # 非 manager 必须有 team_name
-            if not _normalize_team_name(team_name):
-                raise ValueError("账号必须指定 team_name")
-
-            team_name = _normalize_team_name(team_name)
-            team_names = _normalize_team_names_csv(team_names)
-
-    else:
-        raise PermissionError("无权限创建用户")
-
-    u = User(
-        username=username.strip(),
-        password_hash=hash_password(password),
-        team_name=_normalize_team_name(team_name),
-        team_names=_normalize_team_names_csv(team_names),
+    user = User(
+        username=uname,
+        password_hash=hash_password(p),
         status=1,
+        team_name=tn,
+        team_names=tns_csv,
         created_at=now,
         updated_at=now,
     )
-    db.add(u)
-    await db.flush()
+    db.add(user)
 
-    rid = await _get_role_id(db, role_name)
-    db.add(UserRole(user_id=int(u.id), role_id=int(rid)))
+    try:
+        await db.flush()
+    except IntegrityError as e:
+        await db.rollback()
+        logger.exception("create_user flush failed: %s", e)
+        raise ValueError("用户名已存在") from e
+
+    role_row = (
+        (await db.execute(select(Role).where(Role.role_name == rname)))
+        .scalars()
+        .first()
+    )
+    if not role_row:
+        await db.rollback()
+        raise ValueError("角色不存在（请先初始化 seed）")
+
+    db.add(UserRole(user_id=user.id, role_id=role_row.id))
 
     try:
         await db.commit()
     except IntegrityError as e:
         await db.rollback()
-        raise ValueError(f"创建失败: {e}")
+        logger.exception("create_user commit failed: %s", e)
+        raise ValueError("创建用户失败（请检查角色/唯一约束）") from e
 
-    await db.refresh(u)
-    return u
+    await db.refresh(user)
+    return user
 
 
 async def update_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        user_id: int,
-        display_name: Optional[str] = None,
-        phone: Optional[str] = None,
-        password: Optional[str] = None,
-        team_name: Optional[str] = None,
-        team_names: Optional[str] = None,
+    *,
+    db: AsyncSession,
+    current_role: str,
+    user_id: int,
+    password: Optional[str] = None,
+    team_name: Optional[str] = None,
+    team_names: Optional[str] = None,
 ) -> User:
-    """
-    更新用户（冻结口径）
+    _require_super_admin(current_role)
 
-    承重墙：
-    - display_name/phone 不存在：若传入非空 -> 直接报错
-    - manager 的“只能编辑自己创建的子账号”依赖 created_by（不存在），因此不实现该旧规则
-      当前只保留：manager 不可编辑 manager/super_admin 账号（按角色判断）
-    """
-    if display_name is not None and display_name.strip():
-        raise ValueError("不支持字段: display_name（请对齐 models/schemas）")
-    if phone is not None and phone.strip():
-        raise ValueError("不支持字段: phone（请对齐 models/schemas）")
-
-    now = _now_bj_naive()
-
-    u = (await db.execute(select(User).where(User.id == int(user_id)))).scalars().first()
-    if not u:
+    uid = int(user_id)
+    user = (await db.execute(select(User).where(User.id == uid))).scalars().first()
+    if not user:
         raise ValueError("用户不存在")
 
-    # 权限约束
-    if current_role == ROLE_SUPER_ADMIN:
-        if int(getattr(u, "id", 0) or 0) == int(getattr(current_user, "id", 0) or 0):
-            # 允许改自己密码/团队？这里不做额外限制，交给上游业务决定
-            pass
-    elif current_role == ROLE_MANAGER:
-        # manager 不允许编辑 manager / super_admin 账号
-        target_role = await _get_user_primary_role(db, int(u.id))
-        if target_role in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
-            raise PermissionError("无权限编辑该用户")
-    else:
-        raise PermissionError("无权限编辑用户")
+    changed = False
 
-    if password:
-        u.password_hash = hash_password(password)
+    if password is not None:
+        p = _validate_password(password)
+        user.password_hash = hash_password(p)
+        changed = True
 
-    if team_name is not None:
-        u.team_name = _normalize_team_name(team_name)
-    if team_names is not None:
-        u.team_names = _normalize_team_names_csv(team_names)
+    tn = (str(team_name).strip() if team_name is not None else None) or None
+    tns_csv = _normalize_team_names_csv(team_names)
+    _validate_team_names(tn, tns_csv)
 
-    u.updated_at = now
-    await db.commit()
-    await db.refresh(u)
-    return u
+    if user.team_name != tn:
+        user.team_name = tn
+        changed = True
+    if (user.team_names or "") != tns_csv:
+        user.team_names = tns_csv
+        changed = True
+
+    if changed:
+        user.updated_at = _now_bj_naive()
+        await db.commit()
+        await db.refresh(user)
+
+    return user
 
 
 async def delete_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        user_id: int,
+    *,
+    db: AsyncSession,
+    current_user: User,
+    current_role: str,
+    user_id: int,
 ) -> None:
-    """
-    删除用户（冻结口径）
+    _require_super_admin(current_role)
 
-    承重墙：
-    - 不使用 created_by（不存在）
-    - super_admin：不能删自己；不能删 super_admin；允许删 manager（不检查子账号归属关系，因为 created_by 不存在）
-    - manager：默认无删除权限（避免误删）
-    """
-    u = (await db.execute(select(User).where(User.id == int(user_id)))).scalars().first()
-    if not u:
-        return
+    uid = int(user_id)
+    current_uid = int(getattr(current_user, "id", 0) or 0)
+    if uid == current_uid:
+        raise ValueError("不能删除自己")
 
-    if current_role == ROLE_SUPER_ADMIN:
-        if int(getattr(u, "id", 0) or 0) == int(getattr(current_user, "id", 0) or 0):
-            raise PermissionError("禁止删除自己")
-
-        target_role = await _get_user_primary_role(db, int(u.id))
-        if target_role == ROLE_SUPER_ADMIN:
-            raise PermissionError("禁止删除 super_admin")
-
-    else:
-        raise PermissionError("无权限删除用户")
-
-    await db.execute(delete(UserRole).where(UserRole.user_id == int(u.id)))
-    await db.delete(u)
+    await db.execute(delete(UserRole).where(UserRole.user_id == uid))
+    await db.execute(delete(User).where(User.id == uid))
     await db.commit()

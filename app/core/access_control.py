@@ -100,7 +100,6 @@ def normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> T
 def require_ai_assistant_access(
         *,
         role_name: Optional[str],
-        team_names: Tuple[str, ...] = tuple(),
 ) -> None:
     """
     报价助手统一访问权限（当前阶段收口策略）：
@@ -215,7 +214,7 @@ async def ensure_order_write_acl_by_salesperson_id(db: AsyncSession, *, salesper
                                                   role_name=role_name, team_names=team_names)
 
 
-async def apply_orders_list_acl(db: AsyncSession, *, current_user: User, role_name: Optional[str],
+async def apply_orders_list_acl(*, current_user: User, role_name: Optional[str],
                                 team_names: Tuple[str, ...], clauses: List) -> None:
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
@@ -247,7 +246,7 @@ def current_team_names_or_403(*, role_name: Optional[str], team_names: Tuple[str
     if role_name in (ROLE_FINANCE, ROLE_MARKET):
         if len(tns) != 1:
             raise HTTPException(status_code=403, detail="当前账号团队配置异常：该角色必须且只能属于 1 个团队")
-        return (tns[0],)
+        return tns[0],
     if role_name == ROLE_MANAGER:
         return tns
     raise HTTPException(status_code=403, detail="No permission")
@@ -267,8 +266,7 @@ def parse_query_team_names(team_name: Optional[str], team_names: Optional[Tuple[
 
 
 def effective_team_filter_for_query(*, role_name: Optional[str], current_team_names: Optional[Tuple[str, ...]],
-                                    team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Optional[
-    Tuple[str, ...]]:
+                                    team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Optional[Tuple[str, ...]]:
     requested = parse_query_team_names(team_name, team_names)
     if requested:
         invalid = [t for t in requested if t not in TEAM_NAMES]
