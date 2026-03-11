@@ -55,7 +55,33 @@ class OrderInfoIn(OrmBaseModel):
 
 
 class OrderInfoOut(OrmBaseModel):
-    """订单扩展信息出参（最小化）。"""
+    """订单扩展信息出参（当前真实表结构口径）。"""
+    insurance_expire_date: Optional[str] = None
+    owner_phone: Optional[str] = None
+
+    commercial_amount: Optional[float] = None
+    compulsory_amount: Optional[float] = None
+    vehicle_tax_amount: Optional[float] = None
+    non_vehicle_amount: Optional[float] = None
+    premium_total: Optional[float] = None
+
+    channel_commercial_point: Optional[float] = None
+    channel_commercial_supplement_point: Optional[float] = None
+    channel_compulsory_point: Optional[float] = None
+    channel_vehicle_tax_point: Optional[float] = None
+    channel_non_vehicle_point: Optional[float] = None
+    channel_reward: Optional[float] = None
+    channel_total: Optional[float] = None
+
+    customer_commercial_point: Optional[float] = None
+    customer_commercial_supplement_point: Optional[float] = None
+    customer_compulsory_point: Optional[float] = None
+    customer_vehicle_tax_point: Optional[float] = None
+    customer_non_vehicle_point: Optional[float] = None
+    customer_reward: Optional[float] = None
+    customer_total: Optional[float] = None
+
+    profit: Optional[float] = None
     remark: Optional[str] = None
 
 
@@ -140,7 +166,7 @@ class OrderOut(OrmBaseModel):
     # ✅ 唯一图片结构：slot_images（按 slot_field_config 的固定契约）
     slot_images: List[SlotImageNodeOut] = Field(default_factory=list)
 
-    # 扩展信息（如后端已实现 1:1）
+    # 扩展信息（当前真实表结构）
     order_info: Optional[OrderInfoOut] = None
 
     created_at: Optional[str] = None
@@ -149,20 +175,36 @@ class OrderOut(OrmBaseModel):
 
 class OrderListItemOut(OrmBaseModel):
     """
-    列表项（精简专用 schema）
+    列表项（订单列表真实消费口径）
 
     说明：
-    - 列表项不强制等同 OrderOut，避免 read_model 输出精简字段时 schema 校验必炸
-    - 详情仍以 OrderOut 为准
+    - 仅按当前前端真实需要返回
+    - 不做旧字段兼容，不回填 dl_*
     """
     id: int
 
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
+    salesperson_id: Optional[int] = None
+
+    customer_group_name: Optional[str] = None
+    channel_group_name: Optional[str] = None
+    customer_group_market: Optional[str] = None
+
+    salesperson_name: Optional[str] = None
+    manager_name: Optional[str] = None
+    team_name: Optional[str] = None
+    team_names: List[str] = Field(default_factory=list)
 
     is_finished: bool = False
+    is_rebate: bool = False
+    is_paid: bool = False
+
     status: int = 0
     audit_status: int = 0
+
+    dynamic_data: Dict[str, Any] = Field(default_factory=dict)
+    order_info: Optional[OrderInfoOut] = None
 
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
