@@ -2,15 +2,25 @@
 # encoding: utf-8
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class OrmBaseModel(BaseModel):
+    """Pydantic v1/v2 兼容：允许 ORM 对象直接输出。"""
+
+    model_config = {"from_attributes": True}
+
+    class Config:
+        orm_mode = True
 
 
 # =========================
 # Slot Images（唯一真源契约）
 # =========================
 
-class SlotImageItemOut(BaseModel):
+class SlotImageItemOut(OrmBaseModel):
     """卡槽图片条目（字段固定，不多不少）"""
     order_image_id: int
     image_file_id: Optional[int] = None
@@ -20,7 +30,7 @@ class SlotImageItemOut(BaseModel):
     updated_at: Optional[str] = None
 
 
-class SlotImageNodeOut(BaseModel):
+class SlotImageNodeOut(OrmBaseModel):
     """卡槽节点（字段固定，不多不少）"""
     slot_key: str
     title: str
@@ -39,33 +49,59 @@ class OrderImageOut(SlotImageItemOut):
 # Order Info（扩展信息）
 # =========================
 
-class OrderInfoIn(BaseModel):
+class OrderInfoIn(OrmBaseModel):
     """订单扩展信息入参（最小化：只保留 remark，其余走 dynamic_data/事实层）。"""
     remark: Optional[str] = None
 
 
-class OrderInfoOut(BaseModel):
-    """订单扩展信息出参（最小化）。"""
+class OrderInfoOut(OrmBaseModel):
+    """订单扩展信息出参（当前真实表结构口径）。"""
+    insurance_expire_date: Optional[str] = None
+    owner_phone: Optional[str] = None
+
+    commercial_amount: Optional[float] = None
+    compulsory_amount: Optional[float] = None
+    vehicle_tax_amount: Optional[float] = None
+    non_vehicle_amount: Optional[float] = None
+    premium_total: Optional[float] = None
+
+    channel_commercial_point: Optional[float] = None
+    channel_commercial_supplement_point: Optional[float] = None
+    channel_compulsory_point: Optional[float] = None
+    channel_vehicle_tax_point: Optional[float] = None
+    channel_non_vehicle_point: Optional[float] = None
+    channel_reward: Optional[float] = None
+    channel_total: Optional[float] = None
+
+    customer_commercial_point: Optional[float] = None
+    customer_commercial_supplement_point: Optional[float] = None
+    customer_compulsory_point: Optional[float] = None
+    customer_vehicle_tax_point: Optional[float] = None
+    customer_non_vehicle_point: Optional[float] = None
+    customer_reward: Optional[float] = None
+    customer_total: Optional[float] = None
+
+    profit: Optional[float] = None
     remark: Optional[str] = None
-
-    # ✅ 兼容 Pydantic v1/v2：允许 from_orm/from_attributes
-    model_config = {"from_attributes": True}
-
-    class Config:
-        orm_mode = True
 
 
 # =========================
 # Order（主对象）
 # =========================
 
-class OrderCreate(BaseModel):
+class OrderCreate(OrmBaseModel):
     """创建订单（新表口径）"""
     module: str = "order"
     created_by: Optional[int] = None
     salesperson_id: Optional[int] = None
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
+
+    # ✅ 与 orders API 行为对齐：创建时允许传入是否完成标记（默认为 False）
+    is_finished: bool = False
+
+    # ✅ 订单扩展信息（目前只允许 remark）
+    order_info: Optional[OrderInfoIn] = None
 
     status: int = 0
     audit_status: int = 0
@@ -75,7 +111,7 @@ class OrderCreate(BaseModel):
     ocr_raw_json: Dict[str, Any] = Field(default_factory=dict)
 
 
-class OrderUpdate(BaseModel):
+class OrderUpdate(OrmBaseModel):
     """
     更新订单（仅允许更新明确字段；其余通过事实层/业务专用接口）
 
@@ -95,12 +131,19 @@ class OrderUpdate(BaseModel):
     order_info: Optional[OrderInfoIn] = None
 
 
-class OrderStatusUpdate(BaseModel):
-    """订单状态更新（收口：只允许维护 is_finished）"""
+class OrderStatusUpdate(OrmBaseModel):
+    """订单状态更新
+
+    说明：
+    - orders 模块只允许更新 is_finished
+    - is_rebate/is_paid 属于财务字段：schema 显式声明以保证契约完整，但 orders API 会拒绝更新
+    """
     is_finished: Optional[bool] = None
+    is_rebate: Optional[bool] = None
+    is_paid: Optional[bool] = None
 
 
-class OrderOut(BaseModel):
+class OrderOut(OrmBaseModel):
     id: int
     module: str
 
@@ -123,41 +166,57 @@ class OrderOut(BaseModel):
     # ✅ 唯一图片结构：slot_images（按 slot_field_config 的固定契约）
     slot_images: List[SlotImageNodeOut] = Field(default_factory=list)
 
-    # 扩展信息（如后端已实现 1:1）
+    # 扩展信息（当前真实表结构）
     order_info: Optional[OrderInfoOut] = None
 
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
 
-class OrderListItemOut(BaseModel):
+class OrderListItemOut(OrmBaseModel):
     """
-    列表项（精简专用 schema）
+    列表项（订单列表真实消费口径）
 
     说明：
-    - 列表项不强制等同 OrderOut，避免 read_model 输出精简字段时 schema 校验必炸
-    - 详情仍以 OrderOut 为准
+    - 仅按当前前端真实需要返回
+    - 不做旧字段兼容，不回填 dl_*
     """
     id: int
 
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
+    salesperson_id: Optional[int] = None
+
+    customer_group_name: Optional[str] = None
+    channel_group_name: Optional[str] = None
+    customer_group_market: Optional[str] = None
+
+    salesperson_name: Optional[str] = None
+    manager_name: Optional[str] = None
+    team_name: Optional[str] = None
+    team_names: List[str] = Field(default_factory=list)
 
     is_finished: bool = False
+    is_rebate: bool = False
+    is_paid: bool = False
+
     status: int = 0
     audit_status: int = 0
+
+    dynamic_data: Dict[str, Any] = Field(default_factory=dict)
+    order_info: Optional[OrderInfoOut] = None
 
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
 
-class OrderListMeta(BaseModel):
+class OrderListMeta(OrmBaseModel):
     """列表元信息（UI 能力提示等）"""
     source: str = "orders"
     capabilities: Dict[str, Any] = Field(default_factory=dict)
 
 
-class OrderListResponse(BaseModel):
+class OrderListResponse(OrmBaseModel):
     """订单列表响应（与 API 输出一致）"""
     meta: Optional[OrderListMeta] = None
     total: int = 0

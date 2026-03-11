@@ -46,8 +46,6 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
     return LoginOut(
         token=token,
         user_id=user.id,
-        username=user.username,
-        display_name=getattr(user, "display_name", "") or "",
         role_name=role_name,
         team_name=team_name,
         team_names=team_names,

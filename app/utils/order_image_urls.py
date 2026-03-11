@@ -25,9 +25,15 @@ from typing import Protocol, runtime_checkable
 class _StorageProto(Protocol):
     enabled: bool
 
-    def object_url_for_display(self, key: str, expires_in: int = 3600) -> str: ...
+    @staticmethod
+    def object_url_for_display(key: str, expires_in: int = 3600) -> str:
+        # 仅用于类型约束；实现由 StorageService 提供
+        return "" if (key or expires_in) else ""
 
-    def object_public_url(self, key: str) -> str: ...
+    @staticmethod
+    def object_public_url(key: str) -> str:
+        # 仅用于类型约束；实现由 StorageService 提供
+        return "" if key else ""
 
 
 def _norm_str(v: Any) -> str:

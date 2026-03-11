@@ -70,3 +70,21 @@ class UserOut(BaseModel):
 class UserListOut(BaseModel):
     total: int = 0
     items: List[UserOut] = Field(default_factory=list)
+
+
+class UserCreateIn(BaseModel):
+    """创建用户入参（body）"""
+
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=6)
+    role_name: str = Field(..., min_length=1, description="角色：super_admin/manager/sales/finance/market")
+    team_name: Optional[str] = None
+    team_names: Optional[str] = None
+
+
+class UserUpdateIn(BaseModel):
+    """更新用户入参（body）"""
+
+    password: Optional[str] = Field(default=None, min_length=6)
+    team_name: Optional[str] = None
+    team_names: Optional[str] = None
