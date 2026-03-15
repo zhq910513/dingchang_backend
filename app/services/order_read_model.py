@@ -16,7 +16,13 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from app.models.order import Order, OrderImage
-from app.schemas.order import OrderInfoOut, OrderOut
+from app.schemas.order import (
+    OrderInfoOut,
+    OrderOut,
+    OrderListDynamicDataOut,
+    OrderListInfoOut,
+)
+from app.services.ocr_cleaner import norm_fuzzy_date_text
 from app.services.storage import StorageService
 
 if TYPE_CHECKING:
@@ -35,11 +41,41 @@ def _dt_to_ymd(v: Any) -> Optional[str]:
     return s or None
 
 
+def _trim_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
 def _normalize_dynamic_data(dynamic_data: Any) -> Dict[str, Any]:
-    # 新表唯一口径：仅保证 dict 类型，不做旧键回填
-    if isinstance(dynamic_data, dict):
-        return dict(dynamic_data)
-    return {}
+    if not isinstance(dynamic_data, dict):
+        return {}
+
+    dd = dict(dynamic_data)
+
+    if "first_register_date" in dd:
+        dd["first_register_date"] = norm_fuzzy_date_text(dd.get("first_register_date"))
+
+    return dd
+
+
+def _list_dynamic_data_out(dynamic_data: Any) -> OrderListDynamicDataOut:
+    """
+    列表页专用 dynamic_data 输出：
+    仅保留当前前端真实消费字段。
+    """
+    dd = _normalize_dynamic_data(dynamic_data)
+
+    return OrderListDynamicDataOut(
+        owner_name=_trim_or_none(dd.get("owner_name")),
+        plate_no=_trim_or_none(dd.get("plate_no")),
+        vin=_trim_or_none(dd.get("vin")),
+        engine_no=_trim_or_none(dd.get("engine_no")),
+        vehicle_model=_trim_or_none(dd.get("vehicle_model")),
+        first_register_date=norm_fuzzy_date_text(dd.get("first_register_date")),
+        id_number=_trim_or_none(dd.get("id_number")),
+    )
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -70,7 +106,39 @@ def _split_team_names_csv(v: Any) -> List[str]:
     return out
 
 
+def _group_code_name(g) -> Optional[str]:
+    if not g:
+        return None
+
+    code = (
+            getattr(g, "channel_code", None)
+            or getattr(g, "customer_code", None)
+            or getattr(g, "group_code", None)
+            or getattr(g, "code", None)
+    )
+    name = (
+            getattr(g, "channel_name", None)
+            or getattr(g, "customer_name", None)
+            or getattr(g, "group_name", None)
+            or getattr(g, "name", None)
+    )
+
+    code_s = str(code).strip() if code is not None and str(code).strip() else ""
+    name_s = str(name).strip() if name is not None and str(name).strip() else ""
+
+    if code_s and name_s:
+        return f"{code_s} - {name_s}"
+    if name_s:
+        return name_s
+    if code_s:
+        return code_s
+    return None
+
+
 def _order_info_out(info) -> Optional[OrderInfoOut]:
+    """
+    详情页专用 order_info 输出：保持完整口径。
+    """
     if not info:
         return None
 
@@ -108,6 +176,43 @@ def _order_info_out(info) -> Optional[OrderInfoOut]:
     )
 
 
+def _list_order_info_out(info) -> Optional[OrderListInfoOut]:
+    """
+    列表页专用 order_info 输出：
+    仅保留当前订单列表 / 财务列表真实消费字段。
+    """
+    if not info:
+        return None
+
+    return OrderListInfoOut(
+        insurance_expire_date=_dt_to_ymd(getattr(info, "insurance_expire_date", None)),
+        owner_phone=_trim_or_none(getattr(info, "owner_phone", None)),
+
+        commercial_amount=_to_float(getattr(info, "commercial_amount", None)),
+        compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)),
+        vehicle_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)),
+        non_vehicle_amount=_to_float(getattr(info, "non_vehicle_amount", None)),
+
+        channel_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)),
+        channel_commercial_supplement_point=_to_float(getattr(info, "channel_commercial_supplement_point", None)),
+        channel_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)),
+        channel_vehicle_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)),
+        channel_non_vehicle_point=_to_float(getattr(info, "channel_non_vehicle_point", None)),
+        channel_reward=_to_float(getattr(info, "channel_reward", None)),
+        channel_total=_to_float(getattr(info, "channel_total", None)),
+
+        customer_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)),
+        customer_commercial_supplement_point=_to_float(getattr(info, "customer_commercial_supplement_point", None)),
+        customer_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)),
+        customer_vehicle_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)),
+        customer_non_vehicle_point=_to_float(getattr(info, "customer_non_vehicle_point", None)),
+        customer_reward=_to_float(getattr(info, "customer_reward", None)),
+        customer_total=_to_float(getattr(info, "customer_total", None)),
+
+        profit=_to_float(getattr(info, "profit", None)),
+    )
+
+
 def _safe_get_loaded_images(order: Order) -> Optional[List[OrderImage]]:
     try:
         images = getattr(order, "images", None)
@@ -139,6 +244,9 @@ def to_order_out(
     from app.utils.order_image_urls import build_slot_images  # local import
     slot_images = build_slot_images(o, storage)
 
+    customer_group = getattr(o, "customer_group", None)
+    channel_group = getattr(o, "channel_group", None)
+
     return OrderOut(
         id=int(getattr(o, "id", 0) or 0),
         module=str(getattr(o, "module", "") or "order"),
@@ -146,6 +254,8 @@ def to_order_out(
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
         customer_group_id=getattr(o, "customer_group_id", None),
         channel_group_id=getattr(o, "channel_group_id", None),
+        customer_group_name=_group_code_name(customer_group),
+        channel_group_name=_group_code_name(channel_group),
         is_finished=bool(getattr(o, "is_finished", False)),
         is_rebate=bool(getattr(o, "is_rebate", False)),
         is_paid=bool(getattr(o, "is_paid", False)),
@@ -175,14 +285,14 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
         order_info = getattr(o, "order_info", None)
 
         salesperson_name = (
-            str(getattr(salesperson, "real_name", "") or "").strip()
-            or str(getattr(salesperson, "username", "") or "").strip()
-            or None
+                str(getattr(salesperson, "real_name", "") or "").strip()
+                or str(getattr(salesperson, "username", "") or "").strip()
+                or None
         )
         manager_name = (
-            str(getattr(getattr(salesperson, "parent", None), "real_name", "") or "").strip()
-            or str(getattr(getattr(salesperson, "parent", None), "username", "") or "").strip()
-            or None
+                str(getattr(getattr(salesperson, "parent", None), "real_name", "") or "").strip()
+                or str(getattr(getattr(salesperson, "parent", None), "username", "") or "").strip()
+                or None
         )
 
         team_name = str(getattr(salesperson, "team_name", "") or "").strip() or None
@@ -199,13 +309,13 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
                 salesperson_id=getattr(o, "salesperson_id", None),
 
                 customer_group_name=(
-                    str(getattr(customer_group, "customer_name", "") or "").strip() or None
+                        str(getattr(customer_group, "customer_name", "") or "").strip() or None
                 ),
                 channel_group_name=(
-                    str(getattr(channel_group, "channel_name", "") or "").strip() or None
+                        str(getattr(channel_group, "channel_name", "") or "").strip() or None
                 ),
                 customer_group_market=(
-                    str(getattr(customer_group, "market", "") or "").strip() or None
+                        str(getattr(customer_group, "market", "") or "").strip() or None
                 ),
 
                 salesperson_name=salesperson_name,
@@ -219,8 +329,8 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
                 status=int(getattr(o, "status", 0) or 0),
                 audit_status=int(getattr(o, "audit_status", 0) or 0),
 
-                dynamic_data=_normalize_dynamic_data(getattr(o, "dynamic_data", None)),
-                order_info=_order_info_out(order_info),
+                dynamic_data=_list_dynamic_data_out(getattr(o, "dynamic_data", None)),
+                order_info=_list_order_info_out(order_info),
 
                 created_at=_dt_to_ymd(getattr(o, "created_at", None)),
                 updated_at=_dt_to_ymd(getattr(o, "updated_at", None)),

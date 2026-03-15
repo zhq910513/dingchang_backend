@@ -6,7 +6,9 @@ import re
 from typing import Any, Dict, Optional
 
 _YMD_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_YM_RE = re.compile(r"^\d{4}-\d{2}$")
 _8DIGITS_RE = re.compile(r"^\d{8}$")
+_6DIGITS_RE = re.compile(r"^\d{6}$")
 
 
 def _s(v: Any) -> str:
@@ -33,8 +35,16 @@ def norm_text(v: Any) -> Optional[str]:
     return _s(v) or None
 
 
-def norm_ymd(v: Any) -> Optional[str]:
-    """统一日期：只允许 YYYY-MM-DD 或 None。"""
+def norm_fuzzy_date_text(v: Any) -> Optional[str]:
+    """
+    宽松字符串日期：
+    - YYYY-MM-DD -> YYYY-MM-DD
+    - YYYYMMDD   -> YYYY-MM-DD
+    - YYYY/MM/DD -> YYYY-MM-DD
+    - YYYY-MM    -> YYYY-MM
+    - YYYYMM     -> YYYY-MM
+    - -, 空串    -> None
+    """
     if _is_empty(v):
         return None
 
@@ -46,9 +56,28 @@ def norm_ymd(v: Any) -> Optional[str]:
     s2 = re.sub(r"\s+", "", s2)
 
     if _YMD_RE.match(s2):
-        return s2
+        yyyy, mm, dd = s2.split("-")
+        try:
+            mi = int(mm)
+            di = int(dd)
+            if 1 <= mi <= 12 and 1 <= di <= 31:
+                return s2
+        except Exception:
+            return None
+        return None
+
+    if _YM_RE.match(s2):
+        yyyy, mm = s2.split("-")
+        try:
+            mi = int(mm)
+            if 1 <= mi <= 12:
+                return s2
+        except Exception:
+            return None
+        return None
 
     digits = _digits_only(s2)
+
     if _8DIGITS_RE.match(digits):
         yyyy = digits[0:4]
         mm = digits[4:6]
@@ -56,37 +85,59 @@ def norm_ymd(v: Any) -> Optional[str]:
         try:
             mi = int(mm)
             di = int(dd)
-            if mi < 1 or mi > 12:
-                return None
-            if di < 1 or di > 31:
-                return None
+            if 1 <= mi <= 12 and 1 <= di <= 31:
+                return f"{yyyy}-{mm}-{dd}"
         except Exception:
             return None
-        return f"{yyyy}-{mm}-{dd}"
+        return None
+
+    if _6DIGITS_RE.match(digits):
+        yyyy = digits[0:4]
+        mm = digits[4:6]
+        try:
+            mi = int(mm)
+            if 1 <= mi <= 12:
+                return f"{yyyy}-{mm}"
+        except Exception:
+            return None
+        return None
 
     return None
+
+
+def norm_ymd(v: Any) -> Optional[str]:
+    """
+    严格日级日期：
+    - YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD -> YYYY-MM-DD
+    - YYYY-MM / YYYYMM / -, 空串 -> None
+    """
+    s = norm_fuzzy_date_text(v)
+    if not s:
+        return None
+    return s if len(s) == 10 else None
 
 
 def clean_dynamic_data_for_ocr(dyn: Dict[str, Any]) -> Dict[str, Any]:
     """OCR 入库前清洗 dynamic_data（新表唯一口径）。
 
     - 删除所有 dl_* 历史键（禁止再出现）
-    - 日期字段两态化：YYYY-MM-DD / None
+    - first_register_date 允许 YYYY-MM-DD / YYYY-MM / None
+    - 其余严格日期字段：YYYY-MM-DD / None
     - 文本字段：空占位 -> None
     """
     d = dict(dyn or {})
 
-    # 1) 删除历史键
     for k in list(d.keys()):
         if str(k).startswith("dl_"):
             d.pop(k, None)
 
-    # 2) 日期字段
-    for k in ("first_register_date", "issue_date", "id_birth_date", "id_valid_from", "id_valid_to"):
+    if "first_register_date" in d:
+        d["first_register_date"] = norm_fuzzy_date_text(d.get("first_register_date"))
+
+    for k in ("issue_date", "id_birth_date", "id_valid_from", "id_valid_to"):
         if k in d:
             d[k] = norm_ymd(d.get(k))
 
-    # 3) 文本字段
     for k in (
             "owner_name",
             "plate_no",

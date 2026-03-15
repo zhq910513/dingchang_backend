@@ -274,7 +274,7 @@ async def ensure_schema_additive_on_startup(
                             except Exception as error:
                                 if _is_duplicate_column_error(error):
                                     logger.warning(
-                                        "[schema_apply] duplicate_column_ignored=%s.%s (%s)", tn, cn, exc
+                                        "[schema_apply] duplicate_column_ignored=%s.%s (%s)", tn, cn, error
                                     )
                                     continue
                                 raise

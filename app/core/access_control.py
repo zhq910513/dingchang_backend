@@ -1,3 +1,4 @@
+# app/core/access_control.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -8,10 +9,17 @@ from sqlalchemy import and_, or_, false as sql_false, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
-    ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN, TEAM_NAMES,
+    ROLE_FINANCE,
+    ROLE_MANAGER,
+    ROLE_MARKET,
+    ROLE_SALES,
+    ROLE_SUPER_ADMIN,
+    TEAM_NAMES,
 )
 from app.models.order import Order
+from app.models.role import Role
 from app.models.user import User
+from app.models.user_role import UserRole
 
 
 def split_team_names_any(val) -> List[str]:
@@ -104,11 +112,6 @@ def require_ai_assistant_access(
     """
     报价助手统一访问权限（当前阶段收口策略）：
     - 仅超级管理员可访问（试用/灰度阶段）
-    - 后续若放开 manager/market 等角色，只改这里，不改 API/service
-
-    说明：
-    - 当前规则不强制校验 team_names（超级管理员通常可无团队）
-    - 若未来放开非 super_admin，再按角色要求接入团队校验逻辑
     """
     rn = (role_name or "").strip()
     if rn == ROLE_SUPER_ADMIN:
@@ -169,8 +172,12 @@ def user_team_match_expr(teams: Tuple[str, ...]):
     terms = [User.team_name.in_(list(tns))]
     if hasattr(User, "team_names"):
         for t in tns:
-            terms.extend([User.team_names == t, User.team_names.like(f"{t},%"), User.team_names.like(f"%,{t},%"),
-                          User.team_names.like(f"%,{t}")])
+            terms.extend([
+                User.team_names == t,
+                User.team_names.like(f"{t},%"),
+                User.team_names.like(f"%,{t},%"),
+                User.team_names.like(f"%,{t}"),
+            ])
     return or_(*terms)
 
 
@@ -186,8 +193,14 @@ async def ensure_user_in_teams(db: AsyncSession, user_id: int, teams: Tuple[str,
         raise HTTPException(status_code=403, detail="No permission")
 
 
-async def ensure_order_read_acl_by_salesperson_id(db: AsyncSession, *, salesperson_id: int, current_user: User,
-                                                  role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
+async def ensure_order_read_acl_by_salesperson_id(
+        db: AsyncSession,
+        *,
+        salesperson_id: int,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+) -> None:
     rn = role_name or ""
     if rn == ROLE_SUPER_ADMIN:
         return
@@ -207,11 +220,21 @@ async def ensure_order_read_acl_by_salesperson_id(db: AsyncSession, *, salespers
     raise HTTPException(status_code=403, detail="No permission")
 
 
-async def ensure_order_write_acl_by_salesperson_id(db: AsyncSession, *, salesperson_id: int, current_user: User,
-                                                   role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
-    # 与 read ACL 一致，写入口可额外在业务层限制角色
-    await ensure_order_read_acl_by_salesperson_id(db, salesperson_id=salesperson_id, current_user=current_user,
-                                                  role_name=role_name, team_names=team_names)
+async def ensure_order_write_acl_by_salesperson_id(
+        db: AsyncSession,
+        *,
+        salesperson_id: int,
+        current_user: User,
+        role_name: Optional[str],
+        team_names: Tuple[str, ...],
+) -> None:
+    await ensure_order_read_acl_by_salesperson_id(
+        db=db,
+        salesperson_id=salesperson_id,
+        current_user=current_user,
+        role_name=role_name,
+        team_names=team_names,
+    )
 
 
 async def apply_orders_list_acl(*, current_user: User, role_name: Optional[str],
@@ -266,7 +289,8 @@ def parse_query_team_names(team_name: Optional[str], team_names: Optional[Tuple[
 
 
 def effective_team_filter_for_query(*, role_name: Optional[str], current_team_names: Optional[Tuple[str, ...]],
-                                    team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Optional[Tuple[str, ...]]:
+                                    team_name: Optional[str], team_names: Optional[Tuple[str, ...]]) -> Optional[
+    Tuple[str, ...]]:
     requested = parse_query_team_names(team_name, team_names)
     if requested:
         invalid = [t for t in requested if t not in TEAM_NAMES]
@@ -301,3 +325,111 @@ async def salesperson_in_current_teams_or_403(*, salesperson: Optional[User],
         team_names_val = [team_name_val]
     if not team_names_val or not (set(team_names_val) & allowed):
         raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+
+
+# =========================
+# 用户管理（Users）统一权限阀门
+# =========================
+
+USER_MANAGE_ALLOWED_ROLES = {ROLE_SUPER_ADMIN, ROLE_MANAGER}
+USER_MANAGER_CREATABLE_ROLES = {ROLE_SALES, ROLE_FINANCE, ROLE_MARKET}
+USER_SUPER_ADMIN_CREATABLE_ROLES = {ROLE_MANAGER, ROLE_SALES, ROLE_FINANCE, ROLE_MARKET}
+USER_MANAGE_ALL_ALLOWED_ROLES = {
+    ROLE_SUPER_ADMIN,
+    ROLE_MANAGER,
+    ROLE_SALES,
+    ROLE_FINANCE,
+    ROLE_MARKET,
+}
+
+
+def require_user_manage_access(*, role_name: Optional[str]) -> None:
+    rn = (role_name or "").strip()
+    if rn in USER_MANAGE_ALLOWED_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="无权限管理用户")
+
+
+def allowed_user_create_roles(*, role_name: Optional[str]) -> Tuple[str, ...]:
+    rn = (role_name or "").strip()
+    if rn == ROLE_SUPER_ADMIN:
+        return tuple(sorted(USER_SUPER_ADMIN_CREATABLE_ROLES))
+    if rn == ROLE_MANAGER:
+        return tuple(sorted(USER_MANAGER_CREATABLE_ROLES))
+    raise HTTPException(status_code=403, detail="无权限管理用户")
+
+
+async def get_user_primary_role_name(*, db: AsyncSession, user_id: int) -> Optional[str]:
+    stmt = (
+        select(Role.role_name)
+        .join(UserRole, UserRole.role_id == Role.id)
+        .where(UserRole.user_id == int(user_id))
+        .order_by(Role.id.asc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+def validate_user_role_name_for_create(*, current_role: Optional[str], target_role_name: str) -> None:
+    tr = str(target_role_name or "").strip()
+    if tr not in USER_MANAGE_ALL_ALLOWED_ROLES:
+        raise HTTPException(status_code=400, detail="role_name 不合法")
+
+    allowed = set(allowed_user_create_roles(role_name=current_role))
+    if tr not in allowed:
+        raise HTTPException(status_code=403, detail="当前角色无权限创建该类型账号")
+
+
+async def ensure_user_manage_target_allowed(
+        *,
+        db: AsyncSession,
+        current_user: User,
+        current_role: Optional[str],
+        target_user: User,
+) -> None:
+    """
+    用户管理目标约束（按“自己创建的账号”收口）：
+    - super_admin：仅可管理自己创建的账号，且不能管理自己
+    - manager：仅可管理自己创建的账号，且目标角色只能是 sales/finance/market，且不能管理自己
+    """
+    rn = (current_role or "").strip()
+    require_user_manage_access(role_name=rn)
+
+    current_uid = int(getattr(current_user, "id", 0) or 0)
+    target_uid = int(getattr(target_user, "id", 0) or 0)
+    target_parent_id = int(getattr(target_user, "parent_id", 0) or 0)
+
+    if target_uid == current_uid:
+        raise HTTPException(status_code=403, detail="不能管理自己")
+
+    if target_parent_id != current_uid:
+        raise HTTPException(status_code=403, detail="仅可管理自己创建的账号")
+
+    if rn == ROLE_SUPER_ADMIN:
+        return
+
+    target_role = await get_user_primary_role_name(db=db, user_id=target_uid)
+    if target_role not in USER_MANAGER_CREATABLE_ROLES:
+        raise HTTPException(status_code=403, detail="经理仅可管理业务/财务/市场账号")
+
+
+def apply_users_list_acl(*, current_user: User, role_name: Optional[str], stmt):
+    """
+    用户列表权限（按“自己创建的账号”收口）：
+    - super_admin：仅查看自己创建的账号（不包含自己）
+    - manager：仅查看自己创建的账号（不包含自己）
+    """
+    rn = (role_name or "").strip()
+    require_user_manage_access(role_name=rn)
+
+    current_uid = int(getattr(current_user, "id", 0) or 0)
+
+    if rn in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
+        return stmt.where(
+            and_(
+                User.parent_id == current_uid,
+                User.id != current_uid,
+            )
+        )
+
+    raise HTTPException(status_code=403, detail="无权限管理用户")

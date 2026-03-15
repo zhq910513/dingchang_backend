@@ -4,46 +4,43 @@ from __future__ import annotations
 
 """用户/账号管理服务（新表口径 / API 薄壳）
 
-承重墙（冻结口径）：
+冻结原则：
 - 只允许使用已确认存在的字段：
-    User: id, username, password_hash, status, team_name, team_names, created_at, updated_at
+    User: id, username, real_name, password_hash, parent_id, status, team_name, team_names, created_at, updated_at
     Role: id, role_name
     UserRole: user_id, role_id
-- 不兼容旧字段/旧逻辑：display_name/phone/created_by 等一律禁止出现在入参中
+- 不兼容旧字段/旧逻辑：display_name/phone/created_by/role_id/manager_id 等一律禁止出现在接口真源
+
+本文件只负责业务写入与读取；
+权限规则统一收口到 app.core.access_control。
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Sequence
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.constants import (
-    ROLE_FINANCE,
-    ROLE_MANAGER,
-    ROLE_MARKET,
-    ROLE_SALES,
-    ROLE_SUPER_ADMIN,
-    TEAM_NAMES,
+from app.core.access_control import (
+    apply_users_list_acl as _ac_apply_users_list_acl,
+    ensure_user_manage_target_allowed as _ac_ensure_user_manage_target_allowed,
+    require_user_manage_access as _ac_require_user_manage_access,
+    validate_user_role_name_for_create as _ac_validate_user_role_name_for_create,
 )
+from app.core.constants import ROLE_MANAGER, ROLE_SUPER_ADMIN, TEAM_NAMES
 from app.core.security import hash_password
 from app.models.role import Role
+from app.models.session import UserSession
 from app.models.user import User
 from app.models.user_role import UserRole
 
 logger = logging.getLogger(__name__)
 
 _BJ = ZoneInfo("Asia/Shanghai")
-_ALLOWED_ROLES = {
-    ROLE_SUPER_ADMIN,
-    ROLE_MANAGER,
-    ROLE_SALES,
-    ROLE_FINANCE,
-    ROLE_MARKET,
-}
+_ONLINE_WINDOW_MINUTES = 5
 
 
 def _now_bj_naive() -> datetime:
@@ -51,7 +48,6 @@ def _now_bj_naive() -> datetime:
 
 
 def _normalize_team_names_csv(team_names: Optional[str]) -> str:
-    """把 team_names 输入标准化为稳定 CSV：去空、去重、排序。"""
     if team_names is None:
         return ""
     s = str(team_names).strip()
@@ -62,7 +58,6 @@ def _normalize_team_names_csv(team_names: Optional[str]) -> str:
 
 
 def _validate_team_names(team_name: Optional[str], team_names_csv: str) -> None:
-    """校验 team_name + team_names_csv 都在白名单内。"""
     names: list[str] = [x.strip() for x in team_names_csv.split(",") if x and x.strip()]
     if team_name:
         names.append(team_name.strip())
@@ -72,11 +67,6 @@ def _validate_team_names(team_name: Optional[str], team_names_csv: str) -> None:
             raise ValueError(f"非法团队：{n}")
 
 
-def _require_super_admin(current_role: str) -> None:
-    if current_role != ROLE_SUPER_ADMIN:
-        raise PermissionError("仅超级管理员可操作用户管理")
-
-
 def _validate_password(password: str) -> str:
     p = str(password)
     if len(p) < 6:
@@ -84,13 +74,74 @@ def _validate_password(password: str) -> str:
     return p
 
 
+def _users_projection_stmt():
+    """
+    用户列表/详情的轻量投影查询：
+    直接查询最终需要的列，不把整颗 ORM 实体树扛回来。
+    """
+    role_min_sq = (
+        select(
+            UserRole.user_id.label("user_id"),
+            func.min(UserRole.role_id).label("role_id"),
+        )
+        .group_by(UserRole.user_id)
+        .subquery("user_role_min_sq")
+    )
+
+    session_last_active_sq = (
+        select(
+            UserSession.user_id.label("user_id"),
+            func.max(UserSession.last_active_at).label("last_active_at"),
+        )
+        .where(UserSession.expired == 0)
+        .group_by(UserSession.user_id)
+        .subquery("session_last_active_sq")
+    )
+
+    online_cutoff = _now_bj_naive() - timedelta(minutes=_ONLINE_WINDOW_MINUTES)
+
+    stmt = (
+        select(
+            User.id.label("id"),
+            User.username.label("username"),
+            User.real_name.label("real_name"),
+            User.team_name.label("team_name"),
+            User.team_names.label("team_names"),
+            User.status.label("status"),
+            User.parent_id.label("parent_id"),
+            Role.role_name.label("role_name"),
+            case(
+                (
+                    session_last_active_sq.c.last_active_at >= online_cutoff,
+                    1,
+                ),
+                else_=0,
+            ).label("is_online"),
+        )
+        .select_from(User)
+        .outerjoin(role_min_sq, role_min_sq.c.user_id == User.id)
+        .outerjoin(Role, Role.id == role_min_sq.c.role_id)
+        .outerjoin(session_last_active_sq, session_last_active_sq.c.user_id == User.id)
+    )
+    return stmt
+
+
 async def list_users(
-    *,
-    db: AsyncSession,
-    keyword: Optional[str] = None,
-    role: Optional[str] = None,
-) -> Sequence[User]:
-    stmt = select(User)
+        *,
+        db: AsyncSession,
+        current_user: User,
+        current_role: str,
+        keyword: Optional[str] = None,
+        role: Optional[str] = None,
+) -> Sequence:
+    _ac_require_user_manage_access(role_name=current_role)
+
+    stmt = _users_projection_stmt()
+    stmt = _ac_apply_users_list_acl(
+        current_user=current_user,
+        role_name=current_role,
+        stmt=stmt,
+    )
 
     if keyword:
         like = f"%{keyword.strip()}%"
@@ -98,27 +149,34 @@ async def list_users(
 
     if role:
         r = str(role).strip()
-        stmt = (
-            stmt.join(UserRole, UserRole.user_id == User.id)
-            .join(Role, Role.id == UserRole.role_id)
-            .where(Role.role_name == r)
-        )
+        stmt = stmt.where(Role.role_name == r)
 
     stmt = stmt.order_by(User.id.desc())
-    return (await db.execute(stmt)).scalars().all()
+    return (await db.execute(stmt)).mappings().all()
+
+
+async def get_user_projection_by_id(
+        *,
+        db: AsyncSession,
+        user_id: int,
+) -> Optional[dict]:
+    stmt = _users_projection_stmt().where(User.id == int(user_id))
+    row = (await db.execute(stmt)).mappings().first()
+    return dict(row) if row else None
 
 
 async def create_user(
-    *,
-    db: AsyncSession,
-    current_role: str,
-    username: str,
-    password: str,
-    role_name: str,
-    team_name: Optional[str] = None,
-    team_names: Optional[str] = None,
+        *,
+        db: AsyncSession,
+        current_user: User,
+        current_role: str,
+        username: str,
+        password: str,
+        role_name: str,
+        team_name: Optional[str] = None,
+        team_names: Optional[str] = None,
 ) -> User:
-    _require_super_admin(current_role)
+    _ac_require_user_manage_access(role_name=current_role)
 
     uname = str(username).strip()
     if not uname:
@@ -127,20 +185,29 @@ async def create_user(
     p = _validate_password(password)
 
     rname = str(role_name).strip()
-    if rname not in _ALLOWED_ROLES:
-        raise ValueError("role_name 不合法")
+    _ac_validate_user_role_name_for_create(
+        current_role=current_role,
+        target_role_name=rname,
+    )
 
     tn = (str(team_name).strip() if team_name else None) or None
     tns_csv = _normalize_team_names_csv(team_names)
     _validate_team_names(tn, tns_csv)
 
     now = _now_bj_naive()
+
+    parent_id = None
+    if current_role in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
+        parent_id = int(getattr(current_user, "id", 0) or 0)
+
     user = User(
         username=uname,
+        real_name=None,
         password_hash=hash_password(p),
         status=1,
         team_name=tn,
         team_names=tns_csv,
+        parent_id=parent_id,
         created_at=now,
         updated_at=now,
     )
@@ -176,20 +243,28 @@ async def create_user(
 
 
 async def update_user(
-    *,
-    db: AsyncSession,
-    current_role: str,
-    user_id: int,
-    password: Optional[str] = None,
-    team_name: Optional[str] = None,
-    team_names: Optional[str] = None,
+        *,
+        db: AsyncSession,
+        current_user: User,
+        current_role: str,
+        user_id: int,
+        password: Optional[str] = None,
+        team_name: Optional[str] = None,
+        team_names: Optional[str] = None,
 ) -> User:
-    _require_super_admin(current_role)
+    _ac_require_user_manage_access(role_name=current_role)
 
     uid = int(user_id)
     user = (await db.execute(select(User).where(User.id == uid))).scalars().first()
     if not user:
         raise ValueError("用户不存在")
+
+    await _ac_ensure_user_manage_target_allowed(
+        db=db,
+        current_user=current_user,
+        current_role=current_role,
+        target_user=user,
+    )
 
     changed = False
 
@@ -205,6 +280,7 @@ async def update_user(
     if user.team_name != tn:
         user.team_name = tn
         changed = True
+
     if (user.team_names or "") != tns_csv:
         user.team_names = tns_csv
         changed = True
@@ -218,18 +294,29 @@ async def update_user(
 
 
 async def delete_user(
-    *,
-    db: AsyncSession,
-    current_user: User,
-    current_role: str,
-    user_id: int,
+        *,
+        db: AsyncSession,
+        current_user: User,
+        current_role: str,
+        user_id: int,
 ) -> None:
-    _require_super_admin(current_role)
+    _ac_require_user_manage_access(role_name=current_role)
 
     uid = int(user_id)
     current_uid = int(getattr(current_user, "id", 0) or 0)
     if uid == current_uid:
         raise ValueError("不能删除自己")
+
+    user = (await db.execute(select(User).where(User.id == uid))).scalars().first()
+    if not user:
+        raise ValueError("用户不存在")
+
+    await _ac_ensure_user_manage_target_allowed(
+        db=db,
+        current_user=current_user,
+        current_role=current_role,
+        target_user=user,
+    )
 
     await db.execute(delete(UserRole).where(UserRole.user_id == uid))
     await db.execute(delete(User).where(User.id == uid))
