@@ -40,12 +40,18 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
         logger.exception("login failed: %s", e)
         raise HTTPException(status_code=500, detail="登录失败")
 
-    # LoginOut 真源字段：role_name 必填（不做兼容字段 role）
     role_name = role_names[0] if role_names else ""
+
+    username = str(getattr(user, "username", "") or "").strip()
+    real_name = (str(getattr(user, "real_name", "") or "").strip() or None)
+    full_name = real_name or username or None
 
     return LoginOut(
         token=token,
         user_id=user.id,
+        username=username,
+        real_name=real_name,
+        full_name=full_name,
         role_name=role_name,
         team_name=team_name,
         team_names=team_names,
@@ -54,7 +60,6 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
 
 @router.post("/logout")
 async def logout(session=Depends(get_current_session), db: AsyncSession = Depends(get_db)):
-    # get_current_session 真源：session.session_token
     token = session.session_token
     await _logout(db=db, token=token)
     return {"ok": True}

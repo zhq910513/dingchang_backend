@@ -1,4 +1,3 @@
-# app/models/order_fact.py
 # encoding: utf-8
 from __future__ import annotations
 
@@ -19,20 +18,28 @@ class OrderFact(Base):
 
     __tablename__ = "order_fact_new"
 
-    order_id = Column(Integer, ForeignKey("order_new.id", ondelete="CASCADE"), primary_key=True,
-                      comment="订单ID（PK&FK -> order.id）")
+    order_id = Column(
+        Integer,
+        ForeignKey("order_new.id", ondelete="CASCADE"),
+        primary_key=True,
+        comment="订单ID（PK&FK -> order.id）",
+    )
 
-    vin = Column(String(64), nullable=True, index=True, comment="车架号VIN（规范字段）")
-    plate_no = Column(String(32), nullable=True, index=True, comment="车牌号（规范字段）")
+    vin = Column(String(64), nullable=True, comment="车架号VIN（规范字段）")
+    plate_no = Column(String(32), nullable=True, comment="车牌号（规范字段）")
     owner_name = Column(String(128), nullable=True, comment="车主/所有人（规范字段）")
     engine_no = Column(String(64), nullable=True, comment="发动机号（规范字段）")
     vehicle_model = Column(String(255), nullable=True, comment="品牌型号/车辆型号（规范字段）")
     first_register_date = Column(Date, nullable=True, comment="初登日期/注册日期（规范字段，DATE）")
-    id_number = Column(String(32), nullable=True, index=True, comment="身份证号（规范字段）")
+    id_number = Column(String(32), nullable=True, comment="身份证号（规范字段）")
 
-    updated_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"),
-                        server_onupdate=text("CURRENT_TIMESTAMP"),
-                        comment="更新时间（北京时间 naive DATETIME）")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="更新时间（北京时间 naive DATETIME）",
+    )
 
     order = relationship("Order", lazy="selectin", doc="所属订单")
 

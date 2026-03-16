@@ -1,5 +1,6 @@
 # app/schemas/order.py
 # encoding: utf-8
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -50,7 +51,39 @@ class OrderImageOut(SlotImageItemOut):
 # =========================
 
 class OrderInfoIn(OrmBaseModel):
-    """订单扩展信息入参（最小化：只保留 remark，其余走 dynamic_data/事实层）。"""
+    """
+    订单扩展信息入参（与当前真实表结构对齐，可完整编辑）
+    说明：
+    - 详情页可编辑字段全部允许写入
+    - 派生字段（premium_total / channel_total / customer_total / profit）服务端会在保存时重算
+    """
+
+    insurance_expire_date: Optional[str] = None
+    owner_phone: Optional[str] = None
+
+    commercial_amount: Optional[float] = None
+    compulsory_amount: Optional[float] = None
+    vehicle_tax_amount: Optional[float] = None
+    non_vehicle_amount: Optional[float] = None
+    premium_total: Optional[float] = None
+
+    channel_commercial_point: Optional[float] = None
+    channel_commercial_supplement_point: Optional[float] = None
+    channel_compulsory_point: Optional[float] = None
+    channel_vehicle_tax_point: Optional[float] = None
+    channel_non_vehicle_point: Optional[float] = None
+    channel_reward: Optional[float] = None
+    channel_total: Optional[float] = None
+
+    customer_commercial_point: Optional[float] = None
+    customer_commercial_supplement_point: Optional[float] = None
+    customer_compulsory_point: Optional[float] = None
+    customer_vehicle_tax_point: Optional[float] = None
+    customer_non_vehicle_point: Optional[float] = None
+    customer_reward: Optional[float] = None
+    customer_total: Optional[float] = None
+
+    profit: Optional[float] = None
     remark: Optional[str] = None
 
 
@@ -86,6 +119,62 @@ class OrderInfoOut(OrmBaseModel):
 
 
 # =========================
+# Order List（列表专用契约）
+# =========================
+
+class OrderListDynamicDataOut(OrmBaseModel):
+    """
+    列表页专用 dynamic_data 子集
+
+    说明：
+    - 仅保留当前订单列表 / 财务列表真实消费字段
+    - 不透出详情级无关字段
+    """
+    owner_name: Optional[str] = None
+    plate_no: Optional[str] = None
+    vin: Optional[str] = None
+    engine_no: Optional[str] = None
+    vehicle_model: Optional[str] = None
+    first_register_date: Optional[str] = None
+    id_number: Optional[str] = None
+
+
+class OrderListInfoOut(OrmBaseModel):
+    """
+    列表页专用 order_info 子集
+
+    说明：
+    - 仅保留当前订单列表 / 财务列表表格真实消费字段
+    - 不返回 premium_total / remark 等当前列表未消费字段
+    """
+    insurance_expire_date: Optional[str] = None
+    owner_phone: Optional[str] = None
+
+    commercial_amount: Optional[float] = None
+    compulsory_amount: Optional[float] = None
+    vehicle_tax_amount: Optional[float] = None
+    non_vehicle_amount: Optional[float] = None
+
+    channel_commercial_point: Optional[float] = None
+    channel_commercial_supplement_point: Optional[float] = None
+    channel_compulsory_point: Optional[float] = None
+    channel_vehicle_tax_point: Optional[float] = None
+    channel_non_vehicle_point: Optional[float] = None
+    channel_reward: Optional[float] = None
+    channel_total: Optional[float] = None
+
+    customer_commercial_point: Optional[float] = None
+    customer_commercial_supplement_point: Optional[float] = None
+    customer_compulsory_point: Optional[float] = None
+    customer_vehicle_tax_point: Optional[float] = None
+    customer_non_vehicle_point: Optional[float] = None
+    customer_reward: Optional[float] = None
+    customer_total: Optional[float] = None
+
+    profit: Optional[float] = None
+
+
+# =========================
 # Order（主对象）
 # =========================
 
@@ -100,7 +189,7 @@ class OrderCreate(OrmBaseModel):
     # ✅ 与 orders API 行为对齐：创建时允许传入是否完成标记（默认为 False）
     is_finished: bool = False
 
-    # ✅ 订单扩展信息（目前只允许 remark）
+    # ✅ 订单扩展信息（完整可写）
     order_info: Optional[OrderInfoIn] = None
 
     status: int = 0
@@ -127,7 +216,7 @@ class OrderUpdate(OrmBaseModel):
     dynamic_data: Optional[Dict[str, Any]] = None
     ocr_raw_json: Optional[Dict[str, Any]] = None
 
-    # ✅ 订单扩展信息（目前只允许 remark）
+    # ✅ 订单扩展信息（完整可写）
     order_info: Optional[OrderInfoIn] = None
 
 
@@ -153,6 +242,9 @@ class OrderOut(OrmBaseModel):
     customer_group_id: Optional[int] = None
     channel_group_id: Optional[int] = None
 
+    customer_group_name: Optional[str] = None
+    channel_group_name: Optional[str] = None
+
     is_finished: bool = False
     is_rebate: bool = False
     is_paid: bool = False
@@ -175,11 +267,12 @@ class OrderOut(OrmBaseModel):
 
 class OrderListItemOut(OrmBaseModel):
     """
-    列表项（订单列表真实消费口径）
+    列表项（订单列表 / 财务列表真实消费口径）
 
     说明：
     - 仅按当前前端真实需要返回
     - 不做旧字段兼容，不回填 dl_*
+    - dynamic_data / order_info 已收紧为列表专用子契约
     """
     id: int
 
@@ -203,8 +296,8 @@ class OrderListItemOut(OrmBaseModel):
     status: int = 0
     audit_status: int = 0
 
-    dynamic_data: Dict[str, Any] = Field(default_factory=dict)
-    order_info: Optional[OrderInfoOut] = None
+    dynamic_data: OrderListDynamicDataOut = Field(default_factory=OrderListDynamicDataOut)
+    order_info: Optional[OrderListInfoOut] = None
 
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

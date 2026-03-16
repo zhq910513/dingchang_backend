@@ -1,4 +1,3 @@
-# app/schemas/field_config.py
 # encoding: utf-8
 from __future__ import annotations
 
@@ -52,3 +51,31 @@ class FieldConfigUpsertIn(BaseModel):
 
 class FieldConfigListOut(BaseModel):
     items: List[FieldConfigOut] = Field(default_factory=list)
+
+
+# =========================
+# form-config（前端分组表单配置）
+# =========================
+
+class FieldFormItemOut(BaseModel):
+    field_name: str
+    label: str
+    type: str
+
+    required: bool
+    visible: bool
+    editable: bool
+    sort: int
+
+    options: Optional[Any] = None
+    validators: Optional[Any] = None
+    extra: Optional[Any] = None
+
+    class Config:
+        orm_mode = True
+
+
+class FieldGroupConfigOut(BaseModel):
+    group_key: str
+    group_name: str
+    fields: List[FieldFormItemOut] = Field(default_factory=list)

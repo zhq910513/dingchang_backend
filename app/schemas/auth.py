@@ -14,6 +14,11 @@ class LoginIn(BaseModel):
 class LoginOut(BaseModel):
     token: str
     user_id: int
+
+    username: str
+    real_name: Optional[str] = None
+    full_name: Optional[str] = None
+
     role_name: str
     team_names: List[str] = Field(
         default_factory=list,
