@@ -2,6 +2,7 @@
 # encoding: utf-8
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, ClassVar, List, Optional
 
 from pydantic import BaseModel, Field, validator
@@ -45,6 +46,16 @@ def _normalize_team_names_value(v: Any) -> List[str]:
     raise ValueError("team_names 必须为 CSV 字符串、字符串数组或 None")
 
 
+def _normalize_team_names_csv_or_none(v: Any) -> Optional[str]:
+    """
+    输入侧保持当前契约：
+    - None / 空 -> None
+    - CSV str / list[str] -> 规范化后 CSV 字符串
+    """
+    arr = _normalize_team_names_value(v)
+    return ",".join(arr) if arr else None
+
+
 def _normalize_team_name(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -63,6 +74,8 @@ class UserOut(OrmBaseModel):
     team_names: List[str] = Field(default_factory=list, description="可访问团队集合")
     status: int = 1
     is_online: bool = False
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     @validator("team_names", pre=True)
     def _v_team_names(cls, v: Any) -> List[str]:
@@ -89,6 +102,10 @@ class UserCreateIn(OrmBaseModel):
     def _v_create_team_name(cls, v: Any) -> Optional[str]:
         return _normalize_team_name(v)
 
+    @validator("team_names", pre=True)
+    def _v_create_team_names(cls, v: Any) -> Optional[str]:
+        return _normalize_team_names_csv_or_none(v)
+
 
 class UserUpdateIn(OrmBaseModel):
     password: Optional[str] = Field(default=None, min_length=6)
@@ -98,3 +115,7 @@ class UserUpdateIn(OrmBaseModel):
     @validator("team_name", pre=True)
     def _v_update_team_name(cls, v: Any) -> Optional[str]:
         return _normalize_team_name(v)
+
+    @validator("team_names", pre=True)
+    def _v_update_team_names(cls, v: Any) -> Optional[str]:
+        return _normalize_team_names_csv_or_none(v)

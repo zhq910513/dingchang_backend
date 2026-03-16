@@ -109,6 +109,8 @@ def _users_projection_stmt():
             User.team_names.label("team_names"),
             User.status.label("status"),
             User.parent_id.label("parent_id"),
+            User.created_at.label("created_at"),
+            User.updated_at.label("updated_at"),
             Role.role_name.label("role_name"),
             case(
                 (session_last_active_sq.c.last_active_at >= online_cutoff, 1),
@@ -140,15 +142,18 @@ async def list_users(
         stmt=stmt,
     )
 
-    if keyword:
-        like = f"%{keyword.strip()}%"
+    keyword_s = str(keyword or "").strip()
+    if keyword_s:
+        like = f"%{keyword_s}%"
         stmt = stmt.where(User.username.like(like))
 
-    if role:
-        r = str(role).strip()
-        stmt = stmt.where(Role.role_name == r)
+    role_s = str(role or "").strip()
+    if role_s:
+        stmt = stmt.where(Role.role_name == role_s)
 
-    stmt = stmt.order_by(User.id.desc())
+    # 需求：列表按更新时间倒叙；同更新时间时按 id 倒叙兜底
+    stmt = stmt.order_by(User.updated_at.desc(), User.id.desc())
+
     return (await db.execute(stmt)).mappings().all()
 
 
@@ -187,6 +192,15 @@ async def create_user(
         target_role_name=rname,
     )
 
+    # 先查角色，避免 user flush 成功后才发现 role 不存在，白跑一趟数据库
+    role_row = (
+        (await db.execute(select(Role).where(Role.role_name == rname)))
+        .scalars()
+        .first()
+    )
+    if not role_row:
+        raise ValueError("角色不存在（请先初始化 seed）")
+
     tn = (str(team_name).strip() if team_name else None) or None
     tns_csv = _normalize_team_names_csv(team_names)
     _validate_team_names(tn, tns_csv)
@@ -217,15 +231,6 @@ async def create_user(
         logger.exception("create_user flush failed: %s", e)
         raise ValueError("用户名已存在") from e
 
-    role_row = (
-        (await db.execute(select(Role).where(Role.role_name == rname)))
-        .scalars()
-        .first()
-    )
-    if not role_row:
-        await db.rollback()
-        raise ValueError("角色不存在（请先初始化 seed）")
-
     db.add(UserRole(user_id=user.id, role_id=role_row.id))
 
     try:
@@ -235,7 +240,7 @@ async def create_user(
         logger.exception("create_user commit failed: %s", e)
         raise ValueError("创建用户失败（请检查角色/唯一约束）") from e
 
-    await db.refresh(user)
+    # 不 refresh：API 层会调用 get_user_projection_by_id 重新读取最终态
     return user
 
 
@@ -285,7 +290,7 @@ async def update_user(
     if changed:
         user.updated_at = _now_bj_naive()
         await db.commit()
-        await db.refresh(user)
+        # 不 refresh：API 层会调用 get_user_projection_by_id 重新读取最终态
 
     return user
 

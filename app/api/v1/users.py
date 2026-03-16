@@ -40,6 +40,8 @@ def _mapping_to_user_out(row) -> UserOut:
         team_names=row.get("team_names"),
         status=int(row.get("status") or 1),
         is_online=bool(int(row.get("is_online") or 0)),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
     )
 
 
