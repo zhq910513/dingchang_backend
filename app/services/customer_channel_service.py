@@ -7,8 +7,9 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
@@ -44,16 +45,38 @@ def _display_name_expr(user_alias):
     )
 
 
+def _friendly_integrity_error(exc: IntegrityError, default_msg: str) -> str:
+    msg = str(getattr(exc, "orig", exc) or "").lower()
+    if "duplicate" in msg or "unique" in msg:
+        return "编码已存在或唯一约束冲突"
+    if "cannot be null" in msg or "not null" in msg:
+        return "存在必填字段为空"
+    if "foreign key" in msg:
+        return "关联数据不存在或已失效"
+    return default_msg
+
+
+async def _safe_commit(db: AsyncSession, default_msg: str) -> None:
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise ValueError(_friendly_integrity_error(exc, default_msg)) from exc
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        raise ValueError(default_msg) from exc
+
+
 # =========================
 # 下拉 list（轻量）
 # =========================
 
 async def list_customer_groups(
-        *,
-        db: AsyncSession,
-        keyword: Optional[str] = None,
-        page: int = 1,
-        page_size: int = 20,
+    *,
+    db: AsyncSession,
+    keyword: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
 ) -> Dict[str, Any]:
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
@@ -99,11 +122,11 @@ async def list_customer_groups(
 
 
 async def list_channel_groups(
-        *,
-        db: AsyncSession,
-        keyword: Optional[str] = None,
-        page: int = 1,
-        page_size: int = 20,
+    *,
+    db: AsyncSession,
+    keyword: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
 ) -> Dict[str, Any]:
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
@@ -153,16 +176,16 @@ async def list_channel_groups(
 # =========================
 
 async def list_customer_groups_manage(
-        *,
-        db: AsyncSession,
-        customer_code: Optional[str] = None,
-        customer_name: Optional[str] = None,
-        market: Optional[str] = None,
-        region: Optional[str] = None,
-        created_by_name: Optional[str] = None,
-        include_deleted: bool = False,
-        page: int = 1,
-        page_size: int = 20,
+    *,
+    db: AsyncSession,
+    customer_code: Optional[str] = None,
+    customer_name: Optional[str] = None,
+    market: Optional[str] = None,
+    region: Optional[str] = None,
+    created_by_name: Optional[str] = None,
+    include_deleted: bool = False,
+    page: int = 1,
+    page_size: int = 20,
 ) -> Dict[str, Any]:
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
@@ -190,15 +213,12 @@ async def list_customer_groups_manage(
         .outerjoin(creator, creator.id == CustomerGroup.created_by)
     )
 
-    count_stmt = (
-        select(func.count(CustomerGroup.id))
-        .select_from(CustomerGroup)
-        .outerjoin(creator, creator.id == CustomerGroup.created_by)
-    )
+    count_stmt = select(func.count(CustomerGroup.id)).select_from(CustomerGroup)
 
     if not include_deleted:
-        base_stmt = base_stmt.where(CustomerGroup.is_deleted == 0)
-        count_stmt = count_stmt.where(CustomerGroup.is_deleted == 0)
+        cond = CustomerGroup.is_deleted == 0
+        base_stmt = base_stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
 
     cc = _normalize_text(customer_code)
     if cc:
@@ -226,6 +246,7 @@ async def list_customer_groups_manage(
 
     cbn = _normalize_text(created_by_name)
     if cbn:
+        count_stmt = count_stmt.outerjoin(creator, creator.id == CustomerGroup.created_by)
         cond = cast(created_name_expr, String).like(f"%{cbn}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
@@ -250,15 +271,15 @@ async def list_customer_groups_manage(
 
 
 async def list_channel_groups_manage(
-        *,
-        db: AsyncSession,
-        channel_code: Optional[str] = None,
-        channel_name: Optional[str] = None,
-        region: Optional[str] = None,
-        created_by_name: Optional[str] = None,
-        include_deleted: bool = False,
-        page: int = 1,
-        page_size: int = 20,
+    *,
+    db: AsyncSession,
+    channel_code: Optional[str] = None,
+    channel_name: Optional[str] = None,
+    region: Optional[str] = None,
+    created_by_name: Optional[str] = None,
+    include_deleted: bool = False,
+    page: int = 1,
+    page_size: int = 20,
 ) -> Dict[str, Any]:
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
@@ -285,15 +306,12 @@ async def list_channel_groups_manage(
         .outerjoin(creator, creator.id == ChannelGroup.created_by)
     )
 
-    count_stmt = (
-        select(func.count(ChannelGroup.id))
-        .select_from(ChannelGroup)
-        .outerjoin(creator, creator.id == ChannelGroup.created_by)
-    )
+    count_stmt = select(func.count(ChannelGroup.id)).select_from(ChannelGroup)
 
     if not include_deleted:
-        base_stmt = base_stmt.where(ChannelGroup.is_deleted == 0)
-        count_stmt = count_stmt.where(ChannelGroup.is_deleted == 0)
+        cond = ChannelGroup.is_deleted == 0
+        base_stmt = base_stmt.where(cond)
+        count_stmt = count_stmt.where(cond)
 
     cc = _normalize_text(channel_code)
     if cc:
@@ -315,6 +333,7 @@ async def list_channel_groups_manage(
 
     cbn = _normalize_text(created_by_name)
     if cbn:
+        count_stmt = count_stmt.outerjoin(creator, creator.id == ChannelGroup.created_by)
         cond = cast(created_name_expr, String).like(f"%{cbn}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
@@ -339,23 +358,63 @@ async def list_channel_groups_manage(
 
 
 # =========================
+# get one（显式预加载 creator，避免 Async 懒加载 500）
+# =========================
+
+async def get_customer_group_by_id(
+    *,
+    db: AsyncSession,
+    group_id: int,
+    with_creator: bool = False,
+) -> Optional[CustomerGroup]:
+    gid = int(group_id)
+    if not with_creator:
+        return await db.get(CustomerGroup, gid)
+
+    stmt = (
+        select(CustomerGroup)
+        .options(selectinload(CustomerGroup.creator))
+        .where(CustomerGroup.id == gid)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def get_channel_group_by_id(
+    *,
+    db: AsyncSession,
+    group_id: int,
+    with_creator: bool = False,
+) -> Optional[ChannelGroup]:
+    gid = int(group_id)
+    if not with_creator:
+        return await db.get(ChannelGroup, gid)
+
+    stmt = (
+        select(ChannelGroup)
+        .options(selectinload(ChannelGroup.creator))
+        .where(ChannelGroup.id == gid)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+# =========================
 # create
 # =========================
 
 async def create_customer_group(
-        *,
-        db: AsyncSession,
-        customer_code: str,
-        customer_name: str,
-        team_name: Optional[str],
-        market: Optional[str],
-        region: Optional[str],
-        contacts: list,
-        created_by: Optional[int],
+    *,
+    db: AsyncSession,
+    customer_code: str,
+    customer_name: str,
+    team_name: Optional[str],
+    market: Optional[str],
+    region: Optional[str],
+    contacts: list,
+    created_by: Optional[int],
 ) -> CustomerGroup:
     now = _now_bj_naive()
     row = CustomerGroup(
-        team_name=team_name,
+        team_name=_normalize_text(team_name) or None,
         customer_code=_normalize_text(customer_code),
         customer_name=_normalize_text(customer_name),
         market=_normalize_text(market) or None,
@@ -364,26 +423,26 @@ async def create_customer_group(
         created_by=created_by,
         created_at=now,
         updated_at=now,
+        deleted_at=None,
     )
     db.add(row)
-    await db.commit()
-    await db.refresh(row)
-    return row
+    await _safe_commit(db, "创建客户失败")
+    return await get_customer_group_by_id(db=db, group_id=row.id, with_creator=True)
 
 
 async def create_channel_group(
-        *,
-        db: AsyncSession,
-        channel_code: str,
-        channel_name: str,
-        team_name: Optional[str],
-        region: Optional[str],
-        contacts: list,
-        created_by: Optional[int],
+    *,
+    db: AsyncSession,
+    channel_code: str,
+    channel_name: str,
+    team_name: Optional[str],
+    region: Optional[str],
+    contacts: list,
+    created_by: Optional[int],
 ) -> ChannelGroup:
     now = _now_bj_naive()
     row = ChannelGroup(
-        team_name=team_name,
+        team_name=_normalize_text(team_name) or None,
         channel_code=_normalize_text(channel_code),
         channel_name=_normalize_text(channel_name),
         region=_normalize_text(region) or None,
@@ -391,23 +450,11 @@ async def create_channel_group(
         created_by=created_by,
         created_at=now,
         updated_at=now,
+        deleted_at=None,
     )
     db.add(row)
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-# =========================
-# get one
-# =========================
-
-async def get_customer_group_by_id(*, db: AsyncSession, group_id: int) -> Optional[CustomerGroup]:
-    return await db.get(CustomerGroup, int(group_id))
-
-
-async def get_channel_group_by_id(*, db: AsyncSession, group_id: int) -> Optional[ChannelGroup]:
-    return await db.get(ChannelGroup, int(group_id))
+    await _safe_commit(db, "创建渠道失败")
+    return await get_channel_group_by_id(db=db, group_id=row.id, with_creator=True)
 
 
 # =========================
@@ -415,14 +462,14 @@ async def get_channel_group_by_id(*, db: AsyncSession, group_id: int) -> Optiona
 # =========================
 
 async def update_customer_group(
-        *,
-        db: AsyncSession,
-        row: CustomerGroup,
-        customer_code: str,
-        customer_name: str,
-        market: Optional[str],
-        region: Optional[str],
-        contacts: list,
+    *,
+    db: AsyncSession,
+    row: CustomerGroup,
+    customer_code: str,
+    customer_name: str,
+    market: Optional[str],
+    region: Optional[str],
+    contacts: list,
 ) -> CustomerGroup:
     row.customer_code = _normalize_text(customer_code)
     row.customer_name = _normalize_text(customer_name)
@@ -431,19 +478,18 @@ async def update_customer_group(
     row.contacts = contacts or []
     row.updated_at = _now_bj_naive()
 
-    await db.commit()
-    await db.refresh(row)
-    return row
+    await _safe_commit(db, "编辑客户失败")
+    return await get_customer_group_by_id(db=db, group_id=row.id, with_creator=True)
 
 
 async def update_channel_group(
-        *,
-        db: AsyncSession,
-        row: ChannelGroup,
-        channel_code: str,
-        channel_name: str,
-        region: Optional[str],
-        contacts: list,
+    *,
+    db: AsyncSession,
+    row: ChannelGroup,
+    channel_code: str,
+    channel_name: str,
+    region: Optional[str],
+    contacts: list,
 ) -> ChannelGroup:
     row.channel_code = _normalize_text(channel_code)
     row.channel_name = _normalize_text(channel_name)
@@ -451,9 +497,8 @@ async def update_channel_group(
     row.contacts = contacts or []
     row.updated_at = _now_bj_naive()
 
-    await db.commit()
-    await db.refresh(row)
-    return row
+    await _safe_commit(db, "编辑渠道失败")
+    return await get_channel_group_by_id(db=db, group_id=row.id, with_creator=True)
 
 
 # =========================
@@ -464,15 +509,13 @@ async def soft_delete_customer_group(*, db: AsyncSession, row: CustomerGroup) ->
     now = _now_bj_naive()
     row.deleted_at = now
     row.updated_at = now
-    await db.commit()
-    await db.refresh(row)
-    return row
+    await _safe_commit(db, "删除客户失败")
+    return await get_customer_group_by_id(db=db, group_id=row.id, with_creator=True)
 
 
 async def soft_delete_channel_group(*, db: AsyncSession, row: ChannelGroup) -> ChannelGroup:
     now = _now_bj_naive()
     row.deleted_at = now
     row.updated_at = now
-    await db.commit()
-    await db.refresh(row)
-    return row
+    await _safe_commit(db, "删除渠道失败")
+    return await get_channel_group_by_id(db=db, group_id=row.id, with_creator=True)
