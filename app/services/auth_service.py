@@ -20,8 +20,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
-
-from app.core.security import generate_session_token, verify_password
+from app.core.security import (
+    generate_session_token,
+    hash_password,
+    needs_password_rehash,
+    verify_password,
+)
 from app.models.role import Role
 from app.models.session import UserSession
 from app.models.user import User
@@ -40,27 +44,72 @@ _ROLE_PRIORITY = {
 _BJ = ZoneInfo("Asia/Shanghai")
 
 
+def _normalize_team_scope(user: User) -> tuple[list[str], str]:
+    team_name = (getattr(user, "team_name", None) or "").strip()
+    raw_team_names = (getattr(user, "team_names", None) or "").strip()
+
+    teams: list[str] = []
+    if raw_team_names:
+        for item in raw_team_names.split(","):
+            s = (item or "").strip()
+            if s and s not in teams:
+                teams.append(s)
+
+    if team_name and team_name not in teams:
+        teams.append(team_name)
+
+    if not team_name and teams:
+        team_name = teams[0]
+
+    return teams, team_name
+
+
 async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
     User, str, UserSession, list[str], list[str], str
 ]:
-    """
-    返回：(user, token, session_row, role_names, team_names(list), team_name(default))
-    team_names/team_name 语义：
-    - team_names：可访问团队集合（权限范围）
-    - team_name：默认/落点团队（单值）
-    """
-    q = select(User).where(User.username == username)
+    normalized_username = str(username or "").strip()
+    normalized_password = str(password or "")
+
+    if not normalized_username or not normalized_password:
+        raise ValueError("用户名或密码错误")
+
+    q = (
+        select(User)
+        .where(User.username == normalized_username)
+        .limit(1)
+    )
     user = (await db.execute(q)).scalars().first()
     if not user:
         raise ValueError("用户名或密码错误")
 
-    if not verify_password(password, user.password_hash):
+    if int(getattr(user, "status", 0) or 0) != 1:
+        raise ValueError("账号已禁用")
+
+    password_hash = str(getattr(user, "password_hash", "") or "")
+    if not verify_password(normalized_password, password_hash):
         raise ValueError("用户名或密码错误")
+
+    if needs_password_rehash(password_hash):
+        try:
+            user.password_hash = hash_password(normalized_password)
+        except Exception:
+            logger.exception("password rehash failed for username=%s", normalized_username)
+
+    role_q = (
+        select(Role.role_name)
+        .select_from(UserRole)
+        .join(Role, Role.id == UserRole.role_id)
+        .where(UserRole.user_id == user.id)
+    )
+    role_names = list((await db.execute(role_q)).scalars().all())
+    role_names = [str(x or "").strip() for x in role_names if str(x or "").strip()]
+    role_names.sort(key=lambda x: _ROLE_PRIORITY.get(x, 9999))
+
+    teams, team_name = _normalize_team_scope(user)
 
     now = datetime.now(_BJ).replace(tzinfo=None)
     token = generate_session_token()
 
-    # ✅ 新表口径：UserSession 字段为 session_token/expired，无 expired_at
     sess = UserSession(
         user_id=user.id,
         session_token=token,
@@ -70,38 +119,28 @@ async def login(*, db: AsyncSession, username: str, password: str) -> Tuple[
     )
     db.add(sess)
 
-    # role names（Role 字段名按 role_new.role_name）
-    role_q = (
-        select(Role.role_name)
-        .select_from(UserRole)
-        .join(Role, Role.id == UserRole.role_id)
-        .where(UserRole.user_id == user.id)
-    )
-    role_names = list((await db.execute(role_q)).scalars().all())
-    role_names.sort(key=lambda x: _ROLE_PRIORITY.get(x, 9999))
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        logger.exception("login transaction commit failed for username=%s", normalized_username)
+        raise
 
-    # teams normalize: only team_name + team_names (CSV) per hard rule
-    team_name = (getattr(user, "team_name", None) or "").strip() or None
-    raw_team_names = (getattr(user, "team_names", None) or "").strip()
-    teams = [t.strip() for t in raw_team_names.split(",") if t.strip()] if raw_team_names else []
-    if team_name and team_name not in teams:
-        teams.append(team_name)
+    try:
+        await db.refresh(sess)
+    except Exception:
+        logger.exception("refresh session failed after login username=%s", normalized_username)
+        raise
 
-    # ensure default team_name if empty but teams exist
-    if (not team_name) and teams:
-        team_name = teams[0]
-
-    await db.commit()
-    await db.refresh(sess)
-    return user, token, sess, role_names, teams, team_name or ""
+    return user, token, sess, role_names, teams, team_name
 
 
 async def logout(*, db: AsyncSession, token: str) -> None:
-    if not token:
+    normalized_token = str(token or "").strip()
+    if not normalized_token:
         return
 
-    # ✅ 字段名是 session_token（不是 token）
-    q = select(UserSession).where(UserSession.session_token == token)
+    q = select(UserSession).where(UserSession.session_token == normalized_token).limit(1)
     sess = (await db.execute(q)).scalars().first()
     if not sess:
         return

@@ -35,7 +35,9 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
             password=data.password,
         )
     except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        message = str(e) or "登录失败"
+        status_code = 403 if message == "账号已禁用" else 401
+        raise HTTPException(status_code=status_code, detail=message)
     except Exception as e:
         logger.exception("login failed: %s", e)
         raise HTTPException(status_code=500, detail="登录失败")
@@ -53,7 +55,7 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
         real_name=real_name,
         full_name=full_name,
         role_name=role_name,
-        team_name=team_name,
+        team_name=team_name or None,
         team_names=team_names,
     )
 

@@ -1,29 +1,18 @@
 # app/api/deps.py
 # encoding: utf-8
+from __future__ import annotations
+
 """
 依赖项（Dependencies）
 
-去兼容版原则：
+严格口径：
 - 会话只认 DB 的 UserSession + expired + last_active_at + settings.SESSION_TIMEOUT_SECONDS
-- 心跳续命：节流更新 last_active_at（避免每请求 commit 打爆 DB）
-- ✅ 主角色：按“业务优先级”选主角色（避免同时拥有 sales+manager 时被误判为 sales）
-
-团队抽取（冻结字段口径）：
-- 只认 models 冻结字段：
-    * user.team_name：默认/落点团队（单值）
-    * user.team_names：可访问团队集合（CSV 字符串）
-- 本文件只做“抽取与归一化”，不在这里猜业务规则（业务规则在各 API/service 层落地）
-
-✅ 承重墙修复（2026-03-05）：
-- deps 只允许一种返回签名：CurrentUserContext
-- 不再返回 2/3/4 元组，彻底消灭“错误解包/错误取属性”的隐患
-
-✅ 时间口径（2026-03-01）：
-- DB 全局约定：北京时间 naive DATETIME
-- session 的 last_active_at / timeout 计算：统一按北京时间 naive 处理（不再用 UTC naive）
+- 鉴权 Header 只认：X-Session-Token
+- Session 过期后：标记 expired=1，返回 401
+- 心跳续命：按节流时间更新 last_active_at，避免每请求 commit 打爆 DB
+- 主角色：按业务优先级选主角色，避免多角色时出现不稳定行为
+- 时间口径统一：北京时间 naive DATETIME
 """
-
-from __future__ import annotations
 
 import os
 from dataclasses import dataclass
@@ -51,7 +40,10 @@ from app.models.user_role import UserRole
 
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
-SESSION_HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("SESSION_HEARTBEAT_INTERVAL_SECONDS", "30") or "30")
+# 心跳续命节流时间：默认 30 秒
+SESSION_HEARTBEAT_INTERVAL_SECONDS = int(
+    os.getenv("SESSION_HEARTBEAT_INTERVAL_SECONDS", "30") or "30"
+)
 
 _ROLE_PRIORITY = {
     ROLE_SUPER_ADMIN: 0,
@@ -65,14 +57,15 @@ _ROLE_PRIORITY = {
 @dataclass(frozen=True)
 class CurrentUserContext:
     """
-    deps 的唯一输出结构（承重墙）：
+    deps 的唯一输出结构：
 
     - user：当前登录用户
     - primary_role：主角色（按优先级选取）
-    - role_names：全部角色集合（用于少数场景，例如 UI 展示/调试；权限判断应以 primary_role 为主）
-    - team_names：用户可访问团队集合（冻结字段归一化）
-    - team_ids：当前体系暂不使用（保持空元组，保留扩展位）
+    - role_names：全部角色集合
+    - team_names：用户可访问团队集合
+    - team_ids：当前体系暂不使用，保留扩展位
     """
+
     user: User
     primary_role: Optional[str]
     role_names: Tuple[str, ...]
@@ -83,21 +76,19 @@ class CurrentUserContext:
 def _pick_primary_role(role_names: Tuple[str, ...]) -> Optional[str]:
     if not role_names:
         return None
+
     known = [r for r in role_names if r in _ROLE_PRIORITY]
     if known:
         return min(known, key=lambda r: _ROLE_PRIORITY.get(r, 999999))
+
     return role_names[0]
 
 
 def _now_bj_naive() -> datetime:
-    # ✅ 北京时间 naive DATETIME
     return datetime.now(BJ_TZ).replace(tzinfo=None)
 
 
 def _to_bj_naive(dt: datetime) -> datetime:
-    # ✅ 兼容 DB 返回 naive/aware 两种情况：
-    # - naive：按北京时间解释（项目约定）
-    # - aware：转到 Asia/Shanghai 后去 tzinfo
     if dt.tzinfo is None:
         return dt
     try:
@@ -138,28 +129,11 @@ def _as_list(v: Any) -> List[Any]:
     return [v]
 
 
-def _normalize_team_names(raw: Any) -> Tuple[str, ...]:
-    items = _as_list(raw)
-    out: List[str] = []
-    for x in items:
-        try:
-            s = str(x).strip()
-        except Exception:
-            continue
-        if not s:
-            continue
-        out.append(s)
-    return tuple(sorted(set(out)))
-
-
 def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
     """
-    团队抽取（新口径）：
-
-    - 只认 models 冻结字段：
-        * user.team_name：默认/落点团队（单值）
-        * user.team_names：可访问团队集合（CSV 字符串）
-    - 不再兼容其它历史字段形态（team_ids/team_id_list/...）
+    团队抽取（冻结字段口径）：
+    - user.team_name：默认/落点团队（单值）
+    - user.team_names：可访问团队集合（CSV 字符串）
     """
     team_names_set: set[str] = set()
 
@@ -174,35 +148,81 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
             if t:
                 team_names_set.add(t)
 
-    # 当前体系 team_ids 暂不使用（保持空元组）
     team_ids: Tuple[int, ...] = tuple()
     team_names: Tuple[str, ...] = tuple(sorted(team_names_set))
     return team_ids, team_names
 
 
+async def _delete_redis_session_cache(token: str) -> None:
+    try:
+        rds = _get_redis()
+        if rds:
+            await rds.delete(f"session:{token}")
+    except Exception:
+        pass
+
+
+async def _cache_redis_session(token: str, user_id: int, ttl: int) -> None:
+    try:
+        rds = _get_redis()
+        if rds:
+            await rds.set(f"session:{token}", str(user_id), ex=ttl)
+    except Exception:
+        pass
+
+
+async def _expire_session_row(db: AsyncSession, sess: UserSession) -> None:
+    try:
+        await db.execute(
+            update(UserSession)
+            .where(UserSession.id == sess.id)
+            .values(expired=1)
+        )
+        await db.commit()
+        try:
+            sess.expired = 1
+        except Exception:
+            pass
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
 async def get_current_session(
-        db: AsyncSession = Depends(get_db),
-        x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
+    db: AsyncSession = Depends(get_db),
+    x_session_token: Optional[str] = Header(default=None, alias="X-Session-Token"),
 ) -> UserSession:
     token = (x_session_token or "").strip()
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing X-Session-Token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-Session-Token",
+        )
 
-    stmt = select(UserSession).where(UserSession.session_token == token)
+    stmt = (
+        select(UserSession)
+        .where(UserSession.session_token == token)
+        .limit(1)
+    )
     sess = (await db.execute(stmt)).scalars().first()
 
     if not sess or int(getattr(sess, "expired", 0) or 0) == 1:
-        try:
-            rds = _get_redis()
-            if rds:
-                await rds.delete(f"session:{token}")
-        except Exception:
-            pass
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+        await _delete_redis_session_cache(token)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session",
+        )
 
     last_active_at = getattr(sess, "last_active_at", None)
     if not last_active_at:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session (no last_active_at)")
+        await _expire_session_row(db, sess)
+        await _delete_redis_session_cache(token)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session (no last_active_at)",
+        )
 
     ttl = _safe_int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200), 7200)
     if ttl <= 0:
@@ -211,33 +231,20 @@ async def get_current_session(
     now = _now_bj_naive()
     last_active_bj = _to_bj_naive(last_active_at)
 
+    # 超时：标记过期 + 清缓存 + 返回 401
     if now - last_active_bj > timedelta(seconds=ttl):
-        try:
-            await db.execute(
-                update(UserSession)
-                .where(UserSession.id == sess.id)
-                .values(expired=1)
-            )
-            await db.commit()
-        except Exception:
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-
-        try:
-            rds = _get_redis()
-            if rds:
-                await rds.delete(f"session:{token}")
-        except Exception:
-            pass
-
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired")
+        await _expire_session_row(db, sess)
+        await _delete_redis_session_cache(token)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired",
+        )
 
     hb = SESSION_HEARTBEAT_INTERVAL_SECONDS
     if hb < 0:
         hb = 0
 
+    # 心跳节流：只有超过 hb 才更新 last_active_at
     try:
         need_touch = True
         if hb > 0:
@@ -260,37 +267,40 @@ async def get_current_session(
         except Exception:
             pass
 
-    try:
-        rds = _get_redis()
-        if rds:
-            await rds.set(f"session:{token}", str(sess.user_id), ex=ttl)
-    except Exception:
-        pass
-
+    await _cache_redis_session(token, int(getattr(sess, "user_id", 0) or 0), ttl)
     return sess
 
 
 async def get_current_user(
-        sess: UserSession = Depends(get_current_session),
-        db: AsyncSession = Depends(get_db),
+    sess: UserSession = Depends(get_current_session),
+    db: AsyncSession = Depends(get_db),
 ) -> User:
     uid = int(getattr(sess, "user_id", 0) or 0)
     if uid <= 0:
-        raise HTTPException(status_code=401, detail="Invalid session user_id")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session user_id",
+        )
 
-    user = (await db.execute(select(User).where(User.id == uid))).scalars().first()
+    user = (await db.execute(select(User).where(User.id == uid).limit(1))).scalars().first()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
 
     if int(getattr(user, "status", 0) or 0) != 1:
-        raise HTTPException(status_code=403, detail="User disabled")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User disabled",
+        )
 
     return user
 
 
 async def get_current_user_context(
-        user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
     stmt = (
         select(Role.id, Role.role_name)
@@ -313,24 +323,24 @@ async def get_current_user_context(
     )
 
 
-# ---- 兼容导入名：保留函数名，但返回结构统一为 CurrentUserContext（不再返回 tuple） ----
+# ---- 兼容导入名：统一返回 CurrentUserContext ----
 
 async def get_current_user_with_roles(
-        user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
     return await get_current_user_context(user=user, db=db)
 
 
 async def get_current_user_with_role(
-        user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
     return await get_current_user_context(user=user, db=db)
 
 
 async def get_current_user_with_role_and_teams(
-        user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
     return await get_current_user_context(user=user, db=db)

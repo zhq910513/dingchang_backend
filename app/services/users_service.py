@@ -68,7 +68,7 @@ def _validate_team_names(team_name: Optional[str], team_names_csv: str) -> None:
 
 
 def _validate_password(password: str) -> str:
-    p = str(password)
+    p = str(password or "")
     if len(p) < 6:
         raise ValueError("password 长度至少 6")
     return p
@@ -111,10 +111,7 @@ def _users_projection_stmt():
             User.parent_id.label("parent_id"),
             Role.role_name.label("role_name"),
             case(
-                (
-                    session_last_active_sq.c.last_active_at >= online_cutoff,
-                    1,
-                ),
+                (session_last_active_sq.c.last_active_at >= online_cutoff, 1),
                 else_=0,
             ).label("is_online"),
         )
@@ -127,12 +124,12 @@ def _users_projection_stmt():
 
 
 async def list_users(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        keyword: Optional[str] = None,
-        role: Optional[str] = None,
+    *,
+    db: AsyncSession,
+    current_user: User,
+    current_role: str,
+    keyword: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> Sequence:
     _ac_require_user_manage_access(role_name=current_role)
 
@@ -156,9 +153,9 @@ async def list_users(
 
 
 async def get_user_projection_by_id(
-        *,
-        db: AsyncSession,
-        user_id: int,
+    *,
+    db: AsyncSession,
+    user_id: int,
 ) -> Optional[dict]:
     stmt = _users_projection_stmt().where(User.id == int(user_id))
     row = (await db.execute(stmt)).mappings().first()
@@ -166,25 +163,25 @@ async def get_user_projection_by_id(
 
 
 async def create_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        username: str,
-        password: str,
-        role_name: str,
-        team_name: Optional[str] = None,
-        team_names: Optional[str] = None,
+    *,
+    db: AsyncSession,
+    current_user: User,
+    current_role: str,
+    username: str,
+    password: str,
+    role_name: str,
+    team_name: Optional[str] = None,
+    team_names: Optional[str] = None,
 ) -> User:
     _ac_require_user_manage_access(role_name=current_role)
 
-    uname = str(username).strip()
+    uname = str(username or "").strip()
     if not uname:
         raise ValueError("username is required")
 
     p = _validate_password(password)
 
-    rname = str(role_name).strip()
+    rname = str(role_name or "").strip()
     _ac_validate_user_role_name_for_create(
         current_role=current_role,
         target_role_name=rname,
@@ -243,14 +240,14 @@ async def create_user(
 
 
 async def update_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        user_id: int,
-        password: Optional[str] = None,
-        team_name: Optional[str] = None,
-        team_names: Optional[str] = None,
+    *,
+    db: AsyncSession,
+    current_user: User,
+    current_role: str,
+    user_id: int,
+    password: Optional[str] = None,
+    team_name: Optional[str] = None,
+    team_names: Optional[str] = None,
 ) -> User:
     _ac_require_user_manage_access(role_name=current_role)
 
@@ -294,11 +291,11 @@ async def update_user(
 
 
 async def delete_user(
-        *,
-        db: AsyncSession,
-        current_user: User,
-        current_role: str,
-        user_id: int,
+    *,
+    db: AsyncSession,
+    current_user: User,
+    current_role: str,
+    user_id: int,
 ) -> None:
     _ac_require_user_manage_access(role_name=current_role)
 
