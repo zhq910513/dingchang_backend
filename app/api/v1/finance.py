@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -45,6 +45,9 @@ class FinanceOrdersSummaryOut(BaseModel):
     receivable: float = 0.0
     payable: float = 0.0
     profit: float = 0.0
+
+
+_EMPTY_DICT: Dict[str, Any] = {}
 
 
 def _ensure_finance_access(role_name: Optional[str]) -> None:
@@ -158,12 +161,12 @@ def _parse_ymd(ymd: str):
 
 
 def _add_json_date_range_any(
-        clauses: list,
-        *,
-        keys: List[str],
-        start_ymd: Optional[str],
-        end_ymd: Optional[str],
-        err_prefix: str,
+    clauses: list,
+    *,
+    keys: List[str],
+    start_ymd: Optional[str],
+    end_ymd: Optional[str],
+    err_prefix: str,
 ):
     s = (start_ymd or "").strip()
     e = (end_ymd or "").strip()
@@ -193,55 +196,70 @@ def _add_json_date_range_any(
         clauses.append(or_(*or_terms))
 
 
-async def _load_finance_order(
-        db: AsyncSession,
-        order_id: int,
-        *,
-        current_team_names: Optional[Tuple[str, ...]],
-) -> Order:
-    stmt = (
-        select(Order)
-        .where(Order.id == int(order_id))
-        .options(
-            selectinload(Order.salesperson).selectinload(User.parent),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-            selectinload(Order.images).selectinload(OrderImage.image_file),
-        )
-    )
-    o = (await db.execute(stmt)).scalars().first()
-    if not o:
-        raise HTTPException(status_code=404, detail="Order not found")
+def _trim(v: Any) -> str:
+    return str(v or "").strip()
 
-    if not bool(getattr(o, "is_finished", False)):
-        raise HTTPException(status_code=400, detail="Only finished orders can be accessed in finance")
 
-    await _ac_salesperson_in_current_teams_or_403(
-        salesperson=getattr(o, "salesperson", None),
-        current_team_names=current_team_names,
+def _safe_dd(order: Order) -> Dict[str, Any]:
+    dd = getattr(order, "dynamic_data", None)
+    return dd if isinstance(dd, dict) else _EMPTY_DICT
+
+
+def _money(v) -> str:
+    try:
+        return f"{float(v):.2f}"
+    except Exception:
+        return "-"
+
+
+def _esc(s: str) -> str:
+    return (
+        str(s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
     )
-    return o
+
+
+def _group_code_name(g, kind: str) -> str:
+    if not g:
+        return "-"
+    if kind == "channel":
+        code = _trim(getattr(g, "channel_code", None))
+        name = _trim(getattr(g, "channel_name", None))
+    else:
+        code = _trim(getattr(g, "customer_code", None))
+        name = _trim(getattr(g, "customer_name", None))
+
+    if code and name:
+        return f"{code} - {name}"
+    if name:
+        return name
+    if code:
+        return code
+    return "-"
 
 
 def _build_finance_filter_clauses(
-        *,
-        team_name: Optional[str],
-        team_names: Optional[Tuple[str, ...]],
-        current_team_names: Optional[Tuple[str, ...]],
-        role_name: Optional[str],
-        created_date: Optional[str],
-        created_date_start: Optional[str],
-        created_date_end: Optional[str],
-        channel_group_id: Optional[int],
-        customer_group_id: Optional[int],
-        market: Optional[str],
-        owner_name: Optional[str],
-        insurance_expire_date: Optional[str],
-        first_register_date_start: Optional[str],
-        first_register_date_end: Optional[str],
-        is_paid: Optional[bool],
-        is_rebate: Optional[bool],
+    *,
+    team_name: Optional[str],
+    team_names: Optional[Tuple[str, ...]],
+    current_team_names: Optional[Tuple[str, ...]],
+    role_name: Optional[str],
+    created_date: Optional[str],
+    created_date_start: Optional[str],
+    created_date_end: Optional[str],
+    channel_group_id: Optional[int],
+    customer_group_id: Optional[int],
+    market: Optional[str],
+    owner_name: Optional[str],
+    insurance_expire_date: Optional[str],
+    first_register_date_start: Optional[str],
+    first_register_date_end: Optional[str],
+    is_paid: Optional[bool],
+    is_rebate: Optional[bool],
 ) -> Tuple[list, bool, bool]:
     effective_team_names = _ac_effective_team_filter_for_query(
         role_name=role_name,
@@ -309,24 +327,93 @@ def _build_finance_filter_clauses(
     return clauses, need_join_customer, need_join_info
 
 
+def _build_finance_base_stmt(
+    *,
+    clauses: list,
+    need_join_customer: bool,
+    need_join_info: bool,
+    for_summary: bool = False,
+):
+    if for_summary:
+        stmt = (
+            select(
+                func.coalesce(func.sum(OrderInfo.commercial_amount), 0).label("commercial_amount"),
+                func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
+                func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
+                func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("non_vehicle_amount"),
+                func.coalesce(func.sum(OrderInfo.channel_reward), 0).label("channel_reward"),
+                func.coalesce(func.sum(OrderInfo.customer_reward), 0).label("customer_reward"),
+                func.coalesce(func.sum(OrderInfo.channel_total), 0).label("receivable"),
+                func.coalesce(func.sum(OrderInfo.customer_total), 0).label("payable"),
+                func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
+            )
+            .select_from(Order)
+            .join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        )
+    else:
+        stmt = select(Order).select_from(Order)
+
+    if need_join_customer:
+        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+
+    if need_join_info and not for_summary:
+        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+
+    return stmt
+
+
+async def _load_finance_order(
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_team_names: Optional[Tuple[str, ...]],
+) -> Order:
+    stmt = (
+        select(Order)
+        .where(Order.id == int(order_id))
+        .options(
+            selectinload(Order.salesperson).selectinload(User.parent),
+            selectinload(Order.customer_group),
+            selectinload(Order.channel_group),
+            selectinload(Order.order_info),
+            selectinload(Order.images).selectinload(OrderImage.image_file),
+        )
+    )
+    o = (await db.execute(stmt)).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be accessed in finance")
+
+    await _ac_salesperson_in_current_teams_or_403(
+        salesperson=getattr(o, "salesperson", None),
+        current_team_names=current_team_names,
+    )
+    return o
+
+
 @router.get("/orders/summary", response_model=FinanceOrdersSummaryOut)
 async def finance_orders_summary(
-        created_date: Optional[str] = Query(None),
-        created_date_start: Optional[str] = Query(None),
-        created_date_end: Optional[str] = Query(None),
-        channel_group_id: Optional[int] = Query(None),
-        customer_group_id: Optional[int] = Query(None),
-        market: Optional[str] = Query(None),
-        owner_name: Optional[str] = Query(None),
-        insurance_expire_date: Optional[str] = Query(None),
-        first_register_date_start: Optional[str] = Query(None),
-        first_register_date_end: Optional[str] = Query(None),
-        is_paid: Optional[bool] = Query(None),
-        is_rebate: Optional[bool] = Query(None),
-        team_name: Optional[str] = Query(None),
-        team_names: Optional[Tuple[str, ...]] = Query(None),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    created_date: Optional[str] = Query(None),
+    created_date_start: Optional[str] = Query(None),
+    created_date_end: Optional[str] = Query(None),
+    channel_group_id: Optional[int] = Query(None),
+    customer_group_id: Optional[int] = Query(None),
+    market: Optional[str] = Query(None),
+    owner_name: Optional[str] = Query(None),
+    insurance_expire_date: Optional[str] = Query(None),
+    first_register_date_start: Optional[str] = Query(None),
+    first_register_date_end: Optional[str] = Query(None),
+    is_paid: Optional[bool] = Query(None),
+    is_rebate: Optional[bool] = Query(None),
+    team_name: Optional[str] = Query(None),
+    team_names: Optional[Tuple[str, ...]] = Query(None),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> FinanceOrdersSummaryOut:
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -351,27 +438,12 @@ async def finance_orders_summary(
         is_rebate=is_rebate,
     )
 
-    stmt = (
-        select(
-            func.coalesce(func.sum(OrderInfo.commercial_amount), 0).label("commercial_amount"),
-            func.coalesce(func.sum(OrderInfo.compulsory_amount), 0).label("compulsory_amount"),
-            func.coalesce(func.sum(OrderInfo.vehicle_tax_amount), 0).label("vehicle_tax_amount"),
-            func.coalesce(func.sum(OrderInfo.non_vehicle_amount), 0).label("non_vehicle_amount"),
-            func.coalesce(func.sum(OrderInfo.channel_reward), 0).label("channel_reward"),
-            func.coalesce(func.sum(OrderInfo.customer_reward), 0).label("customer_reward"),
-            func.coalesce(func.sum(OrderInfo.channel_total), 0).label("receivable"),
-            func.coalesce(func.sum(OrderInfo.customer_total), 0).label("payable"),
-            func.coalesce(func.sum(OrderInfo.profit), 0).label("profit"),
-        )
-        .select_from(Order)
-        .join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+    stmt = _build_finance_base_stmt(
+        clauses=clauses,
+        need_join_customer=need_join_customer,
+        need_join_info=need_join_info,
+        for_summary=True,
     )
-
-    if need_join_customer:
-        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-
-    if clauses:
-        stmt = stmt.where(and_(*clauses))
 
     row = (await db.execute(stmt)).mappings().first() or {}
     return FinanceOrdersSummaryOut(
@@ -389,23 +461,23 @@ async def finance_orders_summary(
 
 @router.get("/orders/export")
 async def export_finance_orders(
-        created_date: Optional[str] = Query(None),
-        created_date_start: Optional[str] = Query(None),
-        created_date_end: Optional[str] = Query(None),
-        channel_group_id: Optional[int] = Query(None),
-        customer_group_id: Optional[int] = Query(None),
-        market: Optional[str] = Query(None),
-        owner_name: Optional[str] = Query(None),
-        insurance_expire_date: Optional[str] = Query(None),
-        first_register_date_start: Optional[str] = Query(None),
-        first_register_date_end: Optional[str] = Query(None),
-        is_paid: Optional[bool] = Query(None),
-        is_rebate: Optional[bool] = Query(None),
-        team_name: Optional[str] = Query(None),
-        team_names: Optional[Tuple[str, ...]] = Query(None),
-        ids: Optional[Tuple[int, ...]] = Query(None),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    created_date: Optional[str] = Query(None),
+    created_date_start: Optional[str] = Query(None),
+    created_date_end: Optional[str] = Query(None),
+    channel_group_id: Optional[int] = Query(None),
+    customer_group_id: Optional[int] = Query(None),
+    market: Optional[str] = Query(None),
+    owner_name: Optional[str] = Query(None),
+    insurance_expire_date: Optional[str] = Query(None),
+    first_register_date_start: Optional[str] = Query(None),
+    first_register_date_end: Optional[str] = Query(None),
+    is_paid: Optional[bool] = Query(None),
+    is_rebate: Optional[bool] = Query(None),
+    team_name: Optional[str] = Query(None),
+    team_names: Optional[Tuple[str, ...]] = Query(None),
+    ids: Optional[Tuple[int, ...]] = Query(None),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -436,8 +508,32 @@ async def export_finance_orders(
         if valid_ids:
             clauses.append(Order.id.in_(valid_ids))
 
-    stmt = (
+    # 两段式：先拿 ID，再按 ID 拉实体，别一开始就全关系一起扛
+    id_stmt = _build_finance_base_stmt(
+        clauses=clauses,
+        need_join_customer=need_join_customer,
+        need_join_info=need_join_info,
+        for_summary=False,
+    ).with_only_columns(Order.id).order_by(Order.id.desc())
+
+    id_rows = (await db.execute(id_stmt)).all()
+    order_ids = [int(r[0]) for r in id_rows if r and r[0] is not None]
+
+    if not order_ids:
+        body = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8' /></head>"
+            "<body><table border='1'><thead><tr><th>无数据</th></tr></thead><tbody></tbody></table></body></html>"
+        ).encode("utf-8")
+        filename = f"finance_orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls"
+        return StreamingResponse(
+            iter([body]),
+            media_type="application/vnd.ms-excel; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    entity_stmt = (
         select(Order)
+        .where(Order.id.in_(order_ids))
         .options(
             selectinload(Order.salesperson).selectinload(User.parent),
             selectinload(Order.customer_group),
@@ -445,68 +541,23 @@ async def export_finance_orders(
             selectinload(Order.order_info),
         )
     )
-    if need_join_customer:
-        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-    if need_join_info:
-        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
 
-    stmt = stmt.where(and_(*clauses)).order_by(Order.id.desc())
-    rows = (await db.execute(stmt)).scalars().all()
-
-    def esc(s: str) -> str:
-        return (
-            str(s or "")
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;")
-        )
-
-    def money(v) -> str:
-        try:
-            return f"{float(v):.2f}"
-        except Exception:
-            return "-"
-
-    def group_code_name(g, kind: str) -> str:
-        if not g:
-            return "-"
-        if kind == "channel":
-            code = str(getattr(g, "channel_code", "") or "").strip()
-            name = str(getattr(g, "channel_name", "") or "").strip()
-        else:
-            code = str(getattr(g, "customer_code", "") or "").strip()
-            name = str(getattr(g, "customer_name", "") or "").strip()
-
-        if code and name:
-            return f"{code} - {name}"
-        if name:
-            return name
-        if code:
-            return code
-        return "-"
+    rows = (await db.execute(entity_stmt)).scalars().all()
+    row_map = {int(getattr(o, "id", 0) or 0): o for o in rows}
+    ordered_rows = [row_map[oid] for oid in order_ids if oid in row_map]
 
     def td_html(value, *, force_text: bool = False) -> str:
-        text = esc(str(value if value is not None else ""))
+        text = _esc(str(value if value is not None else ""))
         if force_text:
             return f"<td style=\"mso-number-format:'\\@';\">{text}</td>"
         return f"<td>{text}</td>"
 
     def build_row_html(cells: List[str]) -> str:
-        # 强制按文本展示，避免 Excel 自动科学计数/精度丢失
-        # 0 日期
-        # 6 车牌
-        # 7 保险到期日
-        # 8 车架号
-        # 9 发动机号
-        # 11 初登日期
-        # 12 身份证号
-        # 13 电话
         text_indexes = {0, 6, 7, 8, 9, 11, 12, 13}
         tds = []
+        append_td = tds.append
         for idx, val in enumerate(cells):
-            tds.append(td_html(val, force_text=idx in text_indexes))
+            append_td(td_html(val, force_text=idx in text_indexes))
         return "<tr>" + "".join(tds) + "</tr>"
 
     headers = [
@@ -517,35 +568,35 @@ async def export_finance_orders(
         "应收", "应付", "利润", "所属经理", "所属团队", "是否回款", "是否返点",
     ]
 
-    html = [
+    html_parts = [
         "<!DOCTYPE html><html><head><meta charset='utf-8' /></head><body><table border='1'><thead><tr>",
-        *[f"<th>{esc(h)}</th>" for h in headers],
+        *[f"<th>{_esc(h)}</th>" for h in headers],
         "</tr></thead><tbody>",
     ]
+    append_html = html_parts.append
 
-    for o in rows:
-        dd = getattr(o, "dynamic_data", None) or {}
+    for o in ordered_rows:
+        dd = _safe_dd(o)
         info = getattr(o, "order_info", None)
         sp = getattr(o, "salesperson", None)
         cg = getattr(o, "customer_group", None)
         ch = getattr(o, "channel_group", None)
 
-        manager_name = None
-        if sp and getattr(sp, "parent", None):
-            manager_name = getattr(sp.parent, "real_name", None) or getattr(sp.parent, "username", None)
+        parent = getattr(sp, "parent", None) if sp else None
+        manager_name = (getattr(parent, "real_name", None) or getattr(parent, "username", None) or "-")
 
-        team_names_val = []
-        raw_teams = str(getattr(sp, "team_names", "") or "").strip()
+        raw_teams = _trim(getattr(sp, "team_names", None)) if sp else ""
         if raw_teams:
             team_names_val = [x.strip() for x in raw_teams.split(",") if x.strip()]
-        if not team_names_val and getattr(sp, "team_name", None):
-            team_names_val = [str(getattr(sp, "team_name")).strip()]
+        else:
+            single_team = _trim(getattr(sp, "team_name", None)) if sp else ""
+            team_names_val = [single_team] if single_team else []
         team_display = "、".join(team_names_val) if team_names_val else "-"
 
         row = [
             str(getattr(o, "created_at", None) or "-")[:10],
-            group_code_name(ch, "channel"),
-            group_code_name(cg, "customer"),
+            _group_code_name(ch, "channel"),
+            _group_code_name(cg, "customer"),
             getattr(cg, "market", None) or "-",
             (getattr(sp, "real_name", None) or getattr(sp, "username", None) or "-"),
             dd.get("owner_name") or "-",
@@ -557,34 +608,34 @@ async def export_finance_orders(
             dd.get("first_register_date") or "-",
             dd.get("id_number") or "-",
             getattr(info, "owner_phone", None) or "-",
-            money(getattr(info, "commercial_amount", None)),
-            money(getattr(info, "compulsory_amount", None)),
-            money(getattr(info, "vehicle_tax_amount", None)),
-            money(getattr(info, "non_vehicle_amount", None)),
+            _money(getattr(info, "commercial_amount", None)),
+            _money(getattr(info, "compulsory_amount", None)),
+            _money(getattr(info, "vehicle_tax_amount", None)),
+            _money(getattr(info, "non_vehicle_amount", None)),
             str(getattr(info, "channel_commercial_point", None) or "-"),
             str(getattr(info, "channel_commercial_supplement_point", None) or "-"),
             str(getattr(info, "channel_compulsory_point", None) or "-"),
             str(getattr(info, "channel_vehicle_tax_point", None) or "-"),
             str(getattr(info, "channel_non_vehicle_point", None) or "-"),
-            money(getattr(info, "channel_reward", None)),
+            _money(getattr(info, "channel_reward", None)),
             str(getattr(info, "customer_commercial_point", None) or "-"),
             str(getattr(info, "customer_commercial_supplement_point", None) or "-"),
             str(getattr(info, "customer_compulsory_point", None) or "-"),
             str(getattr(info, "customer_vehicle_tax_point", None) or "-"),
             str(getattr(info, "customer_non_vehicle_point", None) or "-"),
-            money(getattr(info, "customer_reward", None)),
-            money(getattr(info, "channel_total", None)),
-            money(getattr(info, "customer_total", None)),
-            money(getattr(info, "profit", None)),
+            _money(getattr(info, "customer_reward", None)),
+            _money(getattr(info, "channel_total", None)),
+            _money(getattr(info, "customer_total", None)),
+            _money(getattr(info, "profit", None)),
             manager_name or "-",
             team_display,
             "是" if bool(getattr(o, "is_paid", False)) else "否",
             "是" if bool(getattr(o, "is_rebate", False)) else "否",
         ]
-        html.append(build_row_html(row))
+        append_html(build_row_html(row))
 
-    html.append("</tbody></table></body></html>")
-    body = "".join(html).encode("utf-8")
+    append_html("</tbody></table></body></html>")
+    body = "".join(html_parts).encode("utf-8")
     filename = f"finance_orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls"
     return StreamingResponse(
         iter([body]),
@@ -595,9 +646,9 @@ async def export_finance_orders(
 
 @router.get("/orders/{order_id}", response_model=OrderOut)
 async def get_finance_order_detail(
-        order_id: int,
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    order_id: int,
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> OrderOut:
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -610,10 +661,10 @@ async def get_finance_order_detail(
 
 @router.patch("/orders/{order_id}/status")
 async def update_finance_order_status(
-        order_id: int,
-        payload: FinanceOrderStatusUpdate,
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    order_id: int,
+    payload: FinanceOrderStatusUpdate,
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -633,9 +684,9 @@ async def update_finance_order_status(
 
 @router.post("/orders/{order_id}/return")
 async def return_finance_order_to_unfinished(
-        order_id: int,
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    order_id: int,
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)

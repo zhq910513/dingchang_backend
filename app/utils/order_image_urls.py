@@ -15,7 +15,7 @@ slot_images: List[{
 }]
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from typing import Protocol, runtime_checkable
 
 from app.core.slot_field_config import ordered_slot_keys, slot_is_multi_image, slot_title, slot_is_ocr
@@ -35,16 +35,21 @@ class _StorageProto(Protocol):
 
 
 def _norm_str(v: Any) -> str:
-    return (str(v or "").strip()) if v is not None else ""
+    if v is None:
+        return ""
+    return str(v).strip()
 
 
 def _storage_key_for_order_image(im: Any) -> str:
     sk = _norm_str(getattr(im, "storage_key", "")).lstrip("/")
     if sk:
         return sk
+
     imf = getattr(im, "image_file", None)
-    sk2 = _norm_str(getattr(imf, "storage_key", "")).lstrip("/")
-    return sk2
+    if imf is None:
+        return ""
+
+    return _norm_str(getattr(imf, "storage_key", "")).lstrip("/")
 
 
 def _display_url_for_storage_key(storage_key: str, storage: _StorageProto) -> str:
@@ -52,6 +57,7 @@ def _display_url_for_storage_key(storage_key: str, storage: _StorageProto) -> st
         return ""
     if not getattr(storage, "enabled", False):
         return ""
+
     try:
         return storage.object_url_for_display(storage_key, expires_in=60 * 60)
     except Exception:
@@ -63,17 +69,20 @@ def _display_url_for_storage_key(storage_key: str, storage: _StorageProto) -> st
 
 def _display_url_for_order_image(im: Any, storage: _StorageProto) -> str:
     sk = _storage_key_for_order_image(im)
-    u = _display_url_for_storage_key(sk, storage)
-    if u:
-        return u
+    if sk:
+        u = _display_url_for_storage_key(sk, storage)
+        if u:
+            return u
 
     url = _norm_str(getattr(im, "image_url", ""))
     if url:
         return url
 
     imf = getattr(im, "image_file", None)
-    url2 = _norm_str(getattr(imf, "url", ""))
-    return url2
+    if imf is None:
+        return ""
+
+    return _norm_str(getattr(imf, "url", ""))
 
 
 def ensure_display_urls_for_order_images(images: List[Any], storage: _StorageProto) -> None:
@@ -81,83 +90,130 @@ def ensure_display_urls_for_order_images(images: List[Any], storage: _StoragePro
         return
 
     cache: Dict[str, str] = {}
+    storage_enabled = bool(getattr(storage, "enabled", False))
 
     for im in images:
         sk = _storage_key_for_order_image(im)
 
-        if sk and sk in cache:
-            if cache[sk]:
-                try:
-                    im.image_url = cache[sk]
-                except Exception:
-                    pass
-            continue
+        if sk:
+            cached = cache.get(sk)
+            if cached is not None:
+                if cached:
+                    try:
+                        im.image_url = cached
+                    except Exception:
+                        pass
+                continue
 
-        u = _display_url_for_order_image(im, storage)
+        u = ""
+        if sk and storage_enabled:
+            u = _display_url_for_storage_key(sk, storage)
+
+        if not u:
+            u = _norm_str(getattr(im, "image_url", ""))
+            if not u:
+                imf = getattr(im, "image_file", None)
+                if imf is not None:
+                    u = _norm_str(getattr(imf, "url", ""))
 
         if u:
             try:
                 im.image_url = u
             except Exception:
                 pass
+
         if sk:
             cache[sk] = u or ""
+
+
+def _build_slot_meta_map() -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+    ordered_keys: List[str] = []
+    meta_map: Dict[str, Dict[str, Any]] = {}
+
+    for sk in ordered_slot_keys():
+        sks = _norm_str(sk)
+        if not sks:
+            continue
+        ordered_keys.append(sks)
+        meta_map[sks] = {
+            "slot_key": sks,
+            "title": slot_title(sks),
+            "multi": bool(slot_is_multi_image(sks)),
+            "ocr": bool(slot_is_ocr(sks)),
+        }
+
+    return ordered_keys, meta_map
+
+
+def _new_slot_node(meta: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "slot_key": meta["slot_key"],
+        "title": meta["title"],
+        "multi": meta["multi"],
+        "ocr": meta["ocr"],
+        "images": [],
+    }
 
 
 def build_slot_images(order: Any, storage: _StorageProto) -> List[Dict[str, Any]]:
     imgs: List[Any] = getattr(order, "images", None) or []
     ensure_display_urls_for_order_images(imgs, storage)
 
+    ordered_keys, slot_meta_map = _build_slot_meta_map()
+
     nodes: List[Dict[str, Any]] = []
     node_map: Dict[str, Dict[str, Any]] = {}
 
-    for sk in ordered_slot_keys():
-        sks = _norm_str(sk)
-        if not sks:
-            continue
-        node = {
-            "slot_key": sks,
-            "title": slot_title(sks),
-            "multi": bool(slot_is_multi_image(sks)),
-            "ocr": bool(slot_is_ocr(sks)),
-            "images": [],
-        }
-        nodes.append(node)
-        node_map[sks] = node
+    append_node = nodes.append
+
+    for sk in ordered_keys:
+        meta = slot_meta_map[sk]
+        node = _new_slot_node(meta)
+        append_node(node)
+        node_map[sk] = node
 
     for im in imgs:
-        slot_key = _norm_str(getattr(im, "slot_key", None) or getattr(im, "slot", None) or "") or "unknown"
-        if slot_key not in node_map:
-            node = {
-                "slot_key": slot_key,
-                "title": slot_title(slot_key),
-                "multi": bool(slot_is_multi_image(slot_key)),
-                "ocr": bool(slot_is_ocr(slot_key)),
-                "images": [],
-            }
-            nodes.append(node)
+        slot_key = _norm_str(getattr(im, "slot_key", None) or getattr(im, "slot", None) or "")
+        if not slot_key:
+            slot_key = "unknown"
+
+        node = node_map.get(slot_key)
+        if node is None:
+            meta = slot_meta_map.get(slot_key)
+            if meta is None:
+                meta = {
+                    "slot_key": slot_key,
+                    "title": slot_title(slot_key),
+                    "multi": bool(slot_is_multi_image(slot_key)),
+                    "ocr": bool(slot_is_ocr(slot_key)),
+                }
+                slot_meta_map[slot_key] = meta
+
+            node = _new_slot_node(meta)
+            append_node(node)
             node_map[slot_key] = node
 
         imf = getattr(im, "image_file", None)
 
+        storage_key = _storage_key_for_order_image(im)
+        url = _norm_str(getattr(im, "image_url", ""))
+
         item = {
             "order_image_id": getattr(im, "id", None),
             "image_file_id": getattr(im, "image_file_id", None),
-            "storage_key": _storage_key_for_order_image(im),
-            "url": _norm_str(getattr(im, "image_url", "")),
-            "md5": _norm_str(getattr(imf, "md5", None)),
-            "etag": _norm_str(getattr(imf, "etag", None)),
-            "size": getattr(imf, "size", None),
-            "content_type": _norm_str(getattr(imf, "content_type", None)),
-            "original_name": _norm_str(getattr(imf, "original_name", None)),
+            "storage_key": storage_key,
+            "url": url,
+            "md5": _norm_str(getattr(imf, "md5", None)) if imf is not None else "",
+            "etag": _norm_str(getattr(imf, "etag", None)) if imf is not None else "",
+            "size": getattr(imf, "size", None) if imf is not None else None,
+            "content_type": _norm_str(getattr(imf, "content_type", None)) if imf is not None else "",
+            "original_name": _norm_str(getattr(imf, "original_name", None)) if imf is not None else "",
             "created_at": _norm_str(getattr(im, "created_at", None)),
             "updated_at": _norm_str(getattr(im, "updated_at", None)),
         }
-        node_map[slot_key]["images"].append(item)
+        node["images"].append(item)
 
     for node in nodes:
-        if not isinstance(node, dict):
-            continue
         if bool(node.get("multi", False)):
             continue
         arr = node.get("images")

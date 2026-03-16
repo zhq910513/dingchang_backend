@@ -143,9 +143,7 @@ class OrderDraftOut(BaseModel):
 
 class FinalizeImageIn(BaseModel):
     slot_key: str
-    order_image_id: Optional[int] = None
-    image_file_id: Optional[int] = None
-    storage_key: Optional[str] = None
+    storage_key: str
     md5: str = ""
     size: int = 0
     content_type: Optional[str] = None
@@ -289,33 +287,10 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
         sid = int(salesperson_id)
     except Exception:
         raise HTTPException(status_code=400, detail="salesperson_id 非法")
-    q = select(User).where(User.id == sid)
+    q = select(User.id).where(User.id == sid)
     u = (await db.execute(q)).scalar_one_or_none()
     if u is None:
         raise HTTPException(status_code=400, detail="salesperson_id 不存在")
-
-
-async def _ensure_customer_group_exists(db: AsyncSession, customer_group_id: int) -> None:
-    try:
-        gid = int(customer_group_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="customer_group_id 非法")
-    q = select(CustomerGroup.id).where(CustomerGroup.id == gid)
-    x = (await db.execute(q)).scalar_one_or_none()
-    if x is None:
-        raise HTTPException(status_code=400, detail="customer_group_id 不存在")
-
-
-async def _ensure_channel_group_exists(db: AsyncSession, channel_group_id: int) -> None:
-    try:
-        gid = int(channel_group_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="channel_group_id 非法")
-    from app.models.channel_group import ChannelGroup
-    q = select(ChannelGroup.id).where(ChannelGroup.id == gid)
-    x = (await db.execute(q)).scalar_one_or_none()
-    if x is None:
-        raise HTTPException(status_code=400, detail="channel_group_id 不存在")
 
 
 def _ensure_orders_access(role_name: Optional[str]) -> None:
@@ -424,6 +399,78 @@ def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
     clauses.append(expr.like(f"%{v.lower()}%"))
 
 
+def _add_owner_name_fuzzy(clauses: list, value: Optional[str]):
+    v = (value or "").strip()
+    if not v:
+        return
+
+    needle = f"%{v.lower()}%"
+    or_terms = []
+
+    direct_keys = [
+        "owner_name",
+        "vehicle_cert_owner_name",
+        "vehicle_owner_name",
+        "certificate_owner_name",
+        "driving_license_owner_name",
+        "license_owner_name",
+        "idcard_name",
+        "id_card_name",
+        "identity_name",
+    ]
+    for key in direct_keys:
+        expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
+        or_terms.append(expr.like(needle))
+
+    json_paths = [
+        "$.vehicle_cert.owner_name",
+        "$.vehicle_cert.vehicle_cert_owner_name",
+        "$.vehicle_cert.vehicle_owner_name",
+        "$.vehicle_cert.certificate_owner_name",
+
+        "$.driving_license.owner_name",
+        "$.driving_license.driving_license_owner_name",
+        "$.driving_license.license_owner_name",
+
+        "$.driving_license_main.owner_name",
+        "$.driving_license_main.driving_license_owner_name",
+        "$.driving_license_main.license_owner_name",
+
+        "$.driving_license_sub.owner_name",
+        "$.driving_license_sub.driving_license_owner_name",
+        "$.driving_license_sub.license_owner_name",
+
+        "$.idcard.name",
+        "$.idcard.owner_name",
+        "$.idcard.idcard_name",
+        "$.idcard.id_card_name",
+        "$.idcard.identity_name",
+
+        "$.idcard_front.name",
+        "$.idcard_front.owner_name",
+        "$.idcard_front.idcard_name",
+        "$.idcard_front.id_card_name",
+        "$.idcard_front.identity_name",
+
+        "$.idcard_back.name",
+        "$.idcard_back.owner_name",
+        "$.idcard_back.idcard_name",
+        "$.idcard_back.id_card_name",
+        "$.idcard_back.identity_name",
+    ]
+
+    d = _dialect_name()
+    for path in json_paths:
+        if "mysql" in d or "mariadb" in d:
+            expr = func.lower(func.json_unquote(func.json_extract(Order.dynamic_data, path)))
+        else:
+            expr = func.lower(cast(func.json_extract(Order.dynamic_data, path), String))
+        or_terms.append(expr.like(needle))
+
+    if or_terms:
+        clauses.append(or_(*or_terms))
+
+
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:
     s = (ymd or "").strip()
     if not s:
@@ -493,23 +540,6 @@ def _parse_date_or_none(v: Any) -> Optional[date]:
         return None
 
     return None
-
-
-def _float_or_none(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return None
-        try:
-            return float(s)
-        except Exception:
-            raise HTTPException(status_code=400, detail="order_info numeric field invalid")
-    try:
-        return float(v)
-    except Exception:
-        raise HTTPException(status_code=400, detail="order_info numeric field invalid")
 
 
 def _float_or_zero(v: Any) -> float:
@@ -596,12 +626,12 @@ def _recalc_order_info_derived(info: OrderInfo) -> None:
         + ch_reward
     )
     customer_total = (
-            commercial * (cu_commercial_point / 100.0)
-            + commercial * (cu_commercial_supplement_point / 100.0)
-            + compulsory * (cu_compulsory_point / 100.0)
-            + vehicle_tax * (cu_vehicle_tax_point / 100.0)
-            + non_vehicle * (cu_non_vehicle_point / 100.0)
-            + cu_reward
+        commercial * (cu_commercial_point / 100.0)
+        + commercial * (cu_commercial_supplement_point / 100.0)
+        + compulsory * (cu_compulsory_point / 100.0)
+        + vehicle_tax * (cu_vehicle_tax_point / 100.0)
+        + non_vehicle * (cu_non_vehicle_point / 100.0)
+        + cu_reward
     )
 
     info.channel_total = channel_total
@@ -615,16 +645,12 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     fs = _model_fields_set(payload)
 
-    text_fields = ["owner_phone", "remark"]
-    date_fields = ["insurance_expire_date"]
-
-    for name in text_fields:
+    for name in ("owner_phone", "remark"):
         if name in fs:
             setattr(info, name, _trim_or_none(getattr(payload, name, None)))
 
-    for name in date_fields:
-        if name in fs:
-            setattr(info, name, _parse_date_or_none(getattr(payload, name, None)))
+    if "insurance_expire_date" in fs:
+        info.insurance_expire_date = _parse_date_or_none(getattr(payload, "insurance_expire_date", None))
 
     for name in ORDER_INFO_NON_NULL_NUMERIC_FIELDS:
         if name in fs:
@@ -805,166 +831,6 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
         raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
 
 
-async def _resolve_finalize_image_item(
-    db: AsyncSession,
-    *,
-    order_id: int,
-    item: FinalizeImageIn,
-) -> Dict[str, Any]:
-    slot_key = str(item.slot_key or "").strip()
-    if slot_key not in ALL_SLOTS:
-        raise HTTPException(status_code=400, detail=f"非法 slot_key: {slot_key}")
-
-    order_image_id = int(item.order_image_id) if item.order_image_id is not None else None
-    image_file_id = int(item.image_file_id) if item.image_file_id is not None else None
-    storage_key = str(item.storage_key or "").strip().lstrip("/")
-    md5_hex = str(item.md5 or "").strip().lower()
-
-    if order_image_id is not None:
-        stmt = (
-            select(OrderImage)
-            .options(selectinload(OrderImage.image_file))
-            .where(and_(OrderImage.id == order_image_id, OrderImage.order_id == order_id))
-        )
-        oi = (await db.execute(stmt)).scalar_one_or_none()
-        if not oi:
-            raise HTTPException(status_code=400, detail=f"order_image_id not found in current order: {order_image_id}")
-
-        oi_slot = str(getattr(oi, "slot_key", "") or "").strip()
-        if oi_slot != slot_key:
-            raise HTTPException(status_code=400, detail="order_image_id slot_key mismatch")
-
-        imf = getattr(oi, "image_file", None)
-        resolved_storage_key = str(getattr(oi, "storage_key", "") or "").strip().lstrip("/")
-        if not resolved_storage_key and imf is not None:
-            resolved_storage_key = str(getattr(imf, "storage_key", "") or "").strip().lstrip("/")
-
-        if not resolved_storage_key:
-            raise HTTPException(status_code=400, detail="resolved storage_key empty for order_image_id")
-
-        return {
-            "slot_key": slot_key,
-            "order_image_id": int(getattr(oi, "id", 0) or 0),
-            "image_file_id": getattr(oi, "image_file_id", None),
-            "storage_key": resolved_storage_key,
-            "md5": str(getattr(imf, "md5", "") or "").strip().lower() if imf is not None else "",
-            "size": int(getattr(imf, "size", 0) or 0) if imf is not None else 0,
-            "content_type": getattr(imf, "content_type", None) if imf is not None else None,
-            "etag": getattr(imf, "etag", None) if imf is not None else None,
-            "original_name": getattr(imf, "original_name", None) if imf is not None else None,
-            "url": (
-                str(getattr(oi, "image_url", "") or "").strip()
-                or (str(getattr(imf, "url", "") or "").strip() if imf is not None else "")
-            ),
-        }
-
-    if image_file_id is not None:
-        stmt = select(ImageFile).where(ImageFile.id == image_file_id)
-        imf = (await db.execute(stmt)).scalar_one_or_none()
-        if not imf:
-            raise HTTPException(status_code=400, detail=f"image_file_id not found: {image_file_id}")
-
-        resolved_storage_key = str(getattr(imf, "storage_key", "") or "").strip().lstrip("/")
-        if not resolved_storage_key:
-            raise HTTPException(status_code=400, detail="resolved storage_key empty for image_file_id")
-
-        resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower()
-        if resolved_md5:
-            _validate_finalize_storage_key(slot_key=slot_key, storage_key=resolved_storage_key, md5_hex=resolved_md5)
-
-        return {
-            "slot_key": slot_key,
-            "order_image_id": None,
-            "image_file_id": int(getattr(imf, "id", 0) or 0),
-            "storage_key": resolved_storage_key,
-            "md5": resolved_md5,
-            "size": int(getattr(imf, "size", 0) or 0),
-            "content_type": getattr(imf, "content_type", None),
-            "etag": getattr(imf, "etag", None),
-            "original_name": getattr(imf, "original_name", None),
-            "url": str(getattr(imf, "url", "") or "").strip(),
-        }
-
-    if storage_key:
-        stmt_oi = (
-            select(OrderImage)
-            .options(selectinload(OrderImage.image_file))
-            .where(
-                and_(
-                    OrderImage.order_id == order_id,
-                    OrderImage.slot_key == slot_key,
-                    OrderImage.storage_key == storage_key,
-                )
-            )
-            .order_by(OrderImage.id.desc())
-        )
-        oi = (await db.execute(stmt_oi)).scalars().first()
-        if oi:
-            imf = getattr(oi, "image_file", None)
-            resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower() if imf is not None else ""
-            if resolved_md5:
-                _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=resolved_md5)
-
-            return {
-                "slot_key": slot_key,
-                "order_image_id": int(getattr(oi, "id", 0) or 0),
-                "image_file_id": getattr(oi, "image_file_id", None),
-                "storage_key": storage_key,
-                "md5": resolved_md5,
-                "size": int(getattr(imf, "size", 0) or 0) if imf is not None else 0,
-                "content_type": getattr(imf, "content_type", None) if imf is not None else None,
-                "etag": getattr(imf, "etag", None) if imf is not None else None,
-                "original_name": getattr(imf, "original_name", None) if imf is not None else None,
-                "url": (
-                    str(getattr(oi, "image_url", "") or "").strip()
-                    or (str(getattr(imf, "url", "") or "").strip() if imf is not None else "")
-                ),
-            }
-
-        stmt_imf = select(ImageFile).where(ImageFile.storage_key == storage_key)
-        imf = (await db.execute(stmt_imf)).scalar_one_or_none()
-
-        if imf is not None:
-            resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower() or md5_hex
-            if not resolved_md5:
-                raise HTTPException(status_code=400, detail="md5 is required for finalize when image_file.md5 missing")
-
-            _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=resolved_md5)
-
-            return {
-                "slot_key": slot_key,
-                "order_image_id": None,
-                "image_file_id": int(getattr(imf, "id", 0) or 0),
-                "storage_key": storage_key,
-                "md5": resolved_md5,
-                "size": int(getattr(imf, "size", 0) or 0) or int(item.size or 0),
-                "content_type": getattr(imf, "content_type", None) or item.content_type,
-                "etag": getattr(imf, "etag", None) or item.etag,
-                "original_name": getattr(imf, "original_name", None) or item.original_name,
-                "url": str(getattr(imf, "url", "") or "").strip() or str(item.url or "").strip(),
-            }
-
-        if not md5_hex:
-            raise HTTPException(status_code=400, detail="md5 is required for new finalize image")
-
-        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
-
-        return {
-            "slot_key": slot_key,
-            "order_image_id": None,
-            "image_file_id": None,
-            "storage_key": storage_key,
-            "md5": md5_hex,
-            "size": int(item.size or 0),
-            "content_type": item.content_type,
-            "etag": item.etag,
-            "original_name": item.original_name,
-            "url": str(item.url or "").strip(),
-        }
-
-    raise HTTPException(status_code=400, detail="finalize image identity missing")
-
-
 async def _apply_ocr_task_acl(
     *,
     stmt,
@@ -998,19 +864,13 @@ async def _apply_ocr_task_acl(
     return stmt
 
 
-async def _load_order_out(
-    db: AsyncSession,
-    order_id: int,
-    *,
-    current_user: User,
-    role_name: Optional[str],
-    team_names: Tuple[str, ...],
-) -> OrderOut:
+def _build_order_detail_stmt(order_id: int):
     stmt = select(Order).where(Order.id == order_id)
 
     opt1 = _maybe_selectinload(Order, "images")
     if opt1 is not None:
         stmt = stmt.options(opt1)
+
     opt2 = _maybe_selectinload_nested(Order, "images", OrderImage, "image_file")
     if opt2 is not None:
         stmt = stmt.options(opt2)
@@ -1024,6 +884,18 @@ async def _load_order_out(
     if hasattr(Order, "channel_group"):
         stmt = stmt.options(selectinload(Order.channel_group))
 
+    return stmt
+
+
+async def _load_order_out(
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
+) -> OrderOut:
+    stmt = _build_order_detail_stmt(order_id)
     o = (await db.execute(stmt)).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -1041,6 +913,151 @@ async def _load_order_out(
 
     images_by_order_id: Dict[int, List[OrderImage]] = {int(order_id): list(getattr(o, "images", None) or [])}
     return _rm_to_order_out(o, storage=storage, images_by_order_id=images_by_order_id)
+
+
+async def _build_order_list_clauses(
+    *,
+    ctx: CurrentUserContext,
+    role_name: str,
+    team_names: Tuple[str, ...],
+    is_finished: Optional[bool],
+    salesperson_id: Optional[int],
+    created_by: Optional[int],
+    customer_group_id: Optional[int],
+    channel_group_id: Optional[int],
+    team_name: Optional[str],
+    created_date: Optional[str],
+    created_date_start: Optional[str],
+    created_date_end: Optional[str],
+    first_register_date_start: Optional[str],
+    first_register_date_end: Optional[str],
+    owner_name: Optional[str],
+    id_number: Optional[str],
+    plate_no: Optional[str],
+    engine_no: Optional[str],
+    vehicle_model: Optional[str],
+    vin: Optional[str],
+    is_paid: Optional[bool],
+    is_rebate: Optional[bool],
+) -> List[Any]:
+    clauses: List[Any] = []
+
+    tf = str(team_name or "").strip()
+    if tf:
+        _ac_require_team_filter_allowed(role_name=role_name, team_names=team_names, team_filter=tf)
+
+    await _ac_apply_orders_list_acl(
+        current_user=ctx.user,
+        role_name=role_name,
+        team_names=team_names,
+        clauses=clauses,
+    )
+
+    if tf:
+        clauses.append(_ac_order_salesperson_in_teams_expr((tf,)))
+
+    if is_finished is not None:
+        clauses.append(Order.is_finished == bool(is_finished))
+    if is_paid is not None:
+        clauses.append(Order.is_paid == bool(is_paid))
+    if is_rebate is not None:
+        clauses.append(Order.is_rebate == bool(is_rebate))
+    if salesperson_id is not None:
+        clauses.append(Order.salesperson_id == int(salesperson_id))
+    if created_by is not None:
+        clauses.append(Order.created_by == int(created_by))
+    if customer_group_id is not None:
+        clauses.append(Order.customer_group_id == int(customer_group_id))
+    if channel_group_id is not None:
+        clauses.append(Order.channel_group_id == int(channel_group_id))
+
+    if created_date_start or created_date_end:
+        if not created_date_start or not created_date_end:
+            raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
+        rng = _parse_bj_date_span(created_date_start, created_date_end)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
+        start_bj, end_bj = rng
+        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
+    elif created_date:
+        rng = _parse_bj_date_range(created_date)
+        if not rng:
+            raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
+        start_bj, end_bj = rng
+        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
+
+    _add_json_date_range_any(
+        clauses,
+        keys=["first_register_date"],
+        start_ymd=first_register_date_start,
+        end_ymd=first_register_date_end,
+        err_prefix="first_register_date",
+    )
+
+    _add_owner_name_fuzzy(clauses, owner_name)
+    _add_json_fuzzy(clauses, "id_number", id_number)
+    _add_json_fuzzy(clauses, "plate_no", plate_no)
+    _add_json_fuzzy(clauses, "engine_no", engine_no)
+    _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
+    _add_json_fuzzy(clauses, "vin", vin)
+
+    return clauses
+
+
+def _need_join_customer(market: Optional[str]) -> bool:
+    return bool((market or "").strip())
+
+
+def _need_join_info(insurance_expire_date: Optional[str], remark: Optional[str]) -> bool:
+    return bool((insurance_expire_date or "").strip() or (remark or "").strip())
+
+
+def _apply_optional_joins_and_filters(
+    *,
+    stmt,
+    count_stmt,
+    clauses: List[Any],
+    market: Optional[str],
+    insurance_expire_date: Optional[str],
+    remark: Optional[str],
+):
+    need_join_customer = _need_join_customer(market)
+    need_join_info = _need_join_info(insurance_expire_date, remark)
+
+    if need_join_customer:
+        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        count_stmt = count_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        mk = (market or "").strip().lower()
+        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
+
+    if need_join_info:
+        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        count_stmt = count_stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+
+    if (insurance_expire_date or "").strip():
+        d = _parse_ymd(insurance_expire_date)
+        if not d:
+            raise HTTPException(status_code=400, detail="insurance_expire_date must be YYYY-MM-DD")
+        clauses.append(OrderInfo.insurance_expire_date == d)
+
+    if (remark or "").strip():
+        clauses.append(func.lower(func.coalesce(OrderInfo.remark, "")).like(f"%{remark.strip().lower()}%"))
+
+    return stmt, count_stmt
+
+
+def _build_order_list_entity_stmt(order_ids: List[int]):
+    stmt = (
+        select(Order)
+        .where(Order.id.in_(order_ids))
+        .options(
+            selectinload(Order.salesperson).selectinload(User.parent),
+            selectinload(Order.customer_group),
+            selectinload(Order.channel_group),
+            selectinload(Order.order_info),
+        )
+    )
+    return stmt
 
 
 @router.get("/customer-groups", response_model=OptionListOut)
@@ -1162,9 +1179,9 @@ async def list_salespersons(
         .join(UserRole, UserRole.user_id == User.id)
         .join(Role, Role.id == UserRole.role_id)
         .where(Role.role_name == ROLE_SALES)
+        .where(User.status == int(status))
         .order_by(User.id.asc())
     )
-    stmt = stmt.where(User.status == int(status))
 
     if role_name != ROLE_SUPER_ADMIN:
         if role_name == ROLE_MANAGER:
@@ -1449,28 +1466,27 @@ async def finalize_order_upload(
         if sk not in MULTI_SLOTS:
             raise HTTPException(status_code=400, detail=f"暂不支持清空该slot: {sk}")
 
-    resolved_by_slot: Dict[str, List[Dict[str, Any]]] = {}
+    by_slot: Dict[str, List[FinalizeImageIn]] = {}
     for im in payload.images or []:
-        resolved = await _resolve_finalize_image_item(db, order_id=order_id, item=im)
-        sk = str(resolved.get("slot_key", "") or "").strip()
+        sk = str(im.slot_key or "").strip()
         if sk not in ALL_SLOTS:
             raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
-        resolved_by_slot.setdefault(sk, []).append(resolved)
+        by_slot.setdefault(sk, []).append(im)
 
-    normalized_images: List[Dict[str, Any]] = []
-    for sk, ims in resolved_by_slot.items():
+    normalized_images: List[FinalizeImageIn] = []
+    for sk, ims in by_slot.items():
         if sk in MULTI_SLOTS:
             normalized_images.extend(ims)
         else:
             normalized_images.append(ims[-1])
 
-    touched_slots = set(resolved_by_slot.keys()) | set(clear_slots)
+    touched_slots = set(by_slot.keys()) | set(clear_slots)
 
     for sk in touched_slots:
         desired_sks: List[str] = []
-        if sk in resolved_by_slot:
-            for im in resolved_by_slot.get(sk, []) or []:
-                storage_key = str(im.get("storage_key", "") or "").strip().lstrip("/")
+        if sk in by_slot:
+            for im in by_slot.get(sk, []) or []:
+                storage_key = str(im.storage_key or "").strip().lstrip("/")
                 if storage_key:
                     desired_sks.append(storage_key)
 
@@ -1484,19 +1500,18 @@ async def finalize_order_upload(
 
     has_ocr_images = False
     for im in normalized_images:
-        slot_key = str(im.get("slot_key", "") or "").strip()
-        storage_key = str(im.get("storage_key", "") or "").strip().lstrip("/")
-        md5_hex = str(im.get("md5", "") or "").strip().lower()
+        slot_key = str(im.slot_key or "").strip()
+        storage_key = str(im.storage_key or "").strip().lstrip("/")
+        md5_hex = str(im.md5 or "").strip().lower()
 
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        if md5_hex:
-            _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
+        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
-        url = str(im.get("url", "") or "").strip()
+        url = str(im.url or "").strip()
         if not url:
             url = storage.object_url_for_display(storage_key, signed=None, expires_in=900)
 
@@ -1504,10 +1519,10 @@ async def finalize_order_upload(
             db,
             storage_key=storage_key,
             url=url,
-            size=int(im.get("size", 0) or 0),
-            original_name=im.get("original_name"),
-            content_type=im.get("content_type"),
-            etag=im.get("etag"),
+            size=int(im.size or 0),
+            original_name=im.original_name,
+            content_type=im.content_type,
+            etag=im.etag,
             md5=md5_hex,
         )
 
@@ -1606,108 +1621,66 @@ async def list_orders(
     _ensure_orders_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, team_names)
 
-    tf = str(team_name or "").strip()
-    if tf:
-        _ac_require_team_filter_allowed(role_name=role_name, team_names=team_names, team_filter=tf)
-
-    stmt = (
-        select(Order)
-        .options(
-            selectinload(Order.salesperson).selectinload(User.parent),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
-        )
-    )
-    count_stmt = select(func.count(Order.id)).select_from(Order)
-
-    clauses: List = []
-    await _ac_apply_orders_list_acl(
-        current_user=ctx.user,
+    clauses = await _build_order_list_clauses(
+        ctx=ctx,
         role_name=role_name,
         team_names=team_names,
+        is_finished=is_finished,
+        salesperson_id=salesperson_id,
+        created_by=created_by,
+        customer_group_id=customer_group_id,
+        channel_group_id=channel_group_id,
+        team_name=team_name,
+        created_date=created_date,
+        created_date_start=created_date_start,
+        created_date_end=created_date_end,
+        first_register_date_start=first_register_date_start,
+        first_register_date_end=first_register_date_end,
+        owner_name=owner_name,
+        id_number=id_number,
+        plate_no=plate_no,
+        engine_no=engine_no,
+        vehicle_model=vehicle_model,
+        vin=vin,
+        is_paid=is_paid,
+        is_rebate=is_rebate,
+    )
+
+    id_stmt = select(Order.id).select_from(Order)
+    count_stmt = select(func.count(Order.id)).select_from(Order)
+
+    id_stmt, count_stmt = _apply_optional_joins_and_filters(
+        stmt=id_stmt,
+        count_stmt=count_stmt,
         clauses=clauses,
+        market=market,
+        insurance_expire_date=insurance_expire_date,
+        remark=remark,
     )
-
-    if tf:
-        clauses.append(_ac_order_salesperson_in_teams_expr((tf,)))
-
-    if is_finished is not None:
-        clauses.append(Order.is_finished == bool(is_finished))
-    if is_paid is not None:
-        clauses.append(Order.is_paid == bool(is_paid))
-    if is_rebate is not None:
-        clauses.append(Order.is_rebate == bool(is_rebate))
-    if salesperson_id is not None:
-        clauses.append(Order.salesperson_id == int(salesperson_id))
-    if created_by is not None:
-        clauses.append(Order.created_by == int(created_by))
-    if customer_group_id is not None:
-        clauses.append(Order.customer_group_id == int(customer_group_id))
-    if channel_group_id is not None:
-        clauses.append(Order.channel_group_id == int(channel_group_id))
-
-    if created_date_start or created_date_end:
-        if not created_date_start or not created_date_end:
-            raise HTTPException(status_code=400, detail="created_date_start and created_date_end are required")
-        rng = _parse_bj_date_span(created_date_start, created_date_end)
-        if not rng:
-            raise HTTPException(status_code=400, detail="created_date_* must be YYYY-MM-DD and end>=start")
-        start_bj, end_bj = rng
-        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
-    elif created_date:
-        rng = _parse_bj_date_range(created_date)
-        if not rng:
-            raise HTTPException(status_code=400, detail="created_date must be YYYY-MM-DD")
-        start_bj, end_bj = rng
-        clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
-
-    _add_json_date_range_any(
-        clauses,
-        keys=["first_register_date"],
-        start_ymd=first_register_date_start,
-        end_ymd=first_register_date_end,
-        err_prefix="first_register_date",
-    )
-
-    _add_json_fuzzy(clauses, "owner_name", owner_name)
-    _add_json_fuzzy(clauses, "id_number", id_number)
-    _add_json_fuzzy(clauses, "plate_no", plate_no)
-    _add_json_fuzzy(clauses, "engine_no", engine_no)
-    _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
-    _add_json_fuzzy(clauses, "vin", vin)
-
-    need_join_customer = bool((market or "").strip())
-    need_join_info = bool((insurance_expire_date or "").strip() or (remark or "").strip())
-
-    if need_join_customer:
-        stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-        count_stmt = count_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-        mk = (market or "").strip().lower()
-        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
-
-    if need_join_info:
-        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
-        count_stmt = count_stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
-
-    if (insurance_expire_date or "").strip():
-        d = _parse_ymd(insurance_expire_date)
-        if not d:
-            raise HTTPException(status_code=400, detail="insurance_expire_date must be YYYY-MM-DD")
-        clauses.append(OrderInfo.insurance_expire_date == d)
-
-    if (remark or "").strip():
-        clauses.append(func.lower(func.coalesce(OrderInfo.remark, "")).like(f"%{remark.strip().lower()}%"))
 
     if clauses:
-        stmt = stmt.where(and_(*clauses))
-        count_stmt = count_stmt.where(and_(*clauses))
+        condition = and_(*clauses)
+        id_stmt = id_stmt.where(condition)
+        count_stmt = count_stmt.where(condition)
 
-    stmt = stmt.order_by(Order.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    id_stmt = id_stmt.order_by(Order.id.desc()).offset((page - 1) * page_size).limit(page_size)
 
     total = int((await db.execute(count_stmt)).scalar() or 0)
-    rows = (await db.execute(stmt)).scalars().all()
-    items = await _rm_orders_to_list_items(rows)
+    if total <= 0:
+        return OrderListResponse(total=0, items=[])
+
+    id_rows = (await db.execute(id_stmt)).all()
+    order_ids = [int(r[0]) for r in id_rows if r and r[0] is not None]
+    if not order_ids:
+        return OrderListResponse(total=total, items=[])
+
+    entity_stmt = _build_order_list_entity_stmt(order_ids)
+    rows = (await db.execute(entity_stmt)).scalars().all()
+
+    row_map = {int(getattr(o, "id", 0) or 0): o for o in rows}
+    ordered_rows = [row_map[oid] for oid in order_ids if oid in row_map]
+
+    items = await _rm_orders_to_list_items(ordered_rows)
     return OrderListResponse(total=total, items=items)
 
 
@@ -1835,17 +1808,9 @@ async def update_order_detail(
         o.salesperson_id = spid
 
     if payload.customer_group_id is not None:
-        if bool(getattr(o, "is_finished", False)):
-            raise HTTPException(status_code=400, detail="customer_group_id can only be updated when order is unfinished")
-        await _ensure_customer_group_exists(db, int(payload.customer_group_id))
-        o.customer_group_id = int(payload.customer_group_id)
-
+        raise HTTPException(status_code=400, detail="customer_group_id cannot be updated")
     if payload.channel_group_id is not None:
-        if bool(getattr(o, "is_finished", False)):
-            raise HTTPException(status_code=400, detail="channel_group_id can only be updated when order is unfinished")
-        await _ensure_channel_group_exists(db, int(payload.channel_group_id))
-        o.channel_group_id = int(payload.channel_group_id)
-
+        raise HTTPException(status_code=400, detail="channel_group_id cannot be updated")
     if payload.status is not None:
         o.status = int(payload.status)
     if payload.audit_status is not None:

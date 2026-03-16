@@ -29,6 +29,10 @@ if TYPE_CHECKING:
     from app.schemas.order import OrderListItemOut
 
 
+_EMPTY_DICT: Dict[str, Any] = {}
+_EMPTY_LIST: List[Any] = []
+
+
 def _dt_to_ymd(v: Any) -> Optional[str]:
     try:
         if v is None:
@@ -48,34 +52,10 @@ def _trim_or_none(v: Any) -> Optional[str]:
     return s or None
 
 
-def _normalize_dynamic_data(dynamic_data: Any) -> Dict[str, Any]:
-    if not isinstance(dynamic_data, dict):
-        return {}
-
-    dd = dict(dynamic_data)
-
-    if "first_register_date" in dd:
-        dd["first_register_date"] = norm_fuzzy_date_text(dd.get("first_register_date"))
-
-    return dd
-
-
-def _list_dynamic_data_out(dynamic_data: Any) -> OrderListDynamicDataOut:
-    """
-    列表页专用 dynamic_data 输出：
-    仅保留当前前端真实消费字段。
-    """
-    dd = _normalize_dynamic_data(dynamic_data)
-
-    return OrderListDynamicDataOut(
-        owner_name=_trim_or_none(dd.get("owner_name")),
-        plate_no=_trim_or_none(dd.get("plate_no")),
-        vin=_trim_or_none(dd.get("vin")),
-        engine_no=_trim_or_none(dd.get("engine_no")),
-        vehicle_model=_trim_or_none(dd.get("vehicle_model")),
-        first_register_date=norm_fuzzy_date_text(dd.get("first_register_date")),
-        id_number=_trim_or_none(dd.get("id_number")),
-    )
+def _trim_or_empty(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
 
 
 def _to_float(v: Any) -> Optional[float]:
@@ -87,22 +67,254 @@ def _to_float(v: Any) -> Optional[float]:
         if isinstance(v, (int, float)):
             return float(v)
         s = str(v).strip()
-        if s == "":
+        if not s:
             return None
         return float(s)
     except Exception:
         return None
 
 
+def _safe_dict(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else _EMPTY_DICT
+
+
+def _pick_first_non_empty(d: Dict[str, Any], *keys: str) -> Optional[str]:
+    if not d:
+        return None
+    for k in keys:
+        val = d.get(k)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
+
+def _pick_ocr_words_result_text(block: Dict[str, Any], field_name: str) -> Optional[str]:
+    if not isinstance(block, dict):
+        return None
+    words_result = block.get("words_result")
+    if not isinstance(words_result, dict):
+        return None
+    node = words_result.get(field_name)
+    if not isinstance(node, dict):
+        return None
+    return _trim_or_none(node.get("words"))
+
+
+def _resolve_owner_name(dd: Dict[str, Any], ocr_raw: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """
+    车主兜底顺序（按你当前真实数据口径补齐）：
+    1. dynamic_data.owner_name
+    2. 车辆合格证相关 owner 键
+    3. 行驶证相关 owner 键
+    4. 身份证相关 name / id_name 键
+    5. ocr_raw_json.idcard_front.words_result.姓名.words
+    """
+    if dd:
+        owner = _pick_first_non_empty(
+            dd,
+            "owner_name",
+            "id_name",
+            "name",
+            "person_name",
+        )
+        if owner:
+            return owner
+
+        vehicle_cert = dd.get("vehicle_cert")
+        if isinstance(vehicle_cert, dict):
+            owner = _pick_first_non_empty(
+                vehicle_cert,
+                "owner_name",
+                "vehicle_cert_owner_name",
+                "vehicle_owner_name",
+                "certificate_owner_name",
+                "name",
+            )
+            if owner:
+                return owner
+
+        owner = _pick_first_non_empty(
+            dd,
+            "vehicle_cert_owner_name",
+            "vehicle_owner_name",
+            "certificate_owner_name",
+        )
+        if owner:
+            return owner
+
+        driving_license = dd.get("driving_license")
+        if isinstance(driving_license, dict):
+            owner = _pick_first_non_empty(
+                driving_license,
+                "owner_name",
+                "driving_license_owner_name",
+                "license_owner_name",
+                "name",
+            )
+            if owner:
+                return owner
+
+        driving_license_main = dd.get("driving_license_main")
+        if isinstance(driving_license_main, dict):
+            owner = _pick_first_non_empty(
+                driving_license_main,
+                "owner_name",
+                "driving_license_owner_name",
+                "license_owner_name",
+                "name",
+            )
+            if owner:
+                return owner
+
+        driving_license_sub = dd.get("driving_license_sub")
+        if isinstance(driving_license_sub, dict):
+            owner = _pick_first_non_empty(
+                driving_license_sub,
+                "owner_name",
+                "driving_license_owner_name",
+                "license_owner_name",
+                "name",
+            )
+            if owner:
+                return owner
+
+        owner = _pick_first_non_empty(
+            dd,
+            "driving_license_owner_name",
+            "license_owner_name",
+        )
+        if owner:
+            return owner
+
+        idcard = dd.get("idcard")
+        if isinstance(idcard, dict):
+            owner = _pick_first_non_empty(
+                idcard,
+                "name",
+                "id_name",
+                "owner_name",
+                "idcard_name",
+                "id_card_name",
+                "identity_name",
+            )
+            if owner:
+                return owner
+
+        idcard_front = dd.get("idcard_front")
+        if isinstance(idcard_front, dict):
+            owner = _pick_first_non_empty(
+                idcard_front,
+                "name",
+                "id_name",
+                "owner_name",
+                "idcard_name",
+                "id_card_name",
+                "identity_name",
+            )
+            if owner:
+                return owner
+
+        idcard_back = dd.get("idcard_back")
+        if isinstance(idcard_back, dict):
+            owner = _pick_first_non_empty(
+                idcard_back,
+                "name",
+                "id_name",
+                "owner_name",
+                "idcard_name",
+                "id_card_name",
+                "identity_name",
+            )
+            if owner:
+                return owner
+
+        owner = _pick_first_non_empty(
+            dd,
+            "idcard_name",
+            "id_card_name",
+            "identity_name",
+            "id_name",
+        )
+        if owner:
+            return owner
+
+    ocr = ocr_raw if isinstance(ocr_raw, dict) else _EMPTY_DICT
+    if ocr:
+        owner = _pick_ocr_words_result_text(ocr.get("idcard_front") or {}, "姓名")
+        if owner:
+            return owner
+
+        owner = _pick_ocr_words_result_text(ocr.get("driving_license_main") or {}, "所有人")
+        if owner:
+            return owner
+
+        owner = _pick_ocr_words_result_text(ocr.get("driving_license") or {}, "所有人")
+        if owner:
+            return owner
+
+    return None
+
+
+def _normalize_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Dict[str, Any]:
+    src = _safe_dict(dynamic_data)
+    if not src:
+        dd: Dict[str, Any] = {}
+    else:
+        dd = dict(src)
+
+    first_register_date = dd.get("first_register_date")
+    if first_register_date is not None:
+        dd["first_register_date"] = norm_fuzzy_date_text(first_register_date)
+
+    resolved_owner_name = _resolve_owner_name(dd, _safe_dict(ocr_raw_json))
+    if resolved_owner_name:
+        dd["owner_name"] = resolved_owner_name
+    elif "owner_name" in dd:
+        dd["owner_name"] = _trim_or_none(dd.get("owner_name"))
+
+    return dd
+
+
+def _list_dynamic_data_out(dynamic_data: Any, ocr_raw_json: Any = None) -> OrderListDynamicDataOut:
+    """
+    列表页专用 dynamic_data 输出：
+    仅保留当前前端真实消费字段。
+    """
+    dd = _normalize_dynamic_data(dynamic_data, ocr_raw_json=ocr_raw_json)
+
+    first_register_date = dd.get("first_register_date")
+    if first_register_date is not None:
+        first_register_date = norm_fuzzy_date_text(first_register_date)
+
+    return OrderListDynamicDataOut(
+        owner_name=_trim_or_none(dd.get("owner_name")),
+        plate_no=_trim_or_none(dd.get("plate_no")),
+        vin=_trim_or_none(dd.get("vin")),
+        engine_no=_trim_or_none(dd.get("engine_no")),
+        vehicle_model=_trim_or_none(dd.get("vehicle_model")),
+        first_register_date=first_register_date,
+        id_number=_trim_or_none(dd.get("id_number")),
+    )
+
+
 def _split_team_names_csv(v: Any) -> List[str]:
     raw = str(v or "").strip()
     if not raw:
         return []
+
+    parts = raw.split(",")
     out: List[str] = []
-    for part in raw.split(","):
-        s = str(part or "").strip()
-        if s and s not in out:
-            out.append(s)
+    seen = set()
+
+    for part in parts:
+        s = part.strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
     return out
 
 
@@ -111,20 +323,20 @@ def _group_code_name(g) -> Optional[str]:
         return None
 
     code = (
-            getattr(g, "channel_code", None)
-            or getattr(g, "customer_code", None)
-            or getattr(g, "group_code", None)
-            or getattr(g, "code", None)
+        getattr(g, "channel_code", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "group_code", None)
+        or getattr(g, "code", None)
     )
     name = (
-            getattr(g, "channel_name", None)
-            or getattr(g, "customer_name", None)
-            or getattr(g, "group_name", None)
-            or getattr(g, "name", None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
     )
 
-    code_s = str(code).strip() if code is not None and str(code).strip() else ""
-    name_s = str(name).strip() if name is not None and str(name).strip() else ""
+    code_s = _trim_or_empty(code)
+    name_s = _trim_or_empty(name)
 
     if code_s and name_s:
         return f"{code_s} - {name_s}"
@@ -142,12 +354,13 @@ def _order_info_out(info) -> Optional[OrderInfoOut]:
     if not info:
         return None
 
-    remark = getattr(info, "remark", None)
-    remark_s = str(remark).strip() if remark is not None and str(remark).strip() else None
+    insurance_expire_date = _dt_to_ymd(getattr(info, "insurance_expire_date", None))
+    owner_phone = _trim_or_none(getattr(info, "owner_phone", None))
+    remark = _trim_or_none(getattr(info, "remark", None))
 
     return OrderInfoOut(
-        insurance_expire_date=_dt_to_ymd(getattr(info, "insurance_expire_date", None)),
-        owner_phone=(str(getattr(info, "owner_phone", "") or "").strip() or None),
+        insurance_expire_date=insurance_expire_date,
+        owner_phone=owner_phone,
 
         commercial_amount=_to_float(getattr(info, "commercial_amount", None)),
         compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)),
@@ -172,7 +385,7 @@ def _order_info_out(info) -> Optional[OrderInfoOut]:
         customer_total=_to_float(getattr(info, "customer_total", None)),
 
         profit=_to_float(getattr(info, "profit", None)),
-        remark=remark_s,
+        remark=remark,
     )
 
 
@@ -226,29 +439,33 @@ def _safe_get_loaded_images(order: Order) -> Optional[List[OrderImage]]:
 
 
 def to_order_out(
-        o: Order,
-        *,
-        storage: StorageService,
-        images_by_order_id: Dict[int, List[OrderImage]],
+    o: Order,
+    *,
+    storage: StorageService,
+    images_by_order_id: Dict[int, List[OrderImage]],
 ) -> OrderOut:
     """统一 Order ORM -> OrderOut 映射（严格按 schemas.order.OrderOut 契约）。"""
+    order_id = int(getattr(o, "id", 0) or 0)
+
     imgs_loaded = _safe_get_loaded_images(o)
     if imgs_loaded is not None:
         setattr(o, "images", imgs_loaded)
     else:
-        setattr(o, "images", images_by_order_id.get(int(getattr(o, "id", 0) or 0), []) or [])
+        setattr(o, "images", images_by_order_id.get(order_id, _EMPTY_LIST) or _EMPTY_LIST)
 
-    dyn_norm = _normalize_dynamic_data(getattr(o, "dynamic_data", None))
     ocr_raw = dict(getattr(o, "ocr_raw_json", None) or {})
+    dyn_norm = _normalize_dynamic_data(getattr(o, "dynamic_data", None), ocr_raw_json=ocr_raw)
 
     from app.utils.order_image_urls import build_slot_images  # local import
+
     slot_images = build_slot_images(o, storage)
 
     customer_group = getattr(o, "customer_group", None)
     channel_group = getattr(o, "channel_group", None)
+    order_info = getattr(o, "order_info", None)
 
     return OrderOut(
-        id=int(getattr(o, "id", 0) or 0),
+        id=order_id,
         module=str(getattr(o, "module", "") or "order"),
         created_by=int(getattr(o, "created_by", 0) or 0),
         salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
@@ -264,7 +481,7 @@ def to_order_out(
         dynamic_data=dyn_norm,
         ocr_raw_json=ocr_raw,
         slot_images=slot_images,
-        order_info=_order_info_out(getattr(o, "order_info", None)),
+        order_info=_order_info_out(order_info),
         created_at=_dt_to_ymd(getattr(o, "created_at", None)),
         updated_at=_dt_to_ymd(getattr(o, "updated_at", None)),
     )
@@ -278,29 +495,30 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
     from app.schemas.order import OrderListItemOut  # local import to avoid cycles
 
     out: List[OrderListItemOut] = []
+    append_item = out.append
+
     for o in orders:
         salesperson = getattr(o, "salesperson", None)
         customer_group = getattr(o, "customer_group", None)
         channel_group = getattr(o, "channel_group", None)
         order_info = getattr(o, "order_info", None)
+        ocr_raw = getattr(o, "ocr_raw_json", None)
 
-        salesperson_name = (
-                str(getattr(salesperson, "real_name", "") or "").strip()
-                or str(getattr(salesperson, "username", "") or "").strip()
-                or None
-        )
-        manager_name = (
-                str(getattr(getattr(salesperson, "parent", None), "real_name", "") or "").strip()
-                or str(getattr(getattr(salesperson, "parent", None), "username", "") or "").strip()
-                or None
-        )
+        sp_real_name = _trim_or_empty(getattr(salesperson, "real_name", None))
+        sp_username = _trim_or_empty(getattr(salesperson, "username", None))
+        salesperson_name = sp_real_name or sp_username or None
 
-        team_name = str(getattr(salesperson, "team_name", "") or "").strip() or None
+        parent = getattr(salesperson, "parent", None)
+        manager_real_name = _trim_or_empty(getattr(parent, "real_name", None))
+        manager_username = _trim_or_empty(getattr(parent, "username", None))
+        manager_name = manager_real_name or manager_username or None
+
+        team_name = _trim_or_none(getattr(salesperson, "team_name", None))
         team_names = _split_team_names_csv(getattr(salesperson, "team_names", None))
         if team_name and team_name not in team_names:
             team_names.append(team_name)
 
-        out.append(
+        append_item(
             OrderListItemOut(
                 id=int(getattr(o, "id", 0) or 0),
 
@@ -308,15 +526,9 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
 
-                customer_group_name=(
-                        str(getattr(customer_group, "customer_name", "") or "").strip() or None
-                ),
-                channel_group_name=(
-                        str(getattr(channel_group, "channel_name", "") or "").strip() or None
-                ),
-                customer_group_market=(
-                        str(getattr(customer_group, "market", "") or "").strip() or None
-                ),
+                customer_group_name=_trim_or_none(getattr(customer_group, "customer_name", None)),
+                channel_group_name=_trim_or_none(getattr(channel_group, "channel_name", None)),
+                customer_group_market=_trim_or_none(getattr(customer_group, "market", None)),
 
                 salesperson_name=salesperson_name,
                 manager_name=manager_name,
@@ -329,11 +541,12 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
                 status=int(getattr(o, "status", 0) or 0),
                 audit_status=int(getattr(o, "audit_status", 0) or 0),
 
-                dynamic_data=_list_dynamic_data_out(getattr(o, "dynamic_data", None)),
+                dynamic_data=_list_dynamic_data_out(getattr(o, "dynamic_data", None), ocr_raw_json=ocr_raw),
                 order_info=_list_order_info_out(order_info),
 
                 created_at=_dt_to_ymd(getattr(o, "created_at", None)),
                 updated_at=_dt_to_ymd(getattr(o, "updated_at", None)),
             )
         )
+
     return out
