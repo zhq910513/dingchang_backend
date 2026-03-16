@@ -1,19 +1,18 @@
 # encoding: utf-8
 from __future__ import annotations
 
+import anyio
 import hashlib
 import inspect
 import re
 from datetime import date, datetime, timedelta
-from typing import Optional, Any, Dict, List, Tuple, Set
-
-import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from typing import Optional, Any, Dict, List, Tuple, Set
 
 from app.api.deps import get_current_user_with_role_and_teams, CurrentUserContext
 from app.core.access_control import (
@@ -73,6 +72,31 @@ OCR_SLOTS = {
 NON_OCR_SLOTS = {"related"}
 ALL_SLOTS = OCR_SLOTS | NON_OCR_SLOTS
 MULTI_SLOTS = {"related"}
+
+# OrderInfo 模型中所有 nullable=False 的数值列。
+# 这些列在 Python 内存态与最终落库态都不允许为 None。
+ORDER_INFO_NON_NULL_NUMERIC_FIELDS: List[str] = [
+    "commercial_amount",
+    "compulsory_amount",
+    "vehicle_tax_amount",
+    "non_vehicle_amount",
+    "premium_total",
+    "channel_commercial_point",
+    "channel_commercial_supplement_point",
+    "channel_compulsory_point",
+    "channel_vehicle_tax_point",
+    "channel_non_vehicle_point",
+    "channel_reward",
+    "channel_total",
+    "customer_commercial_point",
+    "customer_commercial_supplement_point",
+    "customer_compulsory_point",
+    "customer_vehicle_tax_point",
+    "customer_non_vehicle_point",
+    "customer_reward",
+    "customer_total",
+    "profit",
+]
 
 
 class OptionItem(BaseModel):
@@ -465,6 +489,28 @@ def _float_or_none(v: Any) -> Optional[float]:
         raise HTTPException(status_code=400, detail="order_info numeric field invalid")
 
 
+def _float_or_zero(v: Any) -> float:
+    """
+    用于 OrderInfo 中 nullable=False 的数值列：
+    - 前端未填写 / null / 空字符串 => 统一归一成 0.0
+    - 非法值 => 400
+    """
+    if v is None:
+        return 0.0
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            raise HTTPException(status_code=400, detail="order_info numeric field invalid")
+    try:
+        return float(v)
+    except Exception:
+        raise HTTPException(status_code=400, detail="order_info numeric field invalid")
+
+
 def _trim_or_none(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -482,92 +528,73 @@ def _num_or_zero(v: Any) -> float:
 
 
 def _recalc_order_info_derived(info: OrderInfo) -> None:
-    commercial = getattr(info, "commercial_amount", None)
-    compulsory = getattr(info, "compulsory_amount", None)
-    vehicle_tax = getattr(info, "vehicle_tax_amount", None)
-    non_vehicle = getattr(info, "non_vehicle_amount", None)
-
-    commercial = None if commercial is None else max(0.0, float(commercial))
-    compulsory = None if compulsory is None else max(0.0, float(compulsory))
-    vehicle_tax = None if vehicle_tax is None else max(0.0, float(vehicle_tax))
-    non_vehicle = None if non_vehicle is None else max(0.0, float(non_vehicle))
+    """
+    严格口径：
+    - OrderInfo 的数值列在当前模型中全部为 nullable=False
+    - 因此这里不再向任何数值列写入 None
+    - 所有金额/点位/合计/利润，统一保持非空数值语义
+    """
+    commercial = max(0.0, _num_or_zero(getattr(info, "commercial_amount", 0.0)))
+    compulsory = max(0.0, _num_or_zero(getattr(info, "compulsory_amount", 0.0)))
+    vehicle_tax = max(0.0, _num_or_zero(getattr(info, "vehicle_tax_amount", 0.0)))
+    non_vehicle = max(0.0, _num_or_zero(getattr(info, "non_vehicle_amount", 0.0)))
 
     info.commercial_amount = commercial
     info.compulsory_amount = compulsory
     info.vehicle_tax_amount = vehicle_tax
     info.non_vehicle_amount = non_vehicle
 
-    has_any_money = any(x is not None for x in [commercial, compulsory, vehicle_tax, non_vehicle])
+    premium_total = commercial + compulsory + vehicle_tax + non_vehicle
+    info.premium_total = premium_total
 
-    premium_total = (
-            _num_or_zero(commercial)
-            + _num_or_zero(compulsory)
-            + _num_or_zero(vehicle_tax)
-            + _num_or_zero(non_vehicle)
-    )
-    info.premium_total = premium_total if has_any_money else None
+    ch_commercial_point = _num_or_zero(getattr(info, "channel_commercial_point", 0.0))
+    ch_commercial_supplement_point = _num_or_zero(getattr(info, "channel_commercial_supplement_point", 0.0))
+    ch_compulsory_point = _num_or_zero(getattr(info, "channel_compulsory_point", 0.0))
+    ch_vehicle_tax_point = _num_or_zero(getattr(info, "channel_vehicle_tax_point", 0.0))
+    ch_non_vehicle_point = _num_or_zero(getattr(info, "channel_non_vehicle_point", 0.0))
+    ch_reward = _num_or_zero(getattr(info, "channel_reward", 0.0))
 
-    ch_commercial_point = getattr(info, "channel_commercial_point", None)
-    ch_commercial_supplement_point = getattr(info, "channel_commercial_supplement_point", None)
-    ch_compulsory_point = getattr(info, "channel_compulsory_point", None)
-    ch_vehicle_tax_point = getattr(info, "channel_vehicle_tax_point", None)
-    ch_non_vehicle_point = getattr(info, "channel_non_vehicle_point", None)
-    ch_reward = getattr(info, "channel_reward", None)
+    cu_commercial_point = _num_or_zero(getattr(info, "customer_commercial_point", 0.0))
+    cu_commercial_supplement_point = _num_or_zero(getattr(info, "customer_commercial_supplement_point", 0.0))
+    cu_compulsory_point = _num_or_zero(getattr(info, "customer_compulsory_point", 0.0))
+    cu_vehicle_tax_point = _num_or_zero(getattr(info, "customer_vehicle_tax_point", 0.0))
+    cu_non_vehicle_point = _num_or_zero(getattr(info, "customer_non_vehicle_point", 0.0))
+    cu_reward = _num_or_zero(getattr(info, "customer_reward", 0.0))
 
-    cu_commercial_point = getattr(info, "customer_commercial_point", None)
-    cu_commercial_supplement_point = getattr(info, "customer_commercial_supplement_point", None)
-    cu_compulsory_point = getattr(info, "customer_compulsory_point", None)
-    cu_vehicle_tax_point = getattr(info, "customer_vehicle_tax_point", None)
-    cu_non_vehicle_point = getattr(info, "customer_non_vehicle_point", None)
-    cu_reward = getattr(info, "customer_reward", None)
+    info.channel_commercial_point = ch_commercial_point
+    info.channel_commercial_supplement_point = ch_commercial_supplement_point
+    info.channel_compulsory_point = ch_compulsory_point
+    info.channel_vehicle_tax_point = ch_vehicle_tax_point
+    info.channel_non_vehicle_point = ch_non_vehicle_point
+    info.channel_reward = ch_reward
 
-    has_any_channel_cfg = any(
-        x is not None
-        for x in [
-            ch_commercial_point,
-            ch_commercial_supplement_point,
-            ch_compulsory_point,
-            ch_vehicle_tax_point,
-            ch_non_vehicle_point,
-            ch_reward,
-        ]
-    )
-    has_any_customer_cfg = any(
-        x is not None
-        for x in [
-            cu_commercial_point,
-            cu_commercial_supplement_point,
-            cu_compulsory_point,
-            cu_vehicle_tax_point,
-            cu_non_vehicle_point,
-            cu_reward,
-        ]
-    )
+    info.customer_commercial_point = cu_commercial_point
+    info.customer_commercial_supplement_point = cu_commercial_supplement_point
+    info.customer_compulsory_point = cu_compulsory_point
+    info.customer_vehicle_tax_point = cu_vehicle_tax_point
+    info.customer_non_vehicle_point = cu_non_vehicle_point
+    info.customer_reward = cu_reward
 
     channel_total = (
-            _num_or_zero(commercial) * (_num_or_zero(ch_commercial_point) / 100.0)
-            + _num_or_zero(commercial) * (_num_or_zero(ch_commercial_supplement_point) / 100.0)
-            + _num_or_zero(compulsory) * (_num_or_zero(ch_compulsory_point) / 100.0)
-            + _num_or_zero(vehicle_tax) * (_num_or_zero(ch_vehicle_tax_point) / 100.0)
-            + _num_or_zero(non_vehicle) * (_num_or_zero(ch_non_vehicle_point) / 100.0)
-            + _num_or_zero(ch_reward)
+            commercial * (ch_commercial_point / 100.0)
+            + commercial * (ch_commercial_supplement_point / 100.0)
+            + compulsory * (ch_compulsory_point / 100.0)
+            + vehicle_tax * (ch_vehicle_tax_point / 100.0)
+            + non_vehicle * (ch_non_vehicle_point / 100.0)
+            + ch_reward
     )
     customer_total = (
-            _num_or_zero(commercial) * (_num_or_zero(cu_commercial_point) / 100.0)
-            + _num_or_zero(commercial) * (_num_or_zero(cu_commercial_supplement_point) / 100.0)
-            + _num_or_zero(compulsory) * (_num_or_zero(cu_compulsory_point) / 100.0)
-            + _num_or_zero(vehicle_tax) * (_num_or_zero(cu_vehicle_tax_point) / 100.0)
-            + _num_or_zero(non_vehicle) * (_num_or_zero(cu_non_vehicle_point) / 100.0)
-            + _num_or_zero(cu_reward)
+            commercial * (cu_commercial_point / 100.0)
+            + commercial * (cu_commercial_supplement_point / 100.0)
+            + compulsory * (cu_compulsory_point / 100.0)
+            + vehicle_tax * (cu_vehicle_tax_point / 100.0)
+            + non_vehicle * (cu_non_vehicle_point / 100.0)
+            + cu_reward
     )
 
-    info.channel_total = channel_total if (has_any_money or has_any_channel_cfg) else None
-    info.customer_total = customer_total if (has_any_money or has_any_customer_cfg) else None
-
-    if info.channel_total is None or info.customer_total is None:
-        info.profit = None
-    else:
-        info.profit = _num_or_zero(info.channel_total) - _num_or_zero(info.customer_total)
+    info.channel_total = channel_total
+    info.customer_total = customer_total
+    info.profit = channel_total - customer_total
 
 
 def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
@@ -578,28 +605,6 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
 
     text_fields = ["owner_phone", "remark"]
     date_fields = ["insurance_expire_date"]
-    numeric_fields = [
-        "commercial_amount",
-        "compulsory_amount",
-        "vehicle_tax_amount",
-        "non_vehicle_amount",
-        "premium_total",
-        "channel_commercial_point",
-        "channel_commercial_supplement_point",
-        "channel_compulsory_point",
-        "channel_vehicle_tax_point",
-        "channel_non_vehicle_point",
-        "channel_reward",
-        "channel_total",
-        "customer_commercial_point",
-        "customer_commercial_supplement_point",
-        "customer_compulsory_point",
-        "customer_vehicle_tax_point",
-        "customer_non_vehicle_point",
-        "customer_reward",
-        "customer_total",
-        "profit",
-    ]
 
     for name in text_fields:
         if name in fs:
@@ -609,10 +614,13 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
         if name in fs:
             setattr(info, name, _parse_date_or_none(getattr(payload, name, None)))
 
-    for name in numeric_fields:
+    # 当前 OrderInfo 模型中，这些列全部为 nullable=False；
+    # 因此 patch 时不允许把空值写成 None，统一归一成 0.0。
+    for name in ORDER_INFO_NON_NULL_NUMERIC_FIELDS:
         if name in fs:
-            setattr(info, name, _float_or_none(getattr(payload, name, None)))
+            setattr(info, name, _float_or_zero(getattr(payload, name, None)))
 
+    # 统一以后端口径重算派生字段，避免前端脏值、空值或部分字段更新导致不一致。
     _recalc_order_info_derived(info)
 
 
@@ -1741,7 +1749,7 @@ _salesperson_in_current_teams_or_403 = _ac_salesperson_in_current_teams_or_403
 _require_team_for_non_super_admin = _ac_require_team_for_non_super_admin
 _require_single_team_for_strict_roles = _ac_require_single_team_for_strict_roles
 _allowed_teams_for_user = _ac_allowed_teams_for_user
-_require_team_filter_allowed = _ac_require_team_filter_allowed
+_require_team_filter_ALLOWED = _ac_require_team_filter_allowed
 _ac_ensure_user_in_teams = _ac_ensure_user_in_teams
 _ac_ensure_order_read_acl_by_salesperson_id = _ac_ensure_order_read_acl_by_salesperson_id
 _ac_ensure_order_write_acl_by_salesperson_id = _ac_ensure_order_write_acl_by_salesperson_id
