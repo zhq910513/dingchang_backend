@@ -73,8 +73,6 @@ NON_OCR_SLOTS = {"related"}
 ALL_SLOTS = OCR_SLOTS | NON_OCR_SLOTS
 MULTI_SLOTS = {"related"}
 
-# OrderInfo 模型中所有 nullable=False 的数值列。
-# 这些列在 Python 内存态与最终落库态都不允许为 None。
 ORDER_INFO_NON_NULL_NUMERIC_FIELDS: List[str] = [
     "commercial_amount",
     "compulsory_amount",
@@ -145,7 +143,9 @@ class OrderDraftOut(BaseModel):
 
 class FinalizeImageIn(BaseModel):
     slot_key: str
-    storage_key: str
+    order_image_id: Optional[int] = None
+    image_file_id: Optional[int] = None
+    storage_key: Optional[str] = None
     md5: str = ""
     size: int = 0
     content_type: Optional[str] = None
@@ -244,12 +244,12 @@ def _group_display_name(g) -> Optional[str]:
     if not g:
         return None
     return (
-            getattr(g, "channel_name", None)
-            or getattr(g, "customer_name", None)
-            or getattr(g, "group_name", None)
-            or getattr(g, "name", None)
-            or getattr(g, "customer_code", None)
-            or getattr(g, "channel_code", None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "channel_code", None)
     )
 
 
@@ -258,16 +258,16 @@ def _group_code_name(g) -> Optional[str]:
         return None
 
     code = (
-            getattr(g, "channel_code", None)
-            or getattr(g, "customer_code", None)
-            or getattr(g, "group_code", None)
-            or getattr(g, "code", None)
+        getattr(g, "channel_code", None)
+        or getattr(g, "customer_code", None)
+        or getattr(g, "group_code", None)
+        or getattr(g, "code", None)
     )
     name = (
-            getattr(g, "channel_name", None)
-            or getattr(g, "customer_name", None)
-            or getattr(g, "group_name", None)
-            or getattr(g, "name", None)
+        getattr(g, "channel_name", None)
+        or getattr(g, "customer_name", None)
+        or getattr(g, "group_name", None)
+        or getattr(g, "name", None)
     )
 
     code_s = str(code).strip() if code is not None and str(code).strip() else ""
@@ -293,6 +293,29 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
     u = (await db.execute(q)).scalar_one_or_none()
     if u is None:
         raise HTTPException(status_code=400, detail="salesperson_id 不存在")
+
+
+async def _ensure_customer_group_exists(db: AsyncSession, customer_group_id: int) -> None:
+    try:
+        gid = int(customer_group_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="customer_group_id 非法")
+    q = select(CustomerGroup.id).where(CustomerGroup.id == gid)
+    x = (await db.execute(q)).scalar_one_or_none()
+    if x is None:
+        raise HTTPException(status_code=400, detail="customer_group_id 不存在")
+
+
+async def _ensure_channel_group_exists(db: AsyncSession, channel_group_id: int) -> None:
+    try:
+        gid = int(channel_group_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="channel_group_id 非法")
+    from app.models.channel_group import ChannelGroup
+    q = select(ChannelGroup.id).where(ChannelGroup.id == gid)
+    x = (await db.execute(q)).scalar_one_or_none()
+    if x is None:
+        raise HTTPException(status_code=400, detail="channel_group_id 不存在")
 
 
 def _ensure_orders_access(role_name: Optional[str]) -> None:
@@ -490,11 +513,6 @@ def _float_or_none(v: Any) -> Optional[float]:
 
 
 def _float_or_zero(v: Any) -> float:
-    """
-    用于 OrderInfo 中 nullable=False 的数值列：
-    - 前端未填写 / null / 空字符串 => 统一归一成 0.0
-    - 非法值 => 400
-    """
     if v is None:
         return 0.0
     if isinstance(v, str):
@@ -528,12 +546,6 @@ def _num_or_zero(v: Any) -> float:
 
 
 def _recalc_order_info_derived(info: OrderInfo) -> None:
-    """
-    严格口径：
-    - OrderInfo 的数值列在当前模型中全部为 nullable=False
-    - 因此这里不再向任何数值列写入 None
-    - 所有金额/点位/合计/利润，统一保持非空数值语义
-    """
     commercial = max(0.0, _num_or_zero(getattr(info, "commercial_amount", 0.0)))
     compulsory = max(0.0, _num_or_zero(getattr(info, "compulsory_amount", 0.0)))
     vehicle_tax = max(0.0, _num_or_zero(getattr(info, "vehicle_tax_amount", 0.0)))
@@ -576,12 +588,12 @@ def _recalc_order_info_derived(info: OrderInfo) -> None:
     info.customer_reward = cu_reward
 
     channel_total = (
-            commercial * (ch_commercial_point / 100.0)
-            + commercial * (ch_commercial_supplement_point / 100.0)
-            + compulsory * (ch_compulsory_point / 100.0)
-            + vehicle_tax * (ch_vehicle_tax_point / 100.0)
-            + non_vehicle * (ch_non_vehicle_point / 100.0)
-            + ch_reward
+        commercial * (ch_commercial_point / 100.0)
+        + commercial * (ch_commercial_supplement_point / 100.0)
+        + compulsory * (ch_compulsory_point / 100.0)
+        + vehicle_tax * (ch_vehicle_tax_point / 100.0)
+        + non_vehicle * (ch_non_vehicle_point / 100.0)
+        + ch_reward
     )
     customer_total = (
             commercial * (cu_commercial_point / 100.0)
@@ -614,23 +626,20 @@ def _apply_order_info_patch(info: OrderInfo, payload: OrderInfoIn) -> None:
         if name in fs:
             setattr(info, name, _parse_date_or_none(getattr(payload, name, None)))
 
-    # 当前 OrderInfo 模型中，这些列全部为 nullable=False；
-    # 因此 patch 时不允许把空值写成 None，统一归一成 0.0。
     for name in ORDER_INFO_NON_NULL_NUMERIC_FIELDS:
         if name in fs:
             setattr(info, name, _float_or_zero(getattr(payload, name, None)))
 
-    # 统一以后端口径重算派生字段，避免前端脏值、空值或部分字段更新导致不一致。
     _recalc_order_info_derived(info)
 
 
 def _add_json_date_range_any(
-        clauses: list,
-        *,
-        keys: List[str],
-        start_ymd: Optional[str],
-        end_ymd: Optional[str],
-        err_prefix: str,
+    clauses: list,
+    *,
+    keys: List[str],
+    start_ymd: Optional[str],
+    end_ymd: Optional[str],
+    err_prefix: str,
 ):
     s = (start_ymd or "").strip()
     e = (end_ymd or "").strip()
@@ -705,15 +714,15 @@ async def _compute_md5_and_size(up: UploadFile) -> Tuple[str, int]:
 
 
 async def _get_or_create_image_file(
-        db: AsyncSession,
-        *,
-        storage_key: str,
-        url: str,
-        size: int,
-        original_name: Optional[str],
-        content_type: Optional[str],
-        etag: Optional[str],
-        md5: str,
+    db: AsyncSession,
+    *,
+    storage_key: str,
+    url: str,
+    size: int,
+    original_name: Optional[str],
+    content_type: Optional[str],
+    etag: Optional[str],
+    md5: str,
 ) -> ImageFile:
     storage_key = (storage_key or "").strip().lstrip("/")
     md5 = (md5 or "").strip().lower()
@@ -796,12 +805,172 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
         raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
 
 
+async def _resolve_finalize_image_item(
+    db: AsyncSession,
+    *,
+    order_id: int,
+    item: FinalizeImageIn,
+) -> Dict[str, Any]:
+    slot_key = str(item.slot_key or "").strip()
+    if slot_key not in ALL_SLOTS:
+        raise HTTPException(status_code=400, detail=f"非法 slot_key: {slot_key}")
+
+    order_image_id = int(item.order_image_id) if item.order_image_id is not None else None
+    image_file_id = int(item.image_file_id) if item.image_file_id is not None else None
+    storage_key = str(item.storage_key or "").strip().lstrip("/")
+    md5_hex = str(item.md5 or "").strip().lower()
+
+    if order_image_id is not None:
+        stmt = (
+            select(OrderImage)
+            .options(selectinload(OrderImage.image_file))
+            .where(and_(OrderImage.id == order_image_id, OrderImage.order_id == order_id))
+        )
+        oi = (await db.execute(stmt)).scalar_one_or_none()
+        if not oi:
+            raise HTTPException(status_code=400, detail=f"order_image_id not found in current order: {order_image_id}")
+
+        oi_slot = str(getattr(oi, "slot_key", "") or "").strip()
+        if oi_slot != slot_key:
+            raise HTTPException(status_code=400, detail="order_image_id slot_key mismatch")
+
+        imf = getattr(oi, "image_file", None)
+        resolved_storage_key = str(getattr(oi, "storage_key", "") or "").strip().lstrip("/")
+        if not resolved_storage_key and imf is not None:
+            resolved_storage_key = str(getattr(imf, "storage_key", "") or "").strip().lstrip("/")
+
+        if not resolved_storage_key:
+            raise HTTPException(status_code=400, detail="resolved storage_key empty for order_image_id")
+
+        return {
+            "slot_key": slot_key,
+            "order_image_id": int(getattr(oi, "id", 0) or 0),
+            "image_file_id": getattr(oi, "image_file_id", None),
+            "storage_key": resolved_storage_key,
+            "md5": str(getattr(imf, "md5", "") or "").strip().lower() if imf is not None else "",
+            "size": int(getattr(imf, "size", 0) or 0) if imf is not None else 0,
+            "content_type": getattr(imf, "content_type", None) if imf is not None else None,
+            "etag": getattr(imf, "etag", None) if imf is not None else None,
+            "original_name": getattr(imf, "original_name", None) if imf is not None else None,
+            "url": (
+                str(getattr(oi, "image_url", "") or "").strip()
+                or (str(getattr(imf, "url", "") or "").strip() if imf is not None else "")
+            ),
+        }
+
+    if image_file_id is not None:
+        stmt = select(ImageFile).where(ImageFile.id == image_file_id)
+        imf = (await db.execute(stmt)).scalar_one_or_none()
+        if not imf:
+            raise HTTPException(status_code=400, detail=f"image_file_id not found: {image_file_id}")
+
+        resolved_storage_key = str(getattr(imf, "storage_key", "") or "").strip().lstrip("/")
+        if not resolved_storage_key:
+            raise HTTPException(status_code=400, detail="resolved storage_key empty for image_file_id")
+
+        resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower()
+        if resolved_md5:
+            _validate_finalize_storage_key(slot_key=slot_key, storage_key=resolved_storage_key, md5_hex=resolved_md5)
+
+        return {
+            "slot_key": slot_key,
+            "order_image_id": None,
+            "image_file_id": int(getattr(imf, "id", 0) or 0),
+            "storage_key": resolved_storage_key,
+            "md5": resolved_md5,
+            "size": int(getattr(imf, "size", 0) or 0),
+            "content_type": getattr(imf, "content_type", None),
+            "etag": getattr(imf, "etag", None),
+            "original_name": getattr(imf, "original_name", None),
+            "url": str(getattr(imf, "url", "") or "").strip(),
+        }
+
+    if storage_key:
+        stmt_oi = (
+            select(OrderImage)
+            .options(selectinload(OrderImage.image_file))
+            .where(
+                and_(
+                    OrderImage.order_id == order_id,
+                    OrderImage.slot_key == slot_key,
+                    OrderImage.storage_key == storage_key,
+                )
+            )
+            .order_by(OrderImage.id.desc())
+        )
+        oi = (await db.execute(stmt_oi)).scalars().first()
+        if oi:
+            imf = getattr(oi, "image_file", None)
+            resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower() if imf is not None else ""
+            if resolved_md5:
+                _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=resolved_md5)
+
+            return {
+                "slot_key": slot_key,
+                "order_image_id": int(getattr(oi, "id", 0) or 0),
+                "image_file_id": getattr(oi, "image_file_id", None),
+                "storage_key": storage_key,
+                "md5": resolved_md5,
+                "size": int(getattr(imf, "size", 0) or 0) if imf is not None else 0,
+                "content_type": getattr(imf, "content_type", None) if imf is not None else None,
+                "etag": getattr(imf, "etag", None) if imf is not None else None,
+                "original_name": getattr(imf, "original_name", None) if imf is not None else None,
+                "url": (
+                    str(getattr(oi, "image_url", "") or "").strip()
+                    or (str(getattr(imf, "url", "") or "").strip() if imf is not None else "")
+                ),
+            }
+
+        stmt_imf = select(ImageFile).where(ImageFile.storage_key == storage_key)
+        imf = (await db.execute(stmt_imf)).scalar_one_or_none()
+
+        if imf is not None:
+            resolved_md5 = str(getattr(imf, "md5", "") or "").strip().lower() or md5_hex
+            if not resolved_md5:
+                raise HTTPException(status_code=400, detail="md5 is required for finalize when image_file.md5 missing")
+
+            _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=resolved_md5)
+
+            return {
+                "slot_key": slot_key,
+                "order_image_id": None,
+                "image_file_id": int(getattr(imf, "id", 0) or 0),
+                "storage_key": storage_key,
+                "md5": resolved_md5,
+                "size": int(getattr(imf, "size", 0) or 0) or int(item.size or 0),
+                "content_type": getattr(imf, "content_type", None) or item.content_type,
+                "etag": getattr(imf, "etag", None) or item.etag,
+                "original_name": getattr(imf, "original_name", None) or item.original_name,
+                "url": str(getattr(imf, "url", "") or "").strip() or str(item.url or "").strip(),
+            }
+
+        if not md5_hex:
+            raise HTTPException(status_code=400, detail="md5 is required for new finalize image")
+
+        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
+
+        return {
+            "slot_key": slot_key,
+            "order_image_id": None,
+            "image_file_id": None,
+            "storage_key": storage_key,
+            "md5": md5_hex,
+            "size": int(item.size or 0),
+            "content_type": item.content_type,
+            "etag": item.etag,
+            "original_name": item.original_name,
+            "url": str(item.url or "").strip(),
+        }
+
+    raise HTTPException(status_code=400, detail="finalize image identity missing")
+
+
 async def _apply_ocr_task_acl(
-        *,
-        stmt,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
+    *,
+    stmt,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
 ):
     rn = role_name or ""
     tns = _ac_normalize_team_names(team_names)
@@ -830,12 +999,12 @@ async def _apply_ocr_task_acl(
 
 
 async def _load_order_out(
-        db: AsyncSession,
-        order_id: int,
-        *,
-        current_user: User,
-        role_name: Optional[str],
-        team_names: Tuple[str, ...],
+    db: AsyncSession,
+    order_id: int,
+    *,
+    current_user: User,
+    role_name: Optional[str],
+    team_names: Tuple[str, ...],
 ) -> OrderOut:
     stmt = select(Order).where(Order.id == order_id)
 
@@ -876,9 +1045,9 @@ async def _load_order_out(
 
 @router.get("/customer-groups", response_model=OptionListOut)
 async def list_customer_groups(
-        status: Optional[int] = Query(None, description="可选：启用状态过滤"),
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    status: Optional[int] = Query(None, description="可选：启用状态过滤"),
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OptionListOut:
     role_name = ctx.primary_role or ""
     team_names = tuple(ctx.team_names or ())
@@ -916,9 +1085,9 @@ async def list_customer_groups(
 
 @router.get("/channel-groups", response_model=OptionListOut)
 async def list_channel_groups(
-        status: Optional[int] = Query(None, description="可选：启用状态过滤"),
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    status: Optional[int] = Query(None, description="可选：启用状态过滤"),
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OptionListOut:
     from app.models.channel_group import ChannelGroup
 
@@ -958,7 +1127,7 @@ async def list_channel_groups(
 
 @router.get("/teams", response_model=TeamListOut)
 async def list_teams(
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> TeamListOut:
     role_name = ctx.primary_role or ""
     team_names = tuple(ctx.team_names or ())
@@ -972,10 +1141,10 @@ async def list_teams(
 
 @router.get("/salespersons", response_model=SalespersonListOut)
 async def list_salespersons(
-        status: int = Query(1, description="默认仅返回启用账号"),
-        team_name: Optional[str] = Query(None, description="可选：按团队过滤"),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    status: int = Query(1, description="默认仅返回启用账号"),
+    team_name: Optional[str] = Query(None, description="可选：按团队过滤"),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> SalespersonListOut:
     role_name = ctx.primary_role or ""
     team_names = tuple(ctx.team_names or ())
@@ -1017,8 +1186,8 @@ async def list_salespersons(
 
 @router.get("/bos-sts", response_model=BosStsOut)
 async def get_bos_sts(
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> BosStsOut:
     _ = db
     role_name = ctx.primary_role or ""
@@ -1040,10 +1209,10 @@ async def get_bos_sts(
 
 @router.post("/bos-upload", response_model=BosProxyUploadOut)
 async def bos_upload_proxy(
-        slot_key: str = Form(...),
-        file: UploadFile = File(...),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    slot_key: str = Form(...),
+    file: UploadFile = File(...),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> BosProxyUploadOut:
     _ = db
     role_name = ctx.primary_role or ""
@@ -1107,9 +1276,9 @@ async def bos_upload_proxy(
 
 @router.post("/draft", response_model=OrderDraftOut)
 async def create_order_draft(
-        payload: OrderDraftIn,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    payload: OrderDraftIn,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderDraftOut:
     role_name = ctx.primary_role or ""
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1162,12 +1331,12 @@ async def create_order_draft(
 
 @router.get("/ocr-tasks", response_model=OcrTaskListOut)
 async def list_order_ocr_tasks(
-        limit: int = Query(50, ge=1, le=200),
-        order_id: Optional[int] = Query(None),
-        active_only: bool = Query(False),
-        status: Optional[str] = Query(None),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+    order_id: Optional[int] = Query(None),
+    active_only: bool = Query(False),
+    status: Optional[str] = Query(None),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> OcrTaskListOut:
     role_name = ctx.primary_role or ""
     team_names = tuple(ctx.team_names or ())
@@ -1209,9 +1378,9 @@ async def list_order_ocr_tasks(
 
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
-        payload: OrderFinalizeIn,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    payload: OrderFinalizeIn,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderFinalizeOut:
     role_name = ctx.primary_role or ""
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1280,27 +1449,28 @@ async def finalize_order_upload(
         if sk not in MULTI_SLOTS:
             raise HTTPException(status_code=400, detail=f"暂不支持清空该slot: {sk}")
 
-    by_slot: Dict[str, List[FinalizeImageIn]] = {}
+    resolved_by_slot: Dict[str, List[Dict[str, Any]]] = {}
     for im in payload.images or []:
-        sk = str(im.slot_key or "").strip()
+        resolved = await _resolve_finalize_image_item(db, order_id=order_id, item=im)
+        sk = str(resolved.get("slot_key", "") or "").strip()
         if sk not in ALL_SLOTS:
             raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
-        by_slot.setdefault(sk, []).append(im)
+        resolved_by_slot.setdefault(sk, []).append(resolved)
 
-    normalized_images: List[FinalizeImageIn] = []
-    for sk, ims in by_slot.items():
+    normalized_images: List[Dict[str, Any]] = []
+    for sk, ims in resolved_by_slot.items():
         if sk in MULTI_SLOTS:
             normalized_images.extend(ims)
         else:
             normalized_images.append(ims[-1])
 
-    touched_slots = set(by_slot.keys()) | set(clear_slots)
+    touched_slots = set(resolved_by_slot.keys()) | set(clear_slots)
 
     for sk in touched_slots:
         desired_sks: List[str] = []
-        if sk in by_slot:
-            for im in by_slot.get(sk, []) or []:
-                storage_key = str(im.storage_key or "").strip().lstrip("/")
+        if sk in resolved_by_slot:
+            for im in resolved_by_slot.get(sk, []) or []:
+                storage_key = str(im.get("storage_key", "") or "").strip().lstrip("/")
                 if storage_key:
                     desired_sks.append(storage_key)
 
@@ -1314,18 +1484,19 @@ async def finalize_order_upload(
 
     has_ocr_images = False
     for im in normalized_images:
-        slot_key = str(im.slot_key or "").strip()
-        storage_key = str(im.storage_key or "").strip().lstrip("/")
-        md5_hex = str(im.md5 or "").strip().lower()
+        slot_key = str(im.get("slot_key", "") or "").strip()
+        storage_key = str(im.get("storage_key", "") or "").strip().lstrip("/")
+        md5_hex = str(im.get("md5", "") or "").strip().lower()
 
         if not storage_key:
             raise HTTPException(status_code=400, detail="storage_key 不能为空")
 
-        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
+        if md5_hex:
+            _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
-        url = str(im.url or "").strip()
+        url = str(im.get("url", "") or "").strip()
         if not url:
             url = storage.object_url_for_display(storage_key, signed=None, expires_in=900)
 
@@ -1333,10 +1504,10 @@ async def finalize_order_upload(
             db,
             storage_key=storage_key,
             url=url,
-            size=int(im.size or 0),
-            original_name=im.original_name,
-            content_type=im.content_type,
-            etag=im.etag,
+            size=int(im.get("size", 0) or 0),
+            original_name=im.get("original_name"),
+            content_type=im.get("content_type"),
+            etag=im.get("etag"),
             md5=md5_hex,
         )
 
@@ -1402,32 +1573,32 @@ async def finalize_order_upload(
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
-        page: int = Query(1, ge=1),
-        page_size: int = Query(20, ge=1, le=200),
-        is_finished: Optional[bool] = Query(None),
-        salesperson_id: Optional[int] = Query(None),
-        created_by: Optional[int] = Query(None),
-        customer_group_id: Optional[int] = Query(None),
-        channel_group_id: Optional[int] = Query(None),
-        team_name: Optional[str] = Query(None, description="按团队筛选"),
-        created_date: Optional[str] = Query(None, description="YYYY-MM-DD 单日"),
-        created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD 起"),
-        created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD 止，包含当天"),
-        first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD 起"),
-        first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD 止，包含当天"),
-        owner_name: Optional[str] = Query(None),
-        id_number: Optional[str] = Query(None),
-        plate_no: Optional[str] = Query(None),
-        engine_no: Optional[str] = Query(None),
-        vehicle_model: Optional[str] = Query(None),
-        vin: Optional[str] = Query(None),
-        remark: Optional[str] = Query(None),
-        market: Optional[str] = Query(None),
-        insurance_expire_date: Optional[str] = Query(None),
-        is_paid: Optional[bool] = Query(None),
-        is_rebate: Optional[bool] = Query(None),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-        db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    is_finished: Optional[bool] = Query(None),
+    salesperson_id: Optional[int] = Query(None),
+    created_by: Optional[int] = Query(None),
+    customer_group_id: Optional[int] = Query(None),
+    channel_group_id: Optional[int] = Query(None),
+    team_name: Optional[str] = Query(None, description="按团队筛选"),
+    created_date: Optional[str] = Query(None, description="YYYY-MM-DD 单日"),
+    created_date_start: Optional[str] = Query(None, description="YYYY-MM-DD 起"),
+    created_date_end: Optional[str] = Query(None, description="YYYY-MM-DD 止，包含当天"),
+    first_register_date_start: Optional[str] = Query(None, description="YYYY-MM-DD 起"),
+    first_register_date_end: Optional[str] = Query(None, description="YYYY-MM-DD 止，包含当天"),
+    owner_name: Optional[str] = Query(None),
+    id_number: Optional[str] = Query(None),
+    plate_no: Optional[str] = Query(None),
+    engine_no: Optional[str] = Query(None),
+    vehicle_model: Optional[str] = Query(None),
+    vin: Optional[str] = Query(None),
+    remark: Optional[str] = Query(None),
+    market: Optional[str] = Query(None),
+    insurance_expire_date: Optional[str] = Query(None),
+    is_paid: Optional[bool] = Query(None),
+    is_rebate: Optional[bool] = Query(None),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    db: AsyncSession = Depends(get_db),
 ) -> OrderListResponse:
     role_name = ctx.primary_role or ""
     team_names = tuple(ctx.team_names or ())
@@ -1542,9 +1713,9 @@ async def list_orders(
 
 @router.get("/{order_id}", response_model=OrderOut)
 async def get_order_detail(
-        order_id: int,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderOut:
     role_name = ctx.primary_role
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1563,9 +1734,9 @@ async def get_order_detail(
 
 @router.post("", response_model=OrderOut)
 async def create_order(
-        payload: OrderCreate,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    payload: OrderCreate,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderOut:
     role_name = ctx.primary_role
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1624,10 +1795,10 @@ async def create_order(
 
 @router.put("/{order_id}", response_model=OrderOut)
 async def update_order_detail(
-        order_id: int,
-        payload: OrderUpdate,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    payload: OrderUpdate,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderOut:
     role_name = ctx.primary_role
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1664,9 +1835,17 @@ async def update_order_detail(
         o.salesperson_id = spid
 
     if payload.customer_group_id is not None:
-        raise HTTPException(status_code=400, detail="customer_group_id cannot be updated")
+        if bool(getattr(o, "is_finished", False)):
+            raise HTTPException(status_code=400, detail="customer_group_id can only be updated when order is unfinished")
+        await _ensure_customer_group_exists(db, int(payload.customer_group_id))
+        o.customer_group_id = int(payload.customer_group_id)
+
     if payload.channel_group_id is not None:
-        raise HTTPException(status_code=400, detail="channel_group_id cannot be updated")
+        if bool(getattr(o, "is_finished", False)):
+            raise HTTPException(status_code=400, detail="channel_group_id can only be updated when order is unfinished")
+        await _ensure_channel_group_exists(db, int(payload.channel_group_id))
+        o.channel_group_id = int(payload.channel_group_id)
+
     if payload.status is not None:
         o.status = int(payload.status)
     if payload.audit_status is not None:
@@ -1691,10 +1870,10 @@ async def update_order_detail(
 
 @router.patch("/{order_id}/status")
 async def update_order_status(
-        order_id: int,
-        payload: OrderStatusUpdate,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+    order_id: int,
+    payload: OrderStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     role_name = ctx.primary_role
     tns = _ac_normalize_team_names(ctx.team_names)
@@ -1717,8 +1896,8 @@ async def update_order_status(
 
     if payload.is_finished is not None:
         if getattr(o, "is_finished", False) and payload.is_finished is False and role_name not in (
-                ROLE_SUPER_ADMIN,
-                ROLE_MANAGER,
+            ROLE_SUPER_ADMIN,
+            ROLE_MANAGER,
         ):
             raise HTTPException(status_code=403, detail="Only manager/super_admin can reopen finished order")
 

@@ -11,14 +11,14 @@ from __future__ import annotations
 输出结构（固定字段，不多不少）：
 slot_images: List[{
   slot_key, title, multi, ocr,
-  images: List[{order_image_id, image_file_id, storage_key, url, created_at, updated_at}]
+  images: List[{order_image_id, image_file_id, storage_key, url, md5, etag, size, content_type, original_name, created_at, updated_at}]
 }]
 """
 
 from typing import Any, Dict, List
+from typing import Protocol, runtime_checkable
 
 from app.core.slot_field_config import ordered_slot_keys, slot_is_multi_image, slot_title, slot_is_ocr
-from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -27,12 +27,10 @@ class _StorageProto(Protocol):
 
     @staticmethod
     def object_url_for_display(key: str, expires_in: int = 3600) -> str:
-        # 仅用于类型约束；实现由 StorageService 提供
         return "" if (key or expires_in) else ""
 
     @staticmethod
     def object_public_url(key: str) -> str:
-        # 仅用于类型约束；实现由 StorageService 提供
         return "" if key else ""
 
 
@@ -54,7 +52,6 @@ def _display_url_for_storage_key(storage_key: str, storage: _StorageProto) -> st
         return ""
     if not getattr(storage, "enabled", False):
         return ""
-    # 优先签名 URL（短有效期），失败再尝试 public url
     try:
         return storage.object_url_for_display(storage_key, expires_in=60 * 60)
     except Exception:
@@ -80,11 +77,6 @@ def _display_url_for_order_image(im: Any, storage: _StorageProto) -> str:
 
 
 def ensure_display_urls_for_order_images(images: List[Any], storage: _StorageProto) -> None:
-    """批量回填 Any.image_url（性能优化 + 列表稳定性）
-
-    - 同批次缓存：相同 storage_key 只签一次
-    - 仅回填 image_url 字段，不写 DB（由上游自行 commit）
-    """
     if not images:
         return
 
@@ -113,21 +105,12 @@ def ensure_display_urls_for_order_images(images: List[Any], storage: _StoragePro
 
 
 def build_slot_images(order: Any, storage: _StorageProto) -> List[Dict[str, Any]]:
-    """构造订单 slot_images（唯一输出口径，对齐 schemas）
-
-    规则：
-    - 固定按 slot_field_config 的顺序输出卡槽骨架（即使无图也返回空 images）
-    - 未知 slot（脏数据/未来扩展）兜底追加到末尾
-    - 单图槽收口：仅保留最后一张（与覆盖语义一致）
-    - images 条目字段固定：order_image_id/image_file_id/storage_key/url/created_at/updated_at
-    """
     imgs: List[Any] = getattr(order, "images", None) or []
     ensure_display_urls_for_order_images(imgs, storage)
 
     nodes: List[Dict[str, Any]] = []
     node_map: Dict[str, Dict[str, Any]] = {}
 
-    # 1) 固定骨架
     for sk in ordered_slot_keys():
         sks = _norm_str(sk)
         if not sks:
@@ -142,7 +125,6 @@ def build_slot_images(order: Any, storage: _StorageProto) -> List[Dict[str, Any]
         nodes.append(node)
         node_map[sks] = node
 
-    # 2) 填充图片
     for im in imgs:
         slot_key = _norm_str(getattr(im, "slot_key", None) or getattr(im, "slot", None) or "") or "unknown"
         if slot_key not in node_map:
@@ -156,18 +138,23 @@ def build_slot_images(order: Any, storage: _StorageProto) -> List[Dict[str, Any]
             nodes.append(node)
             node_map[slot_key] = node
 
+        imf = getattr(im, "image_file", None)
+
         item = {
             "order_image_id": getattr(im, "id", None),
             "image_file_id": getattr(im, "image_file_id", None),
             "storage_key": _storage_key_for_order_image(im),
             "url": _norm_str(getattr(im, "image_url", "")),
+            "md5": _norm_str(getattr(imf, "md5", None)),
+            "etag": _norm_str(getattr(imf, "etag", None)),
+            "size": getattr(imf, "size", None),
+            "content_type": _norm_str(getattr(imf, "content_type", None)),
+            "original_name": _norm_str(getattr(imf, "original_name", None)),
             "created_at": _norm_str(getattr(im, "created_at", None)),
             "updated_at": _norm_str(getattr(im, "updated_at", None)),
         }
-        # 允许 url 为空（由上游决定是否进一步补齐），但条目仍应存在以便审计
         node_map[slot_key]["images"].append(item)
 
-    # 3) 单图槽收口：只保留最后一张
     for node in nodes:
         if not isinstance(node, dict):
             continue
