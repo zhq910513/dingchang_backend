@@ -11,7 +11,7 @@ v1 - 用户 / 账号管理（API 薄壳）
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,17 +20,17 @@ from app.api.deps import CurrentUserContext, get_current_user_with_role
 from app.core.db import get_db
 from app.schemas.user import UserCreateIn, UserListOut, UserOut, UserUpdateIn
 from app.services.users_service import (
-    list_users as _list_users,
     create_user as _create_user,
-    update_user as _update_user,
     delete_user as _delete_user,
     get_user_projection_by_id as _get_user_projection_by_id,
+    list_users as _list_users,
+    update_user as _update_user,
 )
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
-def _mapping_to_user_out(row) -> UserOut:
+def _mapping_to_user_out(row: Mapping[str, Any]) -> UserOut:
     return UserOut(
         id=int(row.get("id") or 0),
         username=str(row.get("username") or ""),
@@ -42,38 +42,47 @@ def _mapping_to_user_out(row) -> UserOut:
         is_online=bool(int(row.get("is_online") or 0)),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        meta=row.get("meta") or {},
     )
 
 
 @router.get("", response_model=UserListOut)
 async def list_users(
-        keyword: Optional[str] = Query(None),
-        role: Optional[str] = Query(None),
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+    keyword: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
     try:
-        rows = await _list_users(
+        payload = await _list_users(
             db=db,
             current_user=ctx.user,
             current_role=ctx.primary_role or "",
             keyword=keyword,
             role=role,
+            page=page,
+            page_size=page_size,
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    items = [_mapping_to_user_out(r) for r in rows]
-    return UserListOut(total=len(items), items=items)
+    items = [_mapping_to_user_out(row) for row in payload.get("items") or []]
+    return UserListOut(
+        total=int(payload.get("total") or 0),
+        items=items,
+        meta=payload.get("meta") or {},
+    )
 
 
 @router.post("", response_model=UserOut)
 async def create_user(
-        payload: UserCreateIn,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+    payload: UserCreateIn,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ) -> UserOut:
     try:
         row = await _create_user(
@@ -86,10 +95,10 @@ async def create_user(
             team_name=payload.team_name,
             team_names=payload.team_names,
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     proj = await _get_user_projection_by_id(db=db, user_id=int(getattr(row, "id", 0) or 0))
     if not proj:
@@ -99,10 +108,10 @@ async def create_user(
 
 @router.put("/{user_id}", response_model=UserOut)
 async def update_user(
-        user_id: int,
-        payload: UserUpdateIn,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+    user_id: int,
+    payload: UserUpdateIn,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ) -> UserOut:
     try:
         row = await _update_user(
@@ -114,10 +123,10 @@ async def update_user(
             team_name=payload.team_name,
             team_names=payload.team_names,
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        msg = str(e)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
         if msg == "用户不存在":
             raise HTTPException(status_code=404, detail=msg)
         raise HTTPException(status_code=400, detail=msg)
@@ -130,9 +139,9 @@ async def update_user(
 
 @router.delete("/{user_id}")
 async def delete_user(
-        user_id: int,
-        db: AsyncSession = Depends(get_db),
-        ctx: CurrentUserContext = Depends(get_current_user_with_role),
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
     try:
         await _delete_user(
@@ -141,10 +150,10 @@ async def delete_user(
             current_role=ctx.primary_role or "",
             user_id=user_id,
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        msg = str(e)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
         if msg == "用户不存在":
             raise HTTPException(status_code=404, detail=msg)
         raise HTTPException(status_code=400, detail=msg)

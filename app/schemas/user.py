@@ -65,6 +65,35 @@ def _normalize_team_name(v: Any) -> Optional[str]:
     return s or None
 
 
+class UserRowCapabilitiesOut(OrmBaseModel):
+    user_update: bool = False
+    user_delete: bool = False
+
+
+class UserRowMetaOut(OrmBaseModel):
+    capabilities: UserRowCapabilitiesOut = Field(default_factory=UserRowCapabilitiesOut)
+
+
+class UserListCapabilitiesOut(OrmBaseModel):
+    user_create: bool = False
+    user_list_view: bool = False
+
+
+class UserListScopesOut(OrmBaseModel):
+    user_creatable_role_names: List[str] = Field(default_factory=list)
+
+
+class UserListPaginationOut(OrmBaseModel):
+    page: int = 1
+    page_size: int = 20
+
+
+class UserListMetaOut(OrmBaseModel):
+    capabilities: UserListCapabilitiesOut = Field(default_factory=UserListCapabilitiesOut)
+    scopes: UserListScopesOut = Field(default_factory=UserListScopesOut)
+    pagination: UserListPaginationOut = Field(default_factory=UserListPaginationOut)
+
+
 class UserOut(OrmBaseModel):
     id: int
     username: str
@@ -76,6 +105,7 @@ class UserOut(OrmBaseModel):
     is_online: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    meta: UserRowMetaOut = Field(default_factory=UserRowMetaOut)
 
     @validator("team_names", pre=True)
     def _v_team_names(cls, v: Any) -> List[str]:
@@ -89,6 +119,7 @@ class UserOut(OrmBaseModel):
 class UserListOut(OrmBaseModel):
     total: int = 0
     items: List[UserOut] = Field(default_factory=list)
+    meta: UserListMetaOut = Field(default_factory=UserListMetaOut)
 
 
 class UserCreateIn(OrmBaseModel):
