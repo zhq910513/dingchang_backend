@@ -13,17 +13,16 @@ from __future__ import annotations
 - 主角色：按业务优先级选主角色，避免多角色时出现不稳定行为
 - 时间口径统一：北京时间 naive DATETIME
 
-本阶段修正：
-- Redis 仅作为 session 基础信息缓存（token -> session_id/user_id/last_active_at）
-- 用户状态 / 角色集合 / 主角色 仍然每次回 DB 校验，避免缓存一致性带来的权限风险
-- 保持现有返回结构与业务语义不变
+当前版本策略（安全优先）：
+- session 校验：DB-first，不使用 Redis 读缓存
+- 用户状态 / 角色集合 / 主角色：每次回 DB 校验
+- Redis 相关函数保留为 no-op 兼容位，避免外部调用炸裂
 """
 
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, Tuple, List
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, Header, HTTPException, status
@@ -32,11 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.constants import (
-    ROLE_FINANCE,
+    ROLE_SUPER_ADMIN,
     ROLE_MANAGER,
+    ROLE_FINANCE,
     ROLE_MARKET,
     ROLE_SALES,
-    ROLE_SUPER_ADMIN,
 )
 from app.core.db import get_db
 from app.models.role import Role
@@ -103,9 +102,9 @@ def _to_bj_naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None)
 
 
-def _safe_int(value: object, default: int) -> int:
+def _safe_int(v: object, default: int) -> int:
     try:
-        return int(value)  # type: ignore[arg-type]
+        return int(v)  # type: ignore[arg-type]
     except Exception:
         return default
 
@@ -116,6 +115,23 @@ def _get_redis():
         return redis
     except Exception:
         return None
+
+
+def _as_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, (tuple, set)):
+        return list(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        if "," in s:
+            return [x.strip() for x in s.split(",") if x and x.strip()]
+        return [s]
+    return [v]
 
 
 def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
@@ -132,111 +148,50 @@ def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ..
 
     raw_team_names = (getattr(user, "team_names", None) or "").strip()
     if raw_team_names:
-        for team in raw_team_names.split(","):
-            team = (team or "").strip()
-            if team:
-                team_names_set.add(team)
+        for team_name_item in raw_team_names.split(","):
+            team_name_item = (team_name_item or "").strip()
+            if team_name_item:
+                team_names_set.add(team_name_item)
 
     team_ids: Tuple[int, ...] = tuple()
     team_names: Tuple[str, ...] = tuple(sorted(team_names_set))
     return team_ids, team_names
 
 
-def _session_cache_key(token: str) -> str:
-    return f"session:{token}"
-
-
-def _get_session_timeout_seconds() -> int:
-    ttl = _safe_int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200), 7200)
-    if ttl <= 0:
-        ttl = 7200
-    return ttl
-
-
 async def _delete_redis_session_cache(token: str) -> None:
+    """
+    兼容位：
+    当前 session 不走 Redis 读缓存，但保留删除入口，避免外部调用方报错。
+    """
     try:
         redis_client = _get_redis()
         if redis_client:
-            await redis_client.delete(_session_cache_key(token))
+            await redis_client.delete(f"session:{token}")
     except Exception:
         pass
 
 
-async def _cache_redis_session_payload(
-    token: str,
-    *,
-    session_id: int,
-    user_id: int,
-    last_active_at: datetime,
-    ttl: int,
-) -> None:
-    try:
-        redis_client = _get_redis()
-        if not redis_client:
-            return
-
-        payload = {
-            "session_id": int(session_id),
-            "user_id": int(user_id),
-            "last_active_at": last_active_at.isoformat(sep=" "),
-        }
-        await redis_client.set(
-            _session_cache_key(token),
-            json.dumps(payload, ensure_ascii=False),
-            ex=ttl,
-        )
-    except Exception:
-        pass
+async def _cache_redis_session(token: str, user_id: int, ttl: int) -> None:
+    """
+    兼容位：
+    当前版本不使用 Redis session 读缓存，为安全起见这里不写入任何可被信任的数据。
+    """
+    _ = token
+    _ = user_id
+    _ = ttl
+    return None
 
 
-async def _read_redis_session_payload(token: str) -> Optional[Dict[str, Any]]:
-    try:
-        redis_client = _get_redis()
-        if not redis_client:
-            return None
-
-        raw = await redis_client.get(_session_cache_key(token))
-        if not raw:
-            return None
-
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
-
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            return None
-
-        session_id = _safe_int(payload.get("session_id"), 0)
-        user_id = _safe_int(payload.get("user_id"), 0)
-        last_active_at_raw = str(payload.get("last_active_at") or "").strip()
-
-        if session_id <= 0 or user_id <= 0 or not last_active_at_raw:
-            return None
-
-        try:
-            last_active_at = datetime.fromisoformat(last_active_at_raw)
-        except Exception:
-            return None
-
-        return {
-            "session_id": session_id,
-            "user_id": user_id,
-            "last_active_at": last_active_at,
-        }
-    except Exception:
-        return None
-
-
-async def _expire_session_row(db: AsyncSession, session_row: UserSession) -> None:
+async def _expire_session_row(db: AsyncSession, sess: UserSession) -> None:
     try:
         await db.execute(
             update(UserSession)
-            .where(UserSession.id == session_row.id)
+            .where(UserSession.id == sess.id)
             .values(expired=1)
         )
         await db.commit()
         try:
-            session_row.expired = 1
+            sess.expired = 1
         except Exception:
             pass
     except Exception:
@@ -257,101 +212,48 @@ async def get_current_session(
             detail="Missing X-Session-Token",
         )
 
-    ttl = _get_session_timeout_seconds()
-    now = _now_bj_naive()
-    heartbeat_interval_seconds = SESSION_HEARTBEAT_INTERVAL_SECONDS
-    if heartbeat_interval_seconds < 0:
-        heartbeat_interval_seconds = 0
-
-    cached_session = await _read_redis_session_payload(token)
-    if cached_session:
-        cached_last_active_at = _to_bj_naive(cached_session["last_active_at"])
-
-        if now - cached_last_active_at > timedelta(seconds=ttl):
-            await _delete_redis_session_cache(token)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Session expired",
-            )
-
-        session_row = UserSession()
-        session_row.id = int(cached_session["session_id"])
-        session_row.user_id = int(cached_session["user_id"])
-        session_row.session_token = token
-        session_row.expired = 0
-        session_row.last_active_at = cached_last_active_at
-
-        if heartbeat_interval_seconds == 0 or (
-            now - cached_last_active_at > timedelta(seconds=heartbeat_interval_seconds)
-        ):
-            try:
-                update_result = await db.execute(
-                    update(UserSession)
-                    .where(
-                        UserSession.id == session_row.id,
-                        UserSession.expired == 0,
-                    )
-                    .values(last_active_at=now)
-                )
-                await db.commit()
-
-                if int(update_result.rowcount or 0) <= 0:
-                    await _delete_redis_session_cache(token)
-                    raise HTTPException(
-                        status_code=status.HTTP_401_UNAUTHORIZED,
-                        detail="Invalid session",
-                    )
-
-                session_row.last_active_at = now
-                await _cache_redis_session_payload(
-                    token,
-                    session_id=session_row.id,
-                    user_id=session_row.user_id,
-                    last_active_at=now,
-                    ttl=ttl,
-                )
-            except HTTPException:
-                raise
-            except Exception:
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
-
-        return session_row
-
     stmt = (
         select(UserSession)
         .where(UserSession.session_token == token)
         .limit(1)
     )
-    session_row = (await db.execute(stmt)).scalars().first()
+    sess = (await db.execute(stmt)).scalars().first()
 
-    if not session_row or int(getattr(session_row, "expired", 0) or 0) == 1:
+    if not sess or int(getattr(sess, "expired", 0) or 0) == 1:
         await _delete_redis_session_cache(token)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid session",
         )
 
-    last_active_at = getattr(session_row, "last_active_at", None)
+    last_active_at = getattr(sess, "last_active_at", None)
     if not last_active_at:
-        await _expire_session_row(db, session_row)
+        await _expire_session_row(db, sess)
         await _delete_redis_session_cache(token)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid session (no last_active_at)",
         )
 
+    ttl = _safe_int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200), 7200)
+    if ttl <= 0:
+        ttl = 7200
+
+    now = _now_bj_naive()
     last_active_bj = _to_bj_naive(last_active_at)
 
+    # 超时：标记过期 + 清缓存 + 返回 401
     if now - last_active_bj > timedelta(seconds=ttl):
-        await _expire_session_row(db, session_row)
+        await _expire_session_row(db, sess)
         await _delete_redis_session_cache(token)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session expired",
         )
+
+    heartbeat_interval_seconds = SESSION_HEARTBEAT_INTERVAL_SECONDS
+    if heartbeat_interval_seconds < 0:
+        heartbeat_interval_seconds = 0
 
     try:
         need_touch = True
@@ -361,47 +263,36 @@ async def get_current_session(
         if need_touch:
             await db.execute(
                 update(UserSession)
-                .where(UserSession.id == session_row.id)
+                .where(UserSession.id == sess.id)
                 .values(last_active_at=now)
             )
             await db.commit()
             try:
-                session_row.last_active_at = now
+                sess.last_active_at = now
             except Exception:
                 pass
-
-        await _cache_redis_session_payload(
-            token,
-            session_id=int(getattr(session_row, "id", 0) or 0),
-            user_id=int(getattr(session_row, "user_id", 0) or 0),
-            last_active_at=_to_bj_naive(getattr(session_row, "last_active_at", now) or now),
-            ttl=ttl,
-        )
     except Exception:
         try:
             await db.rollback()
         except Exception:
             pass
 
-    return session_row
+    await _cache_redis_session(token, int(getattr(sess, "user_id", 0) or 0), ttl)
+    return sess
 
 
 async def get_current_user(
     sess: UserSession = Depends(get_current_session),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    user_id = int(getattr(sess, "user_id", 0) or 0)
-    if user_id <= 0:
+    uid = int(getattr(sess, "user_id", 0) or 0)
+    if uid <= 0:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid session user_id",
         )
 
-    user = (
-        await db.execute(
-            select(User).where(User.id == user_id).limit(1)
-        )
-    ).scalars().first()
+    user = (await db.execute(select(User).where(User.id == uid).limit(1))).scalars().first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
