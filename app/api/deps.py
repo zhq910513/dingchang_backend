@@ -13,9 +13,9 @@ from __future__ import annotations
 - 主角色：按业务优先级选主角色，避免多角色时出现不稳定行为
 - 时间口径统一：北京时间 naive DATETIME
 
-本阶段优化：
-- Redis 改为 session 读缓存优先
-- 命中缓存时避免每次先查 DB 的固定开销
+本阶段修正：
+- Redis 仅作为 session 基础信息缓存（token -> session_id/user_id/last_active_at）
+- 用户状态 / 角色集合 / 主角色 仍然每次回 DB 校验，避免缓存一致性带来的权限风险
 - 保持现有返回结构与业务语义不变
 """
 
@@ -118,23 +118,6 @@ def _get_redis():
         return None
 
 
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    if isinstance(value, (tuple, set)):
-        return list(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return []
-        if "," in stripped:
-            return [item.strip() for item in stripped.split(",") if item and item.strip()]
-        return [stripped]
-    return [value]
-
-
 def _extract_teams_from_user(user: User) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
     """
     团队抽取（冻结字段口径）：
@@ -163,8 +146,11 @@ def _session_cache_key(token: str) -> str:
     return f"session:{token}"
 
 
-def _session_ctx_cache_key(user_id: int) -> str:
-    return f"session_ctx:{user_id}"
+def _get_session_timeout_seconds() -> int:
+    ttl = _safe_int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200), 7200)
+    if ttl <= 0:
+        ttl = 7200
+    return ttl
 
 
 async def _delete_redis_session_cache(token: str) -> None:
@@ -172,15 +158,6 @@ async def _delete_redis_session_cache(token: str) -> None:
         redis_client = _get_redis()
         if redis_client:
             await redis_client.delete(_session_cache_key(token))
-    except Exception:
-        pass
-
-
-async def _delete_redis_user_context_cache(user_id: int) -> None:
-    try:
-        redis_client = _get_redis()
-        if redis_client and user_id > 0:
-            await redis_client.delete(_session_ctx_cache_key(user_id))
     except Exception:
         pass
 
@@ -250,87 +227,6 @@ async def _read_redis_session_payload(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-async def _cache_redis_user_context_payload(
-    user: User,
-    *,
-    primary_role: Optional[str],
-    role_names: Tuple[str, ...],
-    team_names: Tuple[str, ...],
-    ttl: int,
-) -> None:
-    try:
-        redis_client = _get_redis()
-        if not redis_client:
-            return
-
-        user_id = int(getattr(user, "id", 0) or 0)
-        if user_id <= 0:
-            return
-
-        payload = {
-            "user": {
-                "id": user_id,
-                "username": str(getattr(user, "username", "") or ""),
-                "real_name": getattr(user, "real_name", None),
-                "team_name": getattr(user, "team_name", None),
-                "team_names": getattr(user, "team_names", None),
-                "status": int(getattr(user, "status", 0) or 0),
-            },
-            "primary_role": primary_role,
-            "role_names": list(role_names),
-            "team_names": list(team_names),
-        }
-
-        await redis_client.set(
-            _session_ctx_cache_key(user_id),
-            json.dumps(payload, ensure_ascii=False),
-            ex=ttl,
-        )
-    except Exception:
-        pass
-
-
-async def _read_redis_user_context_payload(user_id: int) -> Optional[Dict[str, Any]]:
-    try:
-        redis_client = _get_redis()
-        if not redis_client or user_id <= 0:
-            return None
-
-        raw = await redis_client.get(_session_ctx_cache_key(user_id))
-        if not raw:
-            return None
-
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
-
-        payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            return None
-
-        user_data = payload.get("user")
-        if not isinstance(user_data, dict):
-            return None
-
-        cached_user_id = _safe_int(user_data.get("id"), 0)
-        if cached_user_id != user_id:
-            return None
-
-        return payload
-    except Exception:
-        return None
-
-
-def _build_detached_user_from_cache(user_data: Dict[str, Any]) -> User:
-    user = User()
-    user.id = _safe_int(user_data.get("id"), 0)
-    user.username = str(user_data.get("username", "") or "")
-    user.real_name = user_data.get("real_name")
-    user.team_name = user_data.get("team_name")
-    user.team_names = user_data.get("team_names")
-    user.status = _safe_int(user_data.get("status"), 0)
-    return user
-
-
 async def _expire_session_row(db: AsyncSession, session_row: UserSession) -> None:
     try:
         await db.execute(
@@ -348,13 +244,6 @@ async def _expire_session_row(db: AsyncSession, session_row: UserSession) -> Non
             await db.rollback()
         except Exception:
             pass
-
-
-def _get_session_timeout_seconds() -> int:
-    ttl = _safe_int(getattr(settings, "SESSION_TIMEOUT_SECONDS", 7200), 7200)
-    if ttl <= 0:
-        ttl = 7200
-    return ttl
 
 
 async def get_current_session(
@@ -380,7 +269,6 @@ async def get_current_session(
 
         if now - cached_last_active_at > timedelta(seconds=ttl):
             await _delete_redis_session_cache(token)
-            await _delete_redis_user_context_cache(int(cached_session["user_id"]))
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session expired",
@@ -397,7 +285,7 @@ async def get_current_session(
             now - cached_last_active_at > timedelta(seconds=heartbeat_interval_seconds)
         ):
             try:
-                await db.execute(
+                update_result = await db.execute(
                     update(UserSession)
                     .where(
                         UserSession.id == session_row.id,
@@ -406,6 +294,14 @@ async def get_current_session(
                     .values(last_active_at=now)
                 )
                 await db.commit()
+
+                if int(update_result.rowcount or 0) <= 0:
+                    await _delete_redis_session_cache(token)
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid session",
+                    )
+
                 session_row.last_active_at = now
                 await _cache_redis_session_payload(
                     token,
@@ -414,6 +310,8 @@ async def get_current_session(
                     last_active_at=now,
                     ttl=ttl,
                 )
+            except HTTPException:
+                raise
             except Exception:
                 try:
                     await db.rollback()
@@ -440,7 +338,6 @@ async def get_current_session(
     if not last_active_at:
         await _expire_session_row(db, session_row)
         await _delete_redis_session_cache(token)
-        await _delete_redis_user_context_cache(int(getattr(session_row, "user_id", 0) or 0))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid session (no last_active_at)",
@@ -451,7 +348,6 @@ async def get_current_session(
     if now - last_active_bj > timedelta(seconds=ttl):
         await _expire_session_row(db, session_row)
         await _delete_redis_session_cache(token)
-        await _delete_redis_user_context_cache(int(getattr(session_row, "user_id", 0) or 0))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session expired",
@@ -473,6 +369,7 @@ async def get_current_session(
                 session_row.last_active_at = now
             except Exception:
                 pass
+
         await _cache_redis_session_payload(
             token,
             session_id=int(getattr(session_row, "id", 0) or 0),
@@ -500,26 +397,18 @@ async def get_current_user(
             detail="Invalid session user_id",
         )
 
-    cached_context = await _read_redis_user_context_payload(user_id)
-    if cached_context:
-        user_data = cached_context.get("user")
-        if isinstance(user_data, dict) and _safe_int(user_data.get("status"), 0) == 1:
-            return _build_detached_user_from_cache(user_data)
-
     user = (
         await db.execute(
             select(User).where(User.id == user_id).limit(1)
         )
     ).scalars().first()
     if not user:
-        await _delete_redis_user_context_cache(user_id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
 
     if int(getattr(user, "status", 0) or 0) != 1:
-        await _delete_redis_user_context_cache(user_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="User disabled",
@@ -532,41 +421,10 @@ async def get_current_user_context(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
-    user_id = int(getattr(user, "id", 0) or 0)
-    ttl = _get_session_timeout_seconds()
-
-    cached_context = await _read_redis_user_context_payload(user_id)
-    if cached_context:
-        user_data = cached_context.get("user")
-        if isinstance(user_data, dict) and _safe_int(user_data.get("status"), 0) == 1:
-            cached_user = _build_detached_user_from_cache(user_data)
-            role_names = tuple(
-                [
-                    str(role_name).strip()
-                    for role_name in _as_list(cached_context.get("role_names"))
-                    if str(role_name).strip()
-                ]
-            )
-            primary_role = str(cached_context.get("primary_role") or "").strip() or None
-            team_names = tuple(
-                [
-                    str(team_name).strip()
-                    for team_name in _as_list(cached_context.get("team_names"))
-                    if str(team_name).strip()
-                ]
-            )
-            return CurrentUserContext(
-                user=cached_user,
-                primary_role=primary_role,
-                role_names=role_names,
-                team_names=team_names,
-                team_ids=tuple(),
-            )
-
     stmt = (
         select(Role.id, Role.role_name)
         .join(UserRole, UserRole.role_id == Role.id)
-        .where(UserRole.user_id == user_id)
+        .where(UserRole.user_id == user.id)
         .order_by(Role.id.asc())
     )
     rows = (await db.execute(stmt)).all()
@@ -574,14 +432,6 @@ async def get_current_user_context(
 
     primary_role = _pick_primary_role(role_names)
     team_ids, team_names = _extract_teams_from_user(user)
-
-    await _cache_redis_user_context_payload(
-        user,
-        primary_role=primary_role,
-        role_names=role_names,
-        team_names=team_names,
-        ttl=ttl,
-    )
 
     return CurrentUserContext(
         user=user,
