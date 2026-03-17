@@ -293,6 +293,30 @@ async def _ensure_salesperson_exists(db: AsyncSession, salesperson_id: int) -> N
         raise HTTPException(status_code=400, detail="salesperson_id 不存在")
 
 
+async def _ensure_customer_group_exists(db: AsyncSession, customer_group_id: int) -> None:
+    try:
+        gid = int(customer_group_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="customer_group_id 非法")
+    q = select(CustomerGroup.id).where(CustomerGroup.id == gid)
+    row = (await db.execute(q)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=400, detail="customer_group_id 不存在")
+
+
+async def _ensure_channel_group_exists(db: AsyncSession, channel_group_id: int) -> None:
+    from app.models.channel_group import ChannelGroup
+
+    try:
+        gid = int(channel_group_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="channel_group_id 非法")
+    q = select(ChannelGroup.id).where(ChannelGroup.id == gid)
+    row = (await db.execute(q)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=400, detail="channel_group_id 不存在")
+
+
 def _ensure_orders_access(role_name: Optional[str]) -> None:
     rn = role_name or ""
     if rn not in (ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_FINANCE, ROLE_MARKET, ROLE_SALES):
@@ -427,31 +451,25 @@ def _add_owner_name_fuzzy(clauses: list, value: Optional[str]):
         "$.vehicle_cert.vehicle_cert_owner_name",
         "$.vehicle_cert.vehicle_owner_name",
         "$.vehicle_cert.certificate_owner_name",
-
         "$.driving_license.owner_name",
         "$.driving_license.driving_license_owner_name",
         "$.driving_license.license_owner_name",
-
         "$.driving_license_main.owner_name",
         "$.driving_license_main.driving_license_owner_name",
         "$.driving_license_main.license_owner_name",
-
         "$.driving_license_sub.owner_name",
         "$.driving_license_sub.driving_license_owner_name",
         "$.driving_license_sub.license_owner_name",
-
         "$.idcard.name",
         "$.idcard.owner_name",
         "$.idcard.idcard_name",
         "$.idcard.id_card_name",
         "$.idcard.identity_name",
-
         "$.idcard_front.name",
         "$.idcard_front.owner_name",
         "$.idcard_front.idcard_name",
         "$.idcard_front.id_card_name",
         "$.idcard_front.identity_name",
-
         "$.idcard_back.name",
         "$.idcard_back.owner_name",
         "$.idcard_back.idcard_name",
@@ -1723,6 +1741,11 @@ async def create_order(
         channel_group_id=payload.channel_group_id,
     )
 
+    if payload.customer_group_id is not None:
+        await _ensure_customer_group_exists(db, payload.customer_group_id)
+    if payload.channel_group_id is not None:
+        await _ensure_channel_group_exists(db, payload.channel_group_id)
+
     if role_name == ROLE_SALES:
         spid = int(ctx.user.id)
     else:
@@ -1795,6 +1818,11 @@ async def update_order_detail(
     if getattr(o, "is_finished", False) and role_name not in (ROLE_SUPER_ADMIN, ROLE_MANAGER):
         raise HTTPException(status_code=403, detail="Finished order cannot be edited")
 
+    can_edit_customer_channel = (
+        role_name in (ROLE_SALES, ROLE_MANAGER, ROLE_SUPER_ADMIN)
+        and bool(getattr(o, "is_finished", False)) is False
+    )
+
     if payload.salesperson_id is not None:
         spid = int(payload.salesperson_id)
         await _ensure_salesperson_exists(db, spid)
@@ -1808,9 +1836,17 @@ async def update_order_detail(
         o.salesperson_id = spid
 
     if payload.customer_group_id is not None:
-        raise HTTPException(status_code=400, detail="customer_group_id cannot be updated")
+        if not can_edit_customer_channel:
+            raise HTTPException(status_code=400, detail="customer_group_id cannot be updated")
+        await _ensure_customer_group_exists(db, payload.customer_group_id)
+        o.customer_group_id = int(payload.customer_group_id)
+
     if payload.channel_group_id is not None:
-        raise HTTPException(status_code=400, detail="channel_group_id cannot be updated")
+        if not can_edit_customer_channel:
+            raise HTTPException(status_code=400, detail="channel_group_id cannot be updated")
+        await _ensure_channel_group_exists(db, payload.channel_group_id)
+        o.channel_group_id = int(payload.channel_group_id)
+
     if payload.status is not None:
         o.status = int(payload.status)
     if payload.audit_status is not None:
@@ -1821,6 +1857,11 @@ async def update_order_detail(
         merged = dict(o.dynamic_data or {})
         merged.update(payload.dynamic_data or {})
         o.dynamic_data = _clean_dynamic_data_for_write(merged)
+
+    _ensure_required_customer_channel(
+        customer_group_id=getattr(o, "customer_group_id", None),
+        channel_group_id=getattr(o, "channel_group_id", None),
+    )
 
     if payload.order_info is not None:
         info = (await db.execute(select(OrderInfo).where(OrderInfo.order_id == int(order_id)))).scalar_one_or_none()
