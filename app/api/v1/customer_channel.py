@@ -132,6 +132,7 @@ def _to_customer_group_list_item_out(row: Mapping[str, Any]) -> CustomerGroupLis
         updated_at=_fmt_dt(row.get("updated_at")),
         deleted_at=_fmt_dt(row.get("deleted_at")),
         is_deleted=int(row.get("is_deleted", 0) or 0),
+        meta=row.get("meta") or {"capabilities": {}},
     )
 
 
@@ -148,6 +149,7 @@ def _to_channel_group_list_item_out(row: Mapping[str, Any]) -> ChannelGroupListI
         updated_at=_fmt_dt(row.get("updated_at")),
         deleted_at=_fmt_dt(row.get("deleted_at")),
         is_deleted=int(row.get("is_deleted", 0) or 0),
+        meta=row.get("meta") or {"capabilities": {}},
     )
 
 
@@ -188,11 +190,11 @@ def _to_channel_group_out(row) -> ChannelGroupOut:
 
 @router.get("/customers", response_model=CustomerGroupOptionPageOut)
 async def list_customers(
-    keyword: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    _: Any = Depends(get_current_user),
+        keyword: Optional[str] = Query(None),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        db: AsyncSession = Depends(get_db),
+        _: Any = Depends(get_current_user),
 ):
     result = await _list_customer_groups(
         db=db,
@@ -212,11 +214,11 @@ async def list_customers(
 
 @router.get("/channels", response_model=ChannelGroupOptionPageOut)
 async def list_channels(
-    keyword: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    _: Any = Depends(get_current_user),
+        keyword: Optional[str] = Query(None),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        db: AsyncSession = Depends(get_db),
+        _: Any = Depends(get_current_user),
 ):
     result = await _list_channel_groups(
         db=db,
@@ -236,79 +238,73 @@ async def list_channels(
 
 @router.get("/customer-groups", response_model=CustomerGroupListPageOut)
 async def list_customer_groups_manage(
-    customer_code: Optional[str] = Query(None),
-    customer_name: Optional[str] = Query(None),
-    market: Optional[str] = Query(None),
-    region: Optional[str] = Query(None),
-    created_by_name: Optional[str] = Query(None),
-    include_deleted: int = Query(0),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        customer_code: Optional[str] = Query(None),
+        customer_name: Optional[str] = Query(None),
+        market: Optional[str] = Query(None),
+        region: Optional[str] = Query(None),
+        created_by_name: Optional[str] = Query(None),
+        include_deleted: int = Query(0),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    caps = _capabilities_by_role(ctx.primary_role)
     result = await _list_customer_groups_manage(
         db=db,
+        role_name=ctx.primary_role,
         customer_code=customer_code,
         customer_name=customer_name,
         market=market,
         region=region,
         created_by_name=created_by_name,
-        include_deleted=(bool(include_deleted) and caps.can_view_deleted),
+        include_deleted=bool(include_deleted),
         page=page,
         page_size=page_size,
     )
     items = [_to_customer_group_list_item_out(r) for r in result["items"]]
     return CustomerGroupListPageOut(
+        total=int(result.get("total", 0) or 0),
         items=items,
-        page=result["page"],
-        page_size=result["page_size"],
-        total=result["total"],
-        has_more=result["has_more"],
-        capabilities=caps,
+        meta=result.get("meta") or {},
     )
 
 
 @router.get("/channel-groups", response_model=ChannelGroupListPageOut)
 async def list_channel_groups_manage(
-    channel_code: Optional[str] = Query(None),
-    channel_name: Optional[str] = Query(None),
-    region: Optional[str] = Query(None),
-    created_by_name: Optional[str] = Query(None),
-    include_deleted: int = Query(0),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        channel_code: Optional[str] = Query(None),
+        channel_name: Optional[str] = Query(None),
+        region: Optional[str] = Query(None),
+        created_by_name: Optional[str] = Query(None),
+        include_deleted: int = Query(0),
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    caps = _capabilities_by_role(ctx.primary_role)
     result = await _list_channel_groups_manage(
         db=db,
+        role_name=ctx.primary_role,
         channel_code=channel_code,
         channel_name=channel_name,
         region=region,
         created_by_name=created_by_name,
-        include_deleted=(bool(include_deleted) and caps.can_view_deleted),
+        include_deleted=bool(include_deleted),
         page=page,
         page_size=page_size,
     )
     items = [_to_channel_group_list_item_out(r) for r in result["items"]]
     return ChannelGroupListPageOut(
+        total=int(result.get("total", 0) or 0),
         items=items,
-        page=result["page"],
-        page_size=result["page_size"],
-        total=result["total"],
-        has_more=result["has_more"],
-        capabilities=caps,
+        meta=result.get("meta") or {},
     )
 
 
 @router.post("/customer-groups", response_model=CustomerGroupOut)
 async def create_customer_group_manage(
-    payload: CustomerGroupCreateIn = Body(...),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        payload: CustomerGroupCreateIn = Body(...),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_create_allowed(ctx)
     created_by = _ensure_valid_user_id(ctx)
@@ -332,9 +328,9 @@ async def create_customer_group_manage(
 
 @router.post("/channel-groups", response_model=ChannelGroupOut)
 async def create_channel_group_manage(
-    payload: ChannelGroupCreateIn = Body(...),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        payload: ChannelGroupCreateIn = Body(...),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_create_allowed(ctx)
     created_by = _ensure_valid_user_id(ctx)
@@ -357,10 +353,10 @@ async def create_channel_group_manage(
 
 @router.put("/customer-groups/{group_id}", response_model=CustomerGroupOut)
 async def update_customer_group_manage(
-    group_id: int,
-    payload: CustomerGroupUpdateIn = Body(...),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        group_id: int,
+        payload: CustomerGroupUpdateIn = Body(...),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_edit_allowed(ctx)
 
@@ -388,10 +384,10 @@ async def update_customer_group_manage(
 
 @router.put("/channel-groups/{group_id}", response_model=ChannelGroupOut)
 async def update_channel_group_manage(
-    group_id: int,
-    payload: ChannelGroupUpdateIn = Body(...),
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        group_id: int,
+        payload: ChannelGroupUpdateIn = Body(...),
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_edit_allowed(ctx)
 
@@ -418,9 +414,9 @@ async def update_channel_group_manage(
 
 @router.delete("/customer-groups/{group_id}", response_model=CustomerGroupOut)
 async def delete_customer_group_manage(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_delete_allowed(ctx)
 
@@ -440,9 +436,9 @@ async def delete_customer_group_manage(
 
 @router.delete("/channel-groups/{group_id}", response_model=ChannelGroupOut)
 async def delete_channel_group_manage(
-    group_id: int,
-    db: AsyncSession = Depends(get_db),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        group_id: int,
+        db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
     _ensure_delete_allowed(ctx)
 

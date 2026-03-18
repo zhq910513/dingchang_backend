@@ -53,6 +53,7 @@ from app.schemas.order import (
     OrderInfoIn,
 )
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
+from app.services.order_owner_name import append_owner_name_fuzzy_clause as _append_owner_name_fuzzy_clause
 from app.services.order_read_model import (
     to_order_out as _rm_to_order_out,
     orders_to_list_items as _rm_orders_to_list_items,
@@ -424,69 +425,22 @@ def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
 
 
 def _add_owner_name_fuzzy(clauses: list, value: Optional[str]):
-    v = (value or "").strip()
-    if not v:
-        return
+    def _flat_text_getter(key: str):
+        return _json_text_unquoted(Order.dynamic_data, key)
 
-    needle = f"%{v.lower()}%"
-    or_terms = []
+    def _path_text_getter(path: str):
+        json_path = f"$.{path}"
+        dialect_name = _dialect_name()
+        if "mysql" in dialect_name or "mariadb" in dialect_name:
+            return func.json_unquote(func.json_extract(Order.dynamic_data, json_path))
+        return cast(func.json_extract(Order.dynamic_data, json_path), String)
 
-    direct_keys = [
-        "owner_name",
-        "vehicle_cert_owner_name",
-        "vehicle_owner_name",
-        "certificate_owner_name",
-        "driving_license_owner_name",
-        "license_owner_name",
-        "idcard_name",
-        "id_card_name",
-        "identity_name",
-    ]
-    for key in direct_keys:
-        expr = func.lower(_json_text_unquoted(Order.dynamic_data, key))
-        or_terms.append(expr.like(needle))
-
-    json_paths = [
-        "$.vehicle_cert.owner_name",
-        "$.vehicle_cert.vehicle_cert_owner_name",
-        "$.vehicle_cert.vehicle_owner_name",
-        "$.vehicle_cert.certificate_owner_name",
-        "$.driving_license.owner_name",
-        "$.driving_license.driving_license_owner_name",
-        "$.driving_license.license_owner_name",
-        "$.driving_license_main.owner_name",
-        "$.driving_license_main.driving_license_owner_name",
-        "$.driving_license_main.license_owner_name",
-        "$.driving_license_sub.owner_name",
-        "$.driving_license_sub.driving_license_owner_name",
-        "$.driving_license_sub.license_owner_name",
-        "$.idcard.name",
-        "$.idcard.owner_name",
-        "$.idcard.idcard_name",
-        "$.idcard.id_card_name",
-        "$.idcard.identity_name",
-        "$.idcard_front.name",
-        "$.idcard_front.owner_name",
-        "$.idcard_front.idcard_name",
-        "$.idcard_front.id_card_name",
-        "$.idcard_front.identity_name",
-        "$.idcard_back.name",
-        "$.idcard_back.owner_name",
-        "$.idcard_back.idcard_name",
-        "$.idcard_back.id_card_name",
-        "$.idcard_back.identity_name",
-    ]
-
-    d = _dialect_name()
-    for path in json_paths:
-        if "mysql" in d or "mariadb" in d:
-            expr = func.lower(func.json_unquote(func.json_extract(Order.dynamic_data, path)))
-        else:
-            expr = func.lower(cast(func.json_extract(Order.dynamic_data, path), String))
-        or_terms.append(expr.like(needle))
-
-    if or_terms:
-        clauses.append(or_(*or_terms))
+    _append_owner_name_fuzzy_clause(
+        clauses,
+        value=value,
+        flat_text_getter=_flat_text_getter,
+        path_text_getter=_path_text_getter,
+    )
 
 
 def _parse_bj_date_range(ymd: str) -> Optional[Tuple[datetime, datetime]]:

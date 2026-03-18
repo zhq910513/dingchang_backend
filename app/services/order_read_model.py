@@ -23,6 +23,7 @@ from app.schemas.order import (
     OrderListInfoOut,
 )
 from app.services.ocr_cleaner import norm_fuzzy_date_text
+from app.services.order_owner_name import resolve_owner_name as _shared_resolve_owner_name
 from app.services.storage import StorageService
 
 if TYPE_CHECKING:
@@ -104,158 +105,8 @@ def _pick_ocr_words_result_text(block: Dict[str, Any], field_name: str) -> Optio
 
 
 def _resolve_owner_name(dd: Dict[str, Any], ocr_raw: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """
-    车主兜底顺序（按你当前真实数据口径补齐）：
-    1. dynamic_data.owner_name
-    2. 车辆合格证相关 owner 键
-    3. 行驶证相关 owner 键
-    4. 身份证相关 name / id_name 键
-    5. ocr_raw_json.idcard_front.words_result.姓名.words
-    """
-    if dd:
-        owner = _pick_first_non_empty(
-            dd,
-            "owner_name",
-            "id_name",
-            "name",
-            "person_name",
-        )
-        if owner:
-            return owner
-
-        vehicle_cert = dd.get("vehicle_cert")
-        if isinstance(vehicle_cert, dict):
-            owner = _pick_first_non_empty(
-                vehicle_cert,
-                "owner_name",
-                "vehicle_cert_owner_name",
-                "vehicle_owner_name",
-                "certificate_owner_name",
-                "name",
-            )
-            if owner:
-                return owner
-
-        owner = _pick_first_non_empty(
-            dd,
-            "vehicle_cert_owner_name",
-            "vehicle_owner_name",
-            "certificate_owner_name",
-        )
-        if owner:
-            return owner
-
-        driving_license = dd.get("driving_license")
-        if isinstance(driving_license, dict):
-            owner = _pick_first_non_empty(
-                driving_license,
-                "owner_name",
-                "driving_license_owner_name",
-                "license_owner_name",
-                "name",
-            )
-            if owner:
-                return owner
-
-        driving_license_main = dd.get("driving_license_main")
-        if isinstance(driving_license_main, dict):
-            owner = _pick_first_non_empty(
-                driving_license_main,
-                "owner_name",
-                "driving_license_owner_name",
-                "license_owner_name",
-                "name",
-            )
-            if owner:
-                return owner
-
-        driving_license_sub = dd.get("driving_license_sub")
-        if isinstance(driving_license_sub, dict):
-            owner = _pick_first_non_empty(
-                driving_license_sub,
-                "owner_name",
-                "driving_license_owner_name",
-                "license_owner_name",
-                "name",
-            )
-            if owner:
-                return owner
-
-        owner = _pick_first_non_empty(
-            dd,
-            "driving_license_owner_name",
-            "license_owner_name",
-        )
-        if owner:
-            return owner
-
-        idcard = dd.get("idcard")
-        if isinstance(idcard, dict):
-            owner = _pick_first_non_empty(
-                idcard,
-                "name",
-                "id_name",
-                "owner_name",
-                "idcard_name",
-                "id_card_name",
-                "identity_name",
-            )
-            if owner:
-                return owner
-
-        idcard_front = dd.get("idcard_front")
-        if isinstance(idcard_front, dict):
-            owner = _pick_first_non_empty(
-                idcard_front,
-                "name",
-                "id_name",
-                "owner_name",
-                "idcard_name",
-                "id_card_name",
-                "identity_name",
-            )
-            if owner:
-                return owner
-
-        idcard_back = dd.get("idcard_back")
-        if isinstance(idcard_back, dict):
-            owner = _pick_first_non_empty(
-                idcard_back,
-                "name",
-                "id_name",
-                "owner_name",
-                "idcard_name",
-                "id_card_name",
-                "identity_name",
-            )
-            if owner:
-                return owner
-
-        owner = _pick_first_non_empty(
-            dd,
-            "idcard_name",
-            "id_card_name",
-            "identity_name",
-            "id_name",
-        )
-        if owner:
-            return owner
-
-    ocr = ocr_raw if isinstance(ocr_raw, dict) else _EMPTY_DICT
-    if ocr:
-        owner = _pick_ocr_words_result_text(ocr.get("idcard_front") or {}, "姓名")
-        if owner:
-            return owner
-
-        owner = _pick_ocr_words_result_text(ocr.get("driving_license_main") or {}, "所有人")
-        if owner:
-            return owner
-
-        owner = _pick_ocr_words_result_text(ocr.get("driving_license") or {}, "所有人")
-        if owner:
-            return owner
-
-    return None
+    """车主新口径：仅按 dynamic_data 解析；ocr_raw 不再参与展示字段回填。"""
+    return _shared_resolve_owner_name(dd)
 
 
 def _normalize_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Dict[str, Any]:
@@ -269,7 +120,7 @@ def _normalize_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Dict
     if first_register_date is not None:
         dd["first_register_date"] = norm_fuzzy_date_text(first_register_date)
 
-    resolved_owner_name = _resolve_owner_name(dd, _safe_dict(ocr_raw_json))
+    resolved_owner_name = _resolve_owner_name(dd)
     if resolved_owner_name:
         dd["owner_name"] = resolved_owner_name
     elif "owner_name" in dd:

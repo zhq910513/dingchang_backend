@@ -28,6 +28,10 @@ from app.models.order_info import OrderInfo
 from app.models.user import User
 from app.schemas.finance import FinanceOrderStatusUpdate
 from app.schemas.order import OrderOut
+from app.services.order_owner_name import (
+    append_owner_name_fuzzy_clause as _append_owner_name_fuzzy_clause,
+    resolve_owner_name as _resolve_owner_name_from_any,
+)
 from app.services.order_read_model import to_order_out as _rm_to_order_out
 from app.services.storage import StorageService
 
@@ -122,6 +126,30 @@ def _add_json_fuzzy(clauses: list, key: str, value: Optional[str]):
     clauses.append(expr.like(f"%{v.lower()}%"))
 
 
+def _resolve_owner_name_from_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Optional[str]:
+    """车主新口径：仅按 dynamic_data 规范字段与多卡槽字段兜底。"""
+    return _resolve_owner_name_from_any(dynamic_data)
+
+
+def _add_owner_name_fuzzy(clauses: list, value: Optional[str]):
+    def _flat_text_getter(key: str):
+        return _json_text_unquoted(Order.dynamic_data, key)
+
+    def _path_text_getter(path: str):
+        json_path = f"$.{path}"
+        dialect_name = _dialect_name()
+        if "mysql" in dialect_name or "mariadb" in dialect_name:
+            return func.json_unquote(func.json_extract(Order.dynamic_data, json_path))
+        return cast(func.json_extract(Order.dynamic_data, json_path), String)
+
+    _append_owner_name_fuzzy_clause(
+        clauses,
+        value=value,
+        flat_text_getter=_flat_text_getter,
+        path_text_getter=_path_text_getter,
+    )
+
+
 def _parse_bj_date_range(ymd: str):
     s = (ymd or "").strip()
     if not s:
@@ -161,12 +189,12 @@ def _parse_ymd(ymd: str):
 
 
 def _add_json_date_range_any(
-    clauses: list,
-    *,
-    keys: List[str],
-    start_ymd: Optional[str],
-    end_ymd: Optional[str],
-    err_prefix: str,
+        clauses: list,
+        *,
+        keys: List[str],
+        start_ymd: Optional[str],
+        end_ymd: Optional[str],
+        err_prefix: str,
 ):
     s = (start_ymd or "").strip()
     e = (end_ymd or "").strip()
@@ -243,23 +271,23 @@ def _group_code_name(g, kind: str) -> str:
 
 
 def _build_finance_filter_clauses(
-    *,
-    team_name: Optional[str],
-    team_names: Optional[Tuple[str, ...]],
-    current_team_names: Optional[Tuple[str, ...]],
-    role_name: Optional[str],
-    created_date: Optional[str],
-    created_date_start: Optional[str],
-    created_date_end: Optional[str],
-    channel_group_id: Optional[int],
-    customer_group_id: Optional[int],
-    market: Optional[str],
-    owner_name: Optional[str],
-    insurance_expire_date: Optional[str],
-    first_register_date_start: Optional[str],
-    first_register_date_end: Optional[str],
-    is_paid: Optional[bool],
-    is_rebate: Optional[bool],
+        *,
+        team_name: Optional[str],
+        team_names: Optional[Tuple[str, ...]],
+        current_team_names: Optional[Tuple[str, ...]],
+        role_name: Optional[str],
+        created_date: Optional[str],
+        created_date_start: Optional[str],
+        created_date_end: Optional[str],
+        channel_group_id: Optional[int],
+        customer_group_id: Optional[int],
+        market: Optional[str],
+        owner_name: Optional[str],
+        insurance_expire_date: Optional[str],
+        first_register_date_start: Optional[str],
+        first_register_date_end: Optional[str],
+        is_paid: Optional[bool],
+        is_rebate: Optional[bool],
 ) -> Tuple[list, bool, bool]:
     effective_team_names = _ac_effective_team_filter_for_query(
         role_name=role_name,
@@ -307,7 +335,7 @@ def _build_finance_filter_clauses(
         clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
 
     if (owner_name or "").strip():
-        _add_json_fuzzy(clauses, "owner_name", owner_name)
+        _add_owner_name_fuzzy(clauses, owner_name)
 
     _add_json_date_range_any(
         clauses,
@@ -328,11 +356,11 @@ def _build_finance_filter_clauses(
 
 
 def _build_finance_base_stmt(
-    *,
-    clauses: list,
-    need_join_customer: bool,
-    need_join_info: bool,
-    for_summary: bool = False,
+        *,
+        clauses: list,
+        need_join_customer: bool,
+        need_join_info: bool,
+        for_summary: bool = False,
 ):
     if for_summary:
         stmt = (
@@ -366,10 +394,10 @@ def _build_finance_base_stmt(
 
 
 async def _load_finance_order(
-    db: AsyncSession,
-    order_id: int,
-    *,
-    current_team_names: Optional[Tuple[str, ...]],
+        db: AsyncSession,
+        order_id: int,
+        *,
+        current_team_names: Optional[Tuple[str, ...]],
 ) -> Order:
     stmt = (
         select(Order)
@@ -398,22 +426,22 @@ async def _load_finance_order(
 
 @router.get("/orders/summary", response_model=FinanceOrdersSummaryOut)
 async def finance_orders_summary(
-    created_date: Optional[str] = Query(None),
-    created_date_start: Optional[str] = Query(None),
-    created_date_end: Optional[str] = Query(None),
-    channel_group_id: Optional[int] = Query(None),
-    customer_group_id: Optional[int] = Query(None),
-    market: Optional[str] = Query(None),
-    owner_name: Optional[str] = Query(None),
-    insurance_expire_date: Optional[str] = Query(None),
-    first_register_date_start: Optional[str] = Query(None),
-    first_register_date_end: Optional[str] = Query(None),
-    is_paid: Optional[bool] = Query(None),
-    is_rebate: Optional[bool] = Query(None),
-    team_name: Optional[str] = Query(None),
-    team_names: Optional[Tuple[str, ...]] = Query(None),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-    db: AsyncSession = Depends(get_db),
+        created_date: Optional[str] = Query(None),
+        created_date_start: Optional[str] = Query(None),
+        created_date_end: Optional[str] = Query(None),
+        channel_group_id: Optional[int] = Query(None),
+        customer_group_id: Optional[int] = Query(None),
+        market: Optional[str] = Query(None),
+        owner_name: Optional[str] = Query(None),
+        insurance_expire_date: Optional[str] = Query(None),
+        first_register_date_start: Optional[str] = Query(None),
+        first_register_date_end: Optional[str] = Query(None),
+        is_paid: Optional[bool] = Query(None),
+        is_rebate: Optional[bool] = Query(None),
+        team_name: Optional[str] = Query(None),
+        team_names: Optional[Tuple[str, ...]] = Query(None),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ) -> FinanceOrdersSummaryOut:
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -461,23 +489,23 @@ async def finance_orders_summary(
 
 @router.get("/orders/export")
 async def export_finance_orders(
-    created_date: Optional[str] = Query(None),
-    created_date_start: Optional[str] = Query(None),
-    created_date_end: Optional[str] = Query(None),
-    channel_group_id: Optional[int] = Query(None),
-    customer_group_id: Optional[int] = Query(None),
-    market: Optional[str] = Query(None),
-    owner_name: Optional[str] = Query(None),
-    insurance_expire_date: Optional[str] = Query(None),
-    first_register_date_start: Optional[str] = Query(None),
-    first_register_date_end: Optional[str] = Query(None),
-    is_paid: Optional[bool] = Query(None),
-    is_rebate: Optional[bool] = Query(None),
-    team_name: Optional[str] = Query(None),
-    team_names: Optional[Tuple[str, ...]] = Query(None),
-    ids: Optional[Tuple[int, ...]] = Query(None),
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-    db: AsyncSession = Depends(get_db),
+        created_date: Optional[str] = Query(None),
+        created_date_start: Optional[str] = Query(None),
+        created_date_end: Optional[str] = Query(None),
+        channel_group_id: Optional[int] = Query(None),
+        customer_group_id: Optional[int] = Query(None),
+        market: Optional[str] = Query(None),
+        owner_name: Optional[str] = Query(None),
+        insurance_expire_date: Optional[str] = Query(None),
+        first_register_date_start: Optional[str] = Query(None),
+        first_register_date_end: Optional[str] = Query(None),
+        is_paid: Optional[bool] = Query(None),
+        is_rebate: Optional[bool] = Query(None),
+        team_name: Optional[str] = Query(None),
+        team_names: Optional[Tuple[str, ...]] = Query(None),
+        ids: Optional[Tuple[int, ...]] = Query(None),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -599,7 +627,7 @@ async def export_finance_orders(
             _group_code_name(cg, "customer"),
             getattr(cg, "market", None) or "-",
             (getattr(sp, "real_name", None) or getattr(sp, "username", None) or "-"),
-            dd.get("owner_name") or "-",
+            _resolve_owner_name_from_dynamic_data(dd, getattr(o, "ocr_raw_json", None)) or "-",
             dd.get("plate_no") or "-",
             str(getattr(info, "insurance_expire_date", None) or "-"),
             dd.get("vin") or "-",
@@ -646,9 +674,9 @@ async def export_finance_orders(
 
 @router.get("/orders/{order_id}", response_model=OrderOut)
 async def get_finance_order_detail(
-    order_id: int,
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-    db: AsyncSession = Depends(get_db),
+        order_id: int,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ) -> OrderOut:
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -661,10 +689,10 @@ async def get_finance_order_detail(
 
 @router.patch("/orders/{order_id}/status")
 async def update_finance_order_status(
-    order_id: int,
-    payload: FinanceOrderStatusUpdate,
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-    db: AsyncSession = Depends(get_db),
+        order_id: int,
+        payload: FinanceOrderStatusUpdate,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)
@@ -684,9 +712,9 @@ async def update_finance_order_status(
 
 @router.post("/orders/{order_id}/return")
 async def return_finance_order_to_unfinished(
-    order_id: int,
-    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
-    db: AsyncSession = Depends(get_db),
+        order_id: int,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     role_name = ctx.primary_role or ""
     _ensure_finance_access(role_name)

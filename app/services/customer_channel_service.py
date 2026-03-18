@@ -2,20 +2,134 @@
 # encoding: utf-8
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 from zoneinfo import ZoneInfo
 
+from fastapi import HTTPException
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.sql.expression import false as sql_false
 
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
 from app.models.channel_group import ChannelGroup
 from app.models.customer_group import CustomerGroup
 from app.models.user import User
 
 _BJ = ZoneInfo("Asia/Shanghai")
+_CHANNEL_GROUP_LIST_ALLOWED_ROLES = {
+    ROLE_SUPER_ADMIN,
+    ROLE_MANAGER,
+    ROLE_MARKET,
+    ROLE_FINANCE,
+    ROLE_SALES,
+}
+
+
+@dataclass(frozen=True)
+class ChannelGroupAclBundle:
+    role_name: str
+    can_list_view: bool
+    can_create: bool
+    can_update: bool
+    can_delete: bool
+    can_view_deleted: bool
+
+
+def compile_channel_group_acl_bundle(*, role_name: Optional[str]) -> ChannelGroupAclBundle:
+    normalized_role_name = str(role_name or "").strip()
+    return ChannelGroupAclBundle(
+        role_name=normalized_role_name,
+        can_list_view=normalized_role_name in _CHANNEL_GROUP_LIST_ALLOWED_ROLES,
+        can_create=normalized_role_name != ROLE_FINANCE,
+        can_update=normalized_role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET),
+        can_delete=normalized_role_name != ROLE_FINANCE,
+        can_view_deleted=normalized_role_name == ROLE_SUPER_ADMIN,
+    )
+
+
+def build_channel_group_page_capabilities(*, acl_bundle: ChannelGroupAclBundle) -> Dict[str, bool]:
+    return {
+        "channel.create": bool(acl_bundle.can_create),
+        "channel.list.view": bool(acl_bundle.can_list_view),
+    }
+
+
+def build_channel_group_row_capabilities(
+    *,
+    acl_bundle: ChannelGroupAclBundle,
+    row: Mapping[str, Any],
+) -> Dict[str, bool]:
+    is_deleted = int(row.get("is_deleted", 0) or 0) == 1
+    return {
+        "channel.update": bool(acl_bundle.can_update and not is_deleted),
+        "channel.delete": bool(acl_bundle.can_delete and not is_deleted),
+    }
+
+
+def apply_channel_group_list_acl(*, stmt, acl_bundle: ChannelGroupAclBundle):
+    if acl_bundle.can_list_view:
+        return stmt
+    return stmt.where(sql_false())
+
+
+_CUSTOMER_GROUP_LIST_ALLOWED_ROLES = {
+    ROLE_SUPER_ADMIN,
+    ROLE_MANAGER,
+    ROLE_MARKET,
+    ROLE_FINANCE,
+    ROLE_SALES,
+}
+
+
+@dataclass(frozen=True)
+class CustomerGroupAclBundle:
+    role_name: str
+    can_list_view: bool
+    can_create: bool
+    can_update: bool
+    can_delete: bool
+    can_view_deleted: bool
+
+
+def compile_customer_group_acl_bundle(*, role_name: Optional[str]) -> CustomerGroupAclBundle:
+    normalized_role_name = str(role_name or "").strip()
+    return CustomerGroupAclBundle(
+        role_name=normalized_role_name,
+        can_list_view=normalized_role_name in _CUSTOMER_GROUP_LIST_ALLOWED_ROLES,
+        can_create=normalized_role_name != ROLE_FINANCE,
+        can_update=normalized_role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET),
+        can_delete=normalized_role_name != ROLE_FINANCE,
+        can_view_deleted=normalized_role_name == ROLE_SUPER_ADMIN,
+    )
+
+
+def build_customer_group_page_capabilities(*, acl_bundle: CustomerGroupAclBundle) -> Dict[str, bool]:
+    return {
+        "customer.create": bool(acl_bundle.can_create),
+        "customer.list.view": bool(acl_bundle.can_list_view),
+    }
+
+
+def build_customer_group_row_capabilities(
+    *,
+    acl_bundle: CustomerGroupAclBundle,
+    row: Mapping[str, Any],
+) -> Dict[str, bool]:
+    is_deleted = int(row.get("is_deleted", 0) or 0) == 1
+    return {
+        "customer.update": bool(acl_bundle.can_update and not is_deleted),
+        "customer.delete": bool(acl_bundle.can_delete and not is_deleted),
+    }
+
+
+def apply_customer_group_list_acl(*, stmt, acl_bundle: CustomerGroupAclBundle):
+    if acl_bundle.can_list_view:
+        return stmt
+    return stmt.where(sql_false())
 
 
 def _normalize_text(v: Optional[str]) -> str:
@@ -104,7 +218,7 @@ async def list_customer_groups(
 
     base_stmt = (
         base_stmt
-        .order_by(CustomerGroup.customer_name.asc(), CustomerGroup.id.asc())
+        .order_by(CustomerGroup.updated_at.desc(), CustomerGroup.id.desc())
         .offset(offset)
         .limit(page_size)
     )
@@ -154,7 +268,7 @@ async def list_channel_groups(
 
     base_stmt = (
         base_stmt
-        .order_by(ChannelGroup.channel_name.asc(), ChannelGroup.id.asc())
+        .order_by(ChannelGroup.updated_at.desc(), ChannelGroup.id.desc())
         .offset(offset)
         .limit(page_size)
     )
@@ -178,6 +292,7 @@ async def list_channel_groups(
 async def list_customer_groups_manage(
     *,
     db: AsyncSession,
+    role_name: Optional[str] = None,
     customer_code: Optional[str] = None,
     customer_name: Optional[str] = None,
     market: Optional[str] = None,
@@ -187,12 +302,14 @@ async def list_customer_groups_manage(
     page: int = 1,
     page_size: int = 20,
 ) -> Dict[str, Any]:
+    acl_bundle = compile_customer_group_acl_bundle(role_name=role_name)
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
     offset = (page - 1) * page_size
 
     creator = aliased(User)
     created_name_expr = _display_name_expr(creator)
+    effective_include_deleted = bool(include_deleted and acl_bundle.can_view_deleted)
 
     base_stmt = (
         select(
@@ -215,64 +332,84 @@ async def list_customer_groups_manage(
 
     count_stmt = select(func.count(CustomerGroup.id)).select_from(CustomerGroup)
 
-    if not include_deleted:
+    base_stmt = apply_customer_group_list_acl(stmt=base_stmt, acl_bundle=acl_bundle)
+    count_stmt = apply_customer_group_list_acl(stmt=count_stmt, acl_bundle=acl_bundle)
+
+    if not effective_include_deleted:
         cond = CustomerGroup.is_deleted == 0
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
-    cc = _normalize_text(customer_code)
-    if cc:
-        cond = CustomerGroup.customer_code.like(f"%{cc}%")
+    normalized_customer_code = _normalize_text(customer_code)
+    if normalized_customer_code:
+        cond = CustomerGroup.customer_code.like(f"%{normalized_customer_code}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
-    cn = _normalize_text(customer_name)
-    if cn:
-        cond = CustomerGroup.customer_name.like(f"%{cn}%")
+    normalized_customer_name = _normalize_text(customer_name)
+    if normalized_customer_name:
+        cond = CustomerGroup.customer_name.like(f"%{normalized_customer_name}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
-    mk = _normalize_text(market)
-    if mk:
-        cond = CustomerGroup.market.like(f"%{mk}%")
+    normalized_market = _normalize_text(market)
+    if normalized_market:
+        cond = CustomerGroup.market.like(f"%{normalized_market}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
-    rg = _normalize_text(region)
-    if rg:
-        cond = CustomerGroup.region.like(f"%{rg}%")
+    normalized_region = _normalize_text(region)
+    if normalized_region:
+        cond = CustomerGroup.region.like(f"%{normalized_region}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
-    cbn = _normalize_text(created_by_name)
-    if cbn:
+    normalized_created_by_name = _normalize_text(created_by_name)
+    if normalized_created_by_name:
         count_stmt = count_stmt.outerjoin(creator, creator.id == CustomerGroup.created_by)
-        cond = cast(created_name_expr, String).like(f"%{cbn}%")
+        cond = cast(created_name_expr, String).like(f"%{normalized_created_by_name}%")
         base_stmt = base_stmt.where(cond)
         count_stmt = count_stmt.where(cond)
 
     base_stmt = (
         base_stmt
-        .order_by(CustomerGroup.customer_name.asc(), CustomerGroup.id.asc())
+        .order_by(CustomerGroup.updated_at.desc(), CustomerGroup.id.desc())
         .offset(offset)
         .limit(page_size)
     )
 
     total = int((await db.execute(count_stmt)).scalar() or 0)
-    items = list((await db.execute(base_stmt)).mappings().all())
+    raw_items = list((await db.execute(base_stmt)).mappings().all())
+    items = []
+    for raw_row in raw_items:
+        row = dict(raw_row)
+        row["meta"] = {
+            "capabilities": build_customer_group_row_capabilities(
+                acl_bundle=acl_bundle,
+                row=row,
+            )
+        }
+        items.append(row)
 
     return {
-        "items": items,
-        "page": page,
-        "page_size": page_size,
         "total": total,
-        "has_more": (offset + len(items)) < total,
+        "items": items,
+        "meta": {
+            "capabilities": build_customer_group_page_capabilities(acl_bundle=acl_bundle),
+            "scopes": {},
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+            },
+        },
     }
+
 
 
 async def list_channel_groups_manage(
     *,
     db: AsyncSession,
+    role_name: Optional[str],
     channel_code: Optional[str] = None,
     channel_name: Optional[str] = None,
     region: Optional[str] = None,
@@ -284,6 +421,10 @@ async def list_channel_groups_manage(
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
     offset = (page - 1) * page_size
+
+    acl_bundle = compile_channel_group_acl_bundle(role_name=role_name)
+    if not acl_bundle.can_list_view:
+        raise HTTPException(status_code=403, detail="无权限查看渠道列表")
 
     creator = aliased(User)
     created_name_expr = _display_name_expr(creator)
@@ -308,6 +449,10 @@ async def list_channel_groups_manage(
 
     count_stmt = select(func.count(ChannelGroup.id)).select_from(ChannelGroup)
 
+    base_stmt = apply_channel_group_list_acl(stmt=base_stmt, acl_bundle=acl_bundle)
+    count_stmt = apply_channel_group_list_acl(stmt=count_stmt, acl_bundle=acl_bundle)
+
+    include_deleted = bool(include_deleted and acl_bundle.can_view_deleted)
     if not include_deleted:
         cond = ChannelGroup.is_deleted == 0
         base_stmt = base_stmt.where(cond)
@@ -340,20 +485,35 @@ async def list_channel_groups_manage(
 
     base_stmt = (
         base_stmt
-        .order_by(ChannelGroup.channel_name.asc(), ChannelGroup.id.asc())
+        .order_by(ChannelGroup.updated_at.desc(), ChannelGroup.id.desc())
         .offset(offset)
         .limit(page_size)
     )
 
     total = int((await db.execute(count_stmt)).scalar() or 0)
-    items = list((await db.execute(base_stmt)).mappings().all())
+    raw_items = list((await db.execute(base_stmt)).mappings().all())
+    items = []
+    for raw_row in raw_items:
+        item = dict(raw_row)
+        item["meta"] = {
+            "capabilities": build_channel_group_row_capabilities(
+                acl_bundle=acl_bundle,
+                row=raw_row,
+            )
+        }
+        items.append(item)
 
     return {
         "items": items,
-        "page": page,
-        "page_size": page_size,
         "total": total,
-        "has_more": (offset + len(items)) < total,
+        "meta": {
+            "capabilities": build_channel_group_page_capabilities(acl_bundle=acl_bundle),
+            "scopes": {},
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+            },
+        },
     }
 
 

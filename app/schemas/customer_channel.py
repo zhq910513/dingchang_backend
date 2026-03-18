@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, root_validator, validator
 
@@ -58,6 +58,36 @@ class CustomerChannelPageCapabilitiesOut(BaseModel):
     can_view_deleted: bool = False
 
 
+class CustomerGroupRowMetaOut(BaseModel):
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+
+
+class CustomerGroupPaginationMetaOut(BaseModel):
+    page: int = 1
+    page_size: int = 20
+
+
+class CustomerGroupPageMetaOut(BaseModel):
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+    scopes: Dict[str, Any] = Field(default_factory=dict)
+    pagination: CustomerGroupPaginationMetaOut = Field(default_factory=CustomerGroupPaginationMetaOut)
+
+
+class ChannelGroupRowMetaOut(BaseModel):
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+
+
+class ChannelGroupPaginationMetaOut(BaseModel):
+    page: int = 1
+    page_size: int = 20
+
+
+class ChannelGroupPageMetaOut(BaseModel):
+    capabilities: Dict[str, bool] = Field(default_factory=dict)
+    scopes: Dict[str, Any] = Field(default_factory=dict)
+    pagination: ChannelGroupPaginationMetaOut = Field(default_factory=ChannelGroupPaginationMetaOut)
+
+
 class CustomerGroupListItemOut(BaseModel):
     id: int
     customer_code: str
@@ -71,6 +101,7 @@ class CustomerGroupListItemOut(BaseModel):
     updated_at: Optional[str] = None
     deleted_at: Optional[str] = None
     is_deleted: int = 0
+    meta: CustomerGroupRowMetaOut = Field(default_factory=CustomerGroupRowMetaOut)
 
 
 class ChannelGroupListItemOut(BaseModel):
@@ -85,24 +116,19 @@ class ChannelGroupListItemOut(BaseModel):
     updated_at: Optional[str] = None
     deleted_at: Optional[str] = None
     is_deleted: int = 0
+    meta: ChannelGroupRowMetaOut = Field(default_factory=ChannelGroupRowMetaOut)
 
 
 class CustomerGroupListPageOut(BaseModel):
-    items: List[CustomerGroupListItemOut] = Field(default_factory=list)
-    page: int = 1
-    page_size: int = 20
     total: int = 0
-    has_more: bool = False
-    capabilities: CustomerChannelPageCapabilitiesOut = Field(default_factory=CustomerChannelPageCapabilitiesOut)
+    items: List[CustomerGroupListItemOut] = Field(default_factory=list)
+    meta: CustomerGroupPageMetaOut = Field(default_factory=CustomerGroupPageMetaOut)
 
 
 class ChannelGroupListPageOut(BaseModel):
-    items: List[ChannelGroupListItemOut] = Field(default_factory=list)
-    page: int = 1
-    page_size: int = 20
     total: int = 0
-    has_more: bool = False
-    capabilities: CustomerChannelPageCapabilitiesOut = Field(default_factory=CustomerChannelPageCapabilitiesOut)
+    items: List[ChannelGroupListItemOut] = Field(default_factory=list)
+    meta: ChannelGroupPageMetaOut = Field(default_factory=ChannelGroupPageMetaOut)
 
 
 class CustomerGroupOut(BaseModel):
