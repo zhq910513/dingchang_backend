@@ -10,10 +10,10 @@ tree-src.txt
 .idea/
 
 # Logs
-logs/*.log
+logs/*
 
 # DOC
-docs/
+docs/*
 
 # Env
 .env
