@@ -12,5 +12,8 @@ tree-src.txt
 # Logs
 logs/*.log
 
+# DOC
+docs/
+
 # Env
 .env
