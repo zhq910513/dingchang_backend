@@ -1,8 +1,0 @@
-{
-  "ok": true,
-  "remote_table_indexes": 38,
-  "local_table_indexes": 38,
-  "remote_index_count": 193,
-  "local_index_count": 193,
-  "diff": []
-}
