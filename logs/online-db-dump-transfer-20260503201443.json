@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "remote_path": "/data/backup/dingchang_db_snapshots/order_system_full_20260503201443.sql.gz",
+  "local_path": "D:\\Projects\\dingchang\\dingchang_backend\\logs\\order_system_full_online_20260503201443.sql.gz",
+  "dump_stdout": "39d2c58cd0253b3561f4297a746cbea018dc4c6e79b0d73421930297aefb9ec7  /data/backup/dingchang_db_snapshots/order_system_full_20260503201443.sql.gz\n/data/backup/dingchang_db_snapshots/order_system_full_20260503201443.sql.gz\t17814742\n",
+  "dump_stderr": "",
+  "local_size": 17814742,
+  "local_sha256": "39d2c58cd0253b3561f4297a746cbea018dc4c6e79b0d73421930297aefb9ec7"
+}

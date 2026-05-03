@@ -1,0 +1,262 @@
+{
+  "ok": false,
+  "run_id": "20260503122720_fdc8df",
+  "created": {
+    "run_id": "20260503122720_fdc8df",
+    "username": "codex_nav_user_20260503122720fdc8df",
+    "user_id": 32,
+    "login_token_present": true,
+    "team_name": "赣州团队"
+  },
+  "rows": [
+    {
+      "label": "get_team_options",
+      "method": "GET",
+      "path": "/orders/teams",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 11.71,
+      "ok": true,
+      "body": {
+        "items": [
+          {
+            "team_name": "赣州团队"
+          },
+          {
+            "team_name": "南昌团队"
+          },
+          {
+            "team_name": "九江团队"
+          }
+        ]
+      }
+    },
+    {
+      "label": "create_sales_user_frontend_payload",
+      "method": "POST",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 173.34,
+      "ok": true,
+      "body": {
+        "id": 32,
+        "username": "codex_nav_user_20260503122720fdc8df",
+        "real_name": null,
+        "role_name": "sales",
+        "team_name": "赣州团队",
+        "team_names": [],
+        "status": 1,
+        "is_online": false,
+        "created_at": "2026-05-03T12:27:20",
+        "updated_at": "2026-05-03T12:27:20",
+        "meta": {
+          "capabilities": {
+            "user_update": false,
+            "user_delete": false
+          }
+        }
+      }
+    },
+    {
+      "label": "list_user_by_keyword",
+      "method": "GET",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 42.81,
+      "ok": true,
+      "body": {
+        "total": 1,
+        "items": [
+          {
+            "id": 32,
+            "username": "codex_nav_user_20260503122720fdc8df",
+            "real_name": null,
+            "role_name": "sales",
+            "team_name": "赣州团队",
+            "team_names": [],
+            "status": 1,
+            "is_online": false,
+            "created_at": "2026-05-03T12:27:20",
+            "updated_at": "2026-05-03T12:27:20",
+            "meta": {
+              "capabilities": {
+                "user_update": true,
+                "user_delete": true
+              }
+            }
+          }
+        ],
+        "meta": {
+          "capabilities": {
+            "user_create": true,
+            "user_list_view": true
+          },
+          "scopes": {
+            "user_creatable_role_names": [
+              "manager",
+              "sales",
+              "finance",
+              "market"
+            ]
+          },
+          "pagination": {
+            "page": 1,
+            "page_size": 20
+          }
+        }
+      }
+    },
+    {
+      "label": "update_user_password_and_team",
+      "method": "PUT",
+      "path": "/users/32",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 141.92,
+      "ok": true,
+      "body": {
+        "id": 32,
+        "username": "codex_nav_user_20260503122720fdc8df",
+        "real_name": null,
+        "role_name": "sales",
+        "team_name": "赣州团队",
+        "team_names": [],
+        "status": 1,
+        "is_online": false,
+        "created_at": "2026-05-03T12:27:20",
+        "updated_at": "2026-05-03T12:27:21",
+        "meta": {
+          "capabilities": {
+            "user_update": false,
+            "user_delete": false
+          }
+        }
+      }
+    },
+    {
+      "label": "login_with_updated_password",
+      "method": "POST",
+      "path": "/auth/login",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 141.73,
+      "ok": true,
+      "body": {
+        "token": "***REDACTED***",
+        "user_id": 32,
+        "username": "codex_nav_user_20260503122720fdc8df",
+        "real_name": null,
+        "full_name": "codex_nav_user_20260503122720fdc8df",
+        "role_name": "sales",
+        "team_names": [
+          "赣州团队"
+        ],
+        "team_name": "赣州团队"
+      }
+    },
+    {
+      "label": "logout_test_user",
+      "method": "POST",
+      "path": "/auth/logout",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 45.12,
+      "ok": true,
+      "body": {
+        "ok": true
+      }
+    },
+    {
+      "label": "delete_test_user_after_logout",
+      "method": "DELETE",
+      "path": "/users/32",
+      "expected": [
+        200
+      ],
+      "status": 500,
+      "elapsed_ms": 413.83,
+      "ok": false,
+      "body": "Internal Server Error"
+    },
+    {
+      "label": "list_user_after_delete",
+      "method": "GET",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 15.41,
+      "ok": true,
+      "body": {
+        "total": 1,
+        "items": [
+          {
+            "id": 32,
+            "username": "codex_nav_user_20260503122720fdc8df",
+            "real_name": null,
+            "role_name": "sales",
+            "team_name": "赣州团队",
+            "team_names": [],
+            "status": 1,
+            "is_online": false,
+            "created_at": "2026-05-03T12:27:20",
+            "updated_at": "2026-05-03T12:27:21",
+            "meta": {
+              "capabilities": {
+                "user_update": true,
+                "user_delete": true
+              }
+            }
+          }
+        ],
+        "meta": {
+          "capabilities": {
+            "user_create": true,
+            "user_list_view": true
+          },
+          "scopes": {
+            "user_creatable_role_names": [
+              "manager",
+              "sales",
+              "finance",
+              "market"
+            ]
+          },
+          "pagination": {
+            "page": 1,
+            "page_size": 20
+          }
+        }
+      }
+    }
+  ],
+  "failures": [
+    {
+      "label": "delete_test_user_after_logout",
+      "method": "DELETE",
+      "path": "/users/32",
+      "expected": [
+        200
+      ],
+      "status": 500,
+      "elapsed_ms": 413.83,
+      "ok": false,
+      "body": "Internal Server Error"
+    }
+  ]
+}

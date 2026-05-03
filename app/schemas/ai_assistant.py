@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 
 
 class AiChatIn(BaseModel):
-    message: str
-    order_id: Optional[int] = None
+    message: str = Field(..., min_length=1, max_length=2000)
+    order_id: Optional[int] = Field(default=None, ge=1)
     images: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -34,7 +34,7 @@ class AiSessionListOut(BaseModel):
 
 class AiCreateSessionIn(BaseModel):
     """创建会话入参（冻结契约）"""
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=100)
 
 
 class AiDeleteSessionOut(BaseModel):

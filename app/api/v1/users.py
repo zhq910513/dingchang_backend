@@ -46,10 +46,18 @@ def _mapping_to_user_out(row: Mapping[str, Any]) -> UserOut:
     )
 
 
+def _model_dump_exclude_unset(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_unset=True)
+    return model.dict(exclude_unset=True)
+
+
 @router.get("", response_model=UserListOut)
 async def list_users(
     keyword: Optional[str] = Query(None),
     role: Optional[str] = Query(None),
+    status: Optional[int] = Query(None, description="账号状态：1=启用，0=禁用"),
+    is_online: Optional[bool] = Query(None, description="是否在线（最近心跳窗口内）"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -62,6 +70,8 @@ async def list_users(
             current_role=ctx.primary_role or "",
             keyword=keyword,
             role=role,
+            status=status,
+            is_online=is_online,
             page=page,
             page_size=page_size,
         )
@@ -113,15 +123,19 @@ async def update_user(
     db: AsyncSession = Depends(get_db),
     ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ) -> UserOut:
+    update_fields = _model_dump_exclude_unset(payload)
+    update_kwargs: dict[str, Any] = {}
+    for field_name in ("password", "team_name", "team_names"):
+        if field_name in update_fields:
+            update_kwargs[field_name] = update_fields.get(field_name)
+
     try:
         row = await _update_user(
             db=db,
             current_user=ctx.user,
             current_role=ctx.primary_role or "",
             user_id=int(user_id),
-            password=payload.password,
-            team_name=payload.team_name,
-            team_names=payload.team_names,
+            **update_kwargs,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))

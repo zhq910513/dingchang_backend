@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "allowed_count_diff_tables": [
+    "order_fact_new"
+  ],
+  "count_diff": [],
+  "finance_diff": [],
+  "status_diff": [],
+  "order_watermark_compare": {
+    "remote": [
+      "6",
+      "5577",
+      "2026-01-07 16:41:44",
+      "2026-05-02 17:34:20",
+      "2026-05-02 17:34:20"
+    ],
+    "local": [
+      "6",
+      "5577",
+      "2026-01-07 16:41:44",
+      "2026-05-02 17:34:20",
+      "2026-05-02 17:34:20"
+    ]
+  },
+  "remote_order_fact_count": 0,
+  "local_order_fact_count": 5535
+}

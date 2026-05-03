@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "host": "180.76.46.121",
+  "ts": "2026-05-03 20:11:02",
+  "results": {
+    "system": {
+      "cmd": "set -o pipefail; hostname; date; uname -a; whoami; pwd",
+      "exit": 0,
+      "stdout": "instance-p3lfwf3w\nSun May  3 20:11:00 CST 2026\nLinux instance-p3lfwf3w 4.18.0-348.7.1.el8_5.x86_64 #1 SMP Wed Dec 22 13:25:12 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux\nroot\n/root\n",
+      "stderr": ""
+    },
+    "data_dirs": {
+      "cmd": "set -o pipefail; for p in /data /data/backend /data/backend/dingchang_backend /data/compose /data/compose/dingchang /data/frontend /data/frontend/dingchang_frontend; do echo \"### $p\"; ls -la \"$p\" 2>&1 | head -80; done",
+      "exit": 0,
+      "stdout": "### /data\ntotal 32\ndrwxr-xr-x   8 root root 4096 Feb 27 03:40 .\ndr-xr-xr-x. 19 root root 4096 Mar 10 22:24 ..\ndrwxr-xr-x   5 root root 4096 Mar  3 00:10 backend\ndrwxr-xr-x   2 root root 4096 Feb 27 03:41 backup\ndrwxr-xr-x   6 root root 4096 Jan  7 02:14 compose\ndrwxr-xr-x   4 root root 4096 Jan 11 12:37 frontend\ndrwxr-xr-x   3 root root 4096 Jan  6 21:57 nginx\ndrwxr-xr-x   5 root root 4096 Jan  7 02:29 runtime\n### /data/backend\ntotal 20\ndrwxr-xr-x 5 root root 4096 Mar  3 00:10 .\ndrwxr-xr-x 8 root root 4096 Feb 27 03:40 ..\ndrwxr-xr-x 5 root root 4096 Jan 16 18:57 aistock_backend\ndrwxr-xr-x 6 root root 4096 Mar 16 17:03 dingchang_backend\ndrwxr-xr-x 7 root root 4096 Mar  3 01:36 dingchang_db_migrator\n### /data/backend/dingchang_backend\ntotal 48\ndrwxr-xr-x 6 root root 4096 Mar 16 17:03 .\ndrwxr-xr-x 5 root root 4096 Mar  3 00:10 ..\ndrwxr-xr-x 9 root root 4096 Mar 16 10:25 app\n-rw-r--r-- 1 root root  987 Feb 24 13:16 Dockerfile\n-rw-r--r-- 1 root root  109 Feb 24 13:16 .dockerignore\n-rw------- 1 root root 2977 Jan  6 02:03 .env\ndrwxr-xr-x 8 root root 4096 Mar 18 08:27 .git\n-rw-r--r-- 1 root root  122 Jan  8 03:12 .gitignore\ndrwxr-xr-x 2 root root 4096 Dec 29 02:43 logs\n-rw-r--r-- 1 root root  462 Feb 24 13:16 requirements.txt\ndrwxr-xr-x 2 root root 4096 Mar 16 10:25 storage\n-rw-r--r-- 1 root root 2533 Mar 16 17:03 权限.txt\n### /data/compose\ntotal 32\ndrwxr-xr-x 6 root root 4096 Jan  7 02:14 .\ndrwxr-xr-x 8 root root 4096 Feb 27 03:40 ..\ndrwxr-xr-x 2 root root 4096 Jan 16 18:34 aistock\ndrwxr-xr-x 2 root root 4096 Mar 11 01:00 dingchang\n-rwxr-xr-x 1 root root  575 Jan  7 02:14 down_all.sh\ndrwxr-xr-x 2 root root 4096 Jan  7 00:25 nginx\ndrwxr-xr-x 2 root root 4096 Jan  7 02:10 redis\n-rwxr-xr-x 1 root root  331 Jan  7 02:11 up_all.sh\n### /data/compose/dingchang\ntotal 20\ndrwxr-xr-x 2 root root 4096 Mar 11 01:00 .\ndrwxr-xr-x 6 root root 4096 Jan  7 02:14 ..\n-rw------- 1 root root 2765 Jan  7 02:21 backend.env\n-rw-r--r-- 1 root root 1680 Jan  7 00:10 docker-compose.yml\n-rw------- 1 root root  217 Jan  6 02:03 .env\n### /data/frontend\ntotal 16\ndrwxr-xr-x 4 root root 4096 Jan 11 12:37 .\ndrwxr-xr-x 8 root root 4096 Feb 27 03:40 ..\ndrwxr-xr-x 3 root root 4096 Jan 15 23:15 aistock_frontend\ndrwxr-xr-x 4 root root 4096 Mar 18 08:27 dingchang_frontend\n### /data/frontend/dingchang_frontend\ntotal 120\ndrwxr-xr-x 4 root root  4096 Mar 18 08:27 .\ndrwxr-xr-x 4 root root  4096 Jan 11 12:37 ..\ndrwxr-xr-x 2 root root 28672 Mar 18 08:27 assets\n-rw-r--r-- 1 root root  9580 Dec 29 02:00 favicon.ico\ndrwxr-xr-x 8 root root  4096 Mar 18 08:27 .git\n-rw-r--r-- 1 root root  1161 Mar 18 08:27 index.html\n-rw-r--r-- 1 root root 59013 Dec 29 02:00 logo.png\n",
+      "stderr": ""
+    },
+    "docker_ps": {
+      "cmd": "docker ps --format \"table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}\"",
+      "exit": 0,
+      "stdout": "NAMES               IMAGE                                            STATUS                 PORTS\ndingchang_backend   dingchang-backend                                Up 6 weeks (healthy)   8000/tcp\naistock_backend     aistock-backend                                  Up 7 weeks             8000/tcp\nedge_nginx          docker.m.daocloud.io/library/nginx:1.25-alpine   Up 7 weeks             0.0.0.0:80->80/tcp, :::80->80/tcp\ndingchang_mysql     docker.m.daocloud.io/library/mysql:8.0           Up 7 weeks (healthy)   3306/tcp, 33060/tcp\ngateway_redis       docker.m.daocloud.io/library/redis:7-alpine      Up 7 weeks             6379/tcp\n",
+      "stderr": ""
+    },
+    "docker_compose_services": {
+      "cmd": "cd /data/compose/dingchang && docker compose config --services && echo \"--- ps ---\" && docker compose ps",
+      "exit": 0,
+      "stdout": "mysql\nbackend\n--- ps ---\nNAME                IMAGE                                    COMMAND                  SERVICE   CREATED        STATUS                 PORTS\ndingchang_backend   dingchang-backend                        \"gunicorn -k uvicorn…\"   backend   6 weeks ago    Up 6 weeks (healthy)   8000/tcp\ndingchang_mysql     docker.m.daocloud.io/library/mysql:8.0   \"docker-entrypoint.s…\"   mysql     3 months ago   Up 7 weeks (healthy)   3306/tcp, 33060/tcp\n",
+      "stderr": ""
+    },
+    "backend_git": {
+      "cmd": "cd /data/backend/dingchang_backend && git remote -v && git branch --show-current && git log -1 --oneline --decorate",
+      "exit": 0,
+      "stdout": "origin\tgit@github.com:zhq910513/dingchang_backend.git (fetch)\norigin\tgit@github.com:zhq910513/dingchang_backend.git (push)\nmain\n93b5685 (HEAD -> main, origin/main) 渠道、客户二次优化\n",
+      "stderr": ""
+    },
+    "frontend_git": {
+      "cmd": "cd /data/frontend/dingchang_frontend && git remote -v && git branch --show-current && git log -1 --oneline --decorate",
+      "exit": 0,
+      "stdout": "origin\tgit@github.com:zhq910513/dingchang_frontend.git (fetch)\norigin\tgit@github.com:zhq910513/dingchang_frontend.git (push)\nmain\n7e7f4fe (HEAD -> main, origin/main) 渠道、客户二次优化\n",
+      "stderr": ""
+    },
+    "backend_env_masked": {
+      "cmd": "docker exec dingchang_backend env | sort (masked)",
+      "exit": 0,
+      "stdout": "ACCESS_TOKEN_EXPIRE_MINUTES=***MASKED***\nAUTO_CREATE_TABLES=1\nAUTO_SEED_AUTH=***MASKED***\nAUTO_SEED_FIELDS=1\nBAIDU_API_KEY=***MASKED***\nBAIDU_OCR_ENABLED=1\nBAIDU_SECRET_KEY=***MASKED***\nBOS_BUCKET=dingchang\nBOS_ENABLED=1\nBOS_REGION=fwh\nBOS_SIGNED_GET_URL=0\nBOS_STS_ACCESS_KEY=***MASKED***\nBOS_STS_ACCOUNT_ID=cf1b89a594464b48aeb89247cc49a6f3\nBOS_STS_HOST=sts.bj.baidubce.com\nBOS_STS_ROLE_NAME=bos_uploader\nBOS_STS_SECRET_KEY=***MASKED***\nCORS_ENABLED=1\nDB_HOST=mysql\nDB_MAX_OVERFLOW=20\nDB_NAME=order_system\nDB_PASSWORD=***MASKED***\nDB_POOL_RECYCLE=1800\nDB_POOL_SIZE=20\nDB_PORT=3306\nDB_SET_TIME_ZONE_ENABLED=1\nDB_TIME_ZONE=+08:00\nDB_USER=dingchang_app\nDISABLE_DOCS=1\nENV=prod\nGPG_KEY=***MASKED***\nHOME=/root\nHOSTNAME=469e845e7c56\nLANG=C.UTF-8\nLOCAL_PUBLIC_PREFIX=/static\nLOG_DIR=/app/logs\nLOG_LEVEL=INFO\nOCR_POLL_BATCH_SIZE=3\nOCR_POLL_ENABLED=1\nOCR_POLL_INTERVAL_SECONDS=3\nPASSWORD_HASH_ITERATIONS=***MASKED***\nPASSWORD_HASH_SALT_BYTES=***MASKED***\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nPROJECT_NAME=dingchang_backend\nPWD=/app\nPYTHONDONTWRITEBYTECODE=1\nPYTHONUNBUFFERED=1\nPYTHON_SHA256=de6517421601e39a9a3bc3e1bc4c7b2f239297423ee05e282598c83ec0647505\nPYTHON_VERSION=3.10.20\nREDIS_URL=redis://gateway_redis:6379/0\nSECRET_KEY=***MASKED***\nSESSION_HEARTBEAT_INTERVAL_SECONDS=30\nSESSION_TIMEOUT_SECONDS=7200\nSTORAGE_ROOT=/app/storage\nTZ=Asia/Shanghai",
+      "stderr": ""
+    },
+    "compose_files": {
+      "cmd": "cd /data/compose/dingchang && find . -maxdepth 2 -type f -printf \"%p\\n\" | sort",
+      "exit": 0,
+      "stdout": "./backend.env\n./docker-compose.yml\n./.env\n",
+      "stderr": ""
+    }
+  }
+}

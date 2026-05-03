@@ -1,0 +1,1106 @@
+{
+  "ok": true,
+  "run_id": "20260503140313",
+  "created": {
+    "users": [
+      {
+        "id": 38,
+        "username": "codex_img_sales_20260503140313",
+        "role": "sales"
+      },
+      {
+        "id": 39,
+        "username": "codex_img_finance_20260503140313",
+        "role": "finance"
+      },
+      {
+        "id": 40,
+        "username": "codex_img_market_20260503140313",
+        "role": "market"
+      }
+    ],
+    "order_id": 3222,
+    "db_storage_keys": [
+      "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+      "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png"
+    ],
+    "cloud_storage_keys": [
+      "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+      "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+      "backup/b0/dc/b0dc731bb7ae678de9e31837aa314ca1.png"
+    ],
+    "team_name": "赣州团队"
+  },
+  "summary": {
+    "total": 38,
+    "failures": 0
+  },
+  "steps": [
+    {
+      "label": "anonymous_bos_sts_401",
+      "method": "GET",
+      "path": "/orders/bos-sts",
+      "expected": [
+        401
+      ],
+      "status": 401,
+      "elapsed_ms": 3.07,
+      "ok": true,
+      "body": {
+        "detail": "Missing X-Session-Token"
+      },
+      "extra": {}
+    },
+    {
+      "label": "anonymous_order_detail_401",
+      "method": "GET",
+      "path": "/orders/3219",
+      "expected": [
+        401
+      ],
+      "status": 401,
+      "elapsed_ms": 2.02,
+      "ok": true,
+      "body": {
+        "detail": "Missing X-Session-Token"
+      },
+      "extra": {}
+    },
+    {
+      "label": "login_admin",
+      "method": "POST",
+      "path": "/auth/login",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 224.03,
+      "ok": true,
+      "body": {
+        "token": "***REDACTED***",
+        "user_id": 1,
+        "username": "dingchang_admin",
+        "real_name": "dingchang",
+        "full_name": "dingchang",
+        "role_name": "super_admin",
+        "team_names": [
+          "九江团队",
+          "南昌团队",
+          "赣州团队"
+        ],
+        "team_name": "赣州团队"
+      },
+      "extra": {}
+    },
+    {
+      "label": "get_team_options_for_test",
+      "method": "GET",
+      "path": "/orders/teams",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 3.99,
+      "ok": true,
+      "body": {
+        "items": [
+          {
+            "team_name": "赣州团队"
+          },
+          {
+            "team_name": "南昌团队"
+          },
+          {
+            "team_name": "九江团队"
+          }
+        ]
+      },
+      "extra": {}
+    },
+    {
+      "label": "create_sales_user",
+      "method": "POST",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 137.82,
+      "ok": true,
+      "body": {
+        "id": 38,
+        "username": "codex_img_sales_20260503140313",
+        "real_name": null,
+        "role_name": "sales",
+        "team_name": "赣州团队",
+        "team_names": [],
+        "status": 1,
+        "is_online": false,
+        "created_at": "2026-05-03T14:03:14",
+        "updated_at": "2026-05-03T14:03:14",
+        "meta": {
+          "capabilities": {
+            "user_update": false,
+            "user_delete": false
+          }
+        }
+      },
+      "extra": {}
+    },
+    {
+      "label": "login_sales",
+      "method": "POST",
+      "path": "/auth/login",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 133.68,
+      "ok": true,
+      "body": {
+        "token": "***REDACTED***",
+        "user_id": 38,
+        "username": "codex_img_sales_20260503140313",
+        "real_name": null,
+        "full_name": "codex_img_sales_20260503140313",
+        "role_name": "sales",
+        "team_names": [
+          "赣州团队"
+        ],
+        "team_name": "赣州团队"
+      },
+      "extra": {}
+    },
+    {
+      "label": "create_finance_user",
+      "method": "POST",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 142.97,
+      "ok": true,
+      "body": {
+        "id": 39,
+        "username": "codex_img_finance_20260503140313",
+        "real_name": null,
+        "role_name": "finance",
+        "team_name": "赣州团队",
+        "team_names": [],
+        "status": 1,
+        "is_online": false,
+        "created_at": "2026-05-03T14:03:14",
+        "updated_at": "2026-05-03T14:03:14",
+        "meta": {
+          "capabilities": {
+            "user_update": false,
+            "user_delete": false
+          }
+        }
+      },
+      "extra": {}
+    },
+    {
+      "label": "login_finance",
+      "method": "POST",
+      "path": "/auth/login",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 152.35,
+      "ok": true,
+      "body": {
+        "token": "***REDACTED***",
+        "user_id": 39,
+        "username": "codex_img_finance_20260503140313",
+        "real_name": null,
+        "full_name": "codex_img_finance_20260503140313",
+        "role_name": "finance",
+        "team_names": [
+          "赣州团队"
+        ],
+        "team_name": "赣州团队"
+      },
+      "extra": {}
+    },
+    {
+      "label": "create_market_user",
+      "method": "POST",
+      "path": "/users",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 144.12,
+      "ok": true,
+      "body": {
+        "id": 40,
+        "username": "codex_img_market_20260503140313",
+        "real_name": null,
+        "role_name": "market",
+        "team_name": "赣州团队",
+        "team_names": [],
+        "status": 1,
+        "is_online": false,
+        "created_at": "2026-05-03T14:03:14",
+        "updated_at": "2026-05-03T14:03:14",
+        "meta": {
+          "capabilities": {
+            "user_update": false,
+            "user_delete": false
+          }
+        }
+      },
+      "extra": {}
+    },
+    {
+      "label": "login_market",
+      "method": "POST",
+      "path": "/auth/login",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 137.4,
+      "ok": true,
+      "body": {
+        "token": "***REDACTED***",
+        "user_id": 40,
+        "username": "codex_img_market_20260503140313",
+        "real_name": null,
+        "full_name": "codex_img_market_20260503140313",
+        "role_name": "market",
+        "team_names": [
+          "赣州团队"
+        ],
+        "team_name": "赣州团队"
+      },
+      "extra": {}
+    },
+    {
+      "label": "market_get_bos_sts_forbidden",
+      "method": "GET",
+      "path": "/orders/bos-sts",
+      "expected": [
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 4.7,
+      "ok": true,
+      "body": {
+        "detail": "No permission"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_create_order_draft",
+      "method": "POST",
+      "path": "/orders/draft",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 26.09,
+      "ok": true,
+      "body": {
+        "order_id": 3222
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_proxy_upload_vehicle_cert",
+      "method": "POST",
+      "path": "/orders/bos-upload",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 1020.78,
+      "ok": true,
+      "body": {
+        "slot_key": "vehicle_cert",
+        "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+        "storage_key": "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+        "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+        "size": 59013,
+        "content_type": "image/png",
+        "original_name": "codex-image-auth-logo.png",
+        "url": "https://dingchang.fwh.bcebos.com/cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_bind_storage_key_wrong_slot_400",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        400
+      ],
+      "status": 400,
+      "elapsed_ms": 18.99,
+      "ok": true,
+      "body": {
+        "detail": "storage_key not valid for slot/md5"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_bind_missing_md5_400",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        400
+      ],
+      "status": 400,
+      "elapsed_ms": 8.15,
+      "ok": true,
+      "body": {
+        "detail": "md5 is required for finalize"
+      },
+      "extra": {}
+    },
+    {
+      "label": "market_proxy_upload_forbidden",
+      "method": "POST",
+      "path": "/orders/bos-upload",
+      "expected": [
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 5.59,
+      "ok": true,
+      "body": {
+        "detail": "No permission"
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_proxy_upload_vehicle_forbidden",
+      "method": "POST",
+      "path": "/orders/bos-upload",
+      "expected": [
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 8.05,
+      "ok": true,
+      "body": {
+        "detail": "Finance can only operate related images"
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_proxy_upload_related_allowed",
+      "method": "POST",
+      "path": "/orders/bos-upload",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 121.5,
+      "ok": true,
+      "body": {
+        "slot_key": "related",
+        "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+        "storage_key": "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+        "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+        "size": 59013,
+        "content_type": "image/png",
+        "original_name": "codex-image-auth-logo.png",
+        "url": "https://dingchang.fwh.bcebos.com/backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_bind_vehicle_cert_ok",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 24.83,
+      "ok": true,
+      "body": {
+        "ok": true,
+        "order_id": 3222,
+        "bound_count": 1,
+        "ocr_task_id": null,
+        "ocr_status": null
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_get_detail_after_bind",
+      "method": "GET",
+      "path": "/orders/3222",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 21.74,
+      "ok": true,
+      "body": {
+        "id": 3222,
+        "module": "order",
+        "created_by": 38,
+        "salesperson_id": 38,
+        "customer_group_id": 2,
+        "channel_group_id": 2,
+        "customer_group_name": "DCKH1001 - 南昌为来集团-保险服务群",
+        "channel_group_name": "HTQD0309 - 宏途九江杨总出单群",
+        "is_finished": false,
+        "is_rebate": false,
+        "is_paid": false,
+        "status": 0,
+        "audit_status": 0,
+        "dynamic_data": {
+          "plate_no": "IMG-AUTH-20260503140313",
+          "owner_name": "Codex image auth test"
+        },
+        "ocr_raw_json": {},
+        "slot_images": [
+          {
+            "slot_key": "vehicle_cert",
+            "title": "车辆合格证",
+            "multi": false,
+            "ocr": true,
+            "images": [
+              {
+                "order_image_id": 11280,
+                "image_file_id": 10618,
+                "storage_key": "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+                "url": "https://dingchang.fwh.bcebos.com/cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+                "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+                "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+                "size": 59013,
+                "content_type": "image/png",
+                "original_name": "codex-image-auth-logo.png",
+                "created_at": "2026-05-03 14:03:15",
+                "updated_at": "2026-05-03 14:03:15"
+              }
+            ]
+          },
+          {
+            "slot_key": "idcard_front",
+            "title": "身份证正面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "idcard_back",
+            "title": "身份证背面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_main",
+            "title": "行驶证正页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_sub",
+            "title": "行驶证副页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "related",
+            "title": "相关图片",
+            "multi": true,
+            "ocr": false,
+            "images": []
+          },
+          {
+            "slot_key": "unknown",
+            "title": "未知图片",
+            "multi": true,
+            "ocr": false,
+            "images": []
+          }
+        ],
+        "order_info": {
+          "insurance_expire_date": null,
+          "owner_phone": null,
+          "commercial_amount": 0.0,
+          "compulsory_amount": 0.0,
+          "vehicle_tax_amount": 0.0,
+          "non_vehicle_amount": 0.0,
+          "premium_total": 0.0,
+          "channel_commercial_point": 0.0,
+          "channel_commercial_supplement_point": 0.0,
+          "channel_compulsory_point": 0.0,
+          "channel_vehicle_tax_point": 0.0,
+          "channel_non_vehicle_point": 0.0,
+          "channel_reward": 0.0,
+          "channel_total": 0.0,
+          "customer_commercial_point": 0.0,
+          "customer_commercial_supplement_point": 0.0,
+          "customer_compulsory_point": 0.0,
+          "customer_vehicle_tax_point": 0.0,
+          "customer_non_vehicle_point": 0.0,
+          "customer_reward": 0.0,
+          "customer_total": 0.0,
+          "profit": 0.0,
+          "remark": null
+        },
+        "created_at": "2026-05-03",
+        "updated_at": "2026-05-03"
+      },
+      "extra": {}
+    },
+    {
+      "label": "assert_detail_vehicle_url_signed",
+      "method": "ASSERT",
+      "path": "slot_images.vehicle_cert.url",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": null,
+      "ok": true,
+      "body": {
+        "url_prefix": "https://dingchang.fwh.bcebos.com/cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+        "has_authorization": "***REDACTED***",
+        "has_token": "***REDACTED***"
+      },
+      "extra": {}
+    },
+    {
+      "label": "anonymous_fetch_signed_detail_url",
+      "method": "GET",
+      "path": "signed-url-from-detail",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 213.28,
+      "ok": true,
+      "body": {
+        "content_type": "image/png",
+        "content_length": "59013",
+        "prefix_hex": "89504e470d0a1a0a"
+      },
+      "extra": {}
+    },
+    {
+      "label": "market_bind_forbidden",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 5.04,
+      "ok": true,
+      "body": {
+        "detail": "No permission"
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_bind_related_before_finished_400",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        400
+      ],
+      "status": 400,
+      "elapsed_ms": 9.2,
+      "ok": true,
+      "body": {
+        "detail": "Only finished orders can be updated in finance"
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_bind_vehicle_forbidden",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 5.06,
+      "ok": true,
+      "body": {
+        "detail": "Finance can only operate related images"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_finish_order",
+      "method": "PATCH",
+      "path": "/orders/3222/status",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 21.56,
+      "ok": true,
+      "body": {
+        "ok": true
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_bind_related_after_finished_ok",
+      "method": "POST",
+      "path": "/orders/3222/images/bind",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 30.0,
+      "ok": true,
+      "body": {
+        "ok": true,
+        "order_id": 3222,
+        "bound_count": 1,
+        "ocr_task_id": null,
+        "ocr_status": null
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_get_finished_order_detail",
+      "method": "GET",
+      "path": "/orders/3222",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 15.7,
+      "ok": true,
+      "body": {
+        "id": 3222,
+        "module": "order",
+        "created_by": 38,
+        "salesperson_id": 38,
+        "customer_group_id": 2,
+        "channel_group_id": 2,
+        "customer_group_name": "DCKH1001 - 南昌为来集团-保险服务群",
+        "channel_group_name": "HTQD0309 - 宏途九江杨总出单群",
+        "is_finished": true,
+        "is_rebate": false,
+        "is_paid": false,
+        "status": 0,
+        "audit_status": 0,
+        "dynamic_data": {
+          "plate_no": "IMG-AUTH-20260503140313",
+          "owner_name": "Codex image auth test"
+        },
+        "ocr_raw_json": {},
+        "slot_images": [
+          {
+            "slot_key": "vehicle_cert",
+            "title": "车辆合格证",
+            "multi": false,
+            "ocr": true,
+            "images": [
+              {
+                "order_image_id": 11280,
+                "image_file_id": 10618,
+                "storage_key": "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+                "url": "https://dingchang.fwh.bcebos.com/cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+                "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+                "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+                "size": 59013,
+                "content_type": "image/png",
+                "original_name": "codex-image-auth-logo.png",
+                "created_at": "2026-05-03 14:03:15",
+                "updated_at": "2026-05-03 14:03:15"
+              }
+            ]
+          },
+          {
+            "slot_key": "idcard_front",
+            "title": "身份证正面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "idcard_back",
+            "title": "身份证背面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_main",
+            "title": "行驶证正页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_sub",
+            "title": "行驶证副页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "related",
+            "title": "相关图片",
+            "multi": true,
+            "ocr": false,
+            "images": [
+              {
+                "order_image_id": 11281,
+                "image_file_id": 10619,
+                "storage_key": "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+                "url": "https://dingchang.fwh.bcebos.com/backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+                "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+                "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+                "size": 59013,
+                "content_type": "image/png",
+                "original_name": "codex-image-auth-logo.png",
+                "created_at": "2026-05-03 14:03:16",
+                "updated_at": "2026-05-03 14:03:16"
+              }
+            ]
+          },
+          {
+            "slot_key": "unknown",
+            "title": "未知图片",
+            "multi": true,
+            "ocr": false,
+            "images": []
+          }
+        ],
+        "order_info": {
+          "insurance_expire_date": null,
+          "owner_phone": null,
+          "commercial_amount": 0.0,
+          "compulsory_amount": 0.0,
+          "vehicle_tax_amount": 0.0,
+          "non_vehicle_amount": 0.0,
+          "premium_total": 0.0,
+          "channel_commercial_point": 0.0,
+          "channel_commercial_supplement_point": 0.0,
+          "channel_compulsory_point": 0.0,
+          "channel_vehicle_tax_point": 0.0,
+          "channel_non_vehicle_point": 0.0,
+          "channel_reward": 0.0,
+          "channel_total": 0.0,
+          "customer_commercial_point": 0.0,
+          "customer_commercial_supplement_point": 0.0,
+          "customer_compulsory_point": 0.0,
+          "customer_vehicle_tax_point": 0.0,
+          "customer_non_vehicle_point": 0.0,
+          "customer_reward": 0.0,
+          "customer_total": 0.0,
+          "profit": 0.0,
+          "remark": null
+        },
+        "created_at": "2026-05-03",
+        "updated_at": "2026-05-03"
+      },
+      "extra": {}
+    },
+    {
+      "label": "finance_domain_get_finished_detail",
+      "method": "GET",
+      "path": "/finance/orders/3222",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 19.21,
+      "ok": true,
+      "body": {
+        "id": 3222,
+        "module": "order",
+        "created_by": 38,
+        "salesperson_id": 38,
+        "customer_group_id": 2,
+        "channel_group_id": 2,
+        "customer_group_name": "DCKH1001 - 南昌为来集团-保险服务群",
+        "channel_group_name": "HTQD0309 - 宏途九江杨总出单群",
+        "is_finished": true,
+        "is_rebate": false,
+        "is_paid": false,
+        "status": 0,
+        "audit_status": 0,
+        "dynamic_data": {
+          "plate_no": "IMG-AUTH-20260503140313",
+          "owner_name": "Codex image auth test"
+        },
+        "ocr_raw_json": {},
+        "slot_images": [
+          {
+            "slot_key": "vehicle_cert",
+            "title": "车辆合格证",
+            "multi": false,
+            "ocr": true,
+            "images": [
+              {
+                "order_image_id": 11280,
+                "image_file_id": 10618,
+                "storage_key": "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+                "url": "https://dingchang.fwh.bcebos.com/cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+                "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+                "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+                "size": 59013,
+                "content_type": "image/png",
+                "original_name": "codex-image-auth-logo.png",
+                "created_at": "2026-05-03 14:03:15",
+                "updated_at": "2026-05-03 14:03:15"
+              }
+            ]
+          },
+          {
+            "slot_key": "idcard_front",
+            "title": "身份证正面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "idcard_back",
+            "title": "身份证背面",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_main",
+            "title": "行驶证正页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "driving_license_sub",
+            "title": "行驶证副页",
+            "multi": false,
+            "ocr": true,
+            "images": []
+          },
+          {
+            "slot_key": "related",
+            "title": "相关图片",
+            "multi": true,
+            "ocr": false,
+            "images": [
+              {
+                "order_image_id": 11281,
+                "image_file_id": 10619,
+                "storage_key": "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+                "url": "https://dingchang.fwh.bcebos.com/backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png?***SIGNED_QUERY_REDACTED***",
+                "md5": "aa2b27dcf4e9038b1871d623e04ba38d",
+                "etag": "\"aa2b27dcf4e9038b1871d623e04ba38d\"",
+                "size": 59013,
+                "content_type": "image/png",
+                "original_name": "codex-image-auth-logo.png",
+                "created_at": "2026-05-03 14:03:16",
+                "updated_at": "2026-05-03 14:03:16"
+              }
+            ]
+          },
+          {
+            "slot_key": "unknown",
+            "title": "未知图片",
+            "multi": true,
+            "ocr": false,
+            "images": []
+          }
+        ],
+        "order_info": {
+          "insurance_expire_date": null,
+          "owner_phone": null,
+          "commercial_amount": 0.0,
+          "compulsory_amount": 0.0,
+          "vehicle_tax_amount": 0.0,
+          "non_vehicle_amount": 0.0,
+          "premium_total": 0.0,
+          "channel_commercial_point": 0.0,
+          "channel_commercial_supplement_point": 0.0,
+          "channel_compulsory_point": 0.0,
+          "channel_vehicle_tax_point": 0.0,
+          "channel_non_vehicle_point": 0.0,
+          "channel_reward": 0.0,
+          "channel_total": 0.0,
+          "customer_commercial_point": 0.0,
+          "customer_commercial_supplement_point": 0.0,
+          "customer_compulsory_point": 0.0,
+          "customer_vehicle_tax_point": 0.0,
+          "customer_non_vehicle_point": 0.0,
+          "customer_reward": 0.0,
+          "customer_total": 0.0,
+          "profit": 0.0,
+          "remark": null
+        },
+        "created_at": "2026-05-03",
+        "updated_at": "2026-05-03"
+      },
+      "extra": {}
+    },
+    {
+      "label": "sales_get_bos_sts",
+      "method": "GET",
+      "path": "/orders/bos-sts",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": 4.07,
+      "ok": true,
+      "body": {
+        "accessKeyId": "***REDACTED***",
+        "secretAccessKey": "***REDACTED***",
+        "sessionToken": "***REDACTED***",
+        "expiration": "2026-05-03T06:18:15Z",
+        "bosHost": "dingchang.fwh.bcebos.com"
+      },
+      "extra": {}
+    },
+    {
+      "label": "direct_sts_head_before_put",
+      "method": "HEAD",
+      "path": "https://dingchang.fwh.bcebos.com/backup/b0/dc/b0dc731bb7ae678de9e31837aa314ca1.png",
+      "expected": [
+        200,
+        404
+      ],
+      "status": 404,
+      "elapsed_ms": 48.21,
+      "ok": true,
+      "body": {
+        "etag": null,
+        "body": ""
+      },
+      "extra": {}
+    },
+    {
+      "label": "direct_sts_put_allowed_prefix",
+      "method": "PUT",
+      "path": "https://dingchang.fwh.bcebos.com/backup/b0/dc/b0dc731bb7ae678de9e31837aa314ca1.png",
+      "expected": [
+        200,
+        201,
+        204
+      ],
+      "status": 200,
+      "elapsed_ms": 57.8,
+      "ok": true,
+      "body": {
+        "etag": "\"b0dc731bb7ae678de9e31837aa314ca1\"",
+        "body": ""
+      },
+      "extra": {}
+    },
+    {
+      "label": "direct_sts_put_forbidden_prefix",
+      "method": "PUT",
+      "path": "https://dingchang.fwh.bcebos.com/not_allowed/20260503140313.png",
+      "expected": [
+        401,
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 45.2,
+      "ok": true,
+      "body": {
+        "body": "{\"code\":\"AccessDenied\",\"message\":\"Access Denied.\",\"requestId\":\"71340137-51ab-4c34-8b8f-bbc10eeb2fa2\"}"
+      },
+      "extra": {}
+    },
+    {
+      "label": "direct_sts_list_forbidden",
+      "method": "GET",
+      "path": "https://dingchang.fwh.bcebos.com/?prefix=backup%2F",
+      "expected": [
+        401,
+        403
+      ],
+      "status": 403,
+      "elapsed_ms": 169.06,
+      "ok": true,
+      "body": {
+        "body": "{\"code\":\"AccessDenied\",\"message\":\"Access Denied.\",\"requestId\":\"73984906-a6fc-4144-8bac-ce2bf31c41fa\"}"
+      },
+      "extra": {}
+    },
+    {
+      "label": "cleanup_local_order_db",
+      "method": "SQL",
+      "path": "local-db",
+      "expected": [
+        200
+      ],
+      "status": 200,
+      "elapsed_ms": null,
+      "ok": true,
+      "body": {
+        "order_id": 3222,
+        "storage_keys": [
+          "cert/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png",
+          "backup/aa/2b/aa2b27dcf4e9038b1871d623e04ba38d.png"
+        ]
+      },
+      "extra": {}
+    },
+    {
+      "label": "delete_temp_user_sales",
+      "method": "DELETE",
+      "path": "/users/38",
+      "expected": [
+        200,
+        404
+      ],
+      "status": 200,
+      "elapsed_ms": 22.31,
+      "ok": true,
+      "body": {
+        "ok": true
+      },
+      "extra": {}
+    },
+    {
+      "label": "delete_temp_user_finance",
+      "method": "DELETE",
+      "path": "/users/39",
+      "expected": [
+        200,
+        404
+      ],
+      "status": 200,
+      "elapsed_ms": 16.82,
+      "ok": true,
+      "body": {
+        "ok": true
+      },
+      "extra": {}
+    },
+    {
+      "label": "delete_temp_user_market",
+      "method": "DELETE",
+      "path": "/users/40",
+      "expected": [
+        200,
+        404
+      ],
+      "status": 200,
+      "elapsed_ms": 28.94,
+      "ok": true,
+      "body": {
+        "ok": true
+      },
+      "extra": {}
+    }
+  ],
+  "failures": [],
+  "notes": [
+    "All API/storage actions above were real requests. Cloud BOS objects are not deleted because no safe delete endpoint exists in the app."
+  ]
+}

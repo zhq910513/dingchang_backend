@@ -9,21 +9,22 @@ from typing import Optional, List, Tuple, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import func, select, and_, or_, cast, String
+from sqlalchemy import func, select, and_, or_, cast, String, literal
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
+from sqlalchemy.sql.expression import false as sql_false
 
 from app.api.deps import get_current_user_with_role_and_teams, CurrentUserContext
 from app.core.access_control import (
     current_team_names_or_403 as _ac_current_team_names_or_403,
     effective_team_filter_for_query as _ac_effective_team_filter_for_query,
-    order_salesperson_in_teams_expr as _ac_order_salesperson_in_teams_expr,
-    salesperson_in_current_teams_or_403 as _ac_salesperson_in_current_teams_or_403,
+    user_team_match_expr as _ac_user_team_match_expr,
 )
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET, ROLE_SALES
 from app.core.db import get_db, engine
 from app.models.customer_group import CustomerGroup
 from app.models.order import Order, OrderImage
+from app.models.order_fact import OrderFact
 from app.models.order_info import OrderInfo
 from app.models.user import User
 from app.schemas.finance import FinanceOrderStatusUpdate
@@ -270,8 +271,38 @@ def _group_code_name(g, kind: str) -> str:
     return "-"
 
 
-def _build_finance_filter_clauses(
+def _build_finance_fact_match_clause(fact_col, value: Optional[str]):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return fact_col.like(f"%{raw}%")
+
+
+async def _resolve_finance_salesperson_ids(
+        db: AsyncSession,
         *,
+        team_name: Optional[str],
+        team_names: Optional[Tuple[str, ...]],
+        current_team_names: Optional[Tuple[str, ...]],
+        role_name: Optional[str],
+) -> Optional[Tuple[int, ...]]:
+    effective_team_names = _ac_effective_team_filter_for_query(
+        role_name=role_name,
+        current_team_names=current_team_names,
+        team_name=team_name,
+        team_names=team_names,
+    )
+    if effective_team_names is None:
+        return None
+
+    stmt = select(User.id).where(_ac_user_team_match_expr(tuple(effective_team_names))).order_by(User.id.asc())
+    ids = [int(x) for x in (await db.execute(stmt)).scalars().all() if x is not None]
+    return tuple(ids)
+
+
+async def _build_finance_filter_clauses(
+        *,
+        db: AsyncSession,
         team_name: Optional[str],
         team_names: Optional[Tuple[str, ...]],
         current_team_names: Optional[Tuple[str, ...]],
@@ -288,20 +319,26 @@ def _build_finance_filter_clauses(
         first_register_date_end: Optional[str],
         is_paid: Optional[bool],
         is_rebate: Optional[bool],
-) -> Tuple[list, bool, bool]:
-    effective_team_names = _ac_effective_team_filter_for_query(
-        role_name=role_name,
-        current_team_names=current_team_names,
-        team_name=team_name,
-        team_names=team_names,
-    )
-
+) -> Tuple[list, bool, bool, bool]:
     clauses: list = [Order.is_finished.is_(True)]
     need_join_customer = False
     need_join_info = False
+    need_join_fact = False
 
-    if effective_team_names is not None:
-        clauses.append(_ac_order_salesperson_in_teams_expr(effective_team_names))
+    salesperson_ids = await _resolve_finance_salesperson_ids(
+        db,
+        team_name=team_name,
+        team_names=team_names,
+        current_team_names=current_team_names,
+        role_name=role_name,
+    )
+    if salesperson_ids is not None:
+        if not salesperson_ids:
+            clauses.append(sql_false())
+        elif len(salesperson_ids) == 1:
+            clauses.append(Order.salesperson_id == salesperson_ids[0])
+        else:
+            clauses.append(Order.salesperson_id.in_(salesperson_ids))
 
     if channel_group_id is not None:
         clauses.append(Order.channel_group_id == int(channel_group_id))
@@ -331,19 +368,25 @@ def _build_finance_filter_clauses(
 
     if (market or "").strip():
         need_join_customer = True
-        mk = (market or "").strip().lower()
-        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
+        clauses.append(CustomerGroup.market.like(f"%{market.strip()}%"))
 
-    if (owner_name or "").strip():
-        _add_owner_name_fuzzy(clauses, owner_name)
+    owner_name_clause = _build_finance_fact_match_clause(OrderFact.owner_name, owner_name)
+    if owner_name_clause is not None:
+        need_join_fact = True
+        clauses.append(owner_name_clause)
 
-    _add_json_date_range_any(
-        clauses,
-        keys=["first_register_date"],
-        start_ymd=first_register_date_start,
-        end_ymd=first_register_date_end,
-        err_prefix="first_register_date",
-    )
+    if first_register_date_start or first_register_date_end:
+        if not first_register_date_start or not first_register_date_end:
+            raise HTTPException(status_code=400, detail="first_register_date_start and first_register_date_end are required")
+        start_date = _parse_ymd(first_register_date_start)
+        end_date = _parse_ymd(first_register_date_end)
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="first_register_date_* must be YYYY-MM-DD")
+        if end_date < start_date:
+            raise HTTPException(status_code=400, detail="first_register_date_end must be >= first_register_date_start")
+        need_join_fact = True
+        clauses.append(OrderFact.first_register_date >= start_date)
+        clauses.append(OrderFact.first_register_date <= end_date)
 
     if (insurance_expire_date or "").strip():
         d = _parse_ymd(insurance_expire_date)
@@ -352,7 +395,7 @@ def _build_finance_filter_clauses(
         need_join_info = True
         clauses.append(OrderInfo.insurance_expire_date == d)
 
-    return clauses, need_join_customer, need_join_info
+    return clauses, need_join_customer, need_join_info, need_join_fact
 
 
 def _build_finance_base_stmt(
@@ -360,6 +403,7 @@ def _build_finance_base_stmt(
         clauses: list,
         need_join_customer: bool,
         need_join_info: bool,
+        need_join_fact: bool,
         for_summary: bool = False,
 ):
     if for_summary:
@@ -381,6 +425,9 @@ def _build_finance_base_stmt(
     else:
         stmt = select(Order).select_from(Order)
 
+    if need_join_fact:
+        stmt = stmt.join(OrderFact, OrderFact.order_id == Order.id, isouter=True)
+
     if need_join_customer:
         stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
 
@@ -399,11 +446,17 @@ async def _load_finance_order(
         *,
         current_team_names: Optional[Tuple[str, ...]],
 ) -> Order:
+    await _ensure_finance_order_access(
+        db,
+        int(order_id),
+        current_team_names=current_team_names,
+    )
+
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
         .options(
-            selectinload(Order.salesperson).selectinload(User.parent),
+            lazyload("*"),
             selectinload(Order.customer_group),
             selectinload(Order.channel_group),
             selectinload(Order.order_info),
@@ -413,14 +466,67 @@ async def _load_finance_order(
     o = (await db.execute(stmt)).scalars().first()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
+    return o
 
-    if not bool(getattr(o, "is_finished", False)):
+
+async def _ensure_finance_order_access(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        current_team_names: Optional[Tuple[str, ...]],
+) -> None:
+    if current_team_names is not None:
+        acl_stmt = (
+            select(Order.salesperson_id, Order.is_finished, User.id.label("allowed_salesperson_id"))
+            .select_from(Order)
+            .outerjoin(
+                User,
+                and_(
+                    User.id == Order.salesperson_id,
+                    _ac_user_team_match_expr(tuple(current_team_names)),
+                ),
+            )
+            .where(Order.id == int(order_id))
+            .limit(1)
+        )
+    else:
+        acl_stmt = (
+            select(Order.salesperson_id, Order.is_finished, literal(True).label("allowed_salesperson_id"))
+            .where(Order.id == int(order_id))
+            .limit(1)
+        )
+
+    acl_row = (await db.execute(acl_stmt)).first()
+    if not acl_row:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if not bool(acl_row[1]):
         raise HTTPException(status_code=400, detail="Only finished orders can be accessed in finance")
 
-    await _ac_salesperson_in_current_teams_or_403(
-        salesperson=getattr(o, "salesperson", None),
+    if current_team_names is not None and acl_row[2] is None:
+        raise HTTPException(status_code=403, detail="跨团队访问被拒绝")
+
+
+async def _load_finance_order_for_status_write(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        current_team_names: Optional[Tuple[str, ...]],
+) -> Order:
+    await _ensure_finance_order_access(
+        db,
+        int(order_id),
         current_team_names=current_team_names,
     )
+
+    stmt = (
+        select(Order)
+        .where(Order.id == int(order_id))
+        .options(lazyload("*"))
+    )
+    o = (await db.execute(stmt)).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
     return o
 
 
@@ -447,7 +553,8 @@ async def finance_orders_summary(
     _ensure_finance_access(role_name)
 
     current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=tuple(ctx.team_names or ()))
-    clauses, need_join_customer, need_join_info = _build_finance_filter_clauses(
+    clauses, need_join_customer, need_join_info, need_join_fact = await _build_finance_filter_clauses(
+        db=db,
         team_name=team_name,
         team_names=team_names,
         current_team_names=current_team_names,
@@ -470,6 +577,7 @@ async def finance_orders_summary(
         clauses=clauses,
         need_join_customer=need_join_customer,
         need_join_info=need_join_info,
+        need_join_fact=need_join_fact,
         for_summary=True,
     )
 
@@ -512,7 +620,8 @@ async def export_finance_orders(
     _ensure_finance_write_access(role_name)
 
     current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=tuple(ctx.team_names or ()))
-    clauses, need_join_customer, need_join_info = _build_finance_filter_clauses(
+    clauses, need_join_customer, need_join_info, need_join_fact = await _build_finance_filter_clauses(
+        db=db,
         team_name=team_name,
         team_names=team_names,
         current_team_names=current_team_names,
@@ -541,6 +650,7 @@ async def export_finance_orders(
         clauses=clauses,
         need_join_customer=need_join_customer,
         need_join_info=need_join_info,
+        need_join_fact=need_join_fact,
         for_summary=False,
     ).with_only_columns(Order.id).order_by(Order.id.desc())
 
@@ -563,6 +673,7 @@ async def export_finance_orders(
         select(Order)
         .where(Order.id.in_(order_ids))
         .options(
+            lazyload("*"),
             selectinload(Order.salesperson).selectinload(User.parent),
             selectinload(Order.customer_group),
             selectinload(Order.channel_group),
@@ -699,7 +810,7 @@ async def update_finance_order_status(
     _ensure_finance_write_access(role_name)
 
     current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=tuple(ctx.team_names or ()))
-    o = await _load_finance_order(db, int(order_id), current_team_names=current_team_names)
+    o = await _load_finance_order_for_status_write(db, int(order_id), current_team_names=current_team_names)
 
     if payload.is_paid is not None:
         o.is_paid = bool(payload.is_paid)
@@ -721,7 +832,7 @@ async def return_finance_order_to_unfinished(
     _ensure_finance_write_access(role_name)
 
     current_team_names = _ac_current_team_names_or_403(role_name=role_name, team_names=tuple(ctx.team_names or ()))
-    o = await _load_finance_order(db, int(order_id), current_team_names=current_team_names)
+    o = await _load_finance_order_for_status_write(db, int(order_id), current_team_names=current_team_names)
 
     o.is_finished = False
     o.is_paid = False

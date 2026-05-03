@@ -131,16 +131,17 @@ class BceStsService:
 
         region = self._infer_region()
 
+        allowed_prefixes = ("cert", "idcard", "dl", "backup")
         return [
             {
                 "service": "bce:bos",
                 "region": region,
                 "effect": "Allow",
                 "resource": [
-                    bucket,
-                    f"{bucket}/*",
+                    f"{bucket}/{prefix}/*"
+                    for prefix in allowed_prefixes
                 ],
-                "permission": ["READ", "LIST", "WRITE"],
+                "permission": ["READ", "WRITE"],
             }
         ]
 

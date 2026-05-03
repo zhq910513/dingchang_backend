@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "rows": [
+    {
+      "label": "anonymous_users_should_401",
+      "method": "GET",
+      "path": "/users",
+      "status": 401,
+      "elapsed_ms": 10.14,
+      "expected": [
+        401,
+        419
+      ],
+      "ok": true,
+      "body": {
+        "detail": "Missing X-Session-Token"
+      }
+    },
+    {
+      "label": "anonymous_orders_should_401",
+      "method": "GET",
+      "path": "/orders",
+      "status": 401,
+      "elapsed_ms": 19.61,
+      "expected": [
+        401,
+        419
+      ],
+      "ok": true,
+      "body": {
+        "detail": "Missing X-Session-Token"
+      }
+    },
+    {
+      "label": "anonymous_customer_dropdown_should_401",
+      "method": "GET",
+      "path": "/customer-channel/customers",
+      "status": 401,
+      "elapsed_ms": 14.21,
+      "expected": [
+        401,
+        419
+      ],
+      "ok": true,
+      "body": {
+        "detail": "Missing X-Session-Token"
+      }
+    }
+  ]
+}

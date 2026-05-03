@@ -1,0 +1,161 @@
+{
+  "created_at": "2026-05-03T21:13:21+0800",
+  "mode": "remote_preimport_mysql_baseline",
+  "queries": {
+    "all_table_counts": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:channel_group_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:customer_group_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_config_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_group_field_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_group_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:finance_record_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:image_file_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:image_ocr_result_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:ocr_image_cache_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:ocr_task_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_fact_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_image_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_info_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_slot_result_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:role_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_role_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_session_new": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_watermark": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_finished": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_paid": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_rebate": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:status": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:audit_status": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "finance_sums": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "finance_watermark": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "ocr_task_status": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_fact_count": {
+      "exit": 0,
+      "stdout": "",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    }
+  },
+  "container_state": {
+    "exit": 0,
+    "stdout": "dingchang_backend\tExited (0) 31 minutes ago\nedge_nginx\tExited (0) 31 minutes ago\ndingchang_mysql\tUp 59 minutes (healthy)",
+    "stderr": ""
+  }
+}

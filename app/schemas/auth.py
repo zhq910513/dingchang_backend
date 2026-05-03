@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 
 
 class LoginIn(BaseModel):
-    username: str
-    password: str
+    username: str = Field(..., min_length=1, max_length=50)
+    password: str = Field(..., min_length=1, max_length=256)
 
 
 class LoginOut(BaseModel):

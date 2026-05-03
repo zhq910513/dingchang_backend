@@ -1,0 +1,15 @@
+{
+  "allowed_table_diffs": [],
+  "business_diffs": [],
+  "left": "D:\\Projects\\dingchang\\dingchang_backend\\logs\\fingerprint-local-standard-final-self-import-20260503.json",
+  "left_label": "local-standard-final-after-self-import",
+  "mode": "compare_db_fingerprints",
+  "ok": true,
+  "right": "D:\\Projects\\dingchang\\dingchang_backend\\logs\\fingerprint-local-from-production-postimport-dump-20260503.json",
+  "right_label": "local-from-production-postimport-dump",
+  "summary": {
+    "business_diff_count": 0,
+    "table_diff_count": 0
+  },
+  "table_diffs": []
+}

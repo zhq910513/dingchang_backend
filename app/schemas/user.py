@@ -7,6 +7,11 @@ from typing import Any, ClassVar, List, Optional
 
 from pydantic import BaseModel, Field, validator
 
+try:
+    from pydantic import ConfigDict
+except Exception:  # pragma: no cover
+    ConfigDict = None  # type: ignore
+
 
 class OrmBaseModel(BaseModel):
     """
@@ -16,10 +21,12 @@ class OrmBaseModel(BaseModel):
     - 关键：model_config 必须是 ClassVar，不能变成响应字段
     """
 
-    model_config: ClassVar[dict] = {"from_attributes": True}
+    if ConfigDict is not None:
+        model_config: ClassVar[dict] = ConfigDict(from_attributes=True)
+    else:
 
-    class Config:
-        orm_mode = True
+        class Config:
+            orm_mode = True
 
 
 def _normalize_team_names_value(v: Any) -> List[str]:
@@ -77,6 +84,7 @@ class UserRowMetaOut(OrmBaseModel):
 class UserListCapabilitiesOut(OrmBaseModel):
     user_create: bool = False
     user_list_view: bool = False
+    user_online_view: bool = False
 
 
 class UserListScopesOut(OrmBaseModel):
@@ -123,11 +131,11 @@ class UserListOut(OrmBaseModel):
 
 
 class UserCreateIn(OrmBaseModel):
-    username: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=6)
-    role_name: str = Field(..., min_length=1, description="角色：super_admin/manager/sales/finance/market")
-    team_name: Optional[str] = None
-    team_names: Optional[str] = None
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=256)
+    role_name: str = Field(..., min_length=1, max_length=50, description="角色：super_admin/manager/sales/finance/market")
+    team_name: Optional[str] = Field(default=None, max_length=32)
+    team_names: Optional[str] = Field(default=None, max_length=255)
 
     @validator("team_name", pre=True)
     def _v_create_team_name(cls, v: Any) -> Optional[str]:
@@ -139,9 +147,9 @@ class UserCreateIn(OrmBaseModel):
 
 
 class UserUpdateIn(OrmBaseModel):
-    password: Optional[str] = Field(default=None, min_length=6)
-    team_name: Optional[str] = None
-    team_names: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=6, max_length=256)
+    team_name: Optional[str] = Field(default=None, max_length=32)
+    team_names: Optional[str] = Field(default=None, max_length=255)
 
     @validator("team_name", pre=True)
     def _v_update_team_name(cls, v: Any) -> Optional[str]:

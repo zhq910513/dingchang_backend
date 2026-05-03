@@ -63,6 +63,7 @@ class ChannelGroup(Base):
         Index("ix_channel_group_channel_code", "channel_code"),
         Index("ix_channel_group_is_deleted", "is_deleted"),
         Index("ix_channel_group_channel_name", "channel_name"),
+        Index("ix_channel_group_list_is_deleted_updated_id", "is_deleted", "updated_at", "id"),
         Index("ix_channel_group_is_deleted_team_name_code", "is_deleted", "team_name", "channel_code"),
         Index("ix_channel_group_is_deleted_team_name_name", "is_deleted", "team_name", "channel_name"),
     )

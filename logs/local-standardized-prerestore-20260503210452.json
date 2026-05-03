@@ -1,0 +1,2871 @@
+{
+  "ok": true,
+  "mode": "standardize_local_online_snapshot",
+  "guard": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "order_system",
+    "user": "dingchang_app"
+  },
+  "rule_version": "ocr-cleaner-2026-05-03-v2",
+  "started_at": "2026-05-03T21:08:48",
+  "elapsed_ms": 8530.73,
+  "summary": {
+    "before_table_count": 47,
+    "extra_table_count_before": 28,
+    "dropped_extra_table_count": 28,
+    "after_table_count": 19,
+    "order_rows": 5535,
+    "changed_order_rows": 4140,
+    "rebuilt_order_fact_rows": 5535,
+    "order_fact_count_after": 5535,
+    "missing_model_table_count_after": 0,
+    "extra_table_count_after": 0,
+    "missing_model_index_count_after": 0
+  },
+  "before": {
+    "tables": [
+      "channel_group",
+      "channel_group_new",
+      "customer_group",
+      "customer_group_new",
+      "field_config",
+      "field_config_new",
+      "field_group",
+      "field_group_field",
+      "field_group_field_new",
+      "field_group_new",
+      "finance_record",
+      "finance_record_backup_2026_03_02",
+      "finance_record_new",
+      "image_file",
+      "image_file_backup_2026_03_02",
+      "image_file_new",
+      "image_ocr_result",
+      "image_ocr_result_backup_2026_03_02",
+      "image_ocr_result_new",
+      "migration_state",
+      "ocr_image_cache",
+      "ocr_image_cache_backup_2026_03_02",
+      "ocr_image_cache_new",
+      "ocr_task",
+      "ocr_task_backup_2026_03_02",
+      "ocr_task_new",
+      "order",
+      "order_backup_2026_03_02",
+      "order_dynamic_data_backup_20260227",
+      "order_dynamic_snapshot_20260227",
+      "order_fact_new",
+      "order_image",
+      "order_image_backup_2026_03_02",
+      "order_image_new",
+      "order_info",
+      "order_info_backup_2026_03_02",
+      "order_info_new",
+      "order_new",
+      "order_slot_result_new",
+      "role",
+      "role_new",
+      "user",
+      "user_new",
+      "user_role",
+      "user_role_new",
+      "user_session",
+      "user_session_new"
+    ],
+    "row_counts": {
+      "channel_group": 231,
+      "channel_group_new": 276,
+      "customer_group": 431,
+      "customer_group_new": 574,
+      "field_config": 72,
+      "field_config_new": 76,
+      "field_group": 4,
+      "field_group_field": 68,
+      "field_group_field_new": 67,
+      "field_group_new": 4,
+      "finance_record": 0,
+      "finance_record_backup_2026_03_02": 0,
+      "finance_record_new": 0,
+      "image_file": 10622,
+      "image_file_backup_2026_03_02": 8220,
+      "image_file_new": 18010,
+      "image_ocr_result": 7819,
+      "image_ocr_result_backup_2026_03_02": 6131,
+      "image_ocr_result_new": 13332,
+      "migration_state": 13,
+      "ocr_image_cache": 7819,
+      "ocr_image_cache_backup_2026_03_02": 6131,
+      "ocr_image_cache_new": 13332,
+      "ocr_task": 2918,
+      "ocr_task_backup_2026_03_02": 2260,
+      "ocr_task_new": 5061,
+      "order": 3176,
+      "order_backup_2026_03_02": 2459,
+      "order_dynamic_data_backup_20260227": 2192,
+      "order_dynamic_snapshot_20260227": 2192,
+      "order_fact_new": 0,
+      "order_image": 11059,
+      "order_image_backup_2026_03_02": 8582,
+      "order_image_new": 18837,
+      "order_info": 3176,
+      "order_info_backup_2026_03_02": 2459,
+      "order_info_new": 5535,
+      "order_new": 5535,
+      "order_slot_result_new": 0,
+      "role": 5,
+      "role_new": 5,
+      "user": 22,
+      "user_new": 23,
+      "user_role": 22,
+      "user_role_new": 23,
+      "user_session": 1638,
+      "user_session_new": 2803
+    },
+    "extra_tables": [
+      "channel_group",
+      "customer_group",
+      "field_config",
+      "field_group",
+      "field_group_field",
+      "finance_record",
+      "finance_record_backup_2026_03_02",
+      "image_file",
+      "image_file_backup_2026_03_02",
+      "image_ocr_result",
+      "image_ocr_result_backup_2026_03_02",
+      "migration_state",
+      "ocr_image_cache",
+      "ocr_image_cache_backup_2026_03_02",
+      "ocr_task",
+      "ocr_task_backup_2026_03_02",
+      "order",
+      "order_backup_2026_03_02",
+      "order_dynamic_data_backup_20260227",
+      "order_dynamic_snapshot_20260227",
+      "order_image",
+      "order_image_backup_2026_03_02",
+      "order_info",
+      "order_info_backup_2026_03_02",
+      "role",
+      "user",
+      "user_role",
+      "user_session"
+    ]
+  },
+  "actions": {
+    "dropped_extra_tables": [
+      "channel_group",
+      "customer_group",
+      "field_config",
+      "field_group",
+      "field_group_field",
+      "finance_record",
+      "finance_record_backup_2026_03_02",
+      "image_file",
+      "image_file_backup_2026_03_02",
+      "image_ocr_result",
+      "image_ocr_result_backup_2026_03_02",
+      "migration_state",
+      "ocr_image_cache",
+      "ocr_image_cache_backup_2026_03_02",
+      "ocr_task",
+      "ocr_task_backup_2026_03_02",
+      "order",
+      "order_backup_2026_03_02",
+      "order_dynamic_data_backup_20260227",
+      "order_dynamic_snapshot_20260227",
+      "order_image",
+      "order_image_backup_2026_03_02",
+      "order_info",
+      "order_info_backup_2026_03_02",
+      "role",
+      "user",
+      "user_role",
+      "user_session"
+    ],
+    "schema_result": {
+      "db_tables": [
+        "channel_group_new",
+        "customer_group_new",
+        "field_config_new",
+        "field_group_field_new",
+        "field_group_new",
+        "finance_record_new",
+        "image_file_new",
+        "image_ocr_result_new",
+        "ocr_image_cache_new",
+        "ocr_task_new",
+        "order_fact_new",
+        "order_image_new",
+        "order_info_new",
+        "order_new",
+        "order_slot_result_new",
+        "role_new",
+        "user_new",
+        "user_role_new",
+        "user_session_new"
+      ],
+      "model_tables": [
+        "channel_group_new",
+        "customer_group_new",
+        "field_config_new",
+        "field_group_field_new",
+        "field_group_new",
+        "finance_record_new",
+        "image_file_new",
+        "image_ocr_result_new",
+        "ocr_image_cache_new",
+        "ocr_task_new",
+        "order_fact_new",
+        "order_image_new",
+        "order_info_new",
+        "order_new",
+        "order_slot_result_new",
+        "role_new",
+        "user_new",
+        "user_role_new",
+        "user_session_new"
+      ],
+      "missing_tables": [],
+      "extra_tables": [],
+      "missing_columns": {},
+      "missing_indexes": {
+        "user_new": [
+          "ix_user_list_parent_updated_id"
+        ],
+        "channel_group_new": [
+          "ix_channel_group_list_is_deleted_updated_id"
+        ],
+        "customer_group_new": [
+          "ix_customer_group_list_is_deleted_updated_id"
+        ],
+        "user_session_new": [
+          "ix_user_session_expired_user_last_active"
+        ],
+        "order_new": [
+          "ix_order_list_salesperson_created_at_id",
+          "ix_order_finance_finished_created_id",
+          "ix_order_finance_finished_paid_id",
+          "ix_order_finance_finished_rebate_id",
+          "ix_order_list_module_id",
+          "ix_order_list_finished_salesperson_id",
+          "ix_order_list_salesperson_finished_id"
+        ],
+        "order_fact_new": [
+          "ix_order_fact_list_vehicle_model",
+          "ix_order_fact_list_first_register_date",
+          "ix_order_fact_list_owner_name",
+          "ix_order_fact_list_engine_no"
+        ],
+        "order_info_new": [
+          "ix_order_info_insurance_expire_order_id"
+        ],
+        "order_slot_result_new": [
+          "ix_order_slot_result_order_slot"
+        ]
+      },
+      "added_columns": [],
+      "added_indexes": [
+        "ix_user_list_parent_updated_id",
+        "ix_channel_group_list_is_deleted_updated_id",
+        "ix_customer_group_list_is_deleted_updated_id",
+        "ix_user_session_expired_user_last_active",
+        "ix_order_list_salesperson_created_at_id",
+        "ix_order_finance_finished_created_id",
+        "ix_order_finance_finished_paid_id",
+        "ix_order_finance_finished_rebate_id",
+        "ix_order_list_module_id",
+        "ix_order_list_finished_salesperson_id",
+        "ix_order_list_salesperson_finished_id",
+        "ix_order_fact_list_vehicle_model",
+        "ix_order_fact_list_first_register_date",
+        "ix_order_fact_list_owner_name",
+        "ix_order_fact_list_engine_no",
+        "ix_order_info_insurance_expire_order_id",
+        "ix_order_slot_result_order_slot"
+      ],
+      "created_tables": []
+    }
+  },
+  "cleaning": {
+    "field_stats": {
+      "approved_passenger_count": {
+        "changed": 906,
+        "filled": 47,
+        "added": 47,
+        "nullified": 1
+      },
+      "dla_approved_passengers": {
+        "changed": 52,
+        "nullified": 50,
+        "removed": 52
+      },
+      "engine_no": {
+        "changed": 47
+      },
+      "first_register_date": {
+        "changed": 634
+      },
+      "id_address": {
+        "changed": 36
+      },
+      "id_birth": {
+        "changed": 97,
+        "removed": 97,
+        "nullified": 57
+      },
+      "id_birth_date": {
+        "changed": 2925,
+        "filled": 547,
+        "added": 320
+      },
+      "id_gender": {
+        "changed": 36
+      },
+      "id_issue_authority": {
+        "changed": 97,
+        "removed": 97,
+        "nullified": 26
+      },
+      "id_name": {
+        "changed": 69
+      },
+      "id_nation": {
+        "changed": 97,
+        "removed": 97,
+        "nullified": 57
+      },
+      "id_number": {
+        "changed": 41,
+        "nullified": 15
+      },
+      "id_valid_from": {
+        "changed": 78,
+        "filled": 11,
+        "added": 10
+      },
+      "id_valid_period": {
+        "changed": 97,
+        "removed": 97,
+        "nullified": 26
+      },
+      "id_valid_to": {
+        "changed": 180,
+        "filled": 114,
+        "added": 112
+      },
+      "issue_date": {
+        "changed": 636,
+        "nullified": 18
+      },
+      "manufacturer_name": {
+        "changed": 23,
+        "nullified": 23
+      },
+      "owner_name": {
+        "changed": 43
+      },
+      "plate_no": {
+        "changed": 161,
+        "nullified": 98
+      },
+      "register_date": {
+        "changed": 97,
+        "removed": 97
+      },
+      "vehicle_brand_name": {
+        "changed": 94,
+        "nullified": 3
+      },
+      "vehicle_model": {
+        "changed": 16
+      },
+      "vehicle_name": {
+        "changed": 97,
+        "removed": 97
+      },
+      "vin": {
+        "changed": 113,
+        "nullified": 38
+      }
+    },
+    "examples": {
+      "approved_passenger_count": [
+        {
+          "order_id": 192,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 253,
+          "before": "2+3",
+          "after": "5"
+        },
+        {
+          "order_id": 301,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 303,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 319,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 324,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 325,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 326,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 329,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 335,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 338,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 340,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 342,
+          "before": null,
+          "after": "7"
+        },
+        {
+          "order_id": 345,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 347,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 348,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 361,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 362,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 375,
+          "before": null,
+          "after": "5"
+        },
+        {
+          "order_id": 378,
+          "before": null,
+          "after": "5"
+        }
+      ],
+      "dla_approved_passengers": [
+        {
+          "order_id": 192,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 301,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 303,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 319,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 324,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 325,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 326,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 329,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 335,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 338,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 340,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 342,
+          "before": "7",
+          "after": null
+        },
+        {
+          "order_id": 345,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 347,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 348,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 361,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 362,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 375,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 378,
+          "before": "5",
+          "after": null
+        },
+        {
+          "order_id": 379,
+          "before": "5",
+          "after": null
+        }
+      ],
+      "engine_no": [
+        {
+          "order_id": 12,
+          "before": "19A017405-QUA",
+          "after": "19A017405QUA"
+        },
+        {
+          "order_id": 359,
+          "before": "*****3145",
+          "after": "3145"
+        },
+        {
+          "order_id": 615,
+          "before": "D024248-1",
+          "after": "D0242481"
+        },
+        {
+          "order_id": 650,
+          "before": "M1G004641 ",
+          "after": "M1G004641"
+        },
+        {
+          "order_id": 768,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 816,
+          "before": "*1164",
+          "after": "1164"
+        },
+        {
+          "order_id": 1003,
+          "before": "*8123",
+          "after": "8123"
+        },
+        {
+          "order_id": 1004,
+          "before": "*QR25",
+          "after": "QR25"
+        },
+        {
+          "order_id": 1018,
+          "before": "*5153",
+          "after": "5153"
+        },
+        {
+          "order_id": 1026,
+          "before": "B7CF 0874 62",
+          "after": "B7CF087462"
+        },
+        {
+          "order_id": 1029,
+          "before": "BDSL.00579",
+          "after": "BDSL00579"
+        },
+        {
+          "order_id": 1158,
+          "before": "冀03E09266",
+          "after": "03E09266"
+        },
+        {
+          "order_id": 1413,
+          "before": "*0999",
+          "after": "0999"
+        },
+        {
+          "order_id": 1445,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1446,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1863,
+          "before": "*205D",
+          "after": "205D"
+        },
+        {
+          "order_id": 1899,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2001,
+          "before": " 087472",
+          "after": "087472"
+        },
+        {
+          "order_id": 2074,
+          "before": "ZT-108-13517110208A",
+          "after": "ZT10813517110208A"
+        },
+        {
+          "order_id": 2081,
+          "before": "",
+          "after": null
+        }
+      ],
+      "first_register_date": [
+        {
+          "order_id": 1087,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1445,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1446,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1680,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1872,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1899,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1949,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1969,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2081,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2144,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2187,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2239,
+          "before": "20230309",
+          "after": "2023-03-09"
+        },
+        {
+          "order_id": 2240,
+          "before": "20250310",
+          "after": "2025-03-10"
+        },
+        {
+          "order_id": 2241,
+          "before": "20250317",
+          "after": "2025-03-17"
+        },
+        {
+          "order_id": 2242,
+          "before": "20250305",
+          "after": "2025-03-05"
+        },
+        {
+          "order_id": 2244,
+          "before": "20110114",
+          "after": "2011-01-14"
+        },
+        {
+          "order_id": 2245,
+          "before": "20250305",
+          "after": "2025-03-05"
+        },
+        {
+          "order_id": 2246,
+          "before": "20190301",
+          "after": "2019-03-01"
+        },
+        {
+          "order_id": 2247,
+          "before": "20210330",
+          "after": "2021-03-30"
+        }
+      ],
+      "id_address": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2310,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2311,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2313,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2314,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2321,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2324,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2329,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2330,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2331,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_birth": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "1993-09-09",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "1982-02-23",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "1998-08-22",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "1975-07-12",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "2002-09-15",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "1997-05-03",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "1992-09-21",
+          "after": null
+        }
+      ],
+      "id_birth_date": [
+        {
+          "order_id": 6,
+          "before": "19780330",
+          "after": "1978-03-30"
+        },
+        {
+          "order_id": 7,
+          "before": "20021001",
+          "after": "2002-10-01"
+        },
+        {
+          "order_id": 8,
+          "before": "19900321",
+          "after": "1990-03-21"
+        },
+        {
+          "order_id": 10,
+          "before": "20001010",
+          "after": "2000-10-10"
+        },
+        {
+          "order_id": 11,
+          "before": "19740808",
+          "after": "1974-08-08"
+        },
+        {
+          "order_id": 12,
+          "before": "19740429",
+          "after": "1974-04-29"
+        },
+        {
+          "order_id": 13,
+          "before": "19901012",
+          "after": "1990-10-12"
+        },
+        {
+          "order_id": 14,
+          "before": "19651226",
+          "after": "1965-12-26"
+        },
+        {
+          "order_id": 16,
+          "before": "19801008",
+          "after": "1980-10-08"
+        },
+        {
+          "order_id": 17,
+          "before": "19911217",
+          "after": "1991-12-17"
+        },
+        {
+          "order_id": 18,
+          "before": "19860221",
+          "after": "1986-02-21"
+        },
+        {
+          "order_id": 19,
+          "before": "19910802",
+          "after": "1991-08-02"
+        },
+        {
+          "order_id": 20,
+          "before": "19820507",
+          "after": "1982-05-07"
+        },
+        {
+          "order_id": 21,
+          "before": "19890910",
+          "after": "1989-09-10"
+        },
+        {
+          "order_id": 23,
+          "before": "19780416",
+          "after": "1978-04-16"
+        },
+        {
+          "order_id": 24,
+          "before": "19820919",
+          "after": "1982-09-19"
+        },
+        {
+          "order_id": 25,
+          "before": "19881221",
+          "after": "1988-12-21"
+        },
+        {
+          "order_id": 26,
+          "before": "19840210",
+          "after": "1984-02-10"
+        },
+        {
+          "order_id": 27,
+          "before": "19790717",
+          "after": "1979-07-17"
+        },
+        {
+          "order_id": 28,
+          "before": "19780719",
+          "after": "1978-07-19"
+        }
+      ],
+      "id_gender": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2310,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2311,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2313,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2314,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2321,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2324,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2329,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2330,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2331,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_issue_authority": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "南昌县公安局",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "南昌市公安局青山湖分局",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_name": [
+        {
+          "order_id": 289,
+          "before": " 蔡灿超 ",
+          "after": "蔡灿超"
+        },
+        {
+          "order_id": 325,
+          "before": " 雷存扬    ",
+          "after": "雷存扬"
+        },
+        {
+          "order_id": 342,
+          "before": " 程受春",
+          "after": "程受春"
+        },
+        {
+          "order_id": 455,
+          "before": "江西海峰洗涤有限公司  ",
+          "after": "江西海峰洗涤有限公司"
+        },
+        {
+          "order_id": 472,
+          "before": "张琼 ",
+          "after": "张琼"
+        },
+        {
+          "order_id": 556,
+          "before": "  余干县华星物流有限公司",
+          "after": "余干县华星物流有限公司"
+        },
+        {
+          "order_id": 563,
+          "before": " 佛山立仁船艇科技有限公司",
+          "after": "佛山立仁船艇科技有限公司"
+        },
+        {
+          "order_id": 716,
+          "before": "袁辉铁     ",
+          "after": "袁辉铁"
+        },
+        {
+          "order_id": 754,
+          "before": "龚晨曦 ",
+          "after": "龚晨曦"
+        },
+        {
+          "order_id": 781,
+          "before": "南昌微纵汽车服务有限公司 ",
+          "after": "南昌微纵汽车服务有限公司"
+        },
+        {
+          "order_id": 789,
+          "before": " 江西华臻电力工程有限公司",
+          "after": "江西华臻电力工程有限公司"
+        },
+        {
+          "order_id": 859,
+          "before": "徐晚君 ",
+          "after": "徐晚君"
+        },
+        {
+          "order_id": 1022,
+          "before": "徐洲洲 ",
+          "after": "徐洲洲"
+        },
+        {
+          "order_id": 1037,
+          "before": "江西竹清建设工程有限公司 ",
+          "after": "江西竹清建设工程有限公司"
+        },
+        {
+          "order_id": 1122,
+          "before": "黄细令 ",
+          "after": "黄细令"
+        },
+        {
+          "order_id": 1182,
+          "before": "  九江寇莹传媒文化有限公司",
+          "after": "九江寇莹传媒文化有限公司"
+        },
+        {
+          "order_id": 1235,
+          "before": "陈杰 ",
+          "after": "陈杰"
+        },
+        {
+          "order_id": 1290,
+          "before": " 蒋志坚",
+          "after": "蒋志坚"
+        },
+        {
+          "order_id": 1392,
+          "before": " 黄家兴 ",
+          "after": "黄家兴"
+        },
+        {
+          "order_id": 1450,
+          "before": " 黄明高",
+          "after": "黄明高"
+        }
+      ],
+      "id_nation": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "汉",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "汉",
+          "after": null
+        }
+      ],
+      "id_number": [
+        {
+          "order_id": 46,
+          "before": "91360104MAC8T7KD4",
+          "after": null
+        },
+        {
+          "order_id": 579,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 676,
+          "before": "1360104MAC8T7KD4B",
+          "after": null
+        },
+        {
+          "order_id": 781,
+          "before": "91360104MAC8T7KD4B ",
+          "after": "91360104MAC8T7KD4B"
+        },
+        {
+          "order_id": 919,
+          "before": "913604007947723510",
+          "after": null
+        },
+        {
+          "order_id": 953,
+          "before": " 362204199412211017",
+          "after": "362204199412211017"
+        },
+        {
+          "order_id": 1001,
+          "before": "91360400MLA35J93P9Q",
+          "after": "91360400MLA35J93P9"
+        },
+        {
+          "order_id": 1078,
+          "before": " 360481196208200079",
+          "after": "360481196208200079"
+        },
+        {
+          "order_id": 1410,
+          "before": "360429199306301939公",
+          "after": "360429199306301939"
+        },
+        {
+          "order_id": 1843,
+          "before": "36042419671222549",
+          "after": null
+        },
+        {
+          "order_id": 1918,
+          "before": "91360102MACNR3T77G ",
+          "after": "91360102MACNR3T77G"
+        },
+        {
+          "order_id": 1971,
+          "before": " 360427199510302725",
+          "after": "360427199510302725"
+        },
+        {
+          "order_id": 2031,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "528272102661127095",
+          "after": null
+        },
+        {
+          "order_id": 2102,
+          "before": "913603023146308819",
+          "after": null
+        },
+        {
+          "order_id": 2214,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2313,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2321,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2324,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2329,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_valid_from": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2309,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2310,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_valid_period": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "20400413",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "20371103",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        }
+      ],
+      "id_valid_to": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2309,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2310,
+          "before": "",
+          "after": null
+        }
+      ],
+      "issue_date": [
+        {
+          "order_id": 946,
+          "before": "2025-02-31",
+          "after": null
+        },
+        {
+          "order_id": 1644,
+          "before": "2024-02-31",
+          "after": null
+        },
+        {
+          "order_id": 2154,
+          "before": "2022-02-31",
+          "after": null
+        },
+        {
+          "order_id": 2239,
+          "before": "20230309",
+          "after": "2023-03-09"
+        },
+        {
+          "order_id": 2240,
+          "before": "20250310",
+          "after": "2025-03-10"
+        },
+        {
+          "order_id": 2241,
+          "before": "20250317",
+          "after": "2025-03-17"
+        },
+        {
+          "order_id": 2242,
+          "before": "20250305",
+          "after": "2025-03-05"
+        },
+        {
+          "order_id": 2244,
+          "before": "20250310",
+          "after": "2025-03-10"
+        },
+        {
+          "order_id": 2245,
+          "before": "20250324",
+          "after": "2025-03-24"
+        },
+        {
+          "order_id": 2246,
+          "before": "20190301",
+          "after": "2019-03-01"
+        },
+        {
+          "order_id": 2247,
+          "before": "20210330",
+          "after": "2021-03-30"
+        },
+        {
+          "order_id": 2248,
+          "before": "20130121",
+          "after": "2013-01-21"
+        },
+        {
+          "order_id": 2249,
+          "before": "20250307",
+          "after": "2025-03-07"
+        },
+        {
+          "order_id": 2250,
+          "before": "20241225",
+          "after": "2024-12-25"
+        },
+        {
+          "order_id": 2251,
+          "before": "20150717",
+          "after": "2015-07-17"
+        },
+        {
+          "order_id": 2252,
+          "before": "20200313",
+          "after": "2020-03-13"
+        },
+        {
+          "order_id": 2253,
+          "before": "20250304",
+          "after": "2025-03-04"
+        },
+        {
+          "order_id": 2255,
+          "before": "20240829",
+          "after": "2024-08-29"
+        },
+        {
+          "order_id": 2258,
+          "before": "20220322",
+          "after": "2022-03-22"
+        },
+        {
+          "order_id": 2260,
+          "before": "20160720",
+          "after": "2016-07-20"
+        }
+      ],
+      "manufacturer_name": [
+        {
+          "order_id": 128,
+          "before": "A115650C281C2J6NB14A6S115",
+          "after": null
+        },
+        {
+          "order_id": 203,
+          "before": "模9",
+          "after": null
+        },
+        {
+          "order_id": 288,
+          "before": "6",
+          "after": null
+        },
+        {
+          "order_id": 403,
+          "before": "A076257XB3N647000M0CC1102",
+          "after": null
+        },
+        {
+          "order_id": 504,
+          "before": "L222220",
+          "after": null
+        },
+        {
+          "order_id": 648,
+          "before": ":(m1)/最大净功率(kW)",
+          "after": null
+        },
+        {
+          "order_id": 768,
+          "before": "GB1495-2002(11)GB/T14365-2017",
+          "after": null
+        },
+        {
+          "order_id": 925,
+          "before": "A009518S311S388N815A70205",
+          "after": null
+        },
+        {
+          "order_id": 1031,
+          "before": "2026.01.2610:46",
+          "after": null
+        },
+        {
+          "order_id": 1188,
+          "before": "A009518S311S388N815A7020",
+          "after": null
+        },
+        {
+          "order_id": 1419,
+          "before": "联系人:马魁基/联系电话:023-67921044",
+          "after": null
+        },
+        {
+          "order_id": 1501,
+          "before": "5320",
+          "after": null
+        },
+        {
+          "order_id": 1559,
+          "before": "A115650C363C349NB14A6S00",
+          "after": null
+        },
+        {
+          "order_id": 1607,
+          "before": "LR281",
+          "after": null
+        },
+        {
+          "order_id": 1875,
+          "before": "联系人:马魁基/联系电话:023-67921044",
+          "after": null
+        },
+        {
+          "order_id": 2044,
+          "before": "烟度(吸收系数(m-1)的校正值)",
+          "after": null
+        },
+        {
+          "order_id": 2187,
+          "before": "(m1)/最大净功率(kW)",
+          "after": null
+        },
+        {
+          "order_id": 2504,
+          "before": "2024011101619273(01/2024年10月30日",
+          "after": null
+        },
+        {
+          "order_id": 3361,
+          "before": "2024011101664229(00)/2024-07-26",
+          "after": null
+        },
+        {
+          "order_id": 3509,
+          "before": "2025011101813104(00)/2025-09-22",
+          "after": null
+        }
+      ],
+      "owner_name": [
+        {
+          "order_id": 199,
+          "before": " 巢芳丽",
+          "after": "巢芳丽"
+        },
+        {
+          "order_id": 325,
+          "before": "雷存扬  ",
+          "after": "雷存扬"
+        },
+        {
+          "order_id": 579,
+          "before": " 冷文宝",
+          "after": "冷文宝"
+        },
+        {
+          "order_id": 697,
+          "before": "杨蕾 ",
+          "after": "杨蕾"
+        },
+        {
+          "order_id": 754,
+          "before": "龚晨曦 ",
+          "after": "龚晨曦"
+        },
+        {
+          "order_id": 874,
+          "before": "李毅弘 ",
+          "after": "李毅弘"
+        },
+        {
+          "order_id": 1018,
+          "before": "吴则胜 ",
+          "after": "吴则胜"
+        },
+        {
+          "order_id": 1022,
+          "before": "徐洲洲 ",
+          "after": "徐洲洲"
+        },
+        {
+          "order_id": 1078,
+          "before": " 邹时利",
+          "after": "邹时利"
+        },
+        {
+          "order_id": 1235,
+          "before": "陈杰 ",
+          "after": "陈杰"
+        },
+        {
+          "order_id": 1308,
+          "before": " 邢国栋",
+          "after": "邢国栋"
+        },
+        {
+          "order_id": 1310,
+          "before": " 李喜艳",
+          "after": "李喜艳"
+        },
+        {
+          "order_id": 1526,
+          "before": "殷燕霞 ",
+          "after": "殷燕霞"
+        },
+        {
+          "order_id": 1663,
+          "before": "张剑峰 ",
+          "after": "张剑峰"
+        },
+        {
+          "order_id": 1847,
+          "before": "刘宝贵 ",
+          "after": "刘宝贵"
+        },
+        {
+          "order_id": 1871,
+          "before": " 李彩霞   ",
+          "after": "李彩霞"
+        },
+        {
+          "order_id": 1975,
+          "before": " 陈冬雪",
+          "after": "陈冬雪"
+        },
+        {
+          "order_id": 1988,
+          "before": "张钦 ",
+          "after": "张钦"
+        },
+        {
+          "order_id": 2000,
+          "before": " 邹少平",
+          "after": "邹少平"
+        },
+        {
+          "order_id": 2001,
+          "before": "周员媛 ",
+          "after": "周员媛"
+        }
+      ],
+      "plate_no": [
+        {
+          "order_id": 199,
+          "before": "赣GUJ288  ",
+          "after": "赣GUJ288"
+        },
+        {
+          "order_id": 323,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 361,
+          "before": "赣G84H67 ",
+          "after": "赣G84H67"
+        },
+        {
+          "order_id": 364,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 429,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 436,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 451,
+          "before": "新车A03588",
+          "after": "车A03588"
+        },
+        {
+          "order_id": 466,
+          "before": "赣GB7F31    ",
+          "after": "赣GB7F31"
+        },
+        {
+          "order_id": 523,
+          "before": "赣G9023警",
+          "after": "赣G9023"
+        },
+        {
+          "order_id": 539,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 553,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 558,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 570,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 624,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 649,
+          "before": "赣G59L80 ",
+          "after": "赣G59L80"
+        },
+        {
+          "order_id": 650,
+          "before": "赣G78753  ",
+          "after": "赣G78753"
+        },
+        {
+          "order_id": 672,
+          "before": "赣GBJ560 ",
+          "after": "赣GBJ560"
+        },
+        {
+          "order_id": 673,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 726,
+          "before": "新车",
+          "after": null
+        },
+        {
+          "order_id": 754,
+          "before": "赣GKE986 ",
+          "after": "赣GKE986"
+        }
+      ],
+      "register_date": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        }
+      ],
+      "vehicle_brand_name": [
+        {
+          "order_id": 925,
+          "before": "中国",
+          "after": null
+        },
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2187,
+          "before": "中国",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        }
+      ],
+      "vehicle_model": [
+        {
+          "order_id": 1445,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1446,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 1899,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2081,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2144,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2331,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2338,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2361,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2367,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2375,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 3148,
+          "before": "",
+          "after": null
+        }
+      ],
+      "vehicle_name": [
+        {
+          "order_id": 2008,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2009,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2048,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2235,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2236,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2237,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2269,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2291,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2296,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2298,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2299,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2300,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2301,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2302,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2303,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2304,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2305,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2306,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2307,
+          "before": "",
+          "after": null
+        },
+        {
+          "order_id": 2308,
+          "before": "",
+          "after": null
+        }
+      ],
+      "vin": [
+        {
+          "order_id": 181,
+          "before": "SVW71527ED",
+          "after": null
+        },
+        {
+          "order_id": 213,
+          "before": "LBECNMAFD7SZ553304",
+          "after": "LBECNMAFD7SZ55330"
+        },
+        {
+          "order_id": 304,
+          "before": "955579H",
+          "after": null
+        },
+        {
+          "order_id": 319,
+          "before": "183260688",
+          "after": null
+        },
+        {
+          "order_id": 359,
+          "before": "*****259898",
+          "after": null
+        },
+        {
+          "order_id": 394,
+          "before": "LDMAA22XG0678055",
+          "after": null
+        },
+        {
+          "order_id": 403,
+          "before": "INBMCUAK9SD250920",
+          "after": "1NBMCUAK9SD250920"
+        },
+        {
+          "order_id": 503,
+          "before": "029500",
+          "after": null
+        },
+        {
+          "order_id": 615,
+          "before": "LVFAC5ADODK000327",
+          "after": "LVFAC5AD0DK000327"
+        },
+        {
+          "order_id": 689,
+          "before": "WDCOJ4GB0JF361796",
+          "after": "WDC0J4GB0JF361796"
+        },
+        {
+          "order_id": 736,
+          "before": "LBENUBKC1HSO09221",
+          "after": "LBENUBKC1HS009221"
+        },
+        {
+          "order_id": 787,
+          "before": "418670",
+          "after": null
+        },
+        {
+          "order_id": 813,
+          "before": "253215",
+          "after": null
+        },
+        {
+          "order_id": 816,
+          "before": "*101987",
+          "after": null
+        },
+        {
+          "order_id": 823,
+          "before": "WAUAFEF5OPA018065",
+          "after": "WAUAFEF50PA018065"
+        },
+        {
+          "order_id": 869,
+          "before": "URRT0EUN",
+          "after": null
+        },
+        {
+          "order_id": 938,
+          "before": "LFMCU1BROS0148068",
+          "after": "LFMCU1BR0S0148068"
+        },
+        {
+          "order_id": 993,
+          "before": "8352620161",
+          "after": null
+        },
+        {
+          "order_id": 1003,
+          "before": "*003685",
+          "after": null
+        },
+        {
+          "order_id": 1004,
+          "before": "**538122",
+          "after": null
+        }
+      ]
+    }
+  },
+  "after": {
+    "tables": [
+      "channel_group_new",
+      "customer_group_new",
+      "field_config_new",
+      "field_group_field_new",
+      "field_group_new",
+      "finance_record_new",
+      "image_file_new",
+      "image_ocr_result_new",
+      "ocr_image_cache_new",
+      "ocr_task_new",
+      "order_fact_new",
+      "order_image_new",
+      "order_info_new",
+      "order_new",
+      "order_slot_result_new",
+      "role_new",
+      "user_new",
+      "user_role_new",
+      "user_session_new"
+    ],
+    "row_counts": {
+      "channel_group_new": 276,
+      "customer_group_new": 574,
+      "field_config_new": 76,
+      "field_group_field_new": 67,
+      "field_group_new": 4,
+      "finance_record_new": 0,
+      "image_file_new": 18010,
+      "image_ocr_result_new": 13332,
+      "ocr_image_cache_new": 13332,
+      "ocr_task_new": 5061,
+      "order_fact_new": 5535,
+      "order_image_new": 18837,
+      "order_info_new": 5535,
+      "order_new": 5535,
+      "order_slot_result_new": 0,
+      "role_new": 5,
+      "user_new": 23,
+      "user_role_new": 23,
+      "user_session_new": 2803
+    },
+    "extra_tables": [],
+    "missing_model_tables": [],
+    "missing_model_indexes": {}
+  }
+}

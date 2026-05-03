@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import CurrentUserContext, get_current_user_with_role_and_teams
+from app.core.access_control import require_ai_assistant_access
 from app.schemas.ai_assistant import (
     AiChatIn,
     AiChatOut,
@@ -58,13 +59,29 @@ def _to_session_item(row: Any) -> AiSessionItem:
     )
 
 
+def _owner_user_id_or_401(ctx: CurrentUserContext) -> int:
+    require_ai_assistant_access(role_name=ctx.primary_role)
+    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
+    if owner_user_id <= 0:
+        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    return owner_user_id
+
+
+def _chat_context(ctx: CurrentUserContext, body: AiChatIn) -> Dict[str, Any]:
+    return {
+        "order_id": body.order_id,
+        "images": body.images,
+        "current_user_id": int(getattr(ctx.user, "id", 0) or 0),
+        "role_name": str(ctx.primary_role or ""),
+        "team_names": list(ctx.team_names or ()),
+    }
+
+
 @router.get("/sessions", response_model=AiSessionListOut)
 async def list_ai_sessions(
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
-    if owner_user_id <= 0:
-        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    owner_user_id = _owner_user_id_or_401(ctx)
 
     rows = _list_sessions(owner_user_id=owner_user_id) or []
     items = [_to_session_item(x) for x in rows]
@@ -76,9 +93,7 @@ async def create_ai_session(
         body: AiCreateSessionIn,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
-    if owner_user_id <= 0:
-        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    owner_user_id = _owner_user_id_or_401(ctx)
 
     row = _create_session(owner_user_id=owner_user_id, title=(body.title or "").strip() or None)
     return {
@@ -96,9 +111,7 @@ async def delete_ai_session(
         session_id: str,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
-    if owner_user_id <= 0:
-        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    owner_user_id = _owner_user_id_or_401(ctx)
 
     ok = _delete_session(session_id=session_id, owner_user_id=owner_user_id)
     if not ok:
@@ -111,9 +124,7 @@ async def get_ai_history(
         session_id: str,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
-    if owner_user_id <= 0:
-        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    owner_user_id = _owner_user_id_or_401(ctx)
 
     rows = _list_messages(session_id=session_id, owner_user_id=owner_user_id) or []
     items: List[Dict[str, Any]] = []
@@ -133,9 +144,7 @@ async def ai_chat(
         body: AiChatIn,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    owner_user_id = int(getattr(ctx.user, "id", 0) or 0)
-    if owner_user_id <= 0:
-        raise HTTPException(status_code=401, detail="无法识别当前用户")
+    owner_user_id = _owner_user_id_or_401(ctx)
 
     result = await _send_message(
         owner_user_id=owner_user_id,
@@ -147,7 +156,7 @@ async def ai_chat(
         temperature=None,
         max_tokens=None,
         stream=False,
-        context={"order_id": body.order_id, "images": body.images},
+        context=_chat_context(ctx, body),
     )
 
     reply = str(_pick(result, "reply", "content", "text", default="") or "")

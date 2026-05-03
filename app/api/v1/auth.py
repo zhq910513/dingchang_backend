@@ -2,14 +2,7 @@
 # encoding: utf-8
 from __future__ import annotations
 
-"""
-认证相关接口（API 薄壳）
-
-原则：
-- Schemas 为接口真源：app.schemas.auth.LoginIn / LoginOut
-- 业务规则全部下沉到 services.auth_service
-- 时间口径：北京时间 naive DATETIME
-"""
+"""Authentication API routes."""
 
 import logging
 
@@ -25,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+_FORBIDDEN_LOGIN_MESSAGES = {"账号已禁用", "账号未配置角色"}
+
 
 @router.post("/login", response_model=LoginOut)
 async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
@@ -36,7 +31,7 @@ async def login(data: LoginIn, db: AsyncSession = Depends(get_db)):
         )
     except ValueError as e:
         message = str(e) or "登录失败"
-        status_code = 403 if message == "账号已禁用" else 401
+        status_code = 403 if message in _FORBIDDEN_LOGIN_MESSAGES else 401
         raise HTTPException(status_code=status_code, detail=message)
     except Exception as e:
         logger.exception("login failed: %s", e)

@@ -1,0 +1,67 @@
+{
+  "ok": true,
+  "mode": "import_mysql_dump_with_pymysql",
+  "guard": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "order_system",
+    "user": "dingchang_app"
+  },
+  "dump_path": "D:\\Projects\\dingchang\\dingchang_backend\\logs\\standardized-model-tables-final-20260503.sql.gz",
+  "elapsed_ms": 18935.77,
+  "summary": {
+    "executed_statements": 352,
+    "skipped_statements": 0,
+    "table_count": 19,
+    "non_empty_table_count": 17,
+    "row_total": 89028
+  },
+  "statement_stats": {
+    "SET": 7,
+    "DROP": 19,
+    "CREATE": 19,
+    "INSERT": 307
+  },
+  "tables": [
+    "channel_group_new",
+    "customer_group_new",
+    "field_config_new",
+    "field_group_field_new",
+    "field_group_new",
+    "finance_record_new",
+    "image_file_new",
+    "image_ocr_result_new",
+    "ocr_image_cache_new",
+    "ocr_task_new",
+    "order_fact_new",
+    "order_image_new",
+    "order_info_new",
+    "order_new",
+    "order_slot_result_new",
+    "role_new",
+    "user_new",
+    "user_role_new",
+    "user_session_new"
+  ],
+  "row_counts": {
+    "channel_group_new": 276,
+    "customer_group_new": 574,
+    "field_config_new": 76,
+    "field_group_field_new": 67,
+    "field_group_new": 4,
+    "finance_record_new": 0,
+    "image_file_new": 18010,
+    "image_ocr_result_new": 13332,
+    "ocr_image_cache_new": 13332,
+    "ocr_task_new": 5061,
+    "order_fact_new": 5535,
+    "order_image_new": 18837,
+    "order_info_new": 5535,
+    "order_new": 5535,
+    "order_slot_result_new": 0,
+    "role_new": 5,
+    "user_new": 23,
+    "user_role_new": 23,
+    "user_session_new": 2803
+  }
+}

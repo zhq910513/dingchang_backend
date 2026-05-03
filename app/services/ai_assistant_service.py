@@ -12,14 +12,17 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, desc, false as sql_false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
 
+from app.core.access_control import normalize_team_names, user_team_match_expr
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
 from app.core.db import get_db
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
+from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
 from app.services.storage import StorageService
@@ -457,15 +460,77 @@ def _json_text_col(col, path: str):
     return func.json_unquote(func.json_extract(col, path))
 
 
-async def _db_get_order_by_id(db: AsyncSession, order_id: int) -> Optional[Order]:
+def _ctx_role_name(ctx: Dict[str, Any]) -> str:
+    return _to_str((ctx or {}).get("role_name")).strip()
+
+
+def _ctx_current_user_id(ctx: Dict[str, Any]) -> int:
+    return _safe_int((ctx or {}).get("current_user_id"), 0)
+
+
+def _ctx_team_names(ctx: Dict[str, Any]) -> Tuple[str, ...]:
+    raw = (ctx or {}).get("team_names") or ()
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    if not isinstance(raw, (list, tuple, set)):
+        raw = []
+    return normalize_team_names(tuple(str(x or "").strip() for x in raw if str(x or "").strip()))
+
+
+def _order_acl_clause_for_ctx(ctx: Dict[str, Any]):
+    role_name = _ctx_role_name(ctx)
+    if role_name == ROLE_SUPER_ADMIN:
+        return None
+
+    if role_name == ROLE_SALES:
+        current_user_id = _ctx_current_user_id(ctx)
+        if current_user_id <= 0:
+            return sql_false()
+        return Order.salesperson_id == current_user_id
+
+    if role_name in (ROLE_MANAGER, ROLE_FINANCE, ROLE_MARKET):
+        team_names = _ctx_team_names(ctx)
+        if not team_names:
+            return sql_false()
+        if role_name in (ROLE_FINANCE, ROLE_MARKET) and len(team_names) != 1:
+            return sql_false()
+        team_user_ids = select(User.id).where(user_team_match_expr(team_names))
+        return Order.salesperson_id.in_(team_user_ids)
+
+    return sql_false()
+
+
+async def _db_can_read_order_by_id(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> bool:
+    stmt = select(Order.id).where(Order.id == int(order_id)).limit(1)
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def _db_get_order_by_id(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[Order]:
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
         .options(
+            lazyload("*"),
             selectinload(Order.order_info),
             selectinload(Order.images).selectinload(OrderImage.image_file),
         )
     )
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
     return (await db.execute(stmt)).scalars().first()
 
 
@@ -476,9 +541,10 @@ async def _db_find_order(
         plate_no: Optional[str],
         owner_phone: Optional[str],
         owner_name: Optional[str],
+        ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Order]:
     if order_id:
-        return await _db_get_order_by_id(db, int(order_id))
+        return await _db_get_order_by_id(db, int(order_id), ctx=ctx)
 
     clauses = []
     if plate_no:
@@ -492,6 +558,7 @@ async def _db_find_order(
         )
 
     stmt = select(Order).options(
+        lazyload("*"),
         selectinload(Order.order_info),
         selectinload(Order.images).selectinload(OrderImage.image_file),
     )
@@ -503,6 +570,10 @@ async def _db_find_order(
     if clauses:
         stmt = stmt.where(and_(*clauses))
 
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
+
     stmt = stmt.order_by(desc(Order.id)).limit(1)
     return (await db.execute(stmt)).scalars().first()
 
@@ -511,40 +582,76 @@ async def _db_get_latest_ocr_task_for_order(db: AsyncSession, order_id: int) -> 
     stmt = (
         select(OcrTask)
         .where(and_(OcrTask.scope_type == "order", OcrTask.scope_id == int(order_id)))
+        .options(lazyload("*"))
         .order_by(desc(OcrTask.id))
         .limit(1)
     )
     return (await db.execute(stmt)).scalars().first()
 
 
-async def _db_get_ocr_task(db: AsyncSession, task_id: int) -> Optional[OcrTask]:
-    stmt = select(OcrTask).where(OcrTask.id == int(task_id))
-    return (await db.execute(stmt)).scalars().first()
+async def _db_get_ocr_task(
+        db: AsyncSession,
+        task_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[OcrTask]:
+    stmt = select(OcrTask).where(OcrTask.id == int(task_id)).options(lazyload("*"))
+    task = (await db.execute(stmt)).scalars().first()
+    if not task:
+        return None
+
+    scope_type = _to_str(getattr(task, "scope_type", None) or "")
+    scope_id = _safe_int(getattr(task, "scope_id", 0), 0)
+    if scope_type == "order" and scope_id > 0:
+        return task if await _db_can_read_order_by_id(db, scope_id, ctx=ctx) else None
+
+    if _ctx_role_name(ctx or {}) == ROLE_SUPER_ADMIN:
+        return task
+    return None
+
+
+def _image_signed_url(storage_key: str) -> Optional[str]:
+    sk = _to_str(storage_key).strip()
+    if not sk or not getattr(storage, "enabled", False):
+        return None
+    try:
+        return storage.object_url_for_display(
+            sk,
+            expires_in=900,
+            allow_fallback_public=False,
+        )
+    except TypeError:
+        try:
+            return storage.object_url_for_display(sk, expires_in=900)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def _latest_image_url(img: Optional[OrderImage]) -> Optional[str]:
     if not img:
         return None
-    u = _to_str(getattr(img, "image_url", "")).strip()
-    if u:
-        return u
-    sk = _to_str(getattr(img, "storage_key", "")).strip()
-    if sk:
-        try:
-            return storage.object_url_for_display(sk, expires_in=900)
-        except Exception:
-            return None
+
+    signed_url = _image_signed_url(getattr(img, "storage_key", ""))
+    if signed_url:
+        return signed_url
+
     imf = getattr(img, "image_file", None)
     if imf is not None:
-        u2 = _to_str(getattr(imf, "url", "")).strip()
-        if u2:
-            return u2
-        sk2 = _to_str(getattr(imf, "storage_key", "")).strip()
-        if sk2:
-            try:
-                return storage.object_url_for_display(sk2, expires_in=900)
-            except Exception:
-                return None
+        signed_url = _image_signed_url(getattr(imf, "storage_key", ""))
+        if signed_url:
+            return signed_url
+
+    if not getattr(storage, "enabled", False):
+        u = _to_str(getattr(img, "image_url", "")).strip()
+        if u:
+            return u
+        if imf is not None:
+            u2 = _to_str(getattr(imf, "url", "")).strip()
+            if u2:
+                return u2
+
     return None
 
 
@@ -764,7 +871,7 @@ async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
     order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
+                                 owner_name=owner_name, ctx=ctx)
     if not order:
         return (
             "当前没有可展示的材料状态（未定位到订单）。你可以先发：查订单123 或 查订单 赣B12345，然后再查看材料状态。",
@@ -837,7 +944,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
         owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
         order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                     owner_name=owner_name)
+                                     owner_name=owner_name, ctx=ctx)
         if not order:
             return (
                 "已识别为OCR任务查询，但你没提供任务号，也没定位到订单。你可以发：查OCR任务 123 或 查订单123 再查OCR状态。",
@@ -873,7 +980,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
             )
         task_id = int(getattr(latest, "id"))
 
-    task = await _db_get_ocr_task(db, int(task_id))
+    task = await _db_get_ocr_task(db, int(task_id), ctx=ctx)
     if not task:
         return (
             f"没找到 OCR任务{task_id}。请确认任务号是否正确。",
@@ -910,7 +1017,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
     order_brief = None
     slot_statuses = []
     if scope_type == "order" and scope_id > 0:
-        order = await _db_get_order_by_id(db, scope_id)
+        order = await _db_get_order_by_id(db, scope_id, ctx=ctx)
         if order:
             order_brief = _order_brief_from_order(order)
             slot_statuses = _ocr_slot_statuses_from_order(order)
@@ -987,7 +1094,7 @@ async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
         )
 
     order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
+                                 owner_name=owner_name, ctx=ctx)
     if not order:
         return (
             "没查到符合条件的订单。你可以换个条件再试试（订单号/车牌/手机号）。",
@@ -1059,7 +1166,8 @@ async def _reply_owner(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
-    order = await _db_find_order(db, order_id=None, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+    order = await _db_find_order(db, order_id=None, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name,
+                                 ctx=ctx)
     if not order:
         return (
             "没查到对应车主信息（可能条件不匹配或暂无订单）。你可以换车牌/手机号/姓名再试一次。",
@@ -1172,7 +1280,7 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
     order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
+                                 owner_name=owner_name, ctx=ctx)
     if not order:
         return (
             f"已识别报价指令：{platform_name}报价，但当前未定位到订单。你可以先发：查订单123 / 查订单 赣B12345，再执行报价。",

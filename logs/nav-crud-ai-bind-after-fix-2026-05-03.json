@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "rows": [
+    {
+      "label": "bind_empty_images_probe",
+      "method": "POST",
+      "path": "/orders/3220/images/bind",
+      "status": 200,
+      "elapsed_ms": 164.5,
+      "ok": true,
+      "expected": [
+        200
+      ],
+      "body": {
+        "ok": true,
+        "order_id": 3220,
+        "bound_count": 0,
+        "ocr_task_id": null,
+        "ocr_status": null
+      }
+    },
+    {
+      "label": "reject_invalid_slot",
+      "method": "POST",
+      "path": "/orders/3220/images/bind",
+      "status": 400,
+      "elapsed_ms": 22.82,
+      "ok": true,
+      "expected": [
+        400
+      ],
+      "body": {
+        "detail": "非法 slot_key: bad"
+      }
+    }
+  ]
+}

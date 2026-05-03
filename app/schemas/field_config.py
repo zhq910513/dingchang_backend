@@ -5,8 +5,10 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas._base import OrmBaseModel
 
-class FieldConfigOut(BaseModel):
+
+class FieldConfigOut(OrmBaseModel):
     id: int
     module: str
     field_name: str
@@ -22,10 +24,6 @@ class FieldConfigOut(BaseModel):
     view_roles: Optional[Any] = None
     edit_roles: Optional[Any] = None
 
-    class Config:
-        orm_mode = True
-
-
 class FieldConfigUpsertIn(BaseModel):
     """
     Upsert 入参（body）
@@ -33,8 +31,8 @@ class FieldConfigUpsertIn(BaseModel):
     注意：
     - module / field_name 由 path 提供（避免 body 重复与冲突）
     """
-    label: str = Field(..., min_length=1)
-    type: str = Field(..., min_length=1)
+    label: str = Field(..., min_length=1, max_length=100)
+    type: str = Field(..., min_length=1, max_length=50)
 
     options: Optional[Any] = None
     validators: Optional[Dict[str, Any]] = None
@@ -57,7 +55,7 @@ class FieldConfigListOut(BaseModel):
 # form-config（前端分组表单配置）
 # =========================
 
-class FieldFormItemOut(BaseModel):
+class FieldFormItemOut(OrmBaseModel):
     field_name: str
     label: str
     type: str
@@ -70,10 +68,6 @@ class FieldFormItemOut(BaseModel):
     options: Optional[Any] = None
     validators: Optional[Any] = None
     extra: Optional[Any] = None
-
-    class Config:
-        orm_mode = True
-
 
 class FieldGroupConfigOut(BaseModel):
     group_key: str

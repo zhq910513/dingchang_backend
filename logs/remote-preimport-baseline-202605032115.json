@@ -1,0 +1,161 @@
+{
+  "created_at": "2026-05-03T21:14:07+0800",
+  "mode": "remote_preimport_mysql_baseline",
+  "queries": {
+    "all_table_counts": {
+      "exit": 0,
+      "stdout": "channel_group\t195\nchannel_group_new\t276\ncustomer_group\t368\ncustomer_group_new\t574\nfield_config\t68\nfield_config_new\t76\nfield_group\t4\nfield_group_field\t68\nfield_group_field_new\t67\nfield_group_new\t4\nfinance_record\t0\nfinance_record_backup_2026_03_02\t0\nfinance_record_new\t0\nimage_file\t10108\nimage_file_backup_2026_03_02\t7897\nimage_file_new\t17751\nimage_ocr_result\t7276\nimage_ocr_result_backup_2026_03_02\t5871\nimage_ocr_result_new\t12778\nmigration_state\t11\nocr_image_cache\t7153\nocr_image_cache_backup_2026_03_02\t5796\nocr_image_cache_new\t12668\nocr_task\t2918\nocr_task_backup_2026_03_02\t2260\nocr_task_new\t4995\norder\t2260\norder_backup_2026_03_02\t1958\norder_dynamic_data_backup_20260227\t2129\norder_dynamic_snapshot_20260227\t1722\norder_fact_new\t0\norder_image\t10646\norder_image_backup_2026_03_02\t8580\norder_image_new\t18739\norder_info\t2993\norder_info_backup_2026_03_02\t2367\norder_info_new\t5678\norder_new\t4520\norder_slot_result_new\t0\nrole\t5\nrole_new\t5\nuser\t18\nuser_new\t23\nuser_role\t18\nuser_role_new\t23\nuser_session\t1638\nuser_session_new\t2803",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:channel_group_new": {
+      "exit": 0,
+      "stdout": "276",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:customer_group_new": {
+      "exit": 0,
+      "stdout": "574",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_config_new": {
+      "exit": 0,
+      "stdout": "76",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_group_field_new": {
+      "exit": 0,
+      "stdout": "67",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:field_group_new": {
+      "exit": 0,
+      "stdout": "4",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:finance_record_new": {
+      "exit": 0,
+      "stdout": "0",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:image_file_new": {
+      "exit": 0,
+      "stdout": "18010",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:image_ocr_result_new": {
+      "exit": 0,
+      "stdout": "13332",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:ocr_image_cache_new": {
+      "exit": 0,
+      "stdout": "13332",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:ocr_task_new": {
+      "exit": 0,
+      "stdout": "5061",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_fact_new": {
+      "exit": 0,
+      "stdout": "0",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_image_new": {
+      "exit": 0,
+      "stdout": "18837",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_info_new": {
+      "exit": 0,
+      "stdout": "5535",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_new": {
+      "exit": 0,
+      "stdout": "5535",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:order_slot_result_new": {
+      "exit": 0,
+      "stdout": "0",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:role_new": {
+      "exit": 0,
+      "stdout": "5",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_new": {
+      "exit": 0,
+      "stdout": "23",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_role_new": {
+      "exit": 0,
+      "stdout": "23",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "count:user_session_new": {
+      "exit": 0,
+      "stdout": "2803",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_watermark": {
+      "exit": 0,
+      "stdout": "6\t5577\t2026-01-07 16:41:44\t2026-05-02 17:34:20\t2026-05-02 17:34:20",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_finished": {
+      "exit": 0,
+      "stdout": "0\t548\n1\t4987",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_paid": {
+      "exit": 0,
+      "stdout": "0\t3738\n1\t1797",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:is_rebate": {
+      "exit": 0,
+      "stdout": "0\t1918\n1\t3617",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:status": {
+      "exit": 0,
+      "stdout": "0\t5535",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_dist:audit_status": {
+      "exit": 0,
+      "stdout": "0\t5535",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "finance_sums": {
+      "exit": 0,
+      "stdout": "11957996.85\t4446472.57\t1413811.95\t1037113.91\t18855395.28\t125810.1400\t8447.0000\t6820.0000\t144.5200\t48158.0000\t132373.36\t4105790.91\t111234.4000\t1769.0000\t2688.5500\t0.0000\t9947.0000\t114881.56\t3507231.65\t598559.64",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "finance_watermark": {
+      "exit": 0,
+      "stdout": "5535\t6\t5542\t2026-05-02 17:34:20",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "ocr_task_status": {
+      "exit": 0,
+      "stdout": "finished\t4725\nfinished_with_errors\t336",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    },
+    "order_fact_count": {
+      "exit": 0,
+      "stdout": "0",
+      "stderr": "mysql: [Warning] Using a password on the command line interface can be insecure."
+    }
+  },
+  "container_state": {
+    "exit": 0,
+    "stdout": "dingchang_backend\tExited (0) 32 minutes ago\nedge_nginx\tExited (0) 32 minutes ago\ndingchang_mysql\tUp About an hour (healthy)",
+    "stderr": ""
+  }
+}
