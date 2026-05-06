@@ -756,6 +756,7 @@ async def create_user(
     username: str,
     password: str,
     role_name: str,
+    real_name: Optional[str] = None,
     team_name: Optional[str] = None,
     team_names: Optional[str] = None,
 ) -> User:
@@ -767,6 +768,8 @@ async def create_user(
     username_str = str(username or "").strip()
     if not username_str:
         raise ValueError("username is required")
+
+    real_name_str = (str(real_name).strip() if real_name else None) or None
 
     password_str = _validate_password(password)
 
@@ -799,7 +802,7 @@ async def create_user(
 
     user = User(
         username=username_str,
-        real_name=None,
+        real_name=real_name_str,
         password_hash=hash_password(password_str),
         status=1,
         team_name=team_name_str,
@@ -836,6 +839,7 @@ async def update_user(
     current_role: str,
     user_id: int,
     password: Optional[str] = None,
+    real_name: Any = _UNSET,
     team_name: Any = _UNSET,
     team_names: Any = _UNSET,
 ) -> User:
@@ -875,6 +879,12 @@ async def update_user(
         password_str = _validate_password(password)
         user.password_hash = hash_password(password_str)
         changed = True
+
+    if real_name is not _UNSET:
+        real_name_str = (str(real_name).strip() if real_name else None) or None
+        if (user.real_name or None) != real_name_str:
+            user.real_name = real_name_str
+            changed = True
 
     target_role_name = str(target_row.get("role_name") or "").strip()
     next_team_name = (

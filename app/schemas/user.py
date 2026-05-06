@@ -72,6 +72,15 @@ def _normalize_team_name(v: Any) -> Optional[str]:
     return s or None
 
 
+def _normalize_real_name(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise ValueError("real_name 必须为字符串或 None")
+    s = v.strip()
+    return s or None
+
+
 class UserRowCapabilitiesOut(OrmBaseModel):
     user_update: bool = False
     user_delete: bool = False
@@ -133,9 +142,14 @@ class UserListOut(OrmBaseModel):
 class UserCreateIn(OrmBaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6, max_length=256)
+    real_name: Optional[str] = Field(default=None, max_length=50)
     role_name: str = Field(..., min_length=1, max_length=50, description="角色：super_admin/manager/sales/finance/market")
     team_name: Optional[str] = Field(default=None, max_length=32)
     team_names: Optional[str] = Field(default=None, max_length=255)
+
+    @validator("real_name", pre=True)
+    def _v_create_real_name(cls, v: Any) -> Optional[str]:
+        return _normalize_real_name(v)
 
     @validator("team_name", pre=True)
     def _v_create_team_name(cls, v: Any) -> Optional[str]:
@@ -148,8 +162,13 @@ class UserCreateIn(OrmBaseModel):
 
 class UserUpdateIn(OrmBaseModel):
     password: Optional[str] = Field(default=None, min_length=6, max_length=256)
+    real_name: Optional[str] = Field(default=None, max_length=50)
     team_name: Optional[str] = Field(default=None, max_length=32)
     team_names: Optional[str] = Field(default=None, max_length=255)
+
+    @validator("real_name", pre=True)
+    def _v_update_real_name(cls, v: Any) -> Optional[str]:
+        return _normalize_real_name(v)
 
     @validator("team_name", pre=True)
     def _v_update_team_name(cls, v: Any) -> Optional[str]:

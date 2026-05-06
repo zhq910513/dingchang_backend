@@ -89,55 +89,13 @@ SALES（销售）
 
 
 
-
-
-
-
-# 1. 更新后端代码
 cd /data/backend/dingchang_backend
 git pull
 
-# 2. 进入 compose 目录
 cd /data/compose/dingchang
-
-# 3. 启动 MySQL
-docker compose up -d mysql
-
-# 4. 等 MySQL 就绪
-docker exec dingchang_mysql mysqladmin ping -h127.0.0.1 -uroot -p'DingChang@13579*^' --silent
-
-# 5. 启动 Redis
-docker start gateway_redis || true
-
-# 6. 构建并启动后端
 docker compose up -d --no-deps --build backend
-
-# 7. 等后端健康
-for i in $(seq 1 60); do
-  s=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' dingchang_backend 2>/dev/null || true)
-  echo "backend=$s attempt=$i"
-  [ "$s" = "healthy" ] && break
-  sleep 2
-done
-
-# 8. 查看容器状态
-docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-
-# 9. 检查后端健康
-docker exec dingchang_backend curl -fsS http://127.0.0.1:8000/api/health
-
-# 10. 查看后端日志
-docker logs --since 5m dingchang_backend
+docker logs -n 200 dingchang_backend
 
 
-
-
-# 11. 更新前端代码（如果前端也已同步到仓库）
-cd /data/frontend/dingchang_frontend
+cd /data/frontend/dingchang_frontend/
 git pull
-
-# 12. 启动 Nginx
-docker start edge_nginx || true
-
-# 13. 重载 Nginx
-docker exec edge_nginx nginx -s reload

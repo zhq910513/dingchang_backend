@@ -6,7 +6,7 @@ v1 - 用户 / 账号管理（API 薄壳）
 原则：
 - Schemas 为接口真源：app.schemas.user
 - 业务规则全部下沉到 services.users_service
-- 不做任何旧兼容：不接 role_id / manager_id / real_name / status 等旧字段
+- 不做任何旧兼容：不接 role_id / manager_id / status 等旧字段
 """
 
 from __future__ import annotations
@@ -102,6 +102,7 @@ async def create_user(
             username=payload.username,
             password=payload.password,
             role_name=payload.role_name,
+            real_name=payload.real_name,
             team_name=payload.team_name,
             team_names=payload.team_names,
         )
@@ -125,7 +126,7 @@ async def update_user(
 ) -> UserOut:
     update_fields = _model_dump_exclude_unset(payload)
     update_kwargs: dict[str, Any] = {}
-    for field_name in ("password", "team_name", "team_names"):
+    for field_name in ("password", "real_name", "team_name", "team_names"):
         if field_name in update_fields:
             update_kwargs[field_name] = update_fields.get(field_name)
 
