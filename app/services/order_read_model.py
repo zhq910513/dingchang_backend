@@ -8,30 +8,33 @@
 - 输出严格按 schemas.order 中的契约：
     * OrderOut（详情）
     * OrderListItemOut（列表项）
+
+性能收敛（2026-03-31）：
+- 列表页新增“扁平结果集 -> DTO”直出路径，避免 ORM 关系树补载
+- 详情页仍沿用 Order ORM -> OrderOut 路径，保持行为稳定
+- 保留旧的 orders_to_list_items 兼容函数，避免其它调用点炸裂
 """
 
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 from app.models.order import Order, OrderImage
 from app.schemas.order import (
     OrderInfoOut,
-    OrderOut,
     OrderListDynamicDataOut,
     OrderListInfoOut,
+    OrderOut,
 )
-from app.services.ocr_cleaner import norm_fuzzy_date_text
+from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, norm_fuzzy_date_text
 from app.services.order_owner_name import resolve_owner_name as _shared_resolve_owner_name
 from app.services.storage import StorageService
 
 if TYPE_CHECKING:
     from app.schemas.order import OrderListItemOut
 
-
 _EMPTY_DICT: Dict[str, Any] = {}
-_EMPTY_LIST: List[Any] = []
 
 
 def _dt_to_ymd(v: Any) -> Optional[str]:
@@ -79,19 +82,6 @@ def _safe_dict(v: Any) -> Dict[str, Any]:
     return v if isinstance(v, dict) else _EMPTY_DICT
 
 
-def _pick_first_non_empty(d: Dict[str, Any], *keys: str) -> Optional[str]:
-    if not d:
-        return None
-    for k in keys:
-        val = d.get(k)
-        if val is None:
-            continue
-        s = str(val).strip()
-        if s:
-            return s
-    return None
-
-
 def _pick_ocr_words_result_text(block: Dict[str, Any], field_name: str) -> Optional[str]:
     if not isinstance(block, dict):
         return None
@@ -104,17 +94,23 @@ def _pick_ocr_words_result_text(block: Dict[str, Any], field_name: str) -> Optio
     return _trim_or_none(node.get("words"))
 
 
-def _resolve_owner_name(dd: Dict[str, Any], ocr_raw: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def _resolve_owner_name(
+    dd: Dict[str, Any],
+    ocr_raw: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """车主新口径：仅按 dynamic_data 解析；ocr_raw 不再参与展示字段回填。"""
     return _shared_resolve_owner_name(dd)
 
 
-def _normalize_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Dict[str, Any]:
+def _normalize_dynamic_data(
+    dynamic_data: Any,
+    ocr_raw_json: Any = None,
+) -> Dict[str, Any]:
     src = _safe_dict(dynamic_data)
     if not src:
         dd: Dict[str, Any] = {}
     else:
-        dd = dict(src)
+        dd = clean_dynamic_data_for_ocr(dict(src))
 
     first_register_date = dd.get("first_register_date")
     if first_register_date is not None:
@@ -129,11 +125,11 @@ def _normalize_dynamic_data(dynamic_data: Any, ocr_raw_json: Any = None) -> Dict
     return dd
 
 
-def _list_dynamic_data_out(dynamic_data: Any, ocr_raw_json: Any = None) -> OrderListDynamicDataOut:
-    """
-    列表页专用 dynamic_data 输出：
-    仅保留当前前端真实消费字段。
-    """
+def _list_dynamic_data_out(
+    dynamic_data: Any,
+    ocr_raw_json: Any = None,
+) -> OrderListDynamicDataOut:
+    """列表页专用 dynamic_data 输出：仅保留当前前端真实消费字段。"""
     dd = _normalize_dynamic_data(dynamic_data, ocr_raw_json=ocr_raw_json)
 
     first_register_date = dd.get("first_register_date")
@@ -148,6 +144,22 @@ def _list_dynamic_data_out(dynamic_data: Any, ocr_raw_json: Any = None) -> Order
         vehicle_model=_trim_or_none(dd.get("vehicle_model")),
         first_register_date=first_register_date,
         id_number=_trim_or_none(dd.get("id_number")),
+    )
+
+
+def _list_dynamic_data_out_from_row(row: Mapping[str, Any]) -> OrderListDynamicDataOut:
+    first_register_date = _dt_to_ymd(row.get("first_register_date"))
+    if first_register_date is not None:
+        first_register_date = norm_fuzzy_date_text(first_register_date)
+
+    return OrderListDynamicDataOut(
+        owner_name=_trim_or_none(row.get("owner_name")),
+        plate_no=_trim_or_none(row.get("plate_no")),
+        vin=_trim_or_none(row.get("vin")),
+        engine_no=_trim_or_none(row.get("engine_no")),
+        vehicle_model=_trim_or_none(row.get("vehicle_model")),
+        first_register_date=first_register_date,
+        id_number=_trim_or_none(row.get("id_number")),
     )
 
 
@@ -199,9 +211,7 @@ def _group_code_name(g) -> Optional[str]:
 
 
 def _order_info_out(info) -> Optional[OrderInfoOut]:
-    """
-    详情页专用 order_info 输出：保持完整口径。
-    """
+    """详情页专用 order_info 输出：保持完整口径。"""
     if not info:
         return None
 
@@ -212,68 +222,122 @@ def _order_info_out(info) -> Optional[OrderInfoOut]:
     return OrderInfoOut(
         insurance_expire_date=insurance_expire_date,
         owner_phone=owner_phone,
-
         commercial_amount=_to_float(getattr(info, "commercial_amount", None)),
         compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)),
         vehicle_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)),
         non_vehicle_amount=_to_float(getattr(info, "non_vehicle_amount", None)),
         premium_total=_to_float(getattr(info, "premium_total", None)),
-
         channel_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)),
-        channel_commercial_supplement_point=_to_float(getattr(info, "channel_commercial_supplement_point", None)),
+        channel_commercial_supplement_point=_to_float(
+            getattr(info, "channel_commercial_supplement_point", None)
+        ),
         channel_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)),
         channel_vehicle_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)),
         channel_non_vehicle_point=_to_float(getattr(info, "channel_non_vehicle_point", None)),
         channel_reward=_to_float(getattr(info, "channel_reward", None)),
         channel_total=_to_float(getattr(info, "channel_total", None)),
-
         customer_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)),
-        customer_commercial_supplement_point=_to_float(getattr(info, "customer_commercial_supplement_point", None)),
+        customer_commercial_supplement_point=_to_float(
+            getattr(info, "customer_commercial_supplement_point", None)
+        ),
         customer_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)),
         customer_vehicle_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)),
         customer_non_vehicle_point=_to_float(getattr(info, "customer_non_vehicle_point", None)),
         customer_reward=_to_float(getattr(info, "customer_reward", None)),
         customer_total=_to_float(getattr(info, "customer_total", None)),
-
         profit=_to_float(getattr(info, "profit", None)),
         remark=remark,
     )
 
 
 def _list_order_info_out(info) -> Optional[OrderListInfoOut]:
-    """
-    列表页专用 order_info 输出：
-    仅保留当前订单列表 / 财务列表真实消费字段。
-    """
+    """列表页专用 order_info 输出：仅保留当前订单列表 / 财务列表真实消费字段。"""
     if not info:
         return None
 
     return OrderListInfoOut(
         insurance_expire_date=_dt_to_ymd(getattr(info, "insurance_expire_date", None)),
         owner_phone=_trim_or_none(getattr(info, "owner_phone", None)),
-
         commercial_amount=_to_float(getattr(info, "commercial_amount", None)),
         compulsory_amount=_to_float(getattr(info, "compulsory_amount", None)),
         vehicle_tax_amount=_to_float(getattr(info, "vehicle_tax_amount", None)),
         non_vehicle_amount=_to_float(getattr(info, "non_vehicle_amount", None)),
-
         channel_commercial_point=_to_float(getattr(info, "channel_commercial_point", None)),
-        channel_commercial_supplement_point=_to_float(getattr(info, "channel_commercial_supplement_point", None)),
+        channel_commercial_supplement_point=_to_float(
+            getattr(info, "channel_commercial_supplement_point", None)
+        ),
         channel_compulsory_point=_to_float(getattr(info, "channel_compulsory_point", None)),
         channel_vehicle_tax_point=_to_float(getattr(info, "channel_vehicle_tax_point", None)),
         channel_non_vehicle_point=_to_float(getattr(info, "channel_non_vehicle_point", None)),
         channel_reward=_to_float(getattr(info, "channel_reward", None)),
         channel_total=_to_float(getattr(info, "channel_total", None)),
-
         customer_commercial_point=_to_float(getattr(info, "customer_commercial_point", None)),
-        customer_commercial_supplement_point=_to_float(getattr(info, "customer_commercial_supplement_point", None)),
+        customer_commercial_supplement_point=_to_float(
+            getattr(info, "customer_commercial_supplement_point", None)
+        ),
         customer_compulsory_point=_to_float(getattr(info, "customer_compulsory_point", None)),
         customer_vehicle_tax_point=_to_float(getattr(info, "customer_vehicle_tax_point", None)),
         customer_non_vehicle_point=_to_float(getattr(info, "customer_non_vehicle_point", None)),
         customer_reward=_to_float(getattr(info, "customer_reward", None)),
         customer_total=_to_float(getattr(info, "customer_total", None)),
-
         profit=_to_float(getattr(info, "profit", None)),
+    )
+
+
+def _list_order_info_out_from_row(row: Mapping[str, Any]) -> Optional[OrderListInfoOut]:
+    has_any_value = any(
+        row.get(key) is not None
+        for key in (
+            "insurance_expire_date",
+            "owner_phone",
+            "commercial_amount",
+            "compulsory_amount",
+            "vehicle_tax_amount",
+            "non_vehicle_amount",
+            "channel_commercial_point",
+            "channel_commercial_supplement_point",
+            "channel_compulsory_point",
+            "channel_vehicle_tax_point",
+            "channel_non_vehicle_point",
+            "channel_reward",
+            "channel_total",
+            "customer_commercial_point",
+            "customer_commercial_supplement_point",
+            "customer_compulsory_point",
+            "customer_vehicle_tax_point",
+            "customer_non_vehicle_point",
+            "customer_reward",
+            "customer_total",
+            "profit",
+        )
+    )
+    if not has_any_value:
+        return None
+
+    return OrderListInfoOut(
+        insurance_expire_date=_dt_to_ymd(row.get("insurance_expire_date")),
+        owner_phone=_trim_or_none(row.get("owner_phone")),
+        commercial_amount=_to_float(row.get("commercial_amount")),
+        compulsory_amount=_to_float(row.get("compulsory_amount")),
+        vehicle_tax_amount=_to_float(row.get("vehicle_tax_amount")),
+        non_vehicle_amount=_to_float(row.get("non_vehicle_amount")),
+        channel_commercial_point=_to_float(row.get("channel_commercial_point")),
+        channel_commercial_supplement_point=_to_float(row.get("channel_commercial_supplement_point")),
+        channel_compulsory_point=_to_float(row.get("channel_compulsory_point")),
+        channel_vehicle_tax_point=_to_float(row.get("channel_vehicle_tax_point")),
+        channel_non_vehicle_point=_to_float(row.get("channel_non_vehicle_point")),
+        channel_reward=_to_float(row.get("channel_reward")),
+        channel_total=_to_float(row.get("channel_total")),
+        customer_commercial_point=_to_float(row.get("customer_commercial_point")),
+        customer_commercial_supplement_point=_to_float(
+            row.get("customer_commercial_supplement_point")
+        ),
+        customer_compulsory_point=_to_float(row.get("customer_compulsory_point")),
+        customer_vehicle_tax_point=_to_float(row.get("customer_vehicle_tax_point")),
+        customer_non_vehicle_point=_to_float(row.get("customer_non_vehicle_point")),
+        customer_reward=_to_float(row.get("customer_reward")),
+        customer_total=_to_float(row.get("customer_total")),
+        profit=_to_float(row.get("profit")),
     )
 
 
@@ -289,6 +353,52 @@ def _safe_get_loaded_images(order: Order) -> Optional[List[OrderImage]]:
         return None
 
 
+def _resolve_detail_images(
+    order: Order,
+    images_by_order_id: Dict[int, List[OrderImage]],
+) -> List[OrderImage]:
+    order_id = int(getattr(order, "id", 0) or 0)
+    loaded_images = _safe_get_loaded_images(order)
+    if loaded_images is not None:
+        return loaded_images
+
+    fallback_images = images_by_order_id.get(order_id)
+    if isinstance(fallback_images, list):
+        return fallback_images
+    if fallback_images:
+        return list(fallback_images)
+    return []
+
+
+def _safe_ocr_raw_json(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        if not v:
+            return {}
+        return dict(v)
+    return {}
+
+
+def _build_detail_slot_images(
+    order: Order,
+    *,
+    storage: StorageService,
+    images: List[OrderImage],
+) -> List[Dict[str, Any]]:
+    if not images:
+        return []
+
+    current_images = getattr(order, "images", None)
+    if current_images is not images:
+        try:
+            setattr(order, "images", images)
+        except Exception:
+            pass
+
+    from app.utils.order_image_urls import build_slot_images
+
+    return build_slot_images(order, storage)
+
+
 def to_order_out(
     o: Order,
     *,
@@ -297,19 +407,18 @@ def to_order_out(
 ) -> OrderOut:
     """统一 Order ORM -> OrderOut 映射（严格按 schemas.order.OrderOut 契约）。"""
     order_id = int(getattr(o, "id", 0) or 0)
+    detail_images = _resolve_detail_images(o, images_by_order_id)
 
-    imgs_loaded = _safe_get_loaded_images(o)
-    if imgs_loaded is not None:
-        setattr(o, "images", imgs_loaded)
-    else:
-        setattr(o, "images", images_by_order_id.get(order_id, _EMPTY_LIST) or _EMPTY_LIST)
-
-    ocr_raw = dict(getattr(o, "ocr_raw_json", None) or {})
-    dyn_norm = _normalize_dynamic_data(getattr(o, "dynamic_data", None), ocr_raw_json=ocr_raw)
-
-    from app.utils.order_image_urls import build_slot_images  # local import
-
-    slot_images = build_slot_images(o, storage)
+    ocr_raw = _safe_ocr_raw_json(getattr(o, "ocr_raw_json", None))
+    dyn_norm = _normalize_dynamic_data(
+        getattr(o, "dynamic_data", None),
+        ocr_raw_json=ocr_raw,
+    )
+    slot_images = _build_detail_slot_images(
+        o,
+        storage=storage,
+        images=detail_images,
+    )
 
     customer_group = getattr(o, "customer_group", None)
     channel_group = getattr(o, "channel_group", None)
@@ -338,12 +447,65 @@ def to_order_out(
     )
 
 
+def _row_to_mapping(row: Any) -> Mapping[str, Any]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return mapping
+    if isinstance(row, Mapping):
+        return row
+    raise TypeError("order list row must be mapping-like")
+
+
+def build_order_list_item_from_row(row: Any) -> "OrderListItemOut":
+    from app.schemas.order import OrderListItemOut
+
+    data = _row_to_mapping(row)
+
+    salesperson_real_name = _trim_or_empty(data.get("salesperson_real_name"))
+    salesperson_username = _trim_or_empty(data.get("salesperson_username"))
+    manager_real_name = _trim_or_empty(data.get("manager_real_name"))
+    manager_username = _trim_or_empty(data.get("manager_username"))
+    team_name = _trim_or_none(data.get("team_name"))
+    team_names = _split_team_names_csv(data.get("team_names_raw"))
+    if team_name and team_name not in team_names:
+        team_names.append(team_name)
+
+    return OrderListItemOut(
+        id=int(data.get("id", 0) or 0),
+        customer_group_id=data.get("customer_group_id"),
+        channel_group_id=data.get("channel_group_id"),
+        salesperson_id=data.get("salesperson_id"),
+        customer_group_name=_trim_or_none(data.get("customer_group_name")),
+        channel_group_name=_trim_or_none(data.get("channel_group_name")),
+        customer_group_market=_trim_or_none(data.get("customer_group_market")),
+        salesperson_name=salesperson_real_name or salesperson_username or None,
+        manager_name=manager_real_name or manager_username or None,
+        team_name=team_name,
+        team_names=team_names,
+        is_finished=bool(data.get("is_finished", False)),
+        is_rebate=bool(data.get("is_rebate", False)),
+        is_paid=bool(data.get("is_paid", False)),
+        status=int(data.get("status", 0) or 0),
+        audit_status=int(data.get("audit_status", 0) or 0),
+        dynamic_data=_list_dynamic_data_out_from_row(data),
+        order_info=_list_order_info_out_from_row(data),
+        created_at=_dt_to_ymd(data.get("created_at")),
+        updated_at=_dt_to_ymd(data.get("updated_at")),
+    )
+
+
+def order_rows_to_list_items(rows: List[Any]) -> List["OrderListItemOut"]:
+    if not rows:
+        return []
+    return [build_order_list_item_from_row(row) for row in rows]
+
+
 async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
     """批量把 Order ORM 转为列表项（严格按 schemas.order.OrderListItemOut）。"""
     if not orders:
         return []
 
-    from app.schemas.order import OrderListItemOut  # local import to avoid cycles
+    from app.schemas.order import OrderListItemOut
 
     out: List[OrderListItemOut] = []
     append_item = out.append
@@ -372,29 +534,26 @@ async def orders_to_list_items(orders: List[Order]) -> List["OrderListItemOut"]:
         append_item(
             OrderListItemOut(
                 id=int(getattr(o, "id", 0) or 0),
-
                 customer_group_id=getattr(o, "customer_group_id", None),
                 channel_group_id=getattr(o, "channel_group_id", None),
                 salesperson_id=getattr(o, "salesperson_id", None),
-
                 customer_group_name=_trim_or_none(getattr(customer_group, "customer_name", None)),
                 channel_group_name=_trim_or_none(getattr(channel_group, "channel_name", None)),
                 customer_group_market=_trim_or_none(getattr(customer_group, "market", None)),
-
                 salesperson_name=salesperson_name,
                 manager_name=manager_name,
                 team_name=team_name,
                 team_names=team_names,
-
                 is_finished=bool(getattr(o, "is_finished", False)),
                 is_rebate=bool(getattr(o, "is_rebate", False)),
                 is_paid=bool(getattr(o, "is_paid", False)),
                 status=int(getattr(o, "status", 0) or 0),
                 audit_status=int(getattr(o, "audit_status", 0) or 0),
-
-                dynamic_data=_list_dynamic_data_out(getattr(o, "dynamic_data", None), ocr_raw_json=ocr_raw),
+                dynamic_data=_list_dynamic_data_out(
+                    getattr(o, "dynamic_data", None),
+                    ocr_raw_json=ocr_raw,
+                ),
                 order_info=_list_order_info_out(order_info),
-
                 created_at=_dt_to_ymd(getattr(o, "created_at", None)),
                 updated_at=_dt_to_ymd(getattr(o, "updated_at", None)),
             )

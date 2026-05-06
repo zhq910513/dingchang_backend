@@ -9,7 +9,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUserContext, get_current_user, get_current_user_with_role_and_teams
-from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SUPER_ADMIN
+from app.core.constants import ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
 from app.core.db import get_db
 from app.models.user import User
 from app.schemas.customer_channel import (
@@ -69,26 +69,47 @@ def _display_name(user: Optional[User]) -> Optional[str]:
 def _capabilities_by_role(role_name: Optional[str]) -> CustomerChannelPageCapabilitiesOut:
     rn = str(role_name or "").strip()
     return CustomerChannelPageCapabilitiesOut(
-        can_create=(rn != ROLE_FINANCE),
+        can_create=(rn in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET, ROLE_SALES)),
         can_edit=(rn in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET)),
-        can_delete=(rn != ROLE_FINANCE),
+        can_delete=(rn in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET)),
         can_view_deleted=(rn == ROLE_SUPER_ADMIN),
     )
 
 
 def _ensure_create_allowed(ctx: CurrentUserContext) -> None:
-    if (ctx.primary_role or "").strip() == ROLE_FINANCE:
-        raise HTTPException(status_code=403, detail="财务账号无新增权限")
+    if (ctx.primary_role or "").strip() not in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET, ROLE_SALES):
+        raise HTTPException(status_code=403, detail="当前账号无新增权限")
 
 
-def _ensure_edit_allowed(ctx: CurrentUserContext) -> None:
-    if (ctx.primary_role or "").strip() not in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET):
-        raise HTTPException(status_code=403, detail="仅经理/超级账号/市场账号可编辑")
+def _ensure_write_candidate_role(ctx: CurrentUserContext, action_label: str) -> None:
+    if (ctx.primary_role or "").strip() not in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET, ROLE_SALES):
+        raise HTTPException(status_code=403, detail=f"当前账号无{action_label}权限")
 
 
-def _ensure_delete_allowed(ctx: CurrentUserContext) -> None:
-    if (ctx.primary_role or "").strip() == ROLE_FINANCE:
-        raise HTTPException(status_code=403, detail="财务账号无删除权限")
+def _is_sales_owner(ctx: CurrentUserContext, row: Any) -> bool:
+    if (ctx.primary_role or "").strip() != ROLE_SALES:
+        return False
+    current_user_id = int(getattr(ctx.user, "id", 0) or 0)
+    created_by = int(getattr(row, "created_by", 0) or 0)
+    return current_user_id > 0 and created_by == current_user_id
+
+
+def _ensure_edit_allowed(ctx: CurrentUserContext, row: Any) -> None:
+    role_name = (ctx.primary_role or "").strip()
+    if role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET):
+        return
+    if _is_sales_owner(ctx, row):
+        return
+    raise HTTPException(status_code=403, detail="当前账号无编辑权限")
+
+
+def _ensure_delete_allowed(ctx: CurrentUserContext, row: Any) -> None:
+    role_name = (ctx.primary_role or "").strip()
+    if role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET):
+        return
+    if _is_sales_owner(ctx, row):
+        return
+    raise HTTPException(status_code=403, detail="当前账号无删除权限")
 
 
 def _ensure_valid_user_id(ctx: CurrentUserContext) -> int:
@@ -249,18 +270,22 @@ async def list_customer_groups_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    result = await _list_customer_groups_manage(
-        db=db,
-        role_name=ctx.primary_role,
-        customer_code=customer_code,
-        customer_name=customer_name,
-        market=market,
-        region=region,
-        created_by_name=created_by_name,
-        include_deleted=bool(include_deleted),
-        page=page,
-        page_size=page_size,
-    )
+    try:
+        result = await _list_customer_groups_manage(
+            db=db,
+            role_name=ctx.primary_role,
+            current_user_id=int(getattr(ctx.user, "id", 0) or 0),
+            customer_code=customer_code,
+            customer_name=customer_name,
+            market=market,
+            region=region,
+            created_by_name=created_by_name,
+            include_deleted=bool(include_deleted),
+            page=page,
+            page_size=page_size,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     items = [_to_customer_group_list_item_out(r) for r in result["items"]]
     return CustomerGroupListPageOut(
         total=int(result.get("total", 0) or 0),
@@ -281,17 +306,21 @@ async def list_channel_groups_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    result = await _list_channel_groups_manage(
-        db=db,
-        role_name=ctx.primary_role,
-        channel_code=channel_code,
-        channel_name=channel_name,
-        region=region,
-        created_by_name=created_by_name,
-        include_deleted=bool(include_deleted),
-        page=page,
-        page_size=page_size,
-    )
+    try:
+        result = await _list_channel_groups_manage(
+            db=db,
+            role_name=ctx.primary_role,
+            current_user_id=int(getattr(ctx.user, "id", 0) or 0),
+            channel_code=channel_code,
+            channel_name=channel_name,
+            region=region,
+            created_by_name=created_by_name,
+            include_deleted=bool(include_deleted),
+            page=page,
+            page_size=page_size,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     items = [_to_channel_group_list_item_out(r) for r in result["items"]]
     return ChannelGroupListPageOut(
         total=int(result.get("total", 0) or 0),
@@ -358,13 +387,14 @@ async def update_customer_group_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    _ensure_edit_allowed(ctx)
+    _ensure_write_candidate_role(ctx, "编辑")
 
     row = await _get_customer_group_by_id(db=db, group_id=group_id, with_creator=False)
     if not row:
         raise HTTPException(status_code=404, detail="客户不存在")
     if int(getattr(row, "is_deleted", 0) or 0) == 1:
         raise HTTPException(status_code=400, detail="客户已删除，无法编辑")
+    _ensure_edit_allowed(ctx, row)
 
     try:
         row = await _update_customer_group(
@@ -389,13 +419,14 @@ async def update_channel_group_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    _ensure_edit_allowed(ctx)
+    _ensure_write_candidate_role(ctx, "编辑")
 
     row = await _get_channel_group_by_id(db=db, group_id=group_id, with_creator=False)
     if not row:
         raise HTTPException(status_code=404, detail="渠道不存在")
     if int(getattr(row, "is_deleted", 0) or 0) == 1:
         raise HTTPException(status_code=400, detail="渠道已删除，无法编辑")
+    _ensure_edit_allowed(ctx, row)
 
     try:
         row = await _update_channel_group(
@@ -418,13 +449,14 @@ async def delete_customer_group_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    _ensure_delete_allowed(ctx)
+    _ensure_write_candidate_role(ctx, "删除")
 
     row = await _get_customer_group_by_id(db=db, group_id=group_id, with_creator=False)
     if not row:
         raise HTTPException(status_code=404, detail="客户不存在")
     if int(getattr(row, "is_deleted", 0) or 0) == 1:
         raise HTTPException(status_code=400, detail="客户已删除")
+    _ensure_delete_allowed(ctx, row)
 
     try:
         row = await _soft_delete_customer_group(db=db, row=row)
@@ -440,13 +472,14 @@ async def delete_channel_group_manage(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ):
-    _ensure_delete_allowed(ctx)
+    _ensure_write_candidate_role(ctx, "删除")
 
     row = await _get_channel_group_by_id(db=db, group_id=group_id, with_creator=False)
     if not row:
         raise HTTPException(status_code=404, detail="渠道不存在")
     if int(getattr(row, "is_deleted", 0) or 0) == 1:
         raise HTTPException(status_code=400, detail="渠道已删除")
+    _ensure_delete_allowed(ctx, row)
 
     try:
         row = await _soft_delete_channel_group(db=db, row=row)

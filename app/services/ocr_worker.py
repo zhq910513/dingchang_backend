@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
 
 from app.core.db import get_db
 from app.models.image_file import ImageFile
@@ -22,8 +22,9 @@ from app.models.image_ocr_result import ImageOcrResult
 from app.models.ocr_image_cache import OcrImageCache
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
-from app.services.baidu_ocr import call_ocr, OcrNotConfigured
+from app.services.baidu_ocr import OcrNotConfigured, call_ocr
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
+from app.services.order_fact_service import sync_order_fact_from_dynamic_data
 from app.services.storage import StorageService
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,6 @@ SLOT_TO_OCR: Dict[str, Tuple[str, Optional[str]]] = {
     "vehicle_cert": ("vehicle_certificate", None),
 }
 
-
 def _now() -> datetime:
     """
     ✅ 全局时间口径对齐：
@@ -50,46 +50,46 @@ def _now() -> datetime:
     return datetime.now(BJ_TZ).replace(tzinfo=None)
 
 
-def _safe_str(v: Any) -> str:
-    if v is None:
+def _safe_str(value: Any) -> str:
+    if value is None:
         return ""
-    return str(v).strip()
+    return str(value).strip()
 
 
-def _normalize_ymd(v: Any) -> str:
+def _normalize_ymd(value: Any) -> str:
     """
     统一日期格式为 YYYY-MM-DD：
     - 支持 YYYYMMDD -> YYYY-MM-DD
     - 支持 YYYY-MM-DD
     - '-', 空串, 非法值 -> ''
     """
-    s = _safe_str(v)
-    if not s or s == "-":
+    text = _safe_str(value)
+    if not text or text == "-":
         return ""
 
-    if re.fullmatch(r"\d{8}", s):
-        s = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    if re.fullmatch(r"\d{8}", text):
+        text = f"{text[:4]}-{text[4:6]}-{text[6:8]}"
 
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         try:
-            datetime.strptime(s, "%Y-%m-%d")
-            return s
+            datetime.strptime(text, "%Y-%m-%d")
+            return text
         except ValueError:
             return ""
 
     return ""
 
 
-def _clamp_progress(v: Any) -> int:
+def _clamp_progress(value: Any) -> int:
     try:
-        n = int(v)
+        number = int(value)
     except Exception:
-        n = 0
-    if n < 0:
+        number = 0
+    if number < 0:
         return 0
-    if n > 100:
+    if number > 100:
         return 100
-    return n
+    return number
 
 
 def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,37 +97,35 @@ def _merge_if_empty(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     仅在目标字段为空时回填 OCR 提取值，避免覆盖人工修正值。
     其中 '-' 视为空占位符，允许被正常值覆盖。
     """
-    for k, v in (src or {}).items():
-        if v is None:
+    for key, value in (src or {}).items():
+        if value is None:
             continue
-        if k not in dst or _safe_str(dst.get(k)) in ("", "-"):
-            dst[k] = v
+        if key not in dst or _safe_str(dst.get(key)) in ("", "-"):
+            dst[key] = value
     return dst
 
 
 def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
     """从身份证 OCR 结果提取标准字段（不写任何 dl_* / 历史别名）。"""
-    wr = resp.get("words_result") or {}
+    words_result = resp.get("words_result") or {}
 
-    def g(name: str) -> str:
-        x = wr.get(name) or {}
-        if isinstance(x, dict):
-            return _safe_str(x.get("words"))
-        return _safe_str(x)
+    def getter(name: str) -> str:
+        node = words_result.get(name) or {}
+        if isinstance(node, dict):
+            return _safe_str(node.get("words"))
+        return _safe_str(node)
 
-    # front
-    id_name = g("姓名")
-    id_number = g("公民身份号码")
-    id_address = g("住址")
-    id_birth_date = _normalize_ymd(g("出生")) or g("出生")
-    id_gender = g("性别")
-    id_ethnicity = g("民族")
+    id_name = getter("姓名")
+    id_number = getter("公民身份号码")
+    id_address = getter("住址")
+    id_birth_date = _normalize_ymd(getter("出生")) or getter("出生")
+    id_gender = getter("性别")
+    id_ethnicity = getter("民族")
 
-    # back
-    id_issuer = g("签发机关")
-    id_validity = g("有效期限") or g("有效期") or g("失效日期")
-    id_valid_from = _normalize_ymd(g("签发日期"))
-    id_valid_to = _normalize_ymd(g("失效日期"))
+    id_issuer = getter("签发机关")
+    id_validity = getter("有效期限") or getter("有效期") or getter("失效日期")
+    id_valid_from = _normalize_ymd(getter("签发日期"))
+    id_valid_to = _normalize_ymd(getter("失效日期"))
 
     out: Dict[str, Any] = {
         "id_name": id_name,
@@ -141,27 +139,27 @@ def _extract_idcard(resp: Dict[str, Any]) -> Dict[str, Any]:
         "id_valid_to": id_valid_to,
         "id_validity": id_validity,
     }
-    return {k: v for k, v in out.items() if _safe_str(v)}
+    return {key: value for key, value in out.items() if _safe_str(value)}
 
 
 def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
     """从行驶证 OCR 结果提取标准字段（不写任何 dl_* / 历史别名）。"""
-    wr = resp.get("words_result") or {}
+    words_result = resp.get("words_result") or {}
 
-    def g(name: str) -> str:
-        x = wr.get(name) or {}
-        return _safe_str(x.get("words") if isinstance(x, dict) else x)
+    def getter(name: str) -> str:
+        node = words_result.get(name) or {}
+        return _safe_str(node.get("words") if isinstance(node, dict) else node)
 
-    plate_no = g("号牌号码")
-    owner_name = g("所有人")
-    vin = g("车辆识别代号")
-    engine_no = g("发动机号码")
-    vehicle_model = g("品牌型号")
-    vehicle_type = g("车辆类型")
-    use_nature = g("使用性质")
-    first_register_date = _normalize_ymd(g("注册日期"))
-    issue_date = _normalize_ymd(g("发证日期"))
-    issuer_org = g("发证机关") or g("发证单位")
+    plate_no = getter("号牌号码")
+    owner_name = getter("所有人")
+    vin = getter("车辆识别代号")
+    engine_no = getter("发动机号码")
+    vehicle_model = getter("品牌型号")
+    vehicle_type = getter("车辆类型")
+    use_nature = getter("使用性质")
+    first_register_date = _normalize_ymd(getter("注册日期"))
+    issue_date = _normalize_ymd(getter("发证日期"))
+    issuer_org = getter("发证机关") or getter("发证单位")
 
     out: Dict[str, Any] = {
         "plate_no": plate_no,
@@ -175,29 +173,29 @@ def _extract_vehicle_license(resp: Dict[str, Any]) -> Dict[str, Any]:
         "issue_date": issue_date,
         "issuer_org": issuer_org,
     }
-    return {k: v for k, v in out.items() if _safe_str(v)}
+    return {key: value for key, value in out.items() if _safe_str(value)}
 
 
 def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
     """从车辆合格证 OCR 结果提取标准字段（不写任何 dl_* 镜像）。"""
-    wr = resp.get("words_result") or {}
+    words_result = resp.get("words_result") or {}
 
-    def g(name: str) -> str:
-        return _safe_str(wr.get(name))
+    def getter(name: str) -> str:
+        return _safe_str(words_result.get(name))
 
-    vehicle_model = g("CarModel") or g("VehicleModel")
-    vin = g("VinNo") or g("VIN")
-    engine_no = g("EngineNo")
+    vehicle_model = getter("CarModel") or getter("VehicleModel")
+    vin = getter("VinNo") or getter("VIN")
+    engine_no = getter("EngineNo")
 
     out: Dict[str, Any] = {
         "vehicle_model": vehicle_model,
         "vin": vin,
         "engine_no": engine_no,
-        "approved_passenger_count": g("SeatingCapacity") or g("LimitPassenger"),
-        "vehicle_brand_name": g("CarBrand") or g("BrandModel"),
-        "manufacturer_name": g("Manufacturer"),
+        "approved_passenger_count": getter("SeatingCapacity") or getter("LimitPassenger"),
+        "vehicle_brand_name": getter("CarBrand") or getter("BrandModel"),
+        "manufacturer_name": getter("Manufacturer"),
     }
-    return {k: v for k, v in out.items() if _safe_str(v)}
+    return {key: value for key, value in out.items() if _safe_str(value)}
 
 
 def _extract_by_type(api_type: str, resp: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,12 +213,12 @@ def _is_baidu_error(resp: Dict[str, Any]) -> bool:
 
 
 async def _set_task(
-        db: AsyncSession,
-        task: OcrTask,
-        *,
-        status: str,
-        progress: int,
-        error_message: Optional[str] = None,
+    db: AsyncSession,
+    task: OcrTask,
+    *,
+    status: str,
+    progress: int,
+    error_message: Optional[str] = None,
 ) -> None:
     task.status = str(status or "").strip() or "failed"
     task.progress = _clamp_progress(progress)
@@ -238,12 +236,12 @@ async def _set_task(
 
 
 async def _cache_get(
-        db: AsyncSession,
-        *,
-        storage_key: str,
-        api_type: str,
-        side: str,
-        provider: str = "baidu",
+    db: AsyncSession,
+    *,
+    storage_key: str,
+    api_type: str,
+    side: str,
+    provider: str = "baidu",
 ) -> Optional[Dict[str, Any]]:
     stmt = select(OcrImageCache).where(
         and_(
@@ -258,13 +256,13 @@ async def _cache_get(
 
 
 async def _cache_put(
-        db: AsyncSession,
-        *,
-        storage_key: str,
-        api_type: str,
-        side: str,
-        provider: str,
-        result: Dict[str, Any],
+    db: AsyncSession,
+    *,
+    storage_key: str,
+    api_type: str,
+    side: str,
+    provider: str,
+    result: Dict[str, Any],
 ) -> None:
     stmt = select(OcrImageCache).where(
         and_(
@@ -303,13 +301,13 @@ async def _cache_put(
 
 
 async def _image_result_upsert(
-        db: AsyncSession,
-        *,
-        image_file_id: int,
-        provider: str,
-        api_type: str,
-        side: str,
-        raw_result: Dict[str, Any],
+    db: AsyncSession,
+    *,
+    image_file_id: int,
+    provider: str,
+    api_type: str,
+    side: str,
+    raw_result: Dict[str, Any],
 ) -> None:
     stmt = select(ImageOcrResult).where(
         and_(
@@ -356,32 +354,31 @@ def _build_ocr_fetch_url(storage_key: str, image_file: Optional[ImageFile]) -> s
     """
     给百度 OCR 用的“服务端可访问 URL”（严格模式）：
     - 优先：BOS 新签名 URL
-    - 其次：ImageFile.url（若已有）
-    - 最后：BOS 公网 URL（仅当确实可用）
+    - 仅本地/非 BOS 图片才使用 ImageFile.url
+    - 不再回退 BOS 公网 URL，避免敏感图片绕过签名链路
 
     ✅ 兼容：storage.object_url_for_display 是否支持 allow_fallback_public 参数（不支持也不炸）
     """
-    sk = (storage_key or "").strip()
+    normalized_storage_key = (storage_key or "").strip()
 
-    if sk and getattr(storage, "enabled", False):
+    if normalized_storage_key and getattr(storage, "enabled", False):
         try:
-            # 先尝试严格参数
             try:
-                return storage.object_url_for_display(sk, expires_in=3600, allow_fallback_public=False)
+                return storage.object_url_for_display(
+                    normalized_storage_key,
+                    expires_in=3600,
+                    allow_fallback_public=False,
+                )
             except TypeError:
-                # 旧版本不支持 allow_fallback_public
-                return storage.object_url_for_display(sk, expires_in=3600)
+                return storage.object_url_for_display(normalized_storage_key, expires_in=3600)
         except Exception:
             pass
 
+    if normalized_storage_key and getattr(storage, "enabled", False):
+        return ""
+
     if image_file and (getattr(image_file, "url", "") or "").strip():
         return (getattr(image_file, "url", "") or "").strip()
-
-    if sk and getattr(storage, "enabled", False):
-        try:
-            return storage.object_public_url(sk)
-        except Exception:
-            return ""
 
     return ""
 
@@ -404,7 +401,7 @@ async def _claim_task(db: AsyncSession, task_id: int) -> bool:
     if hasattr(OcrTask, "started_at"):
         values["started_at"] = _now()
 
-    res = await db.execute(
+    result = await db.execute(
         update(OcrTask)
         .where(
             and_(
@@ -416,7 +413,7 @@ async def _claim_task(db: AsyncSession, task_id: int) -> bool:
         .values(**values)
     )
     await db.commit()
-    return bool(getattr(res, "rowcount", 0) or 0)
+    return bool(getattr(result, "rowcount", 0) or 0)
 
 
 async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
@@ -452,62 +449,62 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
         stmt = (
             select(Order)
             .where(Order.id == order_id)
-            .options(selectinload(Order.images).selectinload(OrderImage.image_file))
+            .options(lazyload("*"), selectinload(Order.images).selectinload(OrderImage.image_file))
         )
         order = (await db.execute(stmt)).scalars().first()
         if not order:
             await _set_task(db, task, status="failed", progress=100, error_message=f"订单不存在: {order_id}")
             return
 
-        slot_to_img: Dict[str, OrderImage] = {}
-        for img in (getattr(order, "images", None) or []):
-            slot = getattr(img, "slot_key", None)
-            if not slot or slot not in SLOT_TO_OCR:
+        slot_to_image: Dict[str, OrderImage] = {}
+        for image in (getattr(order, "images", None) or []):
+            slot_key = getattr(image, "slot_key", None)
+            if not slot_key or slot_key not in SLOT_TO_OCR:
                 continue
 
-            sk = (getattr(img, "storage_key", "") or "").strip()
-            if not sk:
-                imf = getattr(img, "image_file", None)
-                sk = (getattr(imf, "storage_key", "") or "").strip()
-            if not sk:
+            storage_key = (getattr(image, "storage_key", "") or "").strip()
+            if not storage_key:
+                image_file = getattr(image, "image_file", None)
+                storage_key = (getattr(image_file, "storage_key", "") or "").strip()
+            if not storage_key:
                 continue
 
-            old = slot_to_img.get(slot)
-            if not old:
-                slot_to_img[slot] = img
+            old_image = slot_to_image.get(slot_key)
+            if not old_image:
+                slot_to_image[slot_key] = image
                 continue
 
-            old_id = int(getattr(old, "id", 0) or 0)
-            new_id = int(getattr(img, "id", 0) or 0)
+            old_id = int(getattr(old_image, "id", 0) or 0)
+            new_id = int(getattr(image, "id", 0) or 0)
             if new_id >= old_id:
-                slot_to_img[slot] = img
+                slot_to_image[slot_key] = image
 
-        if not slot_to_img:
+        if not slot_to_image:
             await _set_task(db, task, status="skipped", progress=100, error_message="没有可识别的 OCR 图片")
             return
 
-        ocr_raw: Dict[str, Any] = dict(getattr(order, "ocr_raw_json", None) or {})
+        ocr_raw_json: Dict[str, Any] = dict(getattr(order, "ocr_raw_json", None) or {})
         extracted_all: Dict[str, Any] = {}
 
-        total = len(slot_to_img)
+        total = len(slot_to_image)
         done = 0
         errors: Dict[str, str] = {}
 
         logger.info("[ocr_worker] start task_id=%s order_id=%s total=%s", task_id, order_id, total)
 
-        for slot in sorted(slot_to_img.keys()):
-            img = slot_to_img[slot]
-            api_type, side0 = SLOT_TO_OCR[slot]
+        for slot_key in sorted(slot_to_image.keys()):
+            image = slot_to_image[slot_key]
+            api_type, side0 = SLOT_TO_OCR[slot_key]
             side = (side0 or "").strip()
             provider = "baidu"
 
-            storage_key = (getattr(img, "storage_key", "") or "").strip()
+            storage_key = (getattr(image, "storage_key", "") or "").strip()
             if not storage_key:
-                imf0 = getattr(img, "image_file", None)
-                storage_key = (getattr(imf0, "storage_key", "") or "").strip()
+                image_file0 = getattr(image, "image_file", None)
+                storage_key = (getattr(image_file0, "storage_key", "") or "").strip()
 
-            image_file: Optional[ImageFile] = getattr(img, "image_file", None)
-            image_file_id: Optional[int] = getattr(img, "image_file_id", None) or getattr(image_file, "id", None)
+            image_file: Optional[ImageFile] = getattr(image, "image_file", None)
+            image_file_id: Optional[int] = getattr(image, "image_file_id", None) or getattr(image_file, "id", None)
 
             try:
                 cached = await _cache_get(
@@ -541,11 +538,11 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                         result=resp,
                     )
 
-                ocr_raw[slot] = resp
+                ocr_raw_json[slot_key] = resp
 
                 if _is_baidu_error(resp):
-                    emsg = _safe_str(resp.get("error_msg")) or "baidu_error"
-                    errors[slot] = emsg
+                    error_message = _safe_str(resp.get("error_msg")) or "baidu_error"
+                    errors[slot_key] = error_message
                 else:
                     extracted = _extract_by_type(api_type, resp)
                     extracted_all.update(extracted)
@@ -560,12 +557,12 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                         raw_result=resp,
                     )
 
-            except Exception as e:
-                msg = str(e) or e.__class__.__name__
-                if len(msg) > 300:
-                    msg = msg[:300] + "..."
-                errors[slot] = msg
-                ocr_raw[slot] = {"error_code": "worker_error", "error_msg": msg}
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                if len(message) > 300:
+                    message = message[:300] + "..."
+                errors[slot_key] = message
+                ocr_raw_json[slot_key] = {"error_code": "worker_error", "error_msg": message}
 
             done += 1
             await _set_task(
@@ -576,15 +573,14 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
                 error_message=None,
             )
 
-        # =========================
-        # ✅ 写库前：合并 + 强制清洗
-        # =========================
-        dyn = dict(getattr(order, "dynamic_data", None) or {})
-        dyn = _merge_if_empty(dyn, extracted_all)
+        dyn = clean_dynamic_data_for_ocr(dict(getattr(order, "dynamic_data", None) or {}))
+        extracted_clean = clean_dynamic_data_for_ocr(extracted_all)
+        dyn = _merge_if_empty(dyn, extracted_clean)
         dyn = clean_dynamic_data_for_ocr(dyn)
 
         order.dynamic_data = dyn
-        order.ocr_raw_json = ocr_raw
+        order.ocr_raw_json = ocr_raw_json
+        await sync_order_fact_from_dynamic_data(db, order_id=order_id, dynamic_data=dyn)
         await db.commit()
 
         if errors:
@@ -600,13 +596,13 @@ async def _run_ocr_task_in_db(db: AsyncSession, task_id: int) -> None:
 
         logger.info("[ocr_worker] done task_id=%s status=%s", task_id, task.status)
 
-    except OcrNotConfigured as e:
-        await _set_task(db, task, status="skipped", progress=100, error_message=str(e))
+    except OcrNotConfigured as exc:
+        await _set_task(db, task, status="skipped", progress=100, error_message=str(exc))
 
-    except Exception as e:
-        tb = traceback.format_exc(limit=8)
-        logger.error("[ocr_worker] failed task_id=%s err=%s\n%s", task_id, e, tb)
-        msg = str(e) or e.__class__.__name__
-        if len(msg) > 500:
-            msg = msg[:500] + "..."
-        await _set_task(db, task, status="failed", progress=100, error_message=msg)
+    except Exception as exc:
+        trace_text = traceback.format_exc(limit=8)
+        logger.error("[ocr_worker] failed task_id=%s err=%s\n%s", task_id, exc, trace_text)
+        message = str(exc) or exc.__class__.__name__
+        if len(message) > 500:
+            message = message[:500] + "..."
+        await _set_task(db, task, status="failed", progress=100, error_message=message)

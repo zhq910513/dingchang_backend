@@ -40,4 +40,5 @@ class UserSession(Base):
     __table_args__ = (
         UniqueConstraint("session_token", name="session_token"),
         Index("ix_user_session_user_expired", "user_id", "expired"),
+        Index("ix_user_session_expired_user_last_active", "expired", "user_id", "last_active_at"),
     )

@@ -26,6 +26,7 @@ from app.core.logging_config import setup_logging
 from app.core.seed_author_role import seed_initial_data
 from app.core.seed_order_fields import seed_order_fields
 from app.models.ocr_task import OcrTask
+from app.services.order_fact_service import backfill_missing_order_facts, count_missing_order_facts
 from app.services.ocr_worker import run_ocr_task
 
 setup_logging()
@@ -33,14 +34,19 @@ logger = logging.getLogger(__name__)
 
 AUTO_SEED_FIELDS = os.getenv("AUTO_SEED_FIELDS", "1") == "1"
 AUTO_SEED_AUTH = os.getenv("AUTO_SEED_AUTH", "1") == "1"
-AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "1") == "1"
+AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "0") == "1"
 
-# ✅ 新增：启动期 schema 校验/只增补列（默认开启）
+# 默认只检查，不执行 DDL；如需受控迁移，必须显式打开对应环境变量。
 AUTO_SCHEMA_CHECK = os.getenv("AUTO_SCHEMA_CHECK", "1") == "1"
-AUTO_ADD_COLUMNS = os.getenv("AUTO_ADD_COLUMNS", "1") == "1"
+AUTO_ADD_COLUMNS = os.getenv("AUTO_ADD_COLUMNS", "0") == "1"
 AUTO_ADD_COLUMNS_STRICT = os.getenv("AUTO_ADD_COLUMNS_STRICT", "1") == "1"
+AUTO_ADD_INDEXES = os.getenv("AUTO_ADD_INDEXES", "0") == "1"
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+ORDER_FACT_BACKFILL_ENABLED = os.getenv("ORDER_FACT_BACKFILL_ENABLED", "1") == "1"
+ORDER_FACT_BACKFILL_BATCH_SIZE = int(os.getenv("ORDER_FACT_BACKFILL_BATCH_SIZE", "1000") or "1000")
+ORDER_FACT_BACKFILL_MAX_BATCHES = int(os.getenv("ORDER_FACT_BACKFILL_MAX_BATCHES", "20") or "20")
 
 OCR_POLL_ENABLED = os.getenv("OCR_POLL_ENABLED", "1") == "1"
 OCR_POLL_INTERVAL_SECONDS = int(os.getenv("OCR_POLL_INTERVAL_SECONDS", "3") or "3")
@@ -52,9 +58,12 @@ DB_SET_TIME_ZONE_ENABLED = os.getenv("DB_SET_TIME_ZONE_ENABLED", "1") == "1"
 # ========= Redis 分布式锁（启动单例守卫） =========
 LOCK_SEED_KEY = os.getenv("STARTUP_LOCK_SEED_KEY", "dingchang:startup:seed")
 LOCK_POLL_KEY = os.getenv("STARTUP_LOCK_POLL_KEY", "dingchang:startup:ocr_poller")
+LOCK_FACT_BACKFILL_KEY = os.getenv("STARTUP_LOCK_FACT_BACKFILL_KEY", "dingchang:startup:order_fact_backfill")
 
 # seed 锁：短一些即可
 LOCK_SEED_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_SEED_TTL_SECONDS", "120") or "120")
+# order_fact 回填可能扫批量订单，TTL 给足一些；没有 Redis 时仍按旧行为兼容单机启动。
+LOCK_FACT_BACKFILL_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_FACT_BACKFILL_TTL_SECONDS", "600") or "600")
 # poller 锁：需要续租
 LOCK_POLL_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_POLL_TTL_SECONDS", "30") or "30")
 
@@ -190,22 +199,52 @@ async def _ocr_poller_loop(stop_event: asyncio.Event, lock_token: str | None) ->
     logger.info("[ocr_poller] stopped")
 
 
+async def _run_order_fact_backfill_once() -> None:
+    total_backfilled = 0
+    batch_size = max(1, int(ORDER_FACT_BACKFILL_BATCH_SIZE or 1000))
+    max_batches = max(1, int(ORDER_FACT_BACKFILL_MAX_BATCHES or 20))
+
+    for _ in range(max_batches):
+        async with SessionLocal() as db:
+            await _apply_db_time_zone(db)
+            batch = await backfill_missing_order_facts(db, batch_size=batch_size)
+            if batch <= 0:
+                break
+            await db.commit()
+            total_backfilled += batch
+
+    async with SessionLocal() as db:
+        await _apply_db_time_zone(db)
+        remaining_missing = await count_missing_order_facts(db)
+
+    logger.info(
+        "[order_fact_backfill] enabled=1 batch_size=%s max_batches=%s backfilled=%s remaining=%s",
+        batch_size,
+        max_batches,
+        total_backfilled,
+        remaining_missing,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_redis()
 
     # ✅ 启动期 schema：先校验并日志打印，再按开关执行 create_all + 仅 ADD COLUMN
-    if AUTO_SCHEMA_CHECK or AUTO_CREATE_TABLES or AUTO_ADD_COLUMNS:
+    if AUTO_SCHEMA_CHECK or AUTO_CREATE_TABLES or AUTO_ADD_COLUMNS or AUTO_ADD_INDEXES:
         logger.info(
-            "[schema_boot] AUTO_SCHEMA_CHECK=%s AUTO_CREATE_TABLES=%s AUTO_ADD_COLUMNS=%s STRICT=%s",
+            "[schema_boot] AUTO_SCHEMA_CHECK=%s AUTO_CREATE_TABLES=%s "
+            "AUTO_ADD_COLUMNS=%s AUTO_ADD_INDEXES=%s STRICT=%s",
             int(AUTO_SCHEMA_CHECK),
             int(AUTO_CREATE_TABLES),
             int(AUTO_ADD_COLUMNS),
+            int(AUTO_ADD_INDEXES),
             int(AUTO_ADD_COLUMNS_STRICT),
         )
         await ensure_schema_additive_on_startup(
             add_tables=bool(AUTO_CREATE_TABLES),
             add_columns=bool(AUTO_ADD_COLUMNS),
+            add_indexes=bool(AUTO_ADD_INDEXES),
             log_details=bool(AUTO_SCHEMA_CHECK),
             strict_add_columns=bool(AUTO_ADD_COLUMNS_STRICT),
         )
@@ -239,7 +278,22 @@ async def lifespan(app: FastAPI):
         if seed_token:
             await release_lock(LOCK_SEED_KEY, seed_token)
 
-    # ✅ OCR poller：仅允许一个 worker 启动，并且续租锁
+    # ✅ order_fact 回填：多 worker 部署时只允许一个实例扫表，避免启动期争抢列表查询资源
+    if ORDER_FACT_BACKFILL_ENABLED:
+        fact_token = await acquire_lock(LOCK_FACT_BACKFILL_KEY, LOCK_FACT_BACKFILL_TTL_SECONDS)
+        if fact_token:
+            try:
+                await _run_order_fact_backfill_once()
+            finally:
+                await release_lock(LOCK_FACT_BACKFILL_KEY, fact_token)
+        elif await _redis_client() is None:
+            logger.warning("[order_fact_backfill] redis lock unavailable; running without distributed lock")
+            await _run_order_fact_backfill_once()
+        else:
+            logger.info("[order_fact_backfill] skipped (lock not acquired) key=%s", LOCK_FACT_BACKFILL_KEY)
+    else:
+        logger.info("[order_fact_backfill] disabled (ORDER_FACT_BACKFILL_ENABLED=0)")
+
     poll_token = None
     if OCR_POLL_ENABLED:
         poll_token = await acquire_lock(LOCK_POLL_KEY, LOCK_POLL_TTL_SECONDS)

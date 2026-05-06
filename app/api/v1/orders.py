@@ -4,14 +4,15 @@ from __future__ import annotations
 import anyio
 import hashlib
 import inspect
+import json
 import re
 from datetime import date, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete
+from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete, false as sql_false
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, lazyload, selectinload
 from typing import Optional, Any, Dict, List, Tuple, Set
 
 from app.api.deps import get_current_user_with_role_and_teams, CurrentUserContext
@@ -32,14 +33,15 @@ from app.core.access_control import (
     ensure_user_in_teams as _ac_ensure_user_in_teams,
     ensure_order_read_acl_by_salesperson_id as _ac_ensure_order_read_acl_by_salesperson_id,
     ensure_order_write_acl_by_salesperson_id as _ac_ensure_order_write_acl_by_salesperson_id,
-    apply_orders_list_acl as _ac_apply_orders_list_acl,
 )
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_SALES, ROLE_MARKET
 from app.core.db import get_db, engine
 from app.models.customer_group import CustomerGroup
+from app.models.channel_group import ChannelGroup
 from app.models.image_file import ImageFile
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
+from app.models.order_fact import OrderFact
 from app.models.order_info import OrderInfo
 from app.models.role import Role
 from app.models.user import User
@@ -53,10 +55,13 @@ from app.schemas.order import (
     OrderInfoIn,
 )
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
-from app.services.order_owner_name import append_owner_name_fuzzy_clause as _append_owner_name_fuzzy_clause
+from app.services.order_owner_name import (
+    append_owner_name_fuzzy_clause as _append_owner_name_fuzzy_clause,
+)
+from app.services.order_fact_service import sync_order_fact_from_dynamic_data as _sync_order_fact_projection
 from app.services.order_read_model import (
+    order_rows_to_list_items as _rm_order_rows_to_list_items,
     to_order_out as _rm_to_order_out,
-    orders_to_list_items as _rm_orders_to_list_items,
 )
 from app.services.storage import StorageService
 
@@ -73,6 +78,12 @@ OCR_SLOTS = {
 NON_OCR_SLOTS = {"related"}
 ALL_SLOTS = OCR_SLOTS | NON_OCR_SLOTS
 MULTI_SLOTS = {"related"}
+
+MAX_DYNAMIC_DATA_KEYS = 200
+MAX_DYNAMIC_DATA_JSON_CHARS = 100_000
+MAX_OCR_RAW_JSON_KEYS = 1000
+MAX_OCR_RAW_JSON_CHARS = 1_000_000
+MAX_BOS_UPLOAD_BYTES = 20 * 1024 * 1024
 
 ORDER_INFO_NON_NULL_NUMERIC_FIELDS: List[str] = [
     "commercial_amount",
@@ -168,6 +179,20 @@ class OrderFinalizeIn(BaseModel):
 class OrderFinalizeOut(BaseModel):
     ok: bool = True
     order_id: int
+    ocr_task_id: Optional[int] = None
+    ocr_status: Optional[str] = None
+
+
+class OrderImagesBindIn(BaseModel):
+    images: List[FinalizeImageIn] = Field(default_factory=list)
+    clear_slots: List[str] = Field(default_factory=list)
+    trigger_ocr: bool = True
+
+
+class OrderImagesBindOut(BaseModel):
+    ok: bool = True
+    order_id: int
+    bound_count: int = 0
     ocr_task_id: Optional[int] = None
     ocr_status: Optional[str] = None
 
@@ -369,6 +394,15 @@ def _dialect_name() -> str:
         return str(getattr(engine, "dialect", None).name or "").lower()
     except Exception:
         return ""
+
+
+def _with_mysql_force_index(stmt, index_name: str):
+    if "mysql" not in _dialect_name() and "mariadb" not in _dialect_name():
+        return stmt
+    try:
+        return stmt.with_hint(Order, f"FORCE INDEX ({index_name})", dialect_name="mysql")
+    except Exception:
+        return stmt
 
 
 def _json_text(col, key: str):
@@ -667,10 +701,56 @@ def _add_json_date_range_any(
         clauses.append(or_(*or_terms))
 
 
-def _clean_dynamic_data_for_write(dyn: Any) -> Dict[str, Any]:
-    if not isinstance(dyn, dict):
+def _ensure_json_object_within_limits(
+    field_name: str,
+    value: Dict[str, Any],
+    *,
+    max_keys: int,
+    max_chars: int,
+) -> None:
+    if len(value) > max_keys:
+        raise HTTPException(status_code=413, detail=f"{field_name} has too many keys")
+    try:
+        size = len(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{field_name} contains invalid JSON values")
+    if size > max_chars:
+        raise HTTPException(status_code=413, detail=f"{field_name} is too large")
+
+
+def _clean_dynamic_data_for_write(dynamic_data: Any) -> Dict[str, Any]:
+    if not isinstance(dynamic_data, dict):
         return {}
-    return clean_dynamic_data_for_ocr(dict(dyn))
+    cleaned = clean_dynamic_data_for_ocr(dict(dynamic_data))
+    _ensure_json_object_within_limits(
+        "dynamic_data",
+        cleaned,
+        max_keys=MAX_DYNAMIC_DATA_KEYS,
+        max_chars=MAX_DYNAMIC_DATA_JSON_CHARS,
+    )
+    return cleaned
+
+
+def _clean_ocr_raw_json_for_write(ocr_raw_json: Any) -> Dict[str, Any]:
+    if not isinstance(ocr_raw_json, dict):
+        return {}
+    payload = dict(ocr_raw_json)
+    _ensure_json_object_within_limits(
+        "ocr_raw_json",
+        payload,
+        max_keys=MAX_OCR_RAW_JSON_KEYS,
+        max_chars=MAX_OCR_RAW_JSON_CHARS,
+    )
+    return payload
+
+
+async def _sync_order_fact_from_dynamic_data(
+    db: AsyncSession,
+    *,
+    order_id: int,
+    dynamic_data: Any,
+) -> None:
+    await _sync_order_fact_projection(db, order_id=int(order_id), dynamic_data=dynamic_data)
 
 
 def _guess_ext(filename: str, content_type: str) -> str:
@@ -707,6 +787,8 @@ async def _compute_md5_and_size(up: UploadFile) -> Tuple[str, int]:
             break
         md5.update(chunk)
         size += len(chunk)
+        if size > MAX_BOS_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="file is too large")
     await up.seek(0)
     return md5.hexdigest(), size
 
@@ -803,6 +885,133 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
         raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
 
 
+async def _apply_order_image_bind(
+    db: AsyncSession,
+    *,
+    order_id: int,
+    images: List[FinalizeImageIn],
+    clear_slots: List[str],
+    trigger_ocr: bool = True,
+) -> Tuple[int, Optional[int], Optional[str]]:
+    clear_slots = [str(x or "").strip() for x in (clear_slots or [])]
+    clear_slots = [x for x in clear_slots if x]
+    for sk in clear_slots:
+        if sk not in ALL_SLOTS:
+            raise HTTPException(status_code=400, detail=f"非法 clear_slots slot_key: {sk}")
+        if sk not in MULTI_SLOTS:
+            raise HTTPException(status_code=400, detail=f"暂不支持清空该slot: {sk}")
+
+    by_slot: Dict[str, List[FinalizeImageIn]] = {}
+    for im in images or []:
+        sk = str(im.slot_key or "").strip()
+        if sk not in ALL_SLOTS:
+            raise HTTPException(status_code=400, detail=f"非法 slot_key: {sk}")
+        by_slot.setdefault(sk, []).append(im)
+
+    normalized_images: List[FinalizeImageIn] = []
+    for sk, ims in by_slot.items():
+        if sk in MULTI_SLOTS:
+            normalized_images.extend(ims)
+        else:
+            normalized_images.append(ims[-1])
+
+    touched_slots = set(by_slot.keys()) | set(clear_slots)
+
+    for sk in touched_slots:
+        desired_sks: List[str] = []
+        if sk in by_slot:
+            for im in by_slot.get(sk, []) or []:
+                storage_key = str(im.storage_key or "").strip().lstrip("/")
+                if storage_key:
+                    desired_sks.append(storage_key)
+
+            if sk not in MULTI_SLOTS and desired_sks:
+                desired_sks = [desired_sks[-1]]
+
+        del_stmt = delete(OrderImage).where(and_(OrderImage.order_id == order_id, OrderImage.slot_key == sk))
+        if desired_sks:
+            del_stmt = del_stmt.where(~OrderImage.storage_key.in_(desired_sks))
+        await db.execute(del_stmt)
+
+    has_ocr_images = False
+    for im in normalized_images:
+        slot_key = str(im.slot_key or "").strip()
+        storage_key = str(im.storage_key or "").strip().lstrip("/")
+        md5_hex = str(im.md5 or "").strip().lower()
+
+        if not storage_key:
+            raise HTTPException(status_code=400, detail="storage_key 不能为空")
+
+        _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
+
+        has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
+
+        url = ""
+        if not getattr(storage, "enabled", False):
+            url = str(im.url or "").strip()
+
+        imf = await _get_or_create_image_file(
+            db,
+            storage_key=storage_key,
+            url=url,
+            size=int(im.size or 0),
+            original_name=im.original_name,
+            content_type=im.content_type,
+            etag=im.etag,
+            md5=md5_hex,
+        )
+
+        exists_stmt = select(OrderImage.id).where(
+            and_(
+                OrderImage.order_id == order_id,
+                OrderImage.slot_key == slot_key,
+                OrderImage.storage_key == storage_key,
+            )
+        )
+        exists_id = (await db.execute(exists_stmt)).scalar_one_or_none()
+        if exists_id:
+            continue
+
+        oi = OrderImage(
+            order_id=order_id,
+            slot_key=slot_key,
+            storage_key=storage_key,
+            image_url=url or "",
+            image_file_id=imf.id,
+        )
+        db.add(oi)
+
+    ocr_task_id: Optional[int] = None
+    ocr_status: Optional[str] = None
+    if trigger_ocr and has_ocr_images:
+        try:
+            async with db.begin_nested():
+                task = OcrTask(
+                    scope_type="order",
+                    scope_id=order_id,
+                    active_scope_id=order_id,
+                    status="pending",
+                    progress=0,
+                    error_message=None,
+                )
+                db.add(task)
+                await db.flush()
+                ocr_task_id = int(task.id)
+                ocr_status = str(task.status)
+        except IntegrityError:
+            exist_stmt = (
+                select(OcrTask)
+                .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == order_id))
+                .order_by(OcrTask.id.desc())
+            )
+            exist_task = (await db.execute(exist_stmt)).scalars().first()
+            if exist_task:
+                ocr_task_id = int(exist_task.id)
+                ocr_status = str(exist_task.status)
+
+    return len(normalized_images), ocr_task_id, ocr_status
+
+
 async def _apply_ocr_task_acl(
     *,
     stmt,
@@ -822,6 +1031,8 @@ async def _apply_ocr_task_acl(
     _ac_require_team_for_non_super_admin(rn, tns)
 
     stmt = stmt.join(Order, and_(Order.id == OcrTask.scope_id, OcrTask.scope_type == "order"))
+    if rn == ROLE_FINANCE:
+        stmt = stmt.where(Order.is_finished.is_(True))
 
     if rn == ROLE_MANAGER:
         stmt = stmt.where(_ac_order_salesperson_in_teams_expr(tns))
@@ -837,11 +1048,7 @@ async def _apply_ocr_task_acl(
 
 
 def _build_order_detail_stmt(order_id: int):
-    stmt = select(Order).where(Order.id == order_id)
-
-    opt1 = _maybe_selectinload(Order, "images")
-    if opt1 is not None:
-        stmt = stmt.options(opt1)
+    stmt = select(Order).where(Order.id == order_id).options(lazyload("*"))
 
     opt2 = _maybe_selectinload_nested(Order, "images", OrderImage, "image_file")
     if opt2 is not None:
@@ -867,12 +1074,20 @@ async def _load_order_out(
     role_name: Optional[str],
     team_names: Tuple[str, ...],
 ) -> OrderOut:
-    stmt = _build_order_detail_stmt(order_id)
-    o = (await db.execute(stmt)).scalars().first()
-    if not o:
+    acl_row = (
+        await db.execute(
+            select(Order.salesperson_id, Order.is_finished)
+            .where(Order.id == int(order_id))
+            .limit(1)
+        )
+    ).first()
+    if not acl_row:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    salesperson_id = int(getattr(o, "salesperson_id", 0) or 0)
+    salesperson_id = int(acl_row[0] or 0)
+    if role_name == ROLE_FINANCE and not bool(acl_row[1]):
+        raise HTTPException(status_code=403, detail="Finance can only read finished orders")
+
     await _maybe_await(
         _ac_ensure_order_read_acl_by_salesperson_id(
             db=db,
@@ -883,12 +1098,77 @@ async def _load_order_out(
         )
     )
 
+    stmt = _build_order_detail_stmt(order_id)
+    o = (await db.execute(stmt)).scalars().first()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
     images_by_order_id: Dict[int, List[OrderImage]] = {int(order_id): list(getattr(o, "images", None) or [])}
     return _rm_to_order_out(o, storage=storage, images_by_order_id=images_by_order_id)
 
 
+def _is_full_id_number(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:\d{15}|\d{17}[\dXx])", str(value or "").strip()))
+
+
+def _is_full_vin(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9]{17}", str(value or "").strip()))
+
+
+def _build_fact_match_clause(
+    fact_col,
+    value: Optional[str],
+    *,
+    exact_predicate=None,
+    prefix_min_length: int = 0,
+):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    if exact_predicate is not None and exact_predicate(raw):
+        return fact_col == raw
+
+    if prefix_min_length > 0 and len(raw) >= prefix_min_length:
+        return fact_col.like(f"{raw}%")
+
+    return fact_col.like(f"%{raw}%")
+
+
+async def _resolve_orders_list_salesperson_ids(
+    db: AsyncSession,
+    *,
+    ctx: CurrentUserContext,
+    role_name: str,
+    team_names: Tuple[str, ...],
+    team_name: Optional[str],
+) -> Optional[Tuple[int, ...]]:
+    tf = str(team_name or "").strip()
+
+    if role_name == ROLE_SUPER_ADMIN:
+        if not tf:
+            return None
+        scoped_teams = (tf,)
+    elif role_name == ROLE_SALES:
+        return (int(ctx.user.id),)
+    elif role_name == ROLE_MANAGER:
+        scoped_teams = (tf,) if tf else _ac_normalize_team_names(team_names)
+    elif role_name in (ROLE_MARKET, ROLE_FINANCE):
+        scoped_teams = (_ac_require_single_team_for_strict_roles(role_name, team_names),)
+    else:
+        raise HTTPException(status_code=403, detail="No permission")
+
+    if not scoped_teams:
+        return tuple()
+
+    stmt = select(User.id).where(_ac_user_team_match_expr(tuple(scoped_teams))).order_by(User.id.asc())
+    ids = [int(x) for x in (await db.execute(stmt)).scalars().all() if x is not None]
+    return tuple(ids)
+
+
 async def _build_order_list_clauses(
     *,
+    db: AsyncSession,
     ctx: CurrentUserContext,
     role_name: str,
     team_names: Tuple[str, ...],
@@ -918,15 +1198,17 @@ async def _build_order_list_clauses(
     if tf:
         _ac_require_team_filter_allowed(role_name=role_name, team_names=team_names, team_filter=tf)
 
-    await _ac_apply_orders_list_acl(
-        current_user=ctx.user,
+    salesperson_scope_ids = await _resolve_orders_list_salesperson_ids(
+        db,
+        ctx=ctx,
         role_name=role_name,
         team_names=team_names,
-        clauses=clauses,
+        team_name=team_name,
     )
 
-    if tf:
-        clauses.append(_ac_order_salesperson_in_teams_expr((tf,)))
+    if salesperson_scope_ids is not None and not salesperson_scope_ids:
+        clauses.append(sql_false())
+        return clauses
 
     if is_finished is not None:
         clauses.append(Order.is_finished == bool(is_finished))
@@ -935,7 +1217,16 @@ async def _build_order_list_clauses(
     if is_rebate is not None:
         clauses.append(Order.is_rebate == bool(is_rebate))
     if salesperson_id is not None:
-        clauses.append(Order.salesperson_id == int(salesperson_id))
+        sid = int(salesperson_id)
+        if salesperson_scope_ids is not None and sid not in salesperson_scope_ids:
+            clauses.append(sql_false())
+            return clauses
+        clauses.append(Order.salesperson_id == sid)
+    elif salesperson_scope_ids is not None:
+        if len(salesperson_scope_ids) == 1:
+            clauses.append(Order.salesperson_id == int(salesperson_scope_ids[0]))
+        else:
+            clauses.append(Order.salesperson_id.in_(salesperson_scope_ids))
     if created_by is not None:
         clauses.append(Order.created_by == int(created_by))
     if customer_group_id is not None:
@@ -958,22 +1249,57 @@ async def _build_order_list_clauses(
         start_bj, end_bj = rng
         clauses.append(and_(Order.created_at >= start_bj, Order.created_at < end_bj))
 
-    _add_json_date_range_any(
-        clauses,
-        keys=["first_register_date"],
-        start_ymd=first_register_date_start,
-        end_ymd=first_register_date_end,
-        err_prefix="first_register_date",
-    )
+    if first_register_date_start or first_register_date_end:
+        if not first_register_date_start or not first_register_date_end:
+            raise HTTPException(
+                status_code=400,
+                detail="first_register_date_start and first_register_date_end are required",
+            )
+        d_start = _parse_ymd(first_register_date_start)
+        d_end = _parse_ymd(first_register_date_end)
+        if not d_start or not d_end or d_end < d_start:
+            raise HTTPException(
+                status_code=400,
+                detail="first_register_date_* must be YYYY-MM-DD and end>=start",
+            )
+        clauses.append(and_(OrderFact.first_register_date >= d_start, OrderFact.first_register_date <= d_end))
 
-    _add_owner_name_fuzzy(clauses, owner_name)
-    _add_json_fuzzy(clauses, "id_number", id_number)
-    _add_json_fuzzy(clauses, "plate_no", plate_no)
-    _add_json_fuzzy(clauses, "engine_no", engine_no)
-    _add_json_fuzzy(clauses, "vehicle_model", vehicle_model)
-    _add_json_fuzzy(clauses, "vin", vin)
+    fact_clauses = (
+        _build_fact_match_clause(OrderFact.owner_name, owner_name),
+        _build_fact_match_clause(OrderFact.id_number, id_number, exact_predicate=_is_full_id_number),
+        _build_fact_match_clause(OrderFact.plate_no, plate_no),
+        _build_fact_match_clause(OrderFact.engine_no, engine_no),
+        _build_fact_match_clause(OrderFact.vehicle_model, vehicle_model),
+        _build_fact_match_clause(OrderFact.vin, vin, exact_predicate=_is_full_vin),
+    )
+    clauses.extend([clause for clause in fact_clauses if clause is not None])
 
     return clauses
+
+
+def _need_join_fact(
+    first_register_date_start: Optional[str],
+    first_register_date_end: Optional[str],
+    owner_name: Optional[str],
+    id_number: Optional[str],
+    plate_no: Optional[str],
+    engine_no: Optional[str],
+    vehicle_model: Optional[str],
+    vin: Optional[str],
+) -> bool:
+    return any(
+        str(v or "").strip()
+        for v in (
+            first_register_date_start,
+            first_register_date_end,
+            owner_name,
+            id_number,
+            plate_no,
+            engine_no,
+            vehicle_model,
+            vin,
+        )
+    )
 
 
 def _need_join_customer(market: Optional[str]) -> bool:
@@ -992,19 +1318,44 @@ def _apply_optional_joins_and_filters(
     market: Optional[str],
     insurance_expire_date: Optional[str],
     remark: Optional[str],
+    first_register_date_start: Optional[str],
+    first_register_date_end: Optional[str],
+    owner_name: Optional[str],
+    id_number: Optional[str],
+    plate_no: Optional[str],
+    engine_no: Optional[str],
+    vehicle_model: Optional[str],
+    vin: Optional[str],
 ):
+    need_join_fact = _need_join_fact(
+        first_register_date_start=first_register_date_start,
+        first_register_date_end=first_register_date_end,
+        owner_name=owner_name,
+        id_number=id_number,
+        plate_no=plate_no,
+        engine_no=engine_no,
+        vehicle_model=vehicle_model,
+        vin=vin,
+    )
     need_join_customer = _need_join_customer(market)
     need_join_info = _need_join_info(insurance_expire_date, remark)
 
+    if need_join_fact:
+        stmt = stmt.join(OrderFact, OrderFact.order_id == Order.id, isouter=True)
+        if count_stmt is not None:
+            count_stmt = count_stmt.join(OrderFact, OrderFact.order_id == Order.id, isouter=True)
+
     if need_join_customer:
         stmt = stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-        count_stmt = count_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
-        mk = (market or "").strip().lower()
-        clauses.append(func.lower(CustomerGroup.market).like(f"%{mk}%"))
+        if count_stmt is not None:
+            count_stmt = count_stmt.join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        mk = (market or "").strip()
+        clauses.append(CustomerGroup.market.like(f"%{mk}%"))
 
     if need_join_info:
         stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
-        count_stmt = count_stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        if count_stmt is not None:
+            count_stmt = count_stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
 
     if (insurance_expire_date or "").strip():
         d = _parse_ymd(insurance_expire_date)
@@ -1013,23 +1364,77 @@ def _apply_optional_joins_and_filters(
         clauses.append(OrderInfo.insurance_expire_date == d)
 
     if (remark or "").strip():
-        clauses.append(func.lower(func.coalesce(OrderInfo.remark, "")).like(f"%{remark.strip().lower()}%"))
+        clauses.append(OrderInfo.remark.like(f"%{remark.strip()}%"))
 
     return stmt, count_stmt
 
 
-def _build_order_list_entity_stmt(order_ids: List[int]):
-    stmt = (
-        select(Order)
-        .where(Order.id.in_(order_ids))
-        .options(
-            selectinload(Order.salesperson).selectinload(User.parent),
-            selectinload(Order.customer_group),
-            selectinload(Order.channel_group),
-            selectinload(Order.order_info),
+def _build_order_list_row_stmt(order_ids: List[int]):
+    salesperson_user = aliased(User, name="salesperson_user")
+    manager_user = aliased(User, name="manager_user")
+
+    return (
+        select(
+            Order.id.label("id"),
+            Order.customer_group_id.label("customer_group_id"),
+            Order.channel_group_id.label("channel_group_id"),
+            Order.salesperson_id.label("salesperson_id"),
+            Order.is_finished.label("is_finished"),
+            Order.is_rebate.label("is_rebate"),
+            Order.is_paid.label("is_paid"),
+            Order.status.label("status"),
+            Order.audit_status.label("audit_status"),
+            Order.created_at.label("created_at"),
+            Order.updated_at.label("updated_at"),
+            CustomerGroup.customer_name.label("customer_group_name"),
+            CustomerGroup.market.label("customer_group_market"),
+            CustomerGroup.customer_code.label("customer_group_code"),
+            CustomerGroup.team_name.label("customer_group_team_name"),
+            OrderFact.owner_name.label("owner_name"),
+            OrderFact.plate_no.label("plate_no"),
+            OrderFact.vin.label("vin"),
+            OrderFact.engine_no.label("engine_no"),
+            OrderFact.vehicle_model.label("vehicle_model"),
+            OrderFact.first_register_date.label("first_register_date"),
+            OrderFact.id_number.label("id_number"),
+            OrderInfo.insurance_expire_date.label("insurance_expire_date"),
+            OrderInfo.owner_phone.label("owner_phone"),
+            OrderInfo.commercial_amount.label("commercial_amount"),
+            OrderInfo.compulsory_amount.label("compulsory_amount"),
+            OrderInfo.vehicle_tax_amount.label("vehicle_tax_amount"),
+            OrderInfo.non_vehicle_amount.label("non_vehicle_amount"),
+            OrderInfo.channel_commercial_point.label("channel_commercial_point"),
+            OrderInfo.channel_commercial_supplement_point.label("channel_commercial_supplement_point"),
+            OrderInfo.channel_compulsory_point.label("channel_compulsory_point"),
+            OrderInfo.channel_vehicle_tax_point.label("channel_vehicle_tax_point"),
+            OrderInfo.channel_non_vehicle_point.label("channel_non_vehicle_point"),
+            OrderInfo.channel_reward.label("channel_reward"),
+            OrderInfo.channel_total.label("channel_total"),
+            OrderInfo.customer_commercial_point.label("customer_commercial_point"),
+            OrderInfo.customer_commercial_supplement_point.label("customer_commercial_supplement_point"),
+            OrderInfo.customer_compulsory_point.label("customer_compulsory_point"),
+            OrderInfo.customer_vehicle_tax_point.label("customer_vehicle_tax_point"),
+            OrderInfo.customer_non_vehicle_point.label("customer_non_vehicle_point"),
+            OrderInfo.customer_reward.label("customer_reward"),
+            OrderInfo.customer_total.label("customer_total"),
+            OrderInfo.profit.label("profit"),
+            salesperson_user.username.label("salesperson_username"),
+            salesperson_user.real_name.label("salesperson_real_name"),
+            salesperson_user.team_name.label("team_name"),
+            salesperson_user.team_names.label("team_names_raw"),
+            manager_user.username.label("manager_username"),
+            manager_user.real_name.label("manager_real_name"),
+            ChannelGroup.channel_name.label("channel_group_name"),
         )
+        .select_from(Order)
+        .join(OrderFact, OrderFact.order_id == Order.id, isouter=True)
+        .join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        .join(CustomerGroup, CustomerGroup.id == Order.customer_group_id, isouter=True)
+        .join(ChannelGroup, ChannelGroup.id == Order.channel_group_id, isouter=True)
+        .join(salesperson_user, salesperson_user.id == Order.salesperson_id, isouter=True)
+        .join(manager_user, manager_user.id == salesperson_user.parent_id, isouter=True)
+        .where(Order.id.in_(order_ids))
     )
-    return stmt
 
 
 @router.get("/customer-groups", response_model=OptionListOut)
@@ -1044,13 +1449,15 @@ async def list_customer_groups(
     _ensure_orders_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, team_names)
 
-    stmt = select(CustomerGroup).order_by(CustomerGroup.id.asc())
+    stmt = select(CustomerGroup.id, CustomerGroup.customer_code, CustomerGroup.customer_name).order_by(
+        CustomerGroup.id.asc()
+    )
     if hasattr(CustomerGroup, "deleted_at"):
         stmt = stmt.where(getattr(CustomerGroup, "deleted_at").is_(None))
     if status is not None and hasattr(CustomerGroup, "status"):
         stmt = stmt.where(getattr(CustomerGroup, "status") == int(status))
 
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
 
     items: List[OptionItem] = []
     for x in rows:
@@ -1086,13 +1493,15 @@ async def list_channel_groups(
     _ensure_orders_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, team_names)
 
-    stmt = select(ChannelGroup).order_by(ChannelGroup.id.asc())
+    stmt = select(ChannelGroup.id, ChannelGroup.channel_code, ChannelGroup.channel_name).order_by(
+        ChannelGroup.id.asc()
+    )
     if hasattr(ChannelGroup, "deleted_at"):
         stmt = stmt.where(getattr(ChannelGroup, "deleted_at").is_(None))
     if status is not None and hasattr(ChannelGroup, "status"):
         stmt = stmt.where(getattr(ChannelGroup, "status") == int(status))
 
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
 
     items: List[OptionItem] = []
     for x in rows:
@@ -1186,7 +1595,7 @@ async def get_bos_sts(
     _ensure_orders_write_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, team_names)
 
-    cred = storage.assume_role(duration_seconds=900)
+    cred = await anyio.to_thread.run_sync(lambda: storage.assume_role(duration_seconds=900))
     return BosStsOut(
         accessKeyId=cred.access_key_id,
         secretAccessKey=cred.secret_access_key,
@@ -1249,7 +1658,15 @@ async def bos_upload_proxy(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"BOS upload failed: {str(e) or e.__class__.__name__}")
 
-    url = storage.object_url_for_display(storage_key, signed=None, expires_in=900)
+    try:
+        url = storage.object_url_for_display(
+            storage_key,
+            signed=None,
+            expires_in=900,
+            allow_fallback_public=False,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BOS signed url failed: {str(e) or e.__class__.__name__}")
 
     return BosProxyUploadOut(
         slot_key=sk,
@@ -1275,6 +1692,14 @@ async def create_order_draft(
     _ensure_orders_access(role_name)
     _ensure_orders_write_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, tns)
+    _ensure_required_customer_channel(
+        customer_group_id=payload.customer_group_id,
+        channel_group_id=payload.channel_group_id,
+    )
+    if payload.customer_group_id is not None:
+        await _ensure_customer_group_exists(db, payload.customer_group_id)
+    if payload.channel_group_id is not None:
+        await _ensure_channel_group_exists(db, payload.channel_group_id)
 
     if role_name == ROLE_SALES:
         spid = int(ctx.user.id)
@@ -1308,6 +1733,7 @@ async def create_order_draft(
     )
     db.add(o)
     await db.flush()
+    await _sync_order_fact_from_dynamic_data(db, order_id=int(o.id), dynamic_data=o.dynamic_data)
 
     info = OrderInfo(order_id=int(o.id))
     db.add(info)
@@ -1332,7 +1758,17 @@ async def list_order_ocr_tasks(
 
     _ensure_orders_access(role_name)
 
-    stmt = select(OcrTask).where(OcrTask.scope_type == "order").order_by(OcrTask.id.desc())
+    stmt = (
+        select(
+            OcrTask.id,
+            OcrTask.scope_id,
+            OcrTask.status,
+            OcrTask.progress,
+            OcrTask.error_message,
+        )
+        .where(OcrTask.scope_type == "order")
+        .order_by(OcrTask.id.desc())
+    )
 
     if order_id is not None:
         stmt = stmt.where(OcrTask.scope_id == int(order_id))
@@ -1349,7 +1785,7 @@ async def list_order_ocr_tasks(
     )
     stmt = stmt.limit(int(limit))
 
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = (await db.execute(stmt)).all()
     items: List[OcrTaskItemOut] = []
     for t in rows:
         items.append(
@@ -1386,7 +1822,7 @@ async def finalize_order_upload(
         _ensure_orders_write_access(role_name)
 
     order_id = int(payload.order_id)
-    o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
+    o = (await db.execute(select(Order).where(Order.id == order_id).options(lazyload("*")))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -1483,9 +1919,9 @@ async def finalize_order_upload(
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
 
-        url = str(im.url or "").strip()
-        if not url:
-            url = storage.object_url_for_display(storage_key, signed=None, expires_in=900)
+        url = ""
+        if not getattr(storage, "enabled", False):
+            url = str(im.url or "").strip()
 
         imf = await _get_or_create_image_file(
             db,
@@ -1554,14 +1990,75 @@ async def finalize_order_upload(
                 ocr_task_id = int(exist_task.id)
                 ocr_status = str(exist_task.status)
 
+    await _sync_order_fact_from_dynamic_data(db, order_id=order_id, dynamic_data=getattr(o, "dynamic_data", None))
     await db.commit()
     return OrderFinalizeOut(ok=True, order_id=order_id, ocr_task_id=ocr_task_id, ocr_status=ocr_status)
+
+
+@router.post("/{order_id}/images/bind", response_model=OrderImagesBindOut)
+async def bind_order_images(
+    order_id: int,
+    payload: OrderImagesBindIn,
+    db: AsyncSession = Depends(get_db),
+    ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+) -> OrderImagesBindOut:
+    role_name = ctx.primary_role or ""
+    tns = _ac_normalize_team_names(ctx.team_names)
+
+    _ensure_orders_access(role_name)
+    _ac_require_team_for_non_super_admin(role_name, tns)
+
+    if role_name == ROLE_MARKET:
+        raise HTTPException(status_code=403, detail="No permission")
+
+    if role_name == ROLE_FINANCE:
+        for sk in payload.clear_slots or []:
+            _ensure_finance_related_only_slot(str(sk or "").strip())
+        for im in payload.images or []:
+            _ensure_finance_related_only_slot(str(im.slot_key or "").strip())
+    else:
+        _ensure_orders_write_access(role_name)
+
+    oid = int(order_id)
+    o = (await db.execute(select(Order).where(Order.id == oid).options(lazyload("*")))).scalar_one_or_none()
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    await _ac_ensure_order_write_acl_by_salesperson_id(
+        db=db,
+        salesperson_id=int(getattr(o, "salesperson_id", 0) or 0),
+        current_user=ctx.user,
+        role_name=role_name,
+        team_names=tns,
+    )
+
+    if role_name == ROLE_FINANCE and not bool(getattr(o, "is_finished", False)):
+        raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
+
+    bound_count, ocr_task_id, ocr_status = await _apply_order_image_bind(
+        db,
+        order_id=oid,
+        images=payload.images or [],
+        clear_slots=payload.clear_slots or [],
+        trigger_ocr=bool(payload.trigger_ocr),
+    )
+
+    await db.commit()
+    return OrderImagesBindOut(
+        ok=True,
+        order_id=oid,
+        bound_count=bound_count,
+        ocr_task_id=ocr_task_id,
+        ocr_status=ocr_status,
+    )
 
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
+    include_total: bool = Query(False, description="是否同步计算精确 total；首屏建议 false"),
+    total_only: bool = Query(False, description="仅计算精确 total，不返回列表 items"),
     is_finished: Optional[bool] = Query(None),
     salesperson_id: Optional[int] = Query(None),
     created_by: Optional[int] = Query(None),
@@ -1593,11 +2090,18 @@ async def list_orders(
     _ensure_orders_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, team_names)
 
+    effective_is_finished = is_finished
+    if role_name == ROLE_FINANCE:
+        if is_finished is False:
+            raise HTTPException(status_code=403, detail="Finance can only list finished orders")
+        effective_is_finished = True
+
     clauses = await _build_order_list_clauses(
+        db=db,
         ctx=ctx,
         role_name=role_name,
         team_names=team_names,
-        is_finished=is_finished,
+        is_finished=effective_is_finished,
         salesperson_id=salesperson_id,
         created_by=created_by,
         customer_group_id=customer_group_id,
@@ -1619,7 +2123,16 @@ async def list_orders(
     )
 
     id_stmt = select(Order.id).select_from(Order)
-    count_stmt = select(func.count(Order.id)).select_from(Order)
+    count_stmt = select(func.count(Order.id)).select_from(Order) if (include_total or total_only) else None
+    if count_stmt is not None and effective_is_finished is not None:
+        scoped_by_salesperson = salesperson_id is not None or role_name in (
+            ROLE_MANAGER,
+            ROLE_FINANCE,
+            ROLE_MARKET,
+            ROLE_SALES,
+        )
+        if scoped_by_salesperson:
+            count_stmt = _with_mysql_force_index(count_stmt, "ix_order_list_finished_salesperson_id")
 
     id_stmt, count_stmt = _apply_optional_joins_and_filters(
         stmt=id_stmt,
@@ -1628,31 +2141,54 @@ async def list_orders(
         market=market,
         insurance_expire_date=insurance_expire_date,
         remark=remark,
+        first_register_date_start=first_register_date_start,
+        first_register_date_end=first_register_date_end,
+        owner_name=owner_name,
+        id_number=id_number,
+        plate_no=plate_no,
+        engine_no=engine_no,
+        vehicle_model=vehicle_model,
+        vin=vin,
     )
 
     if clauses:
         condition = and_(*clauses)
         id_stmt = id_stmt.where(condition)
-        count_stmt = count_stmt.where(condition)
+        if count_stmt is not None:
+            count_stmt = count_stmt.where(condition)
 
-    id_stmt = id_stmt.order_by(Order.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    if total_only:
+        total = int((await db.execute(count_stmt)).scalar() or 0) if count_stmt is not None else 0
+        return OrderListResponse(total=total, items=[])
 
-    total = int((await db.execute(count_stmt)).scalar() or 0)
-    if total <= 0:
-        return OrderListResponse(total=0, items=[])
+    offset_value = (page - 1) * page_size
+    id_stmt = id_stmt.order_by(Order.id.desc()).offset(offset_value).limit(page_size)
 
     id_rows = (await db.execute(id_stmt)).all()
     order_ids = [int(r[0]) for r in id_rows if r and r[0] is not None]
     if not order_ids:
+        if include_total and count_stmt is not None and page > 1:
+            total = int((await db.execute(count_stmt)).scalar() or 0)
+        else:
+            total = 0
         return OrderListResponse(total=total, items=[])
 
-    entity_stmt = _build_order_list_entity_stmt(order_ids)
-    rows = (await db.execute(entity_stmt)).scalars().all()
-
-    row_map = {int(getattr(o, "id", 0) or 0): o for o in rows}
+    row_stmt = _build_order_list_row_stmt(order_ids)
+    rows = (await db.execute(row_stmt)).all()
+    row_map = {int(getattr(r, "id", 0) or 0): r for r in rows}
     ordered_rows = [row_map[oid] for oid in order_ids if oid in row_map]
+    items = _rm_order_rows_to_list_items(ordered_rows)
 
-    items = await _rm_orders_to_list_items(ordered_rows)
+    if include_total and count_stmt is not None:
+        if len(items) < page_size:
+            total = offset_value + len(items)
+        else:
+            total = int((await db.execute(count_stmt)).scalar() or 0)
+    else:
+        # 极速模式：不做同步 count，返回当前页下界。
+        # 前端应在后台二次请求 include_total=true 以回填精确 total。
+        total = offset_value + len(items)
+
     return OrderListResponse(total=total, items=items)
 
 
@@ -1723,7 +2259,7 @@ async def create_order(
         customer_group_id=payload.customer_group_id,
         channel_group_id=payload.channel_group_id,
         dynamic_data=dyn,
-        ocr_raw_json=payload.ocr_raw_json or {},
+        ocr_raw_json=_clean_ocr_raw_json_for_write(payload.ocr_raw_json),
         status=payload.status or 0,
         audit_status=payload.audit_status or 0,
         is_finished=bool(payload.is_finished),
@@ -1732,6 +2268,7 @@ async def create_order(
     )
     db.add(o)
     await db.flush()
+    await _sync_order_fact_from_dynamic_data(db, order_id=int(o.id), dynamic_data=o.dynamic_data)
 
     info = OrderInfo(order_id=int(o.id))
     db.add(info)
@@ -1757,7 +2294,7 @@ async def update_order_detail(
     _ensure_orders_write_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, tns)
 
-    o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
+    o = (await db.execute(select(Order).where(Order.id == order_id).options(lazyload("*")))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -1806,7 +2343,7 @@ async def update_order_detail(
     if payload.audit_status is not None:
         o.audit_status = int(payload.audit_status)
     if payload.ocr_raw_json is not None:
-        o.ocr_raw_json = payload.ocr_raw_json or {}
+        o.ocr_raw_json = _clean_ocr_raw_json_for_write(payload.ocr_raw_json)
     if payload.dynamic_data is not None:
         merged = dict(o.dynamic_data or {})
         merged.update(payload.dynamic_data or {})
@@ -1824,6 +2361,7 @@ async def update_order_detail(
             db.add(info)
         _apply_order_info_patch(info, payload.order_info)
 
+    await _sync_order_fact_from_dynamic_data(db, order_id=int(order_id), dynamic_data=getattr(o, "dynamic_data", None))
     await db.commit()
     return await _load_order_out(db, int(order_id), current_user=ctx.user, role_name=role_name, team_names=tns)
 
@@ -1842,7 +2380,7 @@ async def update_order_status(
     _ensure_orders_write_access(role_name)
     _ac_require_team_for_non_super_admin(role_name, tns)
 
-    o = (await db.execute(select(Order).where(Order.id == order_id))).scalar_one_or_none()
+    o = (await db.execute(select(Order).where(Order.id == order_id).options(lazyload("*")))).scalar_one_or_none()
     if not o:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -1892,4 +2430,3 @@ _require_team_filter_ALLOWED = _ac_require_team_filter_allowed
 _ac_ensure_user_in_teams = _ac_ensure_user_in_teams
 _ac_ensure_order_read_acl_by_salesperson_id = _ac_ensure_order_read_acl_by_salesperson_id
 _ac_ensure_order_write_acl_by_salesperson_id = _ac_ensure_order_write_acl_by_salesperson_id
-_apply_orders_list_acl = _ac_apply_orders_list_acl

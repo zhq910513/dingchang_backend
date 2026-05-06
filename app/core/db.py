@@ -23,7 +23,7 @@ from sqlalchemy import event, inspect as sa_inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy.schema import CreateColumn
+from sqlalchemy.schema import CreateColumn, CreateIndex
 
 from .config import settings
 
@@ -173,6 +173,63 @@ def _get_model_column(table_name: str, col_name: str):
     return table.columns.get(col_name)
 
 
+def _diff_missing_indexes(conn) -> Dict[str, List[Any]]:
+    """返回：table -> missing Index objects（按 unique + columns 视角比较）。"""
+    insp = sa_inspect(conn)
+    db_tables = set(insp.get_table_names())
+
+    out: Dict[str, List[Any]] = {}
+    for table in Base.metadata.sorted_tables:
+        tn = table.name
+        if tn not in db_tables:
+            continue
+
+        existing_signatures = set()
+
+        try:
+            for idx in insp.get_indexes(tn) or []:
+                cols = tuple(str(col) for col in (idx.get("column_names") or []) if col)
+                if cols:
+                    existing_signatures.add((bool(idx.get("unique")), cols))
+        except Exception:
+            pass
+
+        try:
+            pk = insp.get_pk_constraint(tn) or {}
+            cols = tuple(str(col) for col in (pk.get("constrained_columns") or []) if col)
+            if cols:
+                existing_signatures.add((True, cols))
+        except Exception:
+            pass
+
+        try:
+            for uq in insp.get_unique_constraints(tn) or []:
+                cols = tuple(str(col) for col in (uq.get("column_names") or []) if col)
+                if cols:
+                    existing_signatures.add((True, cols))
+        except Exception:
+            pass
+
+        missing_indexes: List[Any] = []
+        for idx in table.indexes:
+            cols = tuple(col.name for col in idx.columns)
+            if not cols:
+                continue
+            if (bool(idx.unique), cols) in existing_signatures:
+                continue
+            missing_indexes.append(idx)
+
+        if missing_indexes:
+            out[tn] = missing_indexes
+
+    return out
+
+
+def _compile_create_index_ddl(conn, idx) -> str:
+    """生成 CREATE INDEX 的 DDL。"""
+    return str(CreateIndex(idx).compile(dialect=conn.dialect)).strip()
+
+
 def _is_unsafe_notnull_without_default(col) -> bool:
     """严格模式拦截：新增 NOT NULL 且无默认值的列。"""
     try:
@@ -191,6 +248,7 @@ async def ensure_schema_additive_on_startup(
         *,
         add_tables: bool,
         add_columns: bool,
+        add_indexes: bool,
         log_details: bool = True,
         strict_add_columns: bool = True,
 ) -> Dict[str, Any]:
@@ -204,7 +262,9 @@ async def ensure_schema_additive_on_startup(
         "missing_tables": [],
         "extra_tables": [],
         "missing_columns": {},  # table -> [col...]
+        "missing_indexes": {},  # table -> [index_name...]
         "added_columns": [],  # ["table.col", ...]
+        "added_indexes": [],  # ["index_name", ...]
         "created_tables": [],  # ["table", ...]
     }
 
@@ -215,12 +275,17 @@ async def ensure_schema_additive_on_startup(
             db_tables, missing_tables, extra_tables = _diff_tables(sync_conn)
             model_tables = _model_table_names()
             missing_cols = _diff_missing_columns(sync_conn)
+            missing_indexes = _diff_missing_indexes(sync_conn)
 
             result["db_tables"] = db_tables
             result["model_tables"] = model_tables
             result["missing_tables"] = missing_tables
             result["extra_tables"] = extra_tables
             result["missing_columns"] = missing_cols
+            result["missing_indexes"] = {
+                tn: [idx.name or ",".join(col.name for col in idx.columns) for idx in idxs]
+                for tn, idxs in missing_indexes.items()
+            }
 
             if log_details:
                 logger.info("[schema_check] db_tables=%s", ",".join(db_tables) if db_tables else "-")
@@ -238,6 +303,16 @@ async def ensure_schema_additive_on_startup(
                         logger.info("[schema_check] missing_columns table=%s cols=%s", tn, ",".join(cols))
                 else:
                     logger.info("[schema_check] missing_columns none")
+
+                if missing_indexes:
+                    for tn, idxs in missing_indexes.items():
+                        logger.info(
+                            "[schema_check] missing_indexes table=%s indexes=%s",
+                            tn,
+                            ",".join(idx.name or ",".join(col.name for col in idx.columns) for idx in idxs),
+                        )
+                else:
+                    logger.info("[schema_check] missing_indexes none")
 
             # phase 2: create missing tables (optional)
             if add_tables:
@@ -281,7 +356,22 @@ async def ensure_schema_additive_on_startup(
                 else:
                     logger.info("[schema_apply] add_columns enabled but no missing columns")
 
-            # phase 4: final summary
+            # phase 4: add missing indexes (optional)
+            if add_indexes:
+                missing_indexes2 = _diff_missing_indexes(sync_conn)
+                if missing_indexes2:
+                    added_indexes: List[str] = result["added_indexes"]
+                    for tn, idxs in missing_indexes2.items():
+                        for idx in idxs:
+                            ddl = _compile_create_index_ddl(sync_conn, idx)
+                            sync_conn.execute(text(ddl))
+                            idx_name = idx.name or f"{tn}({','.join(col.name for col in idx.columns)})"
+                            added_indexes.append(idx_name)
+                            logger.info("[schema_apply] added_index=%s", idx_name)
+                else:
+                    logger.info("[schema_apply] add_indexes enabled but no missing indexes")
+
+            # phase 5: final summary
             if log_details:
                 try:
                     insp3 = sa_inspect(sync_conn)

@@ -6,22 +6,43 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, desc, false as sql_false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
 
+from app.core.access_control import normalize_team_names, user_team_match_expr
+from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
 from app.core.db import get_db
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
+from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
+from app.services.quote_assistant_service import (
+    _collect_context_images,
+    detect_platform_credential_signal,
+    detect_quote_signal,
+    handle_quote_images_message,
+    handle_platform_credential_message,
+    handle_quote_material_status,
+    handle_quote_message,
+    has_expired_waiting_sms_task,
+    has_quote_case_waiting_for_login_phone,
+    has_waiting_sms_task,
+    looks_like_sms_code,
+    redact_quote_sensitive_text,
+    sanitize_quote_entities,
+)
 from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
@@ -66,6 +87,20 @@ def _to_str(v: Any, default: str = "") -> str:
         return str(v)
     except Exception:
         return default
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return _fmt_dt(value) or value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return _to_str(value)
 
 
 def _new_id() -> str:
@@ -120,9 +155,148 @@ def _mk_data(
     return {
         "result_status": result_status,
         "message": message,
-        "entities": entities or {},
+        "entities": sanitize_quote_entities(entities),
         "payload": payload or {},
     }
+
+
+def _stable_image_url(storage_key: str, raw_url: str = "") -> str:
+    sk = _to_str(storage_key).strip().lstrip("/")
+    if sk:
+        try:
+            return storage.object_public_url(sk)
+        except Exception:
+            pass
+    url = _to_str(raw_url).strip()
+    if not url or url.startswith("blob:"):
+        return ""
+    return url.split("?", 1)[0]
+
+
+def _safe_image_meta_for_history(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    sk = _to_str(item.get("storage_key") or item.get("key")).strip().lstrip("/")
+    stable_url = _stable_image_url(sk, _to_str(item.get("image_url") or item.get("url") or item.get("preview_url")))
+    out: Dict[str, Any] = {}
+    for key in (
+        "id",
+        "slot_key",
+        "provided_slot_key",
+        "predicted_slot_key",
+        "confirmed_slot_key",
+        "storage_key",
+        "md5",
+        "etag",
+        "size",
+        "content_type",
+        "original_name",
+        "context_hint",
+        "confidence",
+        "method",
+        "reason",
+        "recalled",
+        "recalled_at",
+    ):
+        if key in item and item.get(key) not in (None, ""):
+            out[key] = item.get(key)
+    if sk:
+        out["storage_key"] = sk
+    if stable_url:
+        out["url"] = stable_url
+        out["preview_url"] = stable_url
+        out["image_url"] = stable_url
+    return out
+
+
+def _safe_context_for_history(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(ctx, dict):
+        return {}
+    blocked = {"current_user_id", "role_name", "team_names", "session_id"}
+    out: Dict[str, Any] = {}
+    for key, value in ctx.items():
+        if key in blocked:
+            continue
+        if key in {"images", "uploaded_images"} and isinstance(value, list):
+            out[key] = [_safe_image_meta_for_history(x) for x in value]
+        elif key == "page_context" and isinstance(value, dict):
+            page = {}
+            for pk, pv in value.items():
+                if pk in blocked:
+                    continue
+                if pk in {"images", "uploaded_images"} and isinstance(pv, list):
+                    page[pk] = [_safe_image_meta_for_history(x) for x in pv]
+                else:
+                    page[pk] = _json_safe(pv)
+            out[key] = page
+        else:
+            out[key] = _json_safe(value)
+    return out
+
+
+def _looks_like_image_dict(value: Dict[str, Any]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    image_keys = {"storage_key", "image_url", "url", "preview_url", "confirmed_slot_key", "predicted_slot_key"}
+    return bool(image_keys.intersection(value.keys()))
+
+
+def _safe_history_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep persisted chat history stable, displayable, and free of signed URLs."""
+
+    if depth > 8:
+        return _to_str(value)[:500]
+    if isinstance(value, dict):
+        if _looks_like_image_dict(value):
+            return _safe_image_meta_for_history(value)
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            skey = _to_str(key)
+            low = skey.lower()
+            if low in {"authorization", "x-bce-security-token", "secret_access_key", "password", "account_password"}:
+                continue
+            if low.endswith("_ciphertext") or "password_ciphertext" in low:
+                continue
+            if skey in {"current_user_id", "role_name", "team_names", "session_id"}:
+                continue
+            out[skey] = _safe_history_value(item, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_safe_history_value(item, depth=depth + 1) for item in value[:200]]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        if ("authorization=" in text.lower() or "x-bce-security-token=" in text.lower()) and text.startswith(("http://", "https://")):
+            return text.split("?", 1)[0]
+        return text[:4000]
+    return _json_safe(value)
+
+
+def _safe_metadata_for_history(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    return _safe_history_value(metadata)
+
+
+def _humanize_exception(e: Exception) -> str:
+    raw = (_to_str(e) or e.__class__.__name__).strip()
+    lower = raw.lower()
+    if "data too long for column" in lower:
+        m = re.search(r"data too long for column ['`\"]?([^'`\"]+)", raw, flags=re.IGNORECASE)
+        col = m.group(1) if m else "数据库字段"
+        return f"数据库字段 {col} 写入内容过长，请检查上传图片链接或文本长度"
+    if "duplicate entry" in lower:
+        return "数据库唯一性冲突，可能是重复提交了同一份数据"
+    if "can't connect to mysql" in lower or "connect to mysql" in lower:
+        return "数据库连接失败，请确认 MySQL 服务已启动且配置正确"
+    if "lock timeout" in lower:
+        return "会话历史写入锁等待超时，请稍后重试"
+    if "timeout" in lower:
+        return "外部服务或数据库响应超时，请稍后重试"
+    if raw:
+        return raw[:300]
+    return e.__class__.__name__
 
 
 # =============================
@@ -134,13 +308,48 @@ class _Store:
     文件：storage/quote_assistant_sessions.json
     """
 
+    _LOCK_TIMEOUT_SECONDS = 10.0
+    _STALE_LOCK_SECONDS = 30.0
+
     def __init__(self) -> None:
         base_dir = Path(os.getenv("STORAGE_DIR", "storage"))
         base_dir.mkdir(parents=True, exist_ok=True)
         self._file = base_dir / "quote_assistant_sessions.json"
         self._lock = threading.RLock()
         self._data: Dict[str, Any] = {"sessions": {}}
-        self._load()
+        with self._lock:
+            with self._interprocess_lock():
+                self._load()
+
+    @contextmanager
+    def _interprocess_lock(self):
+        lock_file = self._file.with_suffix(self._file.suffix + ".lock")
+        fd: Optional[int] = None
+        deadline = time.monotonic() + self._LOCK_TIMEOUT_SECONDS
+        while fd is None:
+            try:
+                fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+            except FileExistsError:
+                try:
+                    age = time.time() - lock_file.stat().st_mtime
+                    if age > self._STALE_LOCK_SECONDS:
+                        lock_file.unlink()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"AI assistant session store lock timeout: {lock_file}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                lock_file.unlink()
+            except FileNotFoundError:
+                pass
 
     def _load(self) -> None:
         with self._lock:
@@ -162,7 +371,7 @@ class _Store:
     def _flush(self) -> None:
         with self._lock:
             tmp = self._file.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(_json_safe(self._data), ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(self._file)
 
     def create_session(self, *, owner_user_id: str, title: Optional[str] = None) -> Dict[str, Any]:
@@ -178,18 +387,22 @@ class _Store:
             "messages": [],
         }
         with self._lock:
-            self._data["sessions"][sid] = row
-            self._flush()
+            with self._interprocess_lock():
+                self._load()
+                self._data["sessions"][sid] = row
+                self._flush()
         return deepcopy(row)
 
     def get_session(self, *, owner_user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
-            row = self._data["sessions"].get(session_id)
-            if not row or row.get("deleted"):
-                return None
-            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
-                return None
-            return deepcopy(row)
+            with self._interprocess_lock():
+                self._load()
+                row = self._data["sessions"].get(session_id)
+                if not row or row.get("deleted"):
+                    return None
+                if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
+                    return None
+                return deepcopy(row)
 
     def get_or_create_session(
             self,
@@ -207,37 +420,41 @@ class _Store:
     def list_sessions(self, *, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         owner = _to_str(owner_user_id)
         with self._lock:
-            rows: List[Dict[str, Any]] = []
-            for s in self._data["sessions"].values():
-                if s.get("deleted"):
-                    continue
-                if _to_str(s.get("owner_user_id")) != owner:
-                    continue
-                msgs = s.get("messages") or []
-                preview = _to_str((msgs[-1] or {}).get("content"))[:120] if msgs else ""
-                rows.append(
-                    {
-                        "session_id": s.get("session_id"),
-                        "title": s.get("title") or "新会话",
-                        "created_at": s.get("created_at"),
-                        "updated_at": s.get("updated_at"),
-                        "message_count": len(msgs),
-                        "last_message_preview": preview,
-                    }
-                )
-            rows.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
-            return deepcopy(rows[: max(1, min(int(limit or 50), 200))])
+            with self._interprocess_lock():
+                self._load()
+                rows: List[Dict[str, Any]] = []
+                for s in self._data["sessions"].values():
+                    if s.get("deleted"):
+                        continue
+                    if _to_str(s.get("owner_user_id")) != owner:
+                        continue
+                    msgs = s.get("messages") or []
+                    preview = _to_str((msgs[-1] or {}).get("content"))[:120] if msgs else ""
+                    rows.append(
+                        {
+                            "session_id": s.get("session_id"),
+                            "title": s.get("title") or "新会话",
+                            "created_at": s.get("created_at"),
+                            "updated_at": s.get("updated_at"),
+                            "message_count": len(msgs),
+                            "last_message_preview": preview,
+                        }
+                    )
+                rows.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+                return deepcopy(rows[: max(1, min(int(limit or 50), 200))])
 
     def delete_session(self, *, owner_user_id: str, session_id: str) -> bool:
         with self._lock:
-            row = self._data["sessions"].get(session_id)
-            if not row or row.get("deleted"):
-                return False
-            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
-                return False
-            row["deleted"] = True
-            row["updated_at"] = _now_iso()
-            self._flush()
+            with self._interprocess_lock():
+                self._load()
+                row = self._data["sessions"].get(session_id)
+                if not row or row.get("deleted"):
+                    return False
+                if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
+                    return False
+                row["deleted"] = True
+                row["updated_at"] = _now_iso()
+                self._flush()
         return True
 
     def list_messages(
@@ -261,9 +478,12 @@ class _Store:
                 if _to_str(m.get("id")) == _to_str(cursor):
                     idx = i
                     break
-            if idx > 0:
-                sliced = msgs[max(0, idx - lim): idx]
-                has_more = (idx - lim) > 0
+            if idx >= 0:
+                if idx == 0:
+                    return {"items": [], "next_cursor": None, "has_more": False}
+                start = max(0, idx - lim)
+                sliced = msgs[start: idx]
+                has_more = start > 0
                 next_cursor = sliced[0]["id"] if (has_more and sliced) else None
                 return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
 
@@ -282,27 +502,102 @@ class _Store:
             metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         with self._lock:
-            row = self._data["sessions"].get(session_id)
-            if not row or row.get("deleted"):
-                raise ValueError("会话不存在")
-            if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
-                raise ValueError("无权限访问该会话")
+            with self._interprocess_lock():
+                self._load()
+                row = self._data["sessions"].get(session_id)
+                if not row or row.get("deleted"):
+                    raise ValueError("会话不存在")
+                if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
+                    raise ValueError("无权限访问该会话")
 
-            msg = {
-                "id": _new_id(),
-                "role": _to_str(role),
-                "content": _to_str(content),
-                "created_at": _now_iso(),
-                "metadata": metadata or {},
-            }
-            row.setdefault("messages", []).append(msg)
+                msg = {
+                    "id": _new_id(),
+                    "role": _to_str(role),
+                    "content": _to_str(content),
+                    "created_at": _now_iso(),
+                    "metadata": _safe_metadata_for_history(metadata or {}),
+                }
+                row.setdefault("messages", []).append(msg)
 
-            if (row.get("title") in (None, "", "新会话")) and msg["role"] == "user":
-                row["title"] = (msg["content"].strip() or "新会话")[:24]
+                if (row.get("title") in (None, "", "新会话")) and msg["role"] == "user":
+                    row["title"] = (msg["content"].strip() or "新会话")[:24]
 
-            row["updated_at"] = msg["created_at"]
-            self._flush()
-            return deepcopy(msg)
+                row["updated_at"] = msg["created_at"]
+                self._flush()
+                return deepcopy(msg)
+
+    def recall_images(
+            self,
+            *,
+            owner_user_id: str,
+            session_id: str,
+            storage_keys: List[str],
+            message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        keys = {str(x or "").strip().lstrip("/") for x in (storage_keys or []) if str(x or "").strip()}
+        if not keys:
+            return {"updated_messages": 0, "updated_images": 0, "storage_keys": []}
+
+        def mark_list(value: Any, recalled_at: str) -> int:
+            changed = 0
+            if not isinstance(value, list):
+                return changed
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                sk = _to_str(item.get("storage_key") or item.get("key")).strip().lstrip("/")
+                if sk and sk in keys and not item.get("recalled"):
+                    item["recalled"] = True
+                    item["recalled_at"] = recalled_at
+                    changed += 1
+            return changed
+
+        with self._lock:
+            with self._interprocess_lock():
+                self._load()
+                row = self._data["sessions"].get(session_id)
+                if not row or row.get("deleted"):
+                    raise ValueError("会话不存在或无权限访问")
+                if _to_str(row.get("owner_user_id")) != _to_str(owner_user_id):
+                    raise ValueError("会话不存在或无权限访问")
+
+                recalled_at = _now_iso()
+                updated_messages = 0
+                updated_images = 0
+                for msg in row.get("messages") or []:
+                    if message_id and _to_str(msg.get("id")) != _to_str(message_id):
+                        continue
+                    meta = msg.get("metadata")
+                    if not isinstance(meta, dict):
+                        continue
+
+                    before = updated_images
+                    updated_images += mark_list(meta.get("images"), recalled_at)
+                    page_context = meta.get("page_context")
+                    if isinstance(page_context, dict):
+                        updated_images += mark_list(page_context.get("images"), recalled_at)
+                        updated_images += mark_list(page_context.get("uploaded_images"), recalled_at)
+                    data = meta.get("data")
+                    payload = data.get("payload") if isinstance(data, dict) else None
+                    if isinstance(payload, dict):
+                        updated_images += mark_list(payload.get("attached_images"), recalled_at)
+
+                    if updated_images > before:
+                        old_keys = meta.get("recalled_image_storage_keys")
+                        if not isinstance(old_keys, list):
+                            old_keys = []
+                        meta["recalled_image_storage_keys"] = sorted(set([*old_keys, *keys]))
+                        meta["recalled_at"] = recalled_at
+                        updated_messages += 1
+
+                if updated_images:
+                    row["updated_at"] = recalled_at
+                    self._flush()
+                return {
+                    "updated_messages": updated_messages,
+                    "updated_images": updated_images,
+                    "storage_keys": sorted(keys),
+                }
 
 
 _store = _Store()
@@ -357,6 +652,9 @@ def _extract_order_id(text: str) -> Optional[int]:
     for p in (r"(?:订单号|订单)\s*[:：#]?\s*(\d{1,12})", r"\border\s*[:：#]?\s*(\d{1,12})\b"):
         m = re.search(p, text, flags=re.IGNORECASE)
         if m:
+            raw = _to_str(m.group(1)).strip()
+            if re.fullmatch(r"1\d{10}", raw):
+                continue
             x = _safe_int(m.group(1), 0)
             return x if x > 0 else None
     return None
@@ -377,16 +675,100 @@ def _extract_plate_no(text: str) -> Optional[str]:
 
 
 def _extract_owner_name(text: str) -> Optional[str]:
-    m = re.search(r"(?:车主|姓名)\s*[:： ]\s*([\u4e00-\u9fa5]{2,8})", text)
+    m = re.search(r"(?:车主|姓名)\s*[:： ]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", text)
     if m:
         s = _to_str(m.group(1)).strip()
         return s or None
     return None
 
 
+def _extract_loose_owner_name_for_field_query(text: str) -> Optional[str]:
+    t = _norm_text(text)
+    m = re.search(
+        r"(?:查|查询|订单|车主|姓名)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})\s*的?\s*(?:车牌号|车牌|手机号|电话|身份证|证件号|VIN|车架号|发动机号|车型|保费|应收|应付|利润)",
+        t,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    name = re.sub(r"^(?:查|查询|订单|车主|姓名)", "", _to_str(m.group(1)).strip())
+    if re.fullmatch(r"\d+", name):
+        return None
+    if not name or name in {"订单", "车主", "姓名", "车牌号", "车牌", "手机号", "电话", "身份证", "证件号", "车型", "保费"}:
+        return None
+    return name
+
+
+def _extract_loose_owner_name_for_order_query(text: str) -> Optional[str]:
+    t = _norm_text(text)
+    if "报价" in t:
+        return None
+    m = re.search(r"(?:查订单|查询订单|订单信息|订单详情|订单)\s*[:：]?\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", t)
+    if not m:
+        return None
+    name = _to_str(m.group(1)).strip()
+    if re.fullmatch(r"\d+", name):
+        return None
+    if not name or name in {"订单", "详情", "信息", "状态", "车主", "姓名", "车牌号", "车牌", "手机号", "电话", "身份证", "保费"}:
+        return None
+    return name
+
+
 def _extract_owner_phone(text: str) -> Optional[str]:
     m = re.search(r"\b(1\d{10})\b", text)
     return m.group(1) if m else None
+
+
+def _extract_id_number(text: str) -> Optional[str]:
+    m = re.search(r"\b(\d{17}[\dXx])\b", text)
+    return m.group(1).upper() if m else None
+
+
+def _extract_vin(text: str) -> Optional[str]:
+    up = text.upper()
+    m = re.search(r"(?:VIN|车架号|车辆识别代号)\s*[:：]?\s*([A-HJ-NPR-Z0-9]{11,20})", up)
+    if not m:
+        m = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", up)
+    return m.group(1).upper() if m else None
+
+
+def _extract_engine_no(text: str) -> Optional[str]:
+    up = text.upper()
+    m = re.search(r"(?:发动机号|发动机号码|发动机)\s*[:：]?\s*([A-Z0-9\-]{4,32})", up)
+    return m.group(1).upper() if m else None
+
+
+def _extract_order_query_fields(text: str) -> List[str]:
+    t = _norm_text(text)
+    fields: List[str] = []
+    rules = (
+        ("owner_name", ("车主", "姓名")),
+        ("plate_no", ("车牌号", "车牌")),
+        ("owner_phone", ("手机号", "电话", "联系方式")),
+        ("id_number", ("身份证", "证件号", "证件号码")),
+        ("vin", ("车架号", "VIN", "车辆识别代号")),
+        ("engine_no", ("发动机号", "发动机")),
+        ("vehicle_model", ("车型", "品牌型号")),
+        ("first_register_date", ("初登", "初登日期", "注册日期")),
+        ("insurance_expire_date", ("保险到期", "保险到期日", "到期日")),
+        ("premium_total", ("总保费", "保费", "金额")),
+        ("commercial_amount", ("商业金额", "商业险")),
+        ("compulsory_amount", ("交强金额", "交强险")),
+        ("vehicle_tax_amount", ("车船税", "车船税金额")),
+        ("non_vehicle_amount", ("非车", "非车金额")),
+        ("finance_record", ("财务", "结算", "付款", "收款", "利润", "实际金额")),
+        ("profit", ("利润", "差价")),
+        ("channel_total", ("应收", "渠道", "渠道费用", "上游")),
+        ("customer_total", ("应付", "客户", "客户费用", "下游")),
+        ("remark", ("备注", "说明")),
+        ("images", ("图片", "材料", "卡槽", "照片")),
+        ("ocr_summary", ("OCR", "识别", "识别状态")),
+        ("status", ("状态", "完成", "返点", "支付")),
+    )
+    for key, words in rules:
+        if any(w in t for w in words):
+            fields.append(key)
+    return fields
 
 
 def _detect_intent(text: str) -> Tuple[str, float, Dict[str, Any]]:
@@ -421,13 +803,44 @@ def _detect_intent(text: str) -> Tuple[str, float, Dict[str, Any]]:
     if plate_no:
         entities["plate_no"] = plate_no
 
+    query_fields = _extract_order_query_fields(t)
+
     owner_name = _extract_owner_name(t)
+    if not owner_name and query_fields:
+        owner_name = _extract_loose_owner_name_for_field_query(t)
+    if not owner_name:
+        owner_name = _extract_loose_owner_name_for_order_query(t)
     if owner_name:
         entities["owner_name"] = owner_name
 
     owner_phone = _extract_owner_phone(t)
     if owner_phone:
         entities["owner_phone"] = owner_phone
+
+    id_number = _extract_id_number(t)
+    if id_number:
+        entities["id_number"] = id_number
+
+    vin = _extract_vin(t)
+    if vin:
+        entities["vin"] = vin
+
+    engine_no = _extract_engine_no(t)
+    if engine_no:
+        entities["engine_no"] = engine_no
+
+    if query_fields:
+        entities["query_fields"] = query_fields
+
+    credential_signal = detect_platform_credential_signal(t)
+    if credential_signal.get("is_credential"):
+        signal_entities = credential_signal.get("entities")
+        if isinstance(signal_entities, dict):
+            entities.update(signal_entities)
+        credentials = credential_signal.get("credentials")
+        if isinstance(credentials, dict) and _to_str(credentials.get("login_phone")) == _to_str(entities.get("owner_phone")):
+            entities.pop("owner_phone", None)
+        return "quote_credential", 0.96, entities
 
     if _contains_any(low, ["help", "帮助", "怎么用", "能做什么", "指令", "菜单"]):
         return "help", 0.99, entities
@@ -441,7 +854,14 @@ def _detect_intent(text: str) -> Tuple[str, float, Dict[str, Any]]:
     if _contains_any(t, ["ocr任务", "OCR任务", "识别状态", "ocr状态", "任务状态"]) or ("任务" in t and "状态" in t):
         return "query_ocr_task", 0.95 if task_id else 0.82, entities
 
-    if _contains_any(t, ["查订单", "订单信息", "订单详情", "订单状态"]) or order_id:
+    if (
+        _contains_any(t, ["查订单", "订单信息", "订单详情", "订单状态"])
+        or order_id
+        or vin
+        or engine_no
+        or id_number
+        or (query_fields and any([plate_no, owner_phone, owner_name]))
+    ):
         return "query_order", 0.92 if order_id else 0.76, entities
 
     if _contains_any(t, ["车主信息", "车主资料", "查车主", "车主"]) or owner_name or plate_no or owner_phone:
@@ -457,17 +877,82 @@ def _json_text_col(col, path: str):
     return func.json_unquote(func.json_extract(col, path))
 
 
-async def _db_get_order_by_id(db: AsyncSession, order_id: int) -> Optional[Order]:
+def _ctx_role_name(ctx: Dict[str, Any]) -> str:
+    return _to_str((ctx or {}).get("role_name")).strip()
+
+
+def _ctx_current_user_id(ctx: Dict[str, Any]) -> int:
+    return _safe_int((ctx or {}).get("current_user_id"), 0)
+
+
+def _ctx_team_names(ctx: Dict[str, Any]) -> Tuple[str, ...]:
+    raw = (ctx or {}).get("team_names") or ()
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.split(",") if x.strip()]
+    if not isinstance(raw, (list, tuple, set)):
+        raw = []
+    return normalize_team_names(tuple(str(x or "").strip() for x in raw if str(x or "").strip()))
+
+
+def _order_acl_clause_for_ctx(ctx: Dict[str, Any]):
+    role_name = _ctx_role_name(ctx)
+    if role_name == ROLE_SUPER_ADMIN:
+        return None
+
+    if role_name == ROLE_SALES:
+        current_user_id = _ctx_current_user_id(ctx)
+        if current_user_id <= 0:
+            return sql_false()
+        return Order.salesperson_id == current_user_id
+
+    if role_name in (ROLE_MANAGER, ROLE_FINANCE, ROLE_MARKET):
+        team_names = _ctx_team_names(ctx)
+        if not team_names:
+            return sql_false()
+        if role_name in (ROLE_FINANCE, ROLE_MARKET) and len(team_names) != 1:
+            return sql_false()
+        team_user_ids = select(User.id).where(user_team_match_expr(team_names))
+        return Order.salesperson_id.in_(team_user_ids)
+
+    return sql_false()
+
+
+async def _db_can_read_order_by_id(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> bool:
+    stmt = select(Order.id).where(Order.id == int(order_id)).limit(1)
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def _db_get_order_by_id(
+        db: AsyncSession,
+        order_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[Order]:
     stmt = (
         select(Order)
         .where(Order.id == int(order_id))
         .options(
+            lazyload("*"),
+            selectinload(Order.salesperson).selectinload(User.parent),
+            selectinload(Order.customer_group),
+            selectinload(Order.channel_group),
             selectinload(Order.order_info),
+            selectinload(Order.finance_record),
             selectinload(Order.images).selectinload(OrderImage.image_file),
         )
     )
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
     return (await db.execute(stmt)).scalars().first()
-
 
 async def _db_find_order(
         db: AsyncSession,
@@ -476,9 +961,13 @@ async def _db_find_order(
         plate_no: Optional[str],
         owner_phone: Optional[str],
         owner_name: Optional[str],
+        vin: Optional[str] = None,
+        engine_no: Optional[str] = None,
+        id_number: Optional[str] = None,
+        ctx: Optional[Dict[str, Any]] = None,
 ) -> Optional[Order]:
     if order_id:
-        return await _db_get_order_by_id(db, int(order_id))
+        return await _db_get_order_by_id(db, int(order_id), ctx=ctx)
 
     clauses = []
     if plate_no:
@@ -490,9 +979,19 @@ async def _db_find_order(
                 _json_text_col(Order.dynamic_data, "$.id_name") == owner_name,
             )
         )
-
+    if vin:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.vin") == vin.upper())
+    if engine_no:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.engine_no") == engine_no.upper())
+    if id_number:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.id_number") == id_number.upper())
     stmt = select(Order).options(
+        lazyload("*"),
+        selectinload(Order.salesperson).selectinload(User.parent),
+        selectinload(Order.customer_group),
+        selectinload(Order.channel_group),
         selectinload(Order.order_info),
+        selectinload(Order.finance_record),
         selectinload(Order.images).selectinload(OrderImage.image_file),
     )
 
@@ -503,48 +1002,149 @@ async def _db_find_order(
     if clauses:
         stmt = stmt.where(and_(*clauses))
 
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
+
     stmt = stmt.order_by(desc(Order.id)).limit(1)
     return (await db.execute(stmt)).scalars().first()
+
+
+async def _db_find_orders(
+        db: AsyncSession,
+        *,
+        order_id: Optional[int],
+        plate_no: Optional[str],
+        owner_phone: Optional[str],
+        owner_name: Optional[str],
+        vin: Optional[str] = None,
+        engine_no: Optional[str] = None,
+        id_number: Optional[str] = None,
+        ctx: Optional[Dict[str, Any]] = None,
+        limit: int = 6,
+) -> List[Order]:
+    if order_id:
+        order = await _db_get_order_by_id(db, int(order_id), ctx=ctx)
+        return [order] if order else []
+
+    clauses = []
+    if plate_no:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.plate_no") == plate_no.upper())
+    if owner_name:
+        clauses.append(
+            or_(
+                _json_text_col(Order.dynamic_data, "$.owner_name") == owner_name,
+                _json_text_col(Order.dynamic_data, "$.id_name") == owner_name,
+            )
+        )
+    if vin:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.vin") == vin.upper())
+    if engine_no:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.engine_no") == engine_no.upper())
+    if id_number:
+        clauses.append(_json_text_col(Order.dynamic_data, "$.id_number") == id_number.upper())
+    if not clauses and not owner_phone:
+        return []
+
+    stmt = select(Order).options(
+        lazyload("*"),
+        selectinload(Order.salesperson).selectinload(User.parent),
+        selectinload(Order.customer_group),
+        selectinload(Order.channel_group),
+        selectinload(Order.order_info),
+        selectinload(Order.finance_record),
+        selectinload(Order.images).selectinload(OrderImage.image_file),
+    )
+
+    if owner_phone:
+        stmt = stmt.join(OrderInfo, OrderInfo.order_id == Order.id, isouter=True)
+        clauses.append(OrderInfo.owner_phone == owner_phone)
+
+    if clauses:
+        stmt = stmt.where(and_(*clauses))
+
+    acl_clause = _order_acl_clause_for_ctx(ctx or {})
+    if acl_clause is not None:
+        stmt = stmt.where(acl_clause)
+
+    stmt = stmt.order_by(desc(Order.id)).limit(max(1, min(int(limit or 6), 20)))
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def _db_get_latest_ocr_task_for_order(db: AsyncSession, order_id: int) -> Optional[OcrTask]:
     stmt = (
         select(OcrTask)
         .where(and_(OcrTask.scope_type == "order", OcrTask.scope_id == int(order_id)))
+        .options(lazyload("*"))
         .order_by(desc(OcrTask.id))
         .limit(1)
     )
     return (await db.execute(stmt)).scalars().first()
 
 
-async def _db_get_ocr_task(db: AsyncSession, task_id: int) -> Optional[OcrTask]:
-    stmt = select(OcrTask).where(OcrTask.id == int(task_id))
-    return (await db.execute(stmt)).scalars().first()
+async def _db_get_ocr_task(
+        db: AsyncSession,
+        task_id: int,
+        *,
+        ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[OcrTask]:
+    stmt = select(OcrTask).where(OcrTask.id == int(task_id)).options(lazyload("*"))
+    task = (await db.execute(stmt)).scalars().first()
+    if not task:
+        return None
+
+    scope_type = _to_str(getattr(task, "scope_type", None) or "")
+    scope_id = _safe_int(getattr(task, "scope_id", 0), 0)
+    if scope_type == "order" and scope_id > 0:
+        return task if await _db_can_read_order_by_id(db, scope_id, ctx=ctx) else None
+
+    if _ctx_role_name(ctx or {}) == ROLE_SUPER_ADMIN:
+        return task
+    return None
+
+
+def _image_signed_url(storage_key: str) -> Optional[str]:
+    sk = _to_str(storage_key).strip()
+    if not sk or not getattr(storage, "enabled", False):
+        return None
+    try:
+        return storage.object_url_for_display(
+            sk,
+            expires_in=900,
+            allow_fallback_public=False,
+        )
+    except TypeError:
+        try:
+            return storage.object_url_for_display(sk, expires_in=900)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def _latest_image_url(img: Optional[OrderImage]) -> Optional[str]:
     if not img:
         return None
-    u = _to_str(getattr(img, "image_url", "")).strip()
-    if u:
-        return u
-    sk = _to_str(getattr(img, "storage_key", "")).strip()
-    if sk:
-        try:
-            return storage.object_url_for_display(sk, expires_in=900)
-        except Exception:
-            return None
+
+    signed_url = _image_signed_url(getattr(img, "storage_key", ""))
+    if signed_url:
+        return signed_url
+
     imf = getattr(img, "image_file", None)
     if imf is not None:
-        u2 = _to_str(getattr(imf, "url", "")).strip()
-        if u2:
-            return u2
-        sk2 = _to_str(getattr(imf, "storage_key", "")).strip()
-        if sk2:
-            try:
-                return storage.object_url_for_display(sk2, expires_in=900)
-            except Exception:
-                return None
+        signed_url = _image_signed_url(getattr(imf, "storage_key", ""))
+        if signed_url:
+            return signed_url
+
+    if not getattr(storage, "enabled", False):
+        u = _to_str(getattr(img, "image_url", "")).strip()
+        if u:
+            return u
+        if imf is not None:
+            u2 = _to_str(getattr(imf, "url", "")).strip()
+            if u2:
+                return u2
+
     return None
 
 
@@ -622,6 +1222,7 @@ def _order_brief_from_order(order: Order) -> Dict[str, Any]:
 def _order_payload_from_order(order: Order) -> Dict[str, Any]:
     dd = getattr(order, "dynamic_data", None) or {}
     oi = getattr(order, "order_info", None)
+    fr = getattr(order, "finance_record", None)
 
     order_info_payload: Dict[str, Any] = {}
     if oi is not None:
@@ -637,6 +1238,21 @@ def _order_payload_from_order(order: Order) -> Dict[str, Any]:
             "channel_total": getattr(oi, "channel_total", None),
             "customer_total": getattr(oi, "customer_total", None),
             "profit": getattr(oi, "profit", None),
+        }
+
+    finance_payload: Optional[Dict[str, Any]] = None
+    if fr is not None:
+        finance_payload = {
+            "id": _safe_int(getattr(fr, "id", 0), 0) or None,
+            "order_id": _safe_int(getattr(fr, "order_id", 0), 0) or None,
+            "supplier_id": getattr(fr, "supplier_id", None),
+            "upstream_paid": bool(getattr(fr, "upstream_paid", 0)),
+            "downstream_paid": bool(getattr(fr, "downstream_paid", 0)),
+            "settle_amount": getattr(fr, "settle_amount", None),
+            "actual_amount": getattr(fr, "actual_amount", None),
+            "note": _to_str(getattr(fr, "note", None) or "") or None,
+            "created_at": _fmt_dt(getattr(fr, "created_at", None)),
+            "updated_at": _fmt_dt(getattr(fr, "updated_at", None)),
         }
 
     slot_statuses = _ocr_slot_statuses_from_order(order)
@@ -657,6 +1273,7 @@ def _order_payload_from_order(order: Order) -> Dict[str, Any]:
         },
         "dynamic_data": dd,
         "order_info": order_info_payload or None,
+        "finance_record": finance_payload,
         "images": _build_material_slots_from_order(order),
         "ocr_summary": {
             "slot_statuses": slot_statuses,
@@ -764,7 +1381,7 @@ async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
     order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
+                                 owner_name=owner_name, ctx=ctx)
     if not order:
         return (
             "当前没有可展示的材料状态（未定位到订单）。你可以先发：查订单123 或 查订单 赣B12345，然后再查看材料状态。",
@@ -837,7 +1454,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
         owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
         order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                     owner_name=owner_name)
+                                     owner_name=owner_name, ctx=ctx)
         if not order:
             return (
                 "已识别为OCR任务查询，但你没提供任务号，也没定位到订单。你可以发：查OCR任务 123 或 查订单123 再查OCR状态。",
@@ -873,7 +1490,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
             )
         task_id = int(getattr(latest, "id"))
 
-    task = await _db_get_ocr_task(db, int(task_id))
+    task = await _db_get_ocr_task(db, int(task_id), ctx=ctx)
     if not task:
         return (
             f"没找到 OCR任务{task_id}。请确认任务号是否正确。",
@@ -910,7 +1527,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
     order_brief = None
     slot_statuses = []
     if scope_type == "order" and scope_id > 0:
-        order = await _db_get_order_by_id(db, scope_id)
+        order = await _db_get_order_by_id(db, scope_id, ctx=ctx)
         if order:
             order_brief = _order_brief_from_order(order)
             slot_statuses = _ocr_slot_statuses_from_order(order)
@@ -963,13 +1580,296 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
     )
 
 
+def _short_json(value: Any, *, max_len: int = 360) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = _to_str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def _display_text(value: Any) -> str:
+    text = _to_str(value).strip()
+    return text if text else "-"
+
+
+def _fmt_ymd(value: Any) -> str:
+    text = _fmt_dt(value) or ""
+    text = text.strip()
+    if not text:
+        return "-"
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    return text
+
+
+def _fmt_money_text(value: Any) -> str:
+    if value is None:
+        return "-"
+    text = _to_str(value).strip()
+    if text == "":
+        return "-"
+    try:
+        dec = value if isinstance(value, Decimal) else Decimal(text)
+        return f"{dec.quantize(Decimal('0.01'))}"
+    except Exception:
+        return text
+
+
+def _fmt_point_text(value: Any) -> str:
+    if value is None or _to_str(value).strip() == "":
+        return "-"
+    try:
+        dec = value if isinstance(value, Decimal) else Decimal(_to_str(value).strip())
+        return f"{dec.normalize()}%"
+    except Exception:
+        return f"{_to_str(value).strip()}%"
+
+
+def _yes_no(value: Any) -> str:
+    return "是" if bool(value) else "否"
+
+
+def _relation_text(obj: Any, *attrs: str) -> str:
+    for attr in attrs:
+        val = getattr(obj, attr, None) if obj is not None else None
+        text = _to_str(val).strip()
+        if text:
+            return text
+    return "-"
+
+
+def _order_list_style_values(order: Order, payload: Dict[str, Any]) -> Dict[str, str]:
+    dd = payload.get("dynamic_data") if isinstance(payload.get("dynamic_data"), dict) else {}
+    oi = payload.get("order_info") if isinstance(payload.get("order_info"), dict) else {}
+    sp = getattr(order, "salesperson", None)
+    manager = getattr(sp, "parent", None) if sp is not None else None
+    customer_group = getattr(order, "customer_group", None)
+    channel_group = getattr(order, "channel_group", None)
+    team_name = _display_text(
+        getattr(sp, "team_names", None)
+        or getattr(sp, "team_name", None)
+        or getattr(customer_group, "team_name", None)
+        or getattr(channel_group, "team_name", None)
+    )
+
+    return {
+        "订单号": _display_text(_safe_int(getattr(order, "id", 0), 0) or None),
+        "创建日期": _fmt_ymd(getattr(order, "created_at", None)),
+        "客户": _relation_text(customer_group, "customer_name"),
+        "渠道": _relation_text(channel_group, "channel_name"),
+        "市场": _relation_text(customer_group, "market"),
+        "业务员": _relation_text(sp, "real_name", "username"),
+        "车主": _display_text(dd.get("owner_name") or dd.get("id_name")),
+        "车牌": _display_text(dd.get("plate_no")),
+        "保险到期日": _fmt_ymd(oi.get("insurance_expire_date")),
+        "车架号": _display_text(dd.get("vin")),
+        "发动机号": _display_text(dd.get("engine_no")),
+        "车型": _display_text(dd.get("vehicle_model")),
+        "初登日期": _fmt_ymd(dd.get("first_register_date")),
+        "身份证号": _display_text(dd.get("id_number")),
+        "电话": _display_text(oi.get("owner_phone")),
+        "商业金额": _fmt_money_text(oi.get("commercial_amount")),
+        "交强金额": _fmt_money_text(oi.get("compulsory_amount")),
+        "车船税金额": _fmt_money_text(oi.get("vehicle_tax_amount")),
+        "非车金额": _fmt_money_text(oi.get("non_vehicle_amount")),
+        "保费金额": _fmt_money_text(oi.get("premium_total")),
+        "应收": _fmt_money_text(oi.get("channel_total")),
+        "应付": _fmt_money_text(oi.get("customer_total")),
+        "利润": _fmt_money_text(oi.get("profit")),
+        "所属经理": _relation_text(manager, "real_name", "username"),
+        "所属团队": team_name,
+        "是否完成": _yes_no(getattr(order, "is_finished", False)),
+        "是否回款": _yes_no(getattr(order, "is_paid", False)),
+        "是否返点": _yes_no(getattr(order, "is_rebate", False)),
+    }
+
+
+def _order_list_style_lines(order: Order, payload: Dict[str, Any]) -> List[str]:
+    values = _order_list_style_values(order, payload)
+    labels = (
+        "订单号",
+        "创建日期",
+        "客户",
+        "渠道",
+        "市场",
+        "业务员",
+        "车主",
+        "车牌",
+        "保险到期日",
+        "车架号",
+        "发动机号",
+        "车型",
+        "初登日期",
+        "身份证号",
+        "电话",
+        "商业金额",
+        "交强金额",
+        "车船税金额",
+        "非车金额",
+        "保费金额",
+        "应收",
+        "应付",
+        "利润",
+        "所属经理",
+        "所属团队",
+        "是否完成",
+        "是否回款",
+        "是否返点",
+    )
+    return ["订单查询结果：", *[f"{label}：{values.get(label) or '-'}" for label in labels]]
+
+
+def _order_multi_brief_values(order: Order, payload: Dict[str, Any]) -> Dict[str, str]:
+    values = _order_list_style_values(order, payload)
+    labels = (
+        "订单号",
+        "创建日期",
+        "客户",
+        "渠道",
+        "业务员",
+        "车主",
+        "车牌",
+        "车型",
+        "保费金额",
+        "应收",
+        "应付",
+        "利润",
+        "是否完成",
+        "是否回款",
+        "是否返点",
+    )
+    return {label: values.get(label) or "-" for label in labels}
+
+
+def _order_multi_summary_lines(
+        orders: List[Order],
+        *,
+        query_fields: List[str],
+        truncated: bool,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    shown = orders[:5]
+    total_text = f"{len(shown)}条" if not truncated else "超过5条"
+    if query_fields:
+        lines = [
+            f"找到{total_text}匹配订单，按最新订单优先展示前5条。",
+            "因为命中多条，我只列出你指定的字段，并保留订单号/车主/车牌方便区分：",
+        ]
+    else:
+        lines = [
+            f"找到{total_text}匹配订单，按最新订单优先展示前5条。",
+            "下面按订单列表常用字段做摘要。要看完整详情，请继续输入：查订单 订单号。",
+        ]
+
+    display_rows: List[Dict[str, Any]] = []
+    for idx, order in enumerate(shown, start=1):
+        payload = _order_payload_from_order(order)
+        brief = _order_multi_brief_values(order, payload)
+        display_rows.append(brief)
+
+        if query_fields:
+            fields = _order_field_lines(order, payload, query_fields) or ["未识别到可展示字段：-"]
+            lines.append(
+                f"{idx}. 订单 {brief.get('订单号', '-')} | 车主 {brief.get('车主', '-')} | 车牌 {brief.get('车牌', '-')}"
+            )
+            lines.append("   " + "；".join(fields))
+        else:
+            lines.extend(
+                [
+                    f"{idx}. 订单 {brief.get('订单号', '-')} | 创建 {brief.get('创建日期', '-')}",
+                    f"   客户/渠道/业务员：{brief.get('客户', '-')} / {brief.get('渠道', '-')} / {brief.get('业务员', '-')}",
+                    f"   车主/车牌/车型：{brief.get('车主', '-')} / {brief.get('车牌', '-')} / {brief.get('车型', '-')}",
+                    f"   金额：保费 {brief.get('保费金额', '-')}，应收 {brief.get('应收', '-')}，应付 {brief.get('应付', '-')}，利润 {brief.get('利润', '-')}",
+                    f"   状态：完成 {brief.get('是否完成', '-')}，回款 {brief.get('是否回款', '-')}，返点 {brief.get('是否返点', '-')}",
+                ]
+            )
+    if truncated:
+        lines.append("结果超过5条，建议补充车牌、手机号或订单号进一步缩小范围。")
+    return lines, display_rows
+
+
+def _order_field_lines(order: Order, payload: Dict[str, Any], query_fields: List[str]) -> List[str]:
+    if not query_fields:
+        return []
+    dd = payload.get("dynamic_data") if isinstance(payload.get("dynamic_data"), dict) else {}
+    oi = payload.get("order_info") if isinstance(payload.get("order_info"), dict) else {}
+    fr = payload.get("finance_record") if isinstance(payload.get("finance_record"), dict) else None
+    images = payload.get("images") if isinstance(payload.get("images"), dict) else {}
+    ocr = payload.get("ocr_summary") if isinstance(payload.get("ocr_summary"), dict) else {}
+    order_payload = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+
+    out: List[str] = []
+    seen = set()
+    for key in query_fields:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key == "owner_name":
+            out.append(f"车主：{dd.get('owner_name') or dd.get('id_name') or '-'}")
+        elif key == "plate_no":
+            out.append(f"车牌号：{dd.get('plate_no') or '-'}")
+        elif key == "owner_phone":
+            out.append(f"手机号：{oi.get('owner_phone') or '-'}")
+        elif key == "id_number":
+            out.append(f"身份证号：{dd.get('id_number') or '-'}")
+        elif key == "vin":
+            out.append(f"VIN/车架号：{dd.get('vin') or '-'}")
+        elif key == "engine_no":
+            out.append(f"发动机号：{dd.get('engine_no') or '-'}")
+        elif key == "vehicle_model":
+            out.append(f"车型：{dd.get('vehicle_model') or '-'}")
+        elif key == "first_register_date":
+            out.append(f"初登日期：{_fmt_ymd(dd.get('first_register_date'))}")
+        elif key == "insurance_expire_date":
+            out.append(f"保险到期日：{_fmt_ymd(oi.get('insurance_expire_date'))}")
+        elif key == "premium_total":
+            out.append(f"保费金额：{_fmt_money_text(oi.get('premium_total'))}")
+        elif key == "commercial_amount":
+            out.append(f"商业金额：{_fmt_money_text(oi.get('commercial_amount'))}")
+        elif key == "compulsory_amount":
+            out.append(f"交强金额：{_fmt_money_text(oi.get('compulsory_amount'))}")
+        elif key == "vehicle_tax_amount":
+            out.append(f"车船税金额：{_fmt_money_text(oi.get('vehicle_tax_amount'))}")
+        elif key == "non_vehicle_amount":
+            out.append(f"非车金额：{_fmt_money_text(oi.get('non_vehicle_amount'))}")
+        elif key == "profit":
+            out.append(f"利润：{_fmt_money_text(oi.get('profit'))}")
+        elif key == "channel_total":
+            out.append(f"应收：{_fmt_money_text(oi.get('channel_total'))}")
+        elif key == "customer_total":
+            out.append(f"应付：{_fmt_money_text(oi.get('customer_total'))}")
+        elif key == "remark":
+            out.append(f"备注：{oi.get('remark') or '-'}")
+        elif key == "finance_record":
+            out.append(f"财务记录：{_short_json(fr) if fr else '-'}")
+        elif key == "images":
+            ready = [f"{k}:{v.get('count')}" for k, v in images.items() if isinstance(v, dict) and v.get("count")]
+            out.append(f"图片卡槽：{', '.join(ready) if ready else '-'}")
+        elif key == "ocr_summary":
+            out.append(f"OCR状态：{_short_json(ocr)}")
+        elif key == "status":
+            out.append(
+                f"状态：完成={_yes_no(order_payload.get('is_finished'))}，回款={_yes_no(order_payload.get('is_paid'))}，返点={_yes_no(order_payload.get('is_rebate'))}"
+            )
+    return out
+
+
 async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     order_id = _safe_int(entities.get("order_id"), 0) or None
     plate_no = _to_str(entities.get("plate_no") or "").strip() or None
     owner_phone = _to_str(entities.get("owner_phone") or "").strip() or None
     owner_name = _to_str(entities.get("owner_name") or "").strip() or None
+    vin = _to_str(entities.get("vin") or "").strip() or None
+    engine_no = _to_str(entities.get("engine_no") or "").strip() or None
+    id_number = _to_str(entities.get("id_number") or "").strip() or None
+    query_fields = entities.get("query_fields") if isinstance(entities.get("query_fields"), list) else []
 
-    if not any([order_id, plate_no, owner_phone, owner_name]):
+    if not any([order_id, plate_no, owner_phone, owner_name, vin, engine_no, id_number]):
         return (
             "已识别为订单查询，但你还没给查询条件。请补充订单号、车牌或手机号，例如：查订单 10086 / 查订单 赣B12345 / 查订单 13800138000",
             {
@@ -986,9 +1886,19 @@ async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
-    order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
-    if not order:
+    orders = await _db_find_orders(
+        db,
+        order_id=order_id,
+        plate_no=plate_no,
+        owner_phone=owner_phone,
+        owner_name=owner_name,
+        vin=vin,
+        engine_no=engine_no,
+        id_number=id_number,
+        ctx=ctx,
+        limit=6,
+    )
+    if not orders:
         return (
             "没查到符合条件的订单。你可以换个条件再试试（订单号/车牌/手机号）。",
             {
@@ -1005,20 +1915,39 @@ async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
+    if len(orders) > 1:
+        truncated = len(orders) > 5
+        lines, display_rows = _order_multi_summary_lines(
+            orders,
+            query_fields=[_to_str(x) for x in query_fields],
+            truncated=truncated,
+        )
+        return (
+            "\n".join(lines),
+            {
+                "status": "success",
+                "intent": "query_order",
+                "trace_id": _new_id()[:16],
+                "data": _mk_data(
+                    result_status=RESULT_SUCCESS,
+                    message="订单查询命中多条结果",
+                    entities={**entities, "matched_count": len(orders), "truncated": truncated},
+                    payload={
+                        "multiple": True,
+                        "truncated": truncated,
+                        "display_rows": display_rows,
+                    },
+                ),
+                "actions": [_mk_action("请补充订单号查看完整详情"), _mk_action("查看当前材料状态")],
+            },
+        )
+
+    order = orders[0]
     payload = _order_payload_from_order(order)
     brief = _order_brief_from_order(order)
-
-    lines = [
-        f"订单查询结果：订单{brief.get('id') or '-'}",
-        f"车主：{brief.get('owner_name') or '-'}",
-        f"车牌：{brief.get('plate_no') or '-'}",
-        f"VIN：{brief.get('vin') or '-'}",
-        f"发动机号：{brief.get('engine_no') or '-'}",
-    ]
-    oi = (payload.get("order_info") or {}) if isinstance(payload.get("order_info"), dict) else {}
-    remark = _to_str(oi.get("remark") or "").strip()
-    if remark:
-        lines.append(f"备注：{remark}")
+    display = _order_list_style_values(order, payload)
+    field_lines = _order_field_lines(order, payload, [_to_str(x) for x in query_fields])
+    lines = field_lines if field_lines else _order_list_style_lines(order, payload)
 
     return (
         "\n".join(lines),
@@ -1030,7 +1959,10 @@ async def _reply_order(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
                 result_status=RESULT_SUCCESS,
                 message="订单查询成功",
                 entities={**entities, "order_id": brief.get("id")},
-                payload=payload,
+                payload={
+                    "multiple": False,
+                    "display": display if not field_lines else {line.split("：", 1)[0]: line.split("：", 1)[1] for line in field_lines if "：" in line},
+                },
             ),
             "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")],
         },
@@ -1059,7 +1991,8 @@ async def _reply_owner(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
-    order = await _db_find_order(db, order_id=None, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name)
+    order = await _db_find_order(db, order_id=None, plate_no=plate_no, owner_phone=owner_phone, owner_name=owner_name,
+                                 ctx=ctx)
     if not order:
         return (
             "没查到对应车主信息（可能条件不匹配或暂无订单）。你可以换车牌/手机号/姓名再试一次。",
@@ -1172,7 +2105,7 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
     owner_name = _to_str(ctx.get("owner_name") or entities.get("owner_name")).strip() or None
 
     order = await _db_find_order(db, order_id=order_id, plate_no=plate_no, owner_phone=owner_phone,
-                                 owner_name=owner_name)
+                                 owner_name=owner_name, ctx=ctx)
     if not order:
         return (
             f"已识别报价指令：{platform_name}报价，但当前未定位到订单。你可以先发：查订单123 / 查订单 赣B12345，再执行报价。",
@@ -1373,25 +2306,56 @@ def _fallback_reply() -> Tuple[str, Dict[str, Any]]:
 # =============================
 async def _dispatch_rule(text: str, ctx: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     intent, confidence, entities = _detect_intent(text)
+    quote_signal = detect_quote_signal(text)
+    if quote_signal.get("is_quote"):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.96)
+        signal_entities = quote_signal.get("entities")
+        if isinstance(signal_entities, dict):
+            entities.update(signal_entities)
 
     async for db in get_db():
         try:
-            if intent == "help":
+            if intent != "quote" and looks_like_sms_code(text) and await has_waiting_sms_task(db, ctx):
+                intent = "quote"
+                confidence = max(float(confidence or 0.0), 0.93)
+            if intent != "quote" and looks_like_sms_code(text) and await has_expired_waiting_sms_task(db, ctx):
+                intent = "quote"
+                confidence = max(float(confidence or 0.0), 0.91)
+            if intent != "quote" and re.fullmatch(r"\d{11}", _norm_text(text)) and await has_quote_case_waiting_for_login_phone(db, ctx):
+                intent = "quote_credential"
+                confidence = max(float(confidence or 0.0), 0.91)
+
+            image_result = None
+            has_context_images = bool(_collect_context_images(ctx))
+            should_collect_images = has_context_images and intent != "quote_credential" and not entities.get("platform_name")
+            if intent not in {"quote", "quote_credential"} or should_collect_images:
+                image_result = await handle_quote_images_message(db, ctx=ctx, entities=entities, text=text)
+
+            if image_result:
+                reply, meta = image_result
+            elif intent == "help":
                 reply, meta = _help_reply()
             elif intent == "query_material_status":
-                reply, meta = await _reply_material_status(db, ctx, entities)
+                quote_status = await handle_quote_material_status(db, ctx=ctx, entities=entities)
+                if quote_status:
+                    reply, meta = quote_status
+                else:
+                    reply, meta = await _reply_material_status(db, ctx, entities)
             elif intent == "query_ocr_task":
                 reply, meta = await _reply_ocr_task(db, ctx, entities)
             elif intent == "query_order":
                 reply, meta = await _reply_order(db, ctx, entities)
             elif intent == "query_owner":
                 reply, meta = await _reply_owner(db, ctx, entities)
+            elif intent == "quote_credential":
+                reply, meta = await handle_platform_credential_message(db, ctx=ctx, entities=entities, text=text)
             elif intent == "quote":
-                reply, meta = await _reply_quote(db, ctx, entities)
+                reply, meta = await handle_quote_message(db, ctx=ctx, entities=entities, text=text)
             else:
                 reply, meta = _fallback_reply()
 
-            meta["intent"] = intent
+            meta["intent"] = _to_str(meta.get("intent"), intent) or intent
             meta["confidence"] = float(confidence)
             data = meta.get("data")
             if isinstance(data, dict):
@@ -1399,8 +2363,9 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any]) -> Tuple[str, Dict[str,
             return reply, meta
 
         except Exception as e:
+            detail = _humanize_exception(e)
             return (
-                "这次处理没成功（系统繁忙）。请重试一次；如果还不行，先发“查看当前材料状态”。",
+                f"这次处理没成功：{detail}。\n请重试一次；如果还不行，先发“查看当前材料状态”。",
                 {
                     "status": "failed",
                     "intent": "system_error",
@@ -1408,9 +2373,9 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any]) -> Tuple[str, Dict[str,
                     "confidence": 0.0,
                     "data": _mk_data(
                         result_status=RESULT_FAILED,
-                        message="系统繁忙",
+                        message=f"处理失败：{detail}",
                         entities=entities,
-                        payload={"error": (_to_str(e) or "unknown")[:300]},
+                        payload={"error": detail},
                     ),
                     "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")],
                 },
@@ -1441,6 +2406,21 @@ def list_sessions(*, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]
 
 def delete_session(*, owner_user_id: str, session_id: str) -> bool:
     return _store.delete_session(owner_user_id=owner_user_id, session_id=session_id)
+
+
+def recall_session_images(
+        *,
+        owner_user_id: str,
+        session_id: str,
+        storage_keys: List[str],
+        message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return _store.recall_images(
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        storage_keys=storage_keys,
+        message_id=message_id,
+    )
 
 
 def get_session_messages(
@@ -1500,19 +2480,19 @@ async def send_message(
         owner_user_id=owner_user_id,
         session_id=real_session_id,
         role="user",
-        content=final_text,
+        content=redact_quote_sensitive_text(final_text),
         metadata={
             "status": "success",
             "intent": "user_input",
             "client_msg_id": client_msg_id,
-            "page_context": final_context,
+            "page_context": _safe_context_for_history(final_context),
             "use_stream": final_stream,
             "model": _to_str(model, default="rule-engine") or "rule-engine",
         },
     )
 
     # 给平台入口一个 session_id 也能用（不强绑）
-    if isinstance(final_context, dict) and "session_id" not in final_context:
+    if isinstance(final_context, dict):
         final_context["session_id"] = real_session_id
 
     reply_text, reply_meta = await _dispatch_rule(final_text, final_context)
@@ -1521,7 +2501,7 @@ async def send_message(
         owner_user_id=owner_user_id,
         session_id=real_session_id,
         role="assistant",
-        content=reply_text,
+        content=redact_quote_sensitive_text(reply_text),
         metadata=reply_meta,
     )
 
@@ -1550,6 +2530,7 @@ __all__ = [
     "create_session",
     "list_sessions",
     "delete_session",
+    "recall_session_images",
     "get_session_messages",
     "list_messages",
     "send_message",

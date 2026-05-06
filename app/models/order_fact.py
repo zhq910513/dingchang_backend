@@ -47,4 +47,8 @@ class OrderFact(Base):
         Index("ix_order_fact_vin", "vin"),
         Index("ix_order_fact_plate_no", "plate_no"),
         Index("ix_order_fact_id_number", "id_number"),
+        Index("ix_order_fact_list_first_register_date", "first_register_date"),
+        Index("ix_order_fact_list_owner_name", "owner_name"),
+        Index("ix_order_fact_list_engine_no", "engine_no"),
+        Index("ix_order_fact_list_vehicle_model", "vehicle_model"),
     )

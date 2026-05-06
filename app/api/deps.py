@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload
 
 from app.core.config import settings
 from app.core.constants import (
@@ -213,11 +214,26 @@ async def get_current_session(
         )
 
     stmt = (
-        select(UserSession)
+        select(UserSession, User, Role.role_name)
+        .select_from(UserSession)
+        .join(User, User.id == UserSession.user_id)
+        .outerjoin(UserRole, UserRole.user_id == User.id)
+        .outerjoin(Role, Role.id == UserRole.role_id)
+        .options(lazyload("*"))
         .where(UserSession.session_token == token)
-        .limit(1)
+        .order_by(Role.id.asc())
     )
-    sess = (await db.execute(stmt)).scalars().first()
+    rows = (await db.execute(stmt)).all()
+    sess = rows[0][0] if rows else None
+    if sess is not None:
+        user = rows[0][1]
+        role_names = tuple(
+            str(role_name or "").strip()
+            for _, _, role_name in rows
+            if str(role_name or "").strip()
+        )
+        setattr(sess, "_auth_user", user)
+        setattr(user, "_auth_role_names", role_names)
 
     if not sess or int(getattr(sess, "expired", 0) or 0) == 1:
         await _delete_redis_session_cache(token)
@@ -292,7 +308,16 @@ async def get_current_user(
             detail="Invalid session user_id",
         )
 
-    user = (await db.execute(select(User).where(User.id == uid).limit(1))).scalars().first()
+    user = getattr(sess, "_auth_user", None)
+    if not isinstance(user, User):
+        user = (
+            await db.execute(
+                select(User)
+                .options(lazyload("*"))
+                .where(User.id == uid)
+                .limit(1)
+            )
+        ).scalars().first()
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -312,14 +337,22 @@ async def get_current_user_context(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUserContext:
-    stmt = (
-        select(Role.id, Role.role_name)
-        .join(UserRole, UserRole.role_id == Role.id)
-        .where(UserRole.user_id == user.id)
-        .order_by(Role.id.asc())
-    )
-    rows = (await db.execute(stmt)).all()
-    role_names = tuple([role_name for _, role_name in rows if role_name])
+    cached_role_names = getattr(user, "_auth_role_names", None)
+    if cached_role_names is not None:
+        role_names = tuple(
+            str(role_name or "").strip()
+            for role_name in cached_role_names
+            if str(role_name or "").strip()
+        )
+    else:
+        stmt = (
+            select(Role.id, Role.role_name)
+            .join(UserRole, UserRole.role_id == Role.id)
+            .where(UserRole.user_id == user.id)
+            .order_by(Role.id.asc())
+        )
+        rows = (await db.execute(stmt)).all()
+        role_names = tuple([role_name for _, role_name in rows if role_name])
 
     primary_role = _pick_primary_role(role_names)
     team_ids, team_names = _extract_teams_from_user(user)

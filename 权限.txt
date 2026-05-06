@@ -86,3 +86,16 @@ MARKET（市场，单团队，只读）
 SALES（销售）
     权限结论
         禁止访问 finance 域：任何 /finance/* 直接 403（Sales has no permission to access finance）
+
+
+
+cd /data/backend/dingchang_backend
+git pull
+
+cd /data/compose/dingchang
+docker compose up -d --no-deps --build backend
+docker logs -n 200 dingchang_backend
+
+
+cd /data/frontend/dingchang_frontend/
+git pull

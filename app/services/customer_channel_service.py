@@ -7,11 +7,10 @@ from datetime import datetime
 from typing import Any, Dict, Mapping, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import HTTPException
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm import aliased, lazyload, selectinload
 from sqlalchemy.sql.expression import false as sql_false
 
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
@@ -32,6 +31,7 @@ _CHANNEL_GROUP_LIST_ALLOWED_ROLES = {
 @dataclass(frozen=True)
 class ChannelGroupAclBundle:
     role_name: str
+    current_user_id: int
     can_list_view: bool
     can_create: bool
     can_update: bool
@@ -39,14 +39,20 @@ class ChannelGroupAclBundle:
     can_view_deleted: bool
 
 
-def compile_channel_group_acl_bundle(*, role_name: Optional[str]) -> ChannelGroupAclBundle:
+def compile_channel_group_acl_bundle(
+    *,
+    role_name: Optional[str],
+    current_user_id: Optional[int] = None,
+) -> ChannelGroupAclBundle:
     normalized_role_name = str(role_name or "").strip()
+    global_write_roles = (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET)
     return ChannelGroupAclBundle(
         role_name=normalized_role_name,
+        current_user_id=int(current_user_id or 0),
         can_list_view=normalized_role_name in _CHANNEL_GROUP_LIST_ALLOWED_ROLES,
-        can_create=normalized_role_name != ROLE_FINANCE,
-        can_update=normalized_role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET),
-        can_delete=normalized_role_name != ROLE_FINANCE,
+        can_create=normalized_role_name in (*global_write_roles, ROLE_SALES),
+        can_update=normalized_role_name in global_write_roles,
+        can_delete=normalized_role_name in global_write_roles,
         can_view_deleted=normalized_role_name == ROLE_SUPER_ADMIN,
     )
 
@@ -64,9 +70,11 @@ def build_channel_group_row_capabilities(
     row: Mapping[str, Any],
 ) -> Dict[str, bool]:
     is_deleted = int(row.get("is_deleted", 0) or 0) == 1
+    created_by = int(row.get("created_by") or 0)
+    is_sales_owner = acl_bundle.role_name == ROLE_SALES and created_by == acl_bundle.current_user_id
     return {
-        "channel.update": bool(acl_bundle.can_update and not is_deleted),
-        "channel.delete": bool(acl_bundle.can_delete and not is_deleted),
+        "channel.update": bool((acl_bundle.can_update or is_sales_owner) and not is_deleted),
+        "channel.delete": bool((acl_bundle.can_delete or is_sales_owner) and not is_deleted),
     }
 
 
@@ -88,6 +96,7 @@ _CUSTOMER_GROUP_LIST_ALLOWED_ROLES = {
 @dataclass(frozen=True)
 class CustomerGroupAclBundle:
     role_name: str
+    current_user_id: int
     can_list_view: bool
     can_create: bool
     can_update: bool
@@ -95,14 +104,20 @@ class CustomerGroupAclBundle:
     can_view_deleted: bool
 
 
-def compile_customer_group_acl_bundle(*, role_name: Optional[str]) -> CustomerGroupAclBundle:
+def compile_customer_group_acl_bundle(
+    *,
+    role_name: Optional[str],
+    current_user_id: Optional[int] = None,
+) -> CustomerGroupAclBundle:
     normalized_role_name = str(role_name or "").strip()
+    global_write_roles = (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET)
     return CustomerGroupAclBundle(
         role_name=normalized_role_name,
+        current_user_id=int(current_user_id or 0),
         can_list_view=normalized_role_name in _CUSTOMER_GROUP_LIST_ALLOWED_ROLES,
-        can_create=normalized_role_name != ROLE_FINANCE,
-        can_update=normalized_role_name in (ROLE_MANAGER, ROLE_SUPER_ADMIN, ROLE_MARKET),
-        can_delete=normalized_role_name != ROLE_FINANCE,
+        can_create=normalized_role_name in (*global_write_roles, ROLE_SALES),
+        can_update=normalized_role_name in global_write_roles,
+        can_delete=normalized_role_name in global_write_roles,
         can_view_deleted=normalized_role_name == ROLE_SUPER_ADMIN,
     )
 
@@ -120,9 +135,11 @@ def build_customer_group_row_capabilities(
     row: Mapping[str, Any],
 ) -> Dict[str, bool]:
     is_deleted = int(row.get("is_deleted", 0) or 0) == 1
+    created_by = int(row.get("created_by") or 0)
+    is_sales_owner = acl_bundle.role_name == ROLE_SALES and created_by == acl_bundle.current_user_id
     return {
-        "customer.update": bool(acl_bundle.can_update and not is_deleted),
-        "customer.delete": bool(acl_bundle.can_delete and not is_deleted),
+        "customer.update": bool((acl_bundle.can_update or is_sales_owner) and not is_deleted),
+        "customer.delete": bool((acl_bundle.can_delete or is_sales_owner) and not is_deleted),
     }
 
 
@@ -293,6 +310,7 @@ async def list_customer_groups_manage(
     *,
     db: AsyncSession,
     role_name: Optional[str] = None,
+    current_user_id: Optional[int] = None,
     customer_code: Optional[str] = None,
     customer_name: Optional[str] = None,
     market: Optional[str] = None,
@@ -302,7 +320,10 @@ async def list_customer_groups_manage(
     page: int = 1,
     page_size: int = 20,
 ) -> Dict[str, Any]:
-    acl_bundle = compile_customer_group_acl_bundle(role_name=role_name)
+    acl_bundle = compile_customer_group_acl_bundle(
+        role_name=role_name,
+        current_user_id=current_user_id,
+    )
     page = _normalize_page(page)
     page_size = _normalize_page_size(page_size)
     offset = (page - 1) * page_size
@@ -410,6 +431,7 @@ async def list_channel_groups_manage(
     *,
     db: AsyncSession,
     role_name: Optional[str],
+    current_user_id: Optional[int] = None,
     channel_code: Optional[str] = None,
     channel_name: Optional[str] = None,
     region: Optional[str] = None,
@@ -422,9 +444,12 @@ async def list_channel_groups_manage(
     page_size = _normalize_page_size(page_size)
     offset = (page - 1) * page_size
 
-    acl_bundle = compile_channel_group_acl_bundle(role_name=role_name)
+    acl_bundle = compile_channel_group_acl_bundle(
+        role_name=role_name,
+        current_user_id=current_user_id,
+    )
     if not acl_bundle.can_list_view:
-        raise HTTPException(status_code=403, detail="无权限查看渠道列表")
+        raise PermissionError("无权限查看渠道列表")
 
     creator = aliased(User)
     created_name_expr = _display_name_expr(creator)
@@ -529,11 +554,16 @@ async def get_customer_group_by_id(
 ) -> Optional[CustomerGroup]:
     gid = int(group_id)
     if not with_creator:
-        return await db.get(CustomerGroup, gid)
+        stmt = (
+            select(CustomerGroup)
+            .options(lazyload("*"))
+            .where(CustomerGroup.id == gid)
+        )
+        return (await db.execute(stmt)).scalar_one_or_none()
 
     stmt = (
         select(CustomerGroup)
-        .options(selectinload(CustomerGroup.creator))
+        .options(lazyload("*"), selectinload(CustomerGroup.creator))
         .where(CustomerGroup.id == gid)
     )
     return (await db.execute(stmt)).scalar_one_or_none()
@@ -547,11 +577,16 @@ async def get_channel_group_by_id(
 ) -> Optional[ChannelGroup]:
     gid = int(group_id)
     if not with_creator:
-        return await db.get(ChannelGroup, gid)
+        stmt = (
+            select(ChannelGroup)
+            .options(lazyload("*"))
+            .where(ChannelGroup.id == gid)
+        )
+        return (await db.execute(stmt)).scalar_one_or_none()
 
     stmt = (
         select(ChannelGroup)
-        .options(selectinload(ChannelGroup.creator))
+        .options(lazyload("*"), selectinload(ChannelGroup.creator))
         .where(ChannelGroup.id == gid)
     )
     return (await db.execute(stmt)).scalar_one_or_none()

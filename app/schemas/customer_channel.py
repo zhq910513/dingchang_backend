@@ -181,7 +181,7 @@ class ContactItemIn(BaseModel):
             raise ValueError("联系方式不能为空")
         return s
 
-    @root_validator
+    @root_validator(skip_on_failure=True)
     def validate_pair(cls, values):
         contact_type = values.get("type")
         value = values.get("value")

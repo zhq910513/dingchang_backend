@@ -1,16 +1,20 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+
+# Local command notes / generated tree snapshots
 cmd.txt
 tree-src.txt
 
 # IDE
 .idea/
+.vscode/
 
-# Logs
-logs/*.log
+# Runtime logs, reports, and local dumps
+logs/
 
-# Env
+# Local runtime state and secrets
+storage/
 .env
+.env.*

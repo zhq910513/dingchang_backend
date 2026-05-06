@@ -9,6 +9,7 @@ from sqlalchemy import and_, or_, false as sql_false, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import (
+    ROLE_ALL,
     ROLE_FINANCE,
     ROLE_MANAGER,
     ROLE_MARKET,
@@ -109,14 +110,11 @@ def require_ai_assistant_access(
         *,
         role_name: Optional[str],
 ) -> None:
-    """
-    报价助手统一访问权限（当前阶段收口策略）：
-    - 仅超级管理员可访问（试用/灰度阶段）
-    """
+    """报价助手统一访问权限：允许系统已知角色进入，数据读取继续按各业务域 ACL 收口。"""
     rn = (role_name or "").strip()
-    if rn == ROLE_SUPER_ADMIN:
+    if rn in ROLE_ALL:
         return
-    raise HTTPException(status_code=403, detail="报价助手当前仅超级管理员可用")
+    raise HTTPException(status_code=403, detail="No permission")
 
 
 def require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:

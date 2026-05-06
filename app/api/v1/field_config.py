@@ -11,23 +11,30 @@
 - deps 统一返回 CurrentUserContext（不再解包 tuple）
 - API 不自定义入参模型（schemas 约束 API）
 - upsert 必须显式携带 module（FieldConfig.module NOT NULL 且唯一键依赖 module）
+
+性能收敛（2026-03-23）：
+- /form-config 增加进程内只读缓存，按 (module, role_name) 维度缓存
+- upsert 成功后失效对应 module 的缓存，避免返回旧配置
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import copy
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload
 
 from app.api.deps import CurrentUserContext, get_current_user_with_role
-from app.core.constants import ROLE_SUPER_ADMIN, ROLE_MANAGER
+from app.core.constants import ROLE_MANAGER, ROLE_SUPER_ADMIN
 from app.core.db import get_db
 from app.models.field_config import FieldConfig, FieldGroup, FieldGroupField
 from app.schemas.field_config import (
-    FieldConfigOut,
     FieldConfigListOut,
+    FieldConfigOut,
     FieldConfigUpsertIn,
     FieldFormItemOut,
     FieldGroupConfigOut,
@@ -38,6 +45,9 @@ from app.services.field_config_service import (
 )
 
 router = APIRouter(prefix="/field-config", tags=["field-config"])
+
+_FORM_CONFIG_CACHE_TTL_SECONDS = 300
+_FORM_CONFIG_CACHE: Dict[Tuple[str, str], Tuple[float, List[FieldGroupConfigOut]]] = {}
 
 
 def _as_bool(v: Any, default: bool = False) -> bool:
@@ -87,10 +97,65 @@ def _is_editable_for_role(
     return role_name in roles
 
 
+def _cache_key(module_name: str, role_name: str) -> Tuple[str, str]:
+    return (str(module_name or "").strip(), str(role_name or "").strip())
+
+
+def _copy_group_config_list(
+        items: List[FieldGroupConfigOut],
+) -> List[FieldGroupConfigOut]:
+    return copy.deepcopy(items)
+
+
+def _get_cached_form_config(
+        *,
+        module_name: str,
+        role_name: str,
+) -> Optional[List[FieldGroupConfigOut]]:
+    key = _cache_key(module_name, role_name)
+    cached = _FORM_CONFIG_CACHE.get(key)
+    if cached is None:
+        return None
+
+    expires_at, payload = cached
+    now_ts = time.monotonic()
+    if now_ts >= expires_at:
+        _FORM_CONFIG_CACHE.pop(key, None)
+        return None
+
+    return _copy_group_config_list(payload)
+
+
+def _set_cached_form_config(
+        *,
+        module_name: str,
+        role_name: str,
+        payload: List[FieldGroupConfigOut],
+) -> None:
+    key = _cache_key(module_name, role_name)
+    expires_at = time.monotonic() + float(_FORM_CONFIG_CACHE_TTL_SECONDS)
+    _FORM_CONFIG_CACHE[key] = (expires_at, _copy_group_config_list(payload))
+
+
+def _invalidate_form_config_cache_for_module(module_name: str) -> None:
+    normalized_module = str(module_name or "").strip()
+    stale_keys = [
+        key for key in _FORM_CONFIG_CACHE.keys()
+        if key[0] == normalized_module
+    ]
+    for key in stale_keys:
+        _FORM_CONFIG_CACHE.pop(key, None)
+
+
 @router.get("", response_model=FieldConfigListOut)
 async def list_configs(
         db: AsyncSession = Depends(get_db),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ):
+    role = ctx.primary_role or ""
+    if role not in {ROLE_SUPER_ADMIN, ROLE_MANAGER}:
+        raise HTTPException(status_code=403, detail="无权限")
+
     rows = await _list_field_configs(db=db)
     items = [FieldConfigOut.from_orm(r) for r in rows]
     return FieldConfigListOut(items=items)
@@ -102,31 +167,55 @@ async def get_form_config(
         db: AsyncSession = Depends(get_db),
         ctx: CurrentUserContext = Depends(get_current_user_with_role),
 ) -> List[FieldGroupConfigOut]:
-    role_name = ctx.primary_role or ""
+    role_name = str(ctx.primary_role or "").strip()
     module_name = str(module or "").strip() or "order"
+
+    cached = _get_cached_form_config(
+        module_name=module_name,
+        role_name=role_name,
+    )
+    if cached is not None:
+        return cached
 
     stmt_group = (
         select(FieldGroup)
+        .options(lazyload("*"))
         .where(FieldGroup.module == module_name)
         .order_by(FieldGroup.order_index.asc(), FieldGroup.id.asc())
     )
     groups = (await db.execute(stmt_group)).scalars().all()
     if not groups:
+        _set_cached_form_config(
+            module_name=module_name,
+            role_name=role_name,
+            payload=[],
+        )
         return []
 
     group_ids = [int(g.id) for g in groups]
     stmt_map = (
         select(FieldGroupField)
+        .options(lazyload("*"))
         .where(FieldGroupField.group_id.in_(group_ids))
-        .order_by(FieldGroupField.group_id.asc(), FieldGroupField.order_index.asc(), FieldGroupField.id.asc())
+        .order_by(
+            FieldGroupField.group_id.asc(),
+            FieldGroupField.order_index.asc(),
+            FieldGroupField.id.asc(),
+        )
     )
     mappings = (await db.execute(stmt_map)).scalars().all()
     if not mappings:
+        _set_cached_form_config(
+            module_name=module_name,
+            role_name=role_name,
+            payload=[],
+        )
         return []
 
     field_ids = list({int(m.field_id) for m in mappings})
     stmt_field = (
         select(FieldConfig)
+        .options(lazyload("*"))
         .where(
             FieldConfig.module == module_name,
             FieldConfig.id.in_(field_ids),
@@ -136,58 +225,63 @@ async def get_form_config(
     fields = (await db.execute(stmt_field)).scalars().all()
     field_map = {int(f.id): f for f in fields}
 
-    mappings_by_group: dict[int, list[FieldGroupField]] = {}
-    for m in mappings:
-        gid = int(m.group_id)
-        mappings_by_group.setdefault(gid, []).append(m)
+    mappings_by_group: Dict[int, List[FieldGroupField]] = {}
+    for mapping in mappings:
+        group_id = int(mapping.group_id)
+        mappings_by_group.setdefault(group_id, []).append(mapping)
 
     out: List[FieldGroupConfigOut] = []
 
-    for g in groups:
+    for group in groups:
         field_items: List[FieldFormItemOut] = []
 
-        for m in mappings_by_group.get(int(g.id), []):
-            f = field_map.get(int(m.field_id))
-            if not f:
+        for mapping in mappings_by_group.get(int(group.id), []):
+            field = field_map.get(int(mapping.field_id))
+            if not field:
                 continue
 
             visible = _is_visible_for_role(
-                view_roles=getattr(f, "view_roles", None),
+                view_roles=getattr(field, "view_roles", None),
                 role_name=role_name,
-                default_visible=_as_bool(getattr(f, "visible", 1), True),
+                default_visible=_as_bool(getattr(field, "visible", 1), True),
             )
             if not visible:
                 continue
 
             editable = _is_editable_for_role(
-                edit_roles=getattr(f, "edit_roles", None),
+                edit_roles=getattr(field, "edit_roles", None),
                 role_name=role_name,
-                default_editable=_as_bool(getattr(f, "editable", 1), True),
+                default_editable=_as_bool(getattr(field, "editable", 1), True),
             )
 
             field_items.append(
                 FieldFormItemOut(
-                    field_name=str(getattr(f, "field_name", "") or "").strip(),
-                    label=str(getattr(f, "label", "") or "").strip(),
-                    type=str(getattr(f, "type", "") or "text").strip(),
-                    required=_as_bool(getattr(f, "required", 0), False),
+                    field_name=str(getattr(field, "field_name", "") or "").strip(),
+                    label=str(getattr(field, "label", "") or "").strip(),
+                    type=str(getattr(field, "type", "") or "text").strip(),
+                    required=_as_bool(getattr(field, "required", 0), False),
                     visible=True,
                     editable=editable,
-                    sort=int(getattr(f, "sort", 0) or 0),
-                    options=getattr(f, "options", None),
-                    validators=getattr(f, "validators", None),
-                    extra=getattr(f, "extra", None),
+                    sort=int(getattr(field, "sort", 0) or 0),
+                    options=getattr(field, "options", None),
+                    validators=getattr(field, "validators", None),
+                    extra=getattr(field, "extra", None),
                 )
             )
 
         out.append(
             FieldGroupConfigOut(
-                group_key=str(getattr(g, "group_key", "") or "").strip(),
-                group_name=str(getattr(g, "group_name", "") or "").strip(),
+                group_key=str(getattr(group, "group_key", "") or "").strip(),
+                group_name=str(getattr(group, "group_name", "") or "").strip(),
                 fields=field_items,
             )
         )
 
+    _set_cached_form_config(
+        module_name=module_name,
+        role_name=role_name,
+        payload=out,
+    )
     return out
 
 
@@ -203,20 +297,27 @@ async def upsert(
     if role not in {ROLE_SUPER_ADMIN, ROLE_MANAGER}:
         raise HTTPException(status_code=403, detail="无权限")
 
-    row = await _upsert_field_config(
-        db=db,
-        module=str(module).strip(),
-        field_name=str(field_name).strip(),
-        label=data.label,
-        type=data.type,
-        options=data.options,
-        validators=data.validators,
-        extra=data.extra,
-        required=data.required,
-        visible=data.visible,
-        editable=data.editable,
-        sort=data.sort,
-        view_roles=data.view_roles,
-        edit_roles=data.edit_roles,
-    )
+    normalized_module = str(module).strip()
+
+    try:
+        row = await _upsert_field_config(
+            db=db,
+            module=normalized_module,
+            field_name=str(field_name).strip(),
+            label=data.label,
+            type=data.type,
+            options=data.options,
+            validators=data.validators,
+            extra=data.extra,
+            required=data.required,
+            visible=data.visible,
+            editable=data.editable,
+            sort=data.sort,
+            view_roles=data.view_roles,
+            edit_roles=data.edit_roles,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "字段配置保存失败") from exc
+
+    _invalidate_form_config_cache_for_module(normalized_module)
     return FieldConfigOut.from_orm(row)

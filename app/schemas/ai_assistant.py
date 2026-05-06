@@ -7,20 +7,35 @@ from typing import Any, Dict, List, Optional
 
 
 class AiChatIn(BaseModel):
-    message: str
-    order_id: Optional[int] = None
+    session_id: Optional[str] = Field(default=None, max_length=128)
+    message: str = Field(..., min_length=1, max_length=2000)
+    order_id: Optional[int] = Field(default=None, ge=1)
     images: List[Dict[str, Any]] = Field(default_factory=list)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    stream: bool = False
 
 
 class AiChatOut(BaseModel):
     reply: str
     ok: bool = True
+    session_id: Optional[str] = None
+    intent: Optional[str] = None
+    trace_id: Optional[str] = None
+    confidence: float = 0.0
+    actions: List[Dict[str, Any]] = Field(default_factory=list)
+    usage: Optional[Dict[str, Any]] = None
+    model: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
 
 class AiSessionItem(BaseModel):
     session_id: str
     title: str = ""
+    created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    last_message_preview: str = ""
+    message_count: int = 0
 
 
 class AiSessionListOut(BaseModel):
@@ -34,10 +49,21 @@ class AiSessionListOut(BaseModel):
 
 class AiCreateSessionIn(BaseModel):
     """创建会话入参（冻结契约）"""
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=100)
 
 
 class AiDeleteSessionOut(BaseModel):
     """删除会话出参（冻结契约）"""
     ok: bool = True
     session_id: str
+
+
+class AiPlatformAccountBindIn(BaseModel):
+    platform_code: str = Field(..., min_length=1, max_length=32)
+    platform_name: Optional[str] = Field(default=None, max_length=64)
+    values: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AiRecallSessionImageIn(BaseModel):
+    storage_keys: List[str] = Field(default_factory=list)
+    message_id: Optional[str] = Field(default=None, max_length=128)

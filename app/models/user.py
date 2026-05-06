@@ -101,4 +101,5 @@ class User(Base):
         Index("ix_user_parent_status", "parent_id", "status"),
         Index("ix_user_team_name", "team_name"),
         Index("ix_user_team_status", "team_name", "status"),
+        Index("ix_user_list_parent_updated_id", "parent_id", "updated_at", "id"),
     )

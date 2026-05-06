@@ -398,14 +398,14 @@ class StorageService:
             *,
             signed: Optional[bool] = None,
             expires_in: int = 900,
-            allow_fallback_public: bool = True,
+            allow_fallback_public: bool = False,
     ) -> str:
         """
         返回“用于展示/接口返回”的 URL：
         - signed=None：跟随 settings.BOS_SIGNED_GET_URL（支持 .env）
         - signed=True：返回签名 URL
-            * allow_fallback_public=True  -> 签名失败时降级直链
-            * allow_fallback_public=False -> 签名失败直接抛错（给 OCR 严格使用）
+            * allow_fallback_public=True  -> 签名失败时降级直链（仅显式兼容历史场景）
+            * allow_fallback_public=False -> 签名失败直接抛错，避免敏感图片回退公开直链
         - signed=False：返回直链
         """
         if signed is None:

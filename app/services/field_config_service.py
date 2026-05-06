@@ -18,7 +18,9 @@ from typing import List, Optional, Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload
 
+from app.core.constants import ROLE_ALL
 from app.models.field_config import FieldConfig
 
 _BJ = ZoneInfo("Asia/Shanghai")
@@ -32,13 +34,32 @@ def _b2i(v: Any) -> int:
     return 1 if bool(v) else 0
 
 
+def _normalize_roles(v: Any) -> Optional[list[str]]:
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise ValueError("roles must be a list or null")
+
+    allowed_roles = set(ROLE_ALL)
+    out: list[str] = []
+    for item in v:
+        role_name = str(item or "").strip().lower()
+        if not role_name:
+            continue
+        if role_name not in allowed_roles:
+            raise ValueError(f"unknown role: {role_name}")
+        if role_name not in out:
+            out.append(role_name)
+    return out
+
+
 async def list_field_configs(*, db: AsyncSession, module: Optional[str] = None) -> List[FieldConfig]:
     """
     列表查询（零旧字段口径）：
     - 不做 is_deleted 过滤（模型无该字段）
     - 可选按 module 过滤
     """
-    q = select(FieldConfig)
+    q = select(FieldConfig).options(lazyload("*"))
     if module is not None:
         mod = str(module).strip()
         q = q.where(FieldConfig.module == mod)
@@ -76,12 +97,16 @@ async def upsert_field_config(
         raise ValueError("module is required")
     if not fname:
         raise ValueError("field_name is required")
+    normalized_view_roles = _normalize_roles(view_roles)
+    normalized_edit_roles = _normalize_roles(edit_roles)
 
     now = _now_bj_naive()
 
     row = (
         await db.execute(
-            select(FieldConfig).where(FieldConfig.module == mod, FieldConfig.field_name == fname)
+            select(FieldConfig)
+            .options(lazyload("*"))
+            .where(FieldConfig.module == mod, FieldConfig.field_name == fname)
         )
     ).scalars().first()
 
@@ -98,8 +123,8 @@ async def upsert_field_config(
             visible=_b2i(visible),
             editable=_b2i(editable),
             sort=int(sort or 0),
-            view_roles=view_roles,
-            edit_roles=edit_roles,
+            view_roles=normalized_view_roles,
+            edit_roles=normalized_edit_roles,
             created_at=now,
             updated_at=now,
         )
@@ -114,11 +139,10 @@ async def upsert_field_config(
         row.visible = _b2i(visible)
         row.editable = _b2i(editable)
         row.sort = int(sort or 0)
-        row.view_roles = view_roles
-        row.edit_roles = edit_roles
+        row.view_roles = normalized_view_roles
+        row.edit_roles = normalized_edit_roles
         row.updated_at = now
 
     await db.commit()
     await db.refresh(row)
     return row
-

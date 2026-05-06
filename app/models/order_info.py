@@ -168,4 +168,5 @@ class OrderInfo(Base):
     __table_args__ = (
         UniqueConstraint("order_id", name="order_id"),
         Index("ix_order_info_insurance_expire_date", "insurance_expire_date"),
+        Index("ix_order_info_insurance_expire_order_id", "insurance_expire_date", "order_id"),
     )

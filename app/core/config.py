@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     BOS_ENDPOINT_HOST_OVERRIDE: Optional[str] = Field(default=None)
     BOS_BASE_URL_OVERRIDE: Optional[str] = Field(default=None)
 
-    BOS_SIGNED_GET_URL: bool = Field(default=False)
+    BOS_SIGNED_GET_URL: bool = Field(default=True)
 
     BOS_STS_ACCOUNT_ID: Optional[str] = Field(default=None)
     BOS_STS_ROLE_NAME: str = Field(default="bos_uploader")
@@ -220,12 +220,13 @@ class Settings(BaseSettings):
         return Path(self.LOG_DIR).expanduser().resolve()
 
     if PYDANTIC_V2:
-        model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+        model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
     else:
 
         class Config:
             env_file = ".env"
             case_sensitive = True
+            extra = "ignore"
 
 
 settings = Settings()

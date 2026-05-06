@@ -61,6 +61,7 @@ class CustomerGroup(Base):
         Index("created_by", "created_by"),
         Index("ix_customer_group_customer_code", "customer_code"),
         Index("ix_customer_group_customer_name", "customer_name"),
+        Index("ix_customer_group_list_is_deleted_updated_id", "is_deleted", "updated_at", "id"),
         Index("ix_customer_group_is_deleted_team_name_code", "is_deleted", "team_name", "customer_code"),
         Index("ix_customer_group_is_deleted_team_name_name", "is_deleted", "team_name", "customer_name"),
     )
