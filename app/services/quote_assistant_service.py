@@ -40,10 +40,18 @@ RESULT_NEED_MORE = "need_more_info"
 RESULT_NOT_READY = "not_ready"
 RESULT_FAILED = "failed"
 
-ACTIVE_CASE_STATUSES = ("collecting", "ready", "waiting_sms", "failed")
+ACTIVE_CASE_STATUSES = ("collecting", "ready", "waiting_sms", "failed", "quoted")
 ACTIVE_IMAGE_STATUS = "active"
 SINGLE_REQUIRED_SLOTS = ("vehicle_cert", "idcard_front", "driving_license_main")
 QUOTE_IMAGE_OCR_CLASSIFY_ENABLED = os.getenv("QUOTE_IMAGE_OCR_CLASSIFY_ENABLED", "1") == "1"
+try:
+    QUOTE_IMAGE_OCR_CALL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("QUOTE_IMAGE_OCR_CALL_TIMEOUT_SECONDS", "2.5") or "2.5"))
+except Exception:
+    QUOTE_IMAGE_OCR_CALL_TIMEOUT_SECONDS = 2.5
+try:
+    QUOTE_IMAGE_OCR_TOTAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("QUOTE_IMAGE_OCR_TOTAL_TIMEOUT_SECONDS", "4") or "4"))
+except Exception:
+    QUOTE_IMAGE_OCR_TOTAL_TIMEOUT_SECONDS = 4.0
 try:
     QUOTE_SMS_CODE_TTL_SECONDS = max(60, int(os.getenv("QUOTE_SMS_CODE_TTL_SECONDS", "600") or "600"))
 except Exception:
@@ -263,7 +271,7 @@ def _clean_secret_value(value: Any, max_len: int = 256) -> str:
 
 
 def _extract_labeled_value(text: str, labels: Tuple[str, ...], *, max_len: int = 128) -> Optional[str]:
-    label_expr = "|".join(re.escape(x) for x in labels if x)
+    label_expr = "|".join(re.escape(x) for x in sorted(labels, key=len, reverse=True) if x)
     if not label_expr:
         return None
     pattern = rf"(?:{label_expr})\s*[:：=]?\s*([^\s,，;；。]+)"
@@ -305,6 +313,15 @@ _OWNER_PHONE_HINTS = (
     "联系电话",
 )
 
+_OWNER_NAME_HINTS = (
+    "被保险人姓名",
+    "投保人姓名",
+    "联系人姓名",
+    "车主姓名",
+    "车主名称",
+    "姓名",
+)
+
 
 def _has_login_phone_hint(text: str) -> bool:
     low = text.lower()
@@ -313,16 +330,24 @@ def _has_login_phone_hint(text: str) -> bool:
     )
 
 
-def redact_quote_sensitive_text(text: Any) -> str:
-    """Return chat-display/audit-safe text without leaking platform passwords."""
+def redact_quote_sensitive_text(text: Any, *, hide_unlabeled_sms_code: bool = False) -> str:
+    """Return chat-display/audit-safe text without leaking quote credentials."""
 
     raw = _to_str(text)
     if not raw:
         return ""
 
     out = raw
+    if hide_unlabeled_sms_code and re.fullmatch(r"\s*\d{4,8}\s*", out):
+        return "[短信验证码已隐藏]"
     out = re.sub(
         r"((?:登录密码|登陆密码|平台密码|密码|口令|password|pwd)\s*[:：=]?\s*)([^\s,，;；。]+)",
+        lambda m: m.group(1) + "[已隐藏]",
+        out,
+        flags=re.IGNORECASE,
+    )
+    out = re.sub(
+        r"((?:短信验证码|验证码|校验码|code)\s*[:：=]?\s*)(\d{4,8})",
         lambda m: m.group(1) + "[已隐藏]",
         out,
         flags=re.IGNORECASE,
@@ -363,6 +388,7 @@ def _redact_platform_credentials_for_signal(text: Any) -> str:
 def _extract_platform_credentials(text: Any, *, allow_loose_phone: bool = False) -> Dict[str, str]:
     t = _norm_text(text)
     low = t.lower()
+    has_owner_phone_hint = any(h in t for h in _OWNER_PHONE_HINTS)
     has_login_hint = any(
         key in low
         for key in (
@@ -370,10 +396,12 @@ def _extract_platform_credentials(text: Any, *, allow_loose_phone: bool = False)
             "登陆",
             "验证码",
             "短信",
-            "手机号",
-            "手机",
-            "账号",
-            "账户",
+            "平台手机号",
+            "业务员手机号",
+            "业务员手机",
+            "平台账号",
+            "登录账号",
+            "登陆账号",
             "用户名",
             "密码",
             "password",
@@ -384,7 +412,7 @@ def _extract_platform_credentials(text: Any, *, allow_loose_phone: bool = False)
     out: Dict[str, str] = {}
 
     phone = _extract_labeled_value(t, _LOGIN_PHONE_HINTS, max_len=32)
-    if not phone and (has_login_hint or allow_loose_phone):
+    if not phone and (has_login_hint or allow_loose_phone) and not has_owner_phone_hint:
         m = re.search(r"\b(1\d{10})\b", t)
         phone = m.group(1) if m else None
     if phone:
@@ -853,9 +881,14 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
     if engine:
         out["engine_no"] = engine.group(1).upper()
 
-    name = re.search(r"(?:车主|姓名|被保人|投保人|联系人)\s*[:：]?\s*([\u4e00-\u9fa5]{2,12})", t)
-    if name:
-        out["owner_name"] = name.group(1).strip()
+    owner_name = _extract_labeled_value(t, _OWNER_NAME_HINTS, max_len=64)
+    if not owner_name:
+        name = re.search(r"(?:车主|姓名|被保人|投保人|联系人)\s*[:：=]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", t)
+        if not name:
+            name = re.search(r"(?:车主|姓名)\s+([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})(?=\s|$)", t)
+        owner_name = name.group(1).strip() if name else None
+    if owner_name and owner_name not in {"姓名", "车主", "手机号", "电话", "车牌号", "身份证号"}:
+        out["owner_name"] = owner_name.strip()
 
     model = re.search(r"(?:车型|品牌型号|车辆型号)\s*[:：]?\s*([^\s,，;；]{2,60})", t)
     if model:
@@ -1192,17 +1225,23 @@ async def _classify_image_with_optional_ocr(
     provided_slot: str,
     storage_key: str,
 ):
+    context_hint = _to_str(image.get("context_hint")).strip()
+    raw_ocr_text = image.get("ocr_text") or image.get("ocr_text_sample")
+    text_for_classification = raw_ocr_text or context_hint
+    has_actual_ocr_text = bool(raw_ocr_text) and (
+        not context_hint or _to_str(raw_ocr_text).strip() != context_hint
+    )
     classification = classify_image_slot(
         provided_slot_key=provided_slot,
         original_name=image.get("original_name"),
         storage_key=storage_key,
-        ocr_text=image.get("ocr_text") or image.get("ocr_text_sample"),
+        ocr_text=text_for_classification,
         raw_payload=image.get("raw") or image.get("ocr_raw"),
     )
     if (
         not QUOTE_IMAGE_OCR_CLASSIFY_ENABLED
         or classification.confidence >= 0.78
-        or image.get("ocr_text")
+        or has_actual_ocr_text
         or image.get("ocr_raw")
     ):
         return classification, None, {}
@@ -1215,12 +1254,21 @@ async def _classify_image_with_optional_ocr(
     best_raw: Optional[Dict[str, Any]] = None
     best_extracted: Dict[str, Any] = {}
     best_score = float(classification.confidence or 0.0)
+    deadline = asyncio.get_running_loop().time() + float(QUOTE_IMAGE_OCR_TOTAL_TIMEOUT_SECONDS)
 
     for slot_key, api_type, side in _ocr_candidates_for_image(provided_slot, storage_key):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
         try:
-            raw = await asyncio.to_thread(call_ocr, api_type, image_url, side, True)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(call_ocr, api_type, image_url, side, True),
+                timeout=min(float(QUOTE_IMAGE_OCR_CALL_TIMEOUT_SECONDS), remaining),
+            )
         except (OcrNotConfigured, OcrCallError, ValueError, RuntimeError):
             continue
+        except asyncio.TimeoutError:
+            break
         except Exception:
             continue
 
@@ -1630,6 +1678,39 @@ def _is_sms_task_expired(task: QuoteTask) -> bool:
     return (_now() - base).total_seconds() > QUOTE_SMS_CODE_TTL_SECONDS
 
 
+async def _cancel_waiting_tasks_for_case(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> int:
+    ts = now or _now()
+    active_waiting_tasks = (
+        await db.execute(
+            select(QuoteTask).where(
+                QuoteTask.quote_case_id == case.id,
+                QuoteTask.status == "waiting_sms",
+                QuoteTask.login_state == "sms_required",
+            )
+        )
+    ).scalars().all()
+
+    cancelled = 0
+    for task in active_waiting_tasks:
+        task.status = "cancelled"
+        task.login_state = "failed"
+        task.error_detail = reason
+        task.finished_at = ts
+        task.updated_at = ts
+        cancelled += 1
+
+    if cancelled:
+        case.current_task_id = None
+        case.updated_at = ts
+    return cancelled
+
+
 async def has_waiting_sms_task(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
     owner_user_id = _ctx_current_user_id(ctx)
     if owner_user_id <= 0:
@@ -1689,11 +1770,32 @@ async def _start_sms_task(
         )
     ).scalars().first()
     if waiting:
-        case.status = "waiting_sms"
-        case.current_task_id = waiting.id
-        case.updated_at = _now()
-        await db.flush()
-        return waiting
+        if _is_sms_task_expired(waiting):
+            ts = _now()
+            waiting.status = "failed"
+            waiting.login_state = "failed"
+            waiting.error_detail = "sms_code_expired"
+            waiting.finished_at = ts
+            waiting.updated_at = ts
+            if case.current_task_id == waiting.id:
+                case.current_task_id = None
+            case.status = "ready"
+            case.updated_at = ts
+            await _add_event(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                event_type="task",
+                role="system",
+                payload={"task_id": waiting.id, "status": "failed", "reason": "sms_code_expired"},
+            )
+            await db.flush()
+        else:
+            case.status = "waiting_sms"
+            case.current_task_id = waiting.id
+            case.updated_at = _now()
+            await db.flush()
+            return waiting
 
     phone = _to_str(platform_account.login_phone).strip()
     account_snapshot = _credential_public_payload(platform_account) or {}
@@ -1936,6 +2038,14 @@ async def handle_quote_images_message(
     if extracted_from_images:
         normalized_data = _merge_data(normalized_data, extracted_from_images)
 
+    cancelled_waiting_tasks = 0
+    if attached_images:
+        cancelled_waiting_tasks = await _cancel_waiting_tasks_for_case(
+            db,
+            case=case,
+            reason="cancelled_by_material_change",
+        )
+
     images_by_slot = await _active_images_by_slot(db, case.id)
     missing = _missing_requirements(normalized_data, images_by_slot)
     case.normalized_data = normalized_data
@@ -1950,7 +2060,12 @@ async def handle_quote_images_message(
         owner_user_id=owner_user_id,
         event_type="status",
         role="assistant",
-        payload={"status": case.status, "attached_images": attached_images, "missing": missing},
+        payload={
+            "status": case.status,
+            "attached_images": attached_images,
+            "missing": missing,
+            "cancelled_waiting_tasks": cancelled_waiting_tasks,
+        },
     )
     await db.commit()
 
@@ -1967,12 +2082,13 @@ async def handle_quote_images_message(
 
     lines = [
         f"已收到 {len(attached_images)} 张图片，后台已自动识别并放入报价材料池。",
-        f"- 报价草稿：{case.case_no}",
     ]
     if by_slot_count:
         lines.append("- 识别结果：" + "、".join(f"{slot_label(k)}{v}张" for k, v in by_slot_count.items()))
     if moved:
         lines.append("- 已按识别结果静默归位：" + "、".join(moved[:5]))
+    if cancelled_waiting_tasks:
+        lines.append("- 材料已更新，上一条等待中的验证码已作废；请重新输入平台名+报价触发新验证码。")
     if missing:
         lines.append("- 仍缺少：" + "、".join(item.get("label") or item.get("key") for item in missing[:8]))
     lines.append("下一步请直接输入平台名+报价，例如：太平洋报价。")
@@ -2046,22 +2162,14 @@ async def recall_quote_case_images(
 
     cancelled_tasks = 0
     for case in case_map.values():
-        active_waiting_tasks = (
-            await db.execute(
-                select(QuoteTask).where(
-                    QuoteTask.quote_case_id == case.id,
-                    QuoteTask.status == "waiting_sms",
-                    QuoteTask.login_state == "sms_required",
-                )
-            )
-        ).scalars().all()
-        for task in active_waiting_tasks:
-            task.status = "cancelled"
-            task.login_state = "failed"
-            task.error_detail = "cancelled_by_image_recall"
-            task.finished_at = now
-            task.updated_at = now
-            cancelled_tasks += 1
+        case_changed_images = [item for item in changed_images if item.get("quote_case_id") == case.id]
+        case_cancelled_tasks = await _cancel_waiting_tasks_for_case(
+            db,
+            case=case,
+            reason="cancelled_by_image_recall",
+            now=now,
+        )
+        cancelled_tasks += case_cancelled_tasks
 
         images_by_slot = await _active_images_by_slot(db, int(case.id))
         normalized_data = _json_obj(case.normalized_data)
@@ -2069,7 +2177,6 @@ async def recall_quote_case_images(
         case.missing_requirements = missing
         if case.status in {"ready", "waiting_sms", "failed"}:
             case.status = "collecting" if missing else "ready"
-        case.current_task_id = None if cancelled_tasks else case.current_task_id
         case.updated_at = now
         await _add_event(
             db,
@@ -2080,8 +2187,8 @@ async def recall_quote_case_images(
             payload={
                 "image_recall": True,
                 "storage_keys": sorted(keys),
-                "changed_images": changed_images,
-                "cancelled_waiting_tasks": cancelled_tasks,
+                "changed_images": case_changed_images,
+                "cancelled_waiting_tasks": case_cancelled_tasks,
                 "missing_requirements": missing,
             },
         )
@@ -2140,7 +2247,7 @@ async def handle_quote_message(
             task.finished_at = _now()
             task.updated_at = _now()
             case.status = "ready"
-            case.current_task_id = task.id
+            case.current_task_id = None
             case.updated_at = _now()
             await _add_event(
                 db,
@@ -2167,7 +2274,7 @@ async def handle_quote_message(
                 },
             )
 
-    if waiting_pair and not signal.get("is_quote"):
+    if waiting_pair:
         case, task = waiting_pair
         payload = {
             "quote_case": {
@@ -2207,7 +2314,7 @@ async def handle_quote_message(
                     entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
                     payload=payload,
                 ),
-                "actions": [_mk_action("我已收到验证码，输入 123456")],
+                "actions": [_mk_action("输入短信验证码")],
             },
         )
 
@@ -2321,9 +2428,7 @@ async def handle_quote_message(
         missing_fields = [item["label"] for item in missing if item.get("type") == "field"]
         missing_images = [item["label"] for item in missing if item.get("type") == "image"]
         lines = [
-            f"已创建/更新报价草稿：{case.case_no}。",
-            f"目标平台：{platform_name}。",
-            "当前信息还不满足报价必填项，暂不触发平台登录。",
+            f"{platform_name}报价资料还不完整，暂不触发平台登录。",
         ]
         if missing_account_fields:
             lines.append(f"另外，{platform_name}平台账号还未绑定或资料不完整：缺少{_missing_platform_account_labels(missing_account_fields)}。")
@@ -2412,7 +2517,6 @@ async def handle_quote_message(
         missing_text = _missing_platform_account_labels(missing_account_fields)
         lines = [
             f"{platform_name}报价资料已齐，但平台账号还不能用于报价。",
-            f"- 报价草稿：{case.case_no}",
             f"- 缺少登录资料：{missing_text}",
         ]
         if saved_text:
@@ -2467,10 +2571,8 @@ async def handle_quote_message(
     account_payload = _credential_public_payload(platform_account) or {}
     reply = (
         f"{platform_name}报价必填项已满足，已触发登录短信验证（当前为本地假流程）。\n"
-        f"- 报价草稿：{case.case_no}\n"
-        f"- 来源：{'已有订单' if case.order_id else '新订单草稿'}\n"
         f"- 已复用平台登录资料：{account_payload.get('login_phone_mask') or task.sms_phone_mask or '业务员手机号'}\n"
-        "请在聊天框直接输入验证码，例如：123456。"
+        "请在聊天框直接输入收到的 4-8 位短信验证码。"
     )
     return reply, {
         "status": "success",
@@ -2482,7 +2584,7 @@ async def handle_quote_message(
             entities={**merged_entities, "quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
             payload=payload,
         ),
-        "actions": [_mk_action("输入验证码 123456")],
+        "actions": [_mk_action("输入短信验证码")],
     }
 
 
@@ -2584,7 +2686,7 @@ async def handle_platform_credential_message(
         "后续同一账号再走这个平台报价时，我会优先复用这些资料，不会反复向你要。",
     ]
     if case and case.status == "ready" and public_payload.get("has_login_phone"):
-        reply_lines.append(f"当前草稿 {case.case_no} 已经可以继续触发报价，你可以直接输入：{platform_name}报价。")
+        reply_lines.append(f"当前资料已经可以继续触发报价，你可以直接输入：{platform_name}报价。")
 
     return "\n".join(reply_lines), {
         "status": "success",
@@ -2631,10 +2733,8 @@ async def handle_quote_material_status(
     )
 
     lines = [
-        f"报价草稿材料状态：{case.case_no}",
+        "当前报价材料状态：",
         f"- 平台：{case.platform_name or case.platform_code or '-'}",
-        f"- 来源：{'已有订单' if case.order_id else '新订单草稿'}",
-        f"- 状态：{case.status}",
     ]
     ready_slots = payload.get("ready_slots") or {}
     if ready_slots:

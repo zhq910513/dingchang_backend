@@ -7,7 +7,7 @@ import inspect
 import json
 import re
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, and_, or_, cast, String, distinct, delete, false as sql_false
 from sqlalchemy.exc import IntegrityError
@@ -63,6 +63,7 @@ from app.services.order_read_model import (
     order_rows_to_list_items as _rm_order_rows_to_list_items,
     to_order_out as _rm_to_order_out,
 )
+from app.services.ocr_worker import run_ocr_task
 from app.services.storage import StorageService
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -75,6 +76,7 @@ OCR_SLOTS = {
     "driving_license_main",
     "driving_license_sub",
 }
+CORE_OCR_SLOTS = {"vehicle_cert", "idcard_front", "driving_license_main"}
 NON_OCR_SLOTS = {"related"}
 ALL_SLOTS = OCR_SLOTS | NON_OCR_SLOTS
 MULTI_SLOTS = {"related"}
@@ -84,6 +86,96 @@ MAX_DYNAMIC_DATA_JSON_CHARS = 100_000
 MAX_OCR_RAW_JSON_KEYS = 1000
 MAX_OCR_RAW_JSON_CHARS = 1_000_000
 MAX_BOS_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+async def _run_ocr_task_background(task_id: int) -> None:
+    try:
+        await run_ocr_task(int(task_id))
+    except Exception:
+        # run_ocr_task 内部会记录 fatal 日志；这里兜住异常，避免后台任务影响响应生命周期。
+        pass
+
+
+def _enqueue_ocr_task(background_tasks: Optional[BackgroundTasks], task_id: Optional[int]) -> None:
+    if not background_tasks or not task_id:
+        return
+    background_tasks.add_task(_run_ocr_task_background, int(task_id))
+
+
+async def _get_or_create_ocr_task_for_order(db: AsyncSession, order_id: int) -> Tuple[Optional[int], Optional[str], bool]:
+    oid = int(order_id)
+    try:
+        async with db.begin_nested():
+            task = OcrTask(
+                scope_type="order",
+                scope_id=oid,
+                active_scope_id=oid,
+                status="pending",
+                progress=0,
+                error_message=None,
+            )
+            db.add(task)
+            await db.flush()
+            return int(task.id), str(task.status), True
+    except IntegrityError:
+        active_stmt = (
+            select(OcrTask)
+            .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == oid))
+            .order_by(OcrTask.id.desc())
+        )
+        active_task = (await db.execute(active_stmt)).scalars().first()
+        if not active_task:
+            try:
+                async with db.begin_nested():
+                    task = OcrTask(
+                        scope_type="order",
+                        scope_id=oid,
+                        active_scope_id=oid,
+                        status="pending",
+                        progress=0,
+                        error_message=None,
+                    )
+                    db.add(task)
+                    await db.flush()
+                    return int(task.id), str(task.status), True
+            except IntegrityError:
+                active_task = (await db.execute(active_stmt)).scalars().first()
+
+        if not active_task:
+            return None, None, False
+
+        active_status = str(getattr(active_task, "status", "") or "").strip()
+        if active_status == "processing":
+            queued_stmt = (
+                select(OcrTask)
+                .where(
+                    and_(
+                        OcrTask.scope_type == "order",
+                        OcrTask.scope_id == oid,
+                        OcrTask.active_scope_id.is_(None),
+                        OcrTask.status == "pending",
+                    )
+                )
+                .order_by(OcrTask.id.desc())
+            )
+            queued_task = (await db.execute(queued_stmt)).scalars().first()
+            if queued_task:
+                return int(queued_task.id), str(queued_task.status), False
+
+            queued_task = OcrTask(
+                scope_type="order",
+                scope_id=oid,
+                active_scope_id=None,
+                status="pending",
+                progress=0,
+                error_message="Waiting for active OCR task to finish before rescan",
+            )
+            db.add(queued_task)
+            await db.flush()
+            return int(queued_task.id), str(queued_task.status), False
+
+        return int(active_task.id), active_status, True
+
 
 ORDER_INFO_NON_NULL_NUMERIC_FIELDS: List[str] = [
     "commercial_amount",
@@ -885,6 +977,16 @@ def _validate_finalize_storage_key(*, slot_key: str, storage_key: str, md5_hex: 
         raise HTTPException(status_code=400, detail="storage_key not valid for slot/md5")
 
 
+async def _order_has_core_ocr_images(db: AsyncSession, order_id: int) -> bool:
+    stmt = (
+        select(OrderImage.slot_key)
+        .select_from(OrderImage)
+        .where(and_(OrderImage.order_id == int(order_id), OrderImage.slot_key.in_(CORE_OCR_SLOTS)))
+    )
+    found = {str(x or "").strip() for x in (await db.execute(stmt)).scalars().all()}
+    return CORE_OCR_SLOTS.issubset(found)
+
+
 async def _apply_order_image_bind(
     db: AsyncSession,
     *,
@@ -892,7 +994,7 @@ async def _apply_order_image_bind(
     images: List[FinalizeImageIn],
     clear_slots: List[str],
     trigger_ocr: bool = True,
-) -> Tuple[int, Optional[int], Optional[str]]:
+) -> Tuple[int, Optional[int], Optional[str], bool]:
     clear_slots = [str(x or "").strip() for x in (clear_slots or [])]
     clear_slots = [x for x in clear_slots if x]
     for sk in clear_slots:
@@ -934,6 +1036,7 @@ async def _apply_order_image_bind(
         await db.execute(del_stmt)
 
     has_ocr_images = False
+    has_related_images = False
     for im in normalized_images:
         slot_key = str(im.slot_key or "").strip()
         storage_key = str(im.storage_key or "").strip().lstrip("/")
@@ -945,6 +1048,7 @@ async def _apply_order_image_bind(
         _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
+        has_related_images = has_related_images or (slot_key == "related")
 
         url = ""
         if not getattr(storage, "enabled", False):
@@ -983,33 +1087,17 @@ async def _apply_order_image_bind(
 
     ocr_task_id: Optional[int] = None
     ocr_status: Optional[str] = None
-    if trigger_ocr and has_ocr_images:
-        try:
-            async with db.begin_nested():
-                task = OcrTask(
-                    scope_type="order",
-                    scope_id=order_id,
-                    active_scope_id=order_id,
-                    status="pending",
-                    progress=0,
-                    error_message=None,
-                )
-                db.add(task)
-                await db.flush()
-                ocr_task_id = int(task.id)
-                ocr_status = str(task.status)
-        except IntegrityError:
-            exist_stmt = (
-                select(OcrTask)
-                .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == order_id))
-                .order_by(OcrTask.id.desc())
-            )
-            exist_task = (await db.execute(exist_stmt)).scalars().first()
-            if exist_task:
-                ocr_task_id = int(exist_task.id)
-                ocr_status = str(exist_task.status)
+    ocr_task_active = False
+    await db.flush()
+    related_fallback_needed = (
+        has_related_images
+        and not has_ocr_images
+        and not await _order_has_core_ocr_images(db, order_id)
+    )
+    if trigger_ocr and (has_ocr_images or related_fallback_needed):
+        ocr_task_id, ocr_status, ocr_task_active = await _get_or_create_ocr_task_for_order(db, order_id)
 
-    return len(normalized_images), ocr_task_id, ocr_status
+    return len(normalized_images), ocr_task_id, ocr_status, ocr_task_active
 
 
 async def _apply_ocr_task_acl(
@@ -1804,6 +1892,7 @@ async def list_order_ocr_tasks(
 @router.post("/finalize", response_model=OrderFinalizeOut)
 async def finalize_order_upload(
     payload: OrderFinalizeIn,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderFinalizeOut:
@@ -1907,6 +1996,7 @@ async def finalize_order_upload(
         await db.execute(del_stmt)
 
     has_ocr_images = False
+    has_related_images = False
     for im in normalized_images:
         slot_key = str(im.slot_key or "").strip()
         storage_key = str(im.storage_key or "").strip().lstrip("/")
@@ -1918,6 +2008,7 @@ async def finalize_order_upload(
         _validate_finalize_storage_key(slot_key=slot_key, storage_key=storage_key, md5_hex=md5_hex)
 
         has_ocr_images = has_ocr_images or (slot_key in OCR_SLOTS)
+        has_related_images = has_related_images or (slot_key == "related")
 
         url = ""
         if not getattr(storage, "enabled", False):
@@ -1964,34 +2055,20 @@ async def finalize_order_upload(
 
     ocr_task_id: Optional[int] = None
     ocr_status: Optional[str] = None
-    if has_ocr_images:
-        try:
-            async with db.begin_nested():
-                task = OcrTask(
-                    scope_type="order",
-                    scope_id=order_id,
-                    active_scope_id=order_id,
-                    status="pending",
-                    progress=0,
-                    error_message=None,
-                )
-                db.add(task)
-                await db.flush()
-                ocr_task_id = int(task.id)
-                ocr_status = str(task.status)
-        except IntegrityError:
-            exist_stmt = (
-                select(OcrTask)
-                .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == order_id))
-                .order_by(OcrTask.id.desc())
-            )
-            exist_task = (await db.execute(exist_stmt)).scalars().first()
-            if exist_task:
-                ocr_task_id = int(exist_task.id)
-                ocr_status = str(exist_task.status)
+    ocr_task_active = False
+    await db.flush()
+    related_fallback_needed = (
+        has_related_images
+        and not has_ocr_images
+        and not await _order_has_core_ocr_images(db, order_id)
+    )
+    if has_ocr_images or related_fallback_needed:
+        ocr_task_id, ocr_status, ocr_task_active = await _get_or_create_ocr_task_for_order(db, order_id)
 
     await _sync_order_fact_from_dynamic_data(db, order_id=order_id, dynamic_data=getattr(o, "dynamic_data", None))
     await db.commit()
+    if ocr_task_active:
+        _enqueue_ocr_task(background_tasks, ocr_task_id)
     return OrderFinalizeOut(ok=True, order_id=order_id, ocr_task_id=ocr_task_id, ocr_status=ocr_status)
 
 
@@ -1999,6 +2076,7 @@ async def finalize_order_upload(
 async def bind_order_images(
     order_id: int,
     payload: OrderImagesBindIn,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
 ) -> OrderImagesBindOut:
@@ -2035,7 +2113,7 @@ async def bind_order_images(
     if role_name == ROLE_FINANCE and not bool(getattr(o, "is_finished", False)):
         raise HTTPException(status_code=400, detail="Only finished orders can be updated in finance")
 
-    bound_count, ocr_task_id, ocr_status = await _apply_order_image_bind(
+    bound_count, ocr_task_id, ocr_status, ocr_task_active = await _apply_order_image_bind(
         db,
         order_id=oid,
         images=payload.images or [],
@@ -2044,6 +2122,8 @@ async def bind_order_images(
     )
 
     await db.commit()
+    if ocr_task_active:
+        _enqueue_ocr_task(background_tasks, ocr_task_id)
     return OrderImagesBindOut(
         ok=True,
         order_id=oid,

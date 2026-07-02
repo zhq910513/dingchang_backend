@@ -24,7 +24,15 @@ from app.models.order_fact import OrderFact  # noqa: F401
 from app.models.order_info import OrderInfo  # noqa: F401
 # 新增事实层（首次部署可直接建表）
 from app.models.order_slot_result import OrderSlotResult  # noqa: F401
-from app.models.quote_assistant import QuoteCase, QuoteCaseEvent, QuoteCaseImage, QuotePlatformAccount, QuoteTask  # noqa: F401
+from app.models.quote_assistant import (  # noqa: F401
+    QuoteAssistantMessage,
+    QuoteAssistantSession,
+    QuoteCase,
+    QuoteCaseEvent,
+    QuoteCaseImage,
+    QuotePlatformAccount,
+    QuoteTask,
+)
 from app.models.role import Role  # noqa: F401
 from app.models.session import UserSession  # noqa: F401
 from app.models.user import User  # noqa: F401
@@ -55,4 +63,6 @@ __all__ = [
     "QuoteTask",
     "QuotePlatformAccount",
     "QuoteCaseEvent",
+    "QuoteAssistantSession",
+    "QuoteAssistantMessage",
 ]
