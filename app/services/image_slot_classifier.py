@@ -103,11 +103,28 @@ _KEYWORDS: Dict[str, tuple[str, ...]] = {
 
 _FILENAME_HINTS: Dict[str, tuple[str, ...]] = {
     "vehicle_cert": ("hege", "cert", "certificate", "hgz", "合格", "合格证"),
-    "idcard_front": ("idcard_front", "sfz_front", "id_front", "身份证正", "身份证人像", "正面"),
-    "idcard_back": ("idcard_back", "sfz_back", "id_back", "身份证反", "国徽", "反面"),
-    "driving_license_main": ("drive_main", "driving_main", "xsz_main", "行驶证主页", "行驶证正", "主页"),
-    "driving_license_sub": ("drive_sub", "driving_sub", "xsz_sub", "行驶证副页", "行驶证反", "副页"),
+    "idcard_front": ("idcard_front", "idcard-front", "sfz_front", "sfz-front", "id_front", "id-front", "身份证正", "身份证人像", "正面"),
+    "idcard_back": ("idcard_back", "idcard-back", "sfz_back", "sfz-back", "id_back", "id-back", "身份证反", "国徽", "反面"),
+    "driving_license_main": ("drive_main", "drive-main", "driving_main", "driving-main", "xsz_main", "xsz-main", "行驶证主页", "行驶证正", "主页"),
+    "driving_license_sub": ("drive_sub", "drive-sub", "driving_sub", "driving-sub", "xsz_sub", "xsz-sub", "行驶证副页", "行驶证反", "副页"),
     "related": ("related", "backup", "other", "其他", "截图"),
+}
+
+_STRONG_FILENAME_HINTS: Dict[str, tuple[str, ...]] = {
+    "vehicle_cert": ("vehicle_cert", "vehicle-cert", "vehicle_certificate", "vehicle-certificate", "cert", "certificate", "hgz", "合格证"),
+    "idcard_front": ("idcard_front", "idcard-front", "sfz_front", "sfz-front", "id_front", "id-front", "身份证正面", "身份证人像面"),
+    "idcard_back": ("idcard_back", "idcard-back", "sfz_back", "sfz-back", "id_back", "id-back", "身份证反面", "身份证国徽面"),
+    "driving_license_main": ("driving_license_main", "driving-license-main", "drive_main", "drive-main", "xsz_main", "xsz-main", "行驶证主页"),
+    "driving_license_sub": ("driving_license_sub", "driving-license-sub", "drive_sub", "drive-sub", "xsz_sub", "xsz-sub", "行驶证副页"),
+}
+
+_CONTEXT_HINTS: Dict[str, tuple[str, ...]] = {
+    "vehicle_cert": ("合格证", "车辆合格证", "整车出厂合格证", "机动车整车出厂合格证"),
+    "idcard_front": ("身份证正面", "身份证人像面", "身份证头像面", "身份证正页", "身份证人像页"),
+    "idcard_back": ("身份证反面", "身份证国徽面", "身份证背面", "身份证反页", "身份证国徽页"),
+    "driving_license_main": ("行驶证主页", "行驶证正页", "行驶证正本", "行驶证主页照片"),
+    "driving_license_sub": ("行驶证副页", "行驶证反页", "行驶证副本", "行驶证副页照片"),
+    "related": ("相关图片", "其他材料", "补充材料", "聊天截图"),
 }
 
 _PREFIX_HINTS: Dict[str, str] = {
@@ -223,6 +240,22 @@ def classify_image_slot(
     }
 
     if text:
+        context_hits = {
+            slot: _score_keywords(text, hints)
+            for slot, hints in _CONTEXT_HINTS.items()
+        }
+        features["context_hint_hits"] = context_hits
+        hint_slot, hint_score = max(context_hits.items(), key=lambda item: item[1])
+        if hint_score > 0:
+            return SlotClassification(
+                predicted_slot_key=hint_slot,
+                confidence=0.86,
+                method="context_hint_rule",
+                reason="图片上下文说明命中明确材料类型",
+                text_features=features,
+                ocr_text_sample=text[:2000],
+            )
+
         scores = {slot: _score_keywords(text, words) for slot, words in _KEYWORDS.items()}
         features["keyword_scores"] = scores
         best_slot, best_score = max(scores.items(), key=lambda item: item[1])
@@ -246,6 +279,22 @@ def classify_image_slot(
                 text_features=features,
                 ocr_text_sample=text[:2000],
             )
+
+    strong_filename_scores = {
+        slot: _score_keywords(name + " " + storage, hints)
+        for slot, hints in _STRONG_FILENAME_HINTS.items()
+    }
+    features["strong_filename_hits"] = strong_filename_scores
+    strong_file_slot, strong_file_score = max(strong_filename_scores.items(), key=lambda item: item[1])
+    if strong_file_score > 0:
+        return SlotClassification(
+            predicted_slot_key=strong_file_slot,
+            confidence=0.82,
+            method="strong_filename_rule",
+            reason="文件名或路径包含明确材料类型",
+            text_features=features,
+            ocr_text_sample=text[:2000],
+        )
 
     filename_scores = {
         slot: _score_keywords(name + " " + storage, hints)

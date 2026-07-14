@@ -30,6 +30,8 @@ ENDPOINTS = {
     "idcard": "https://aip.baidubce.com/rest/2.0/ocr/v1/idcard",
     "vehicle_license": "https://aip.baidubce.com/rest/2.0/ocr/v1/vehicle_license",
     "vehicle_certificate": "https://aip.baidubce.com/rest/2.0/ocr/v1/vehicle_certificate",
+    # 模板接口失败或用户放错卡槽时使用，结果由业务侧做保守正则提取。
+    "accurate_basic": "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic",
 }
 
 # token 相关（进程内缓存）
@@ -184,6 +186,8 @@ def _call_ocr_once(
     elif api_type == "vehicle_certificate":
         # 百度 vehicle_certificate 无 side 参数
         pass
+    elif api_type == "accurate_basic":
+        payload["detect_direction"] = _bool_str(bool(detect_direction))
 
     url = f"{ENDPOINTS[api_type]}?access_token={access_token}"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}

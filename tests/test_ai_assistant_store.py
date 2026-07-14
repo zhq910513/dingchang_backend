@@ -5,9 +5,10 @@ import os
 import tempfile
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest import TestCase
-from unittest.mock import patch
+from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import AsyncMock, patch
 
+import app.services.ai_assistant_service as aas
 from app.services.ai_assistant_service import (
     _Store,
     _detect_intent,
@@ -168,6 +169,58 @@ class AiAssistantStoreTests(TestCase):
             safe["data"]["payload"]["attached_images"][0]["storage_key"],
             "backup/a/b.jpg",
         )
+
+
+class AiAssistantSendMessageRedactionTests(IsolatedAsyncioTestCase):
+    async def test_waiting_sms_redacts_unlabeled_numeric_code_in_history(self) -> None:
+        async def fake_get_db():
+            yield SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"STORAGE_DIR": tmpdir}):
+            store = _Store()
+            with patch.object(aas, "_store", store), patch.object(aas, "get_db", fake_get_db), patch.object(
+                aas, "has_waiting_sms_task", new=AsyncMock(return_value=True)
+            ), patch.object(aas, "has_expired_waiting_sms_task", new=AsyncMock(return_value=False)), patch.object(
+                aas,
+                "_dispatch_rule",
+                new=AsyncMock(
+                    return_value=(
+                        "验证码已提交，报价流程继续。",
+                        {"status": "success", "intent": "quote", "data": {"result_status": "success"}},
+                    )
+                ),
+            ):
+                resp = await aas.send_message(owner_user_id="7", message="123456", context={})
+
+            page = store.list_messages(owner_user_id="7", session_id=resp["session_id"], limit=5)
+            user_messages = [m["content"] for m in page["items"] if m["role"] == "user"]
+
+            self.assertEqual(user_messages, ["[短信验证码已隐藏]"])
+
+    async def test_numeric_order_like_text_is_preserved_when_not_waiting_sms(self) -> None:
+        async def fake_get_db():
+            yield SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"STORAGE_DIR": tmpdir}):
+            store = _Store()
+            with patch.object(aas, "_store", store), patch.object(aas, "get_db", fake_get_db), patch.object(
+                aas, "has_waiting_sms_task", new=AsyncMock(return_value=False)
+            ), patch.object(aas, "has_expired_waiting_sms_task", new=AsyncMock(return_value=False)), patch.object(
+                aas,
+                "_dispatch_rule",
+                new=AsyncMock(
+                    return_value=(
+                        "请补充订单查询条件。",
+                        {"status": "success", "intent": "fallback", "data": {"result_status": "invalid_command"}},
+                    )
+                ),
+            ):
+                resp = await aas.send_message(owner_user_id="7", message="5577", context={})
+
+            page = store.list_messages(owner_user_id="7", session_id=resp["session_id"], limit=5)
+            user_messages = [m["content"] for m in page["items"] if m["role"] == "user"]
+
+            self.assertEqual(user_messages, ["5577"])
 
 
 class AiAssistantOrderQueryReplyTests(TestCase):

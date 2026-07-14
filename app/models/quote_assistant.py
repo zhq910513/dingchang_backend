@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -211,4 +212,73 @@ class QuoteCaseEvent(Base):
         Index("ix_quote_case_event_case_id", "quote_case_id", "id"),
         Index("ix_quote_case_event_owner_session", "owner_user_id", "session_id", "id"),
         Index("ix_quote_case_event_type", "event_type", "id"),
+    )
+
+
+class QuoteAssistantSession(Base):
+    """DB-backed chat session for quote assistant.
+
+    This replaces the local JSON conversation file in production while staying
+    independent from existing order tables.
+    """
+
+    __tablename__ = "quote_assistant_session_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    session_id = Column(String(64), nullable=False, comment="Public session id")
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+
+    title = Column(String(128), nullable=False, server_default=text("'新会话'"), comment="Session title")
+    deleted = Column(Boolean, nullable=False, server_default=text("0"), comment="Soft deleted")
+    message_count = Column(Integer, nullable=False, server_default=text("0"), comment="Visible message count")
+    last_message_preview = Column(String(256), nullable=False, server_default=text("''"), comment="Last message preview")
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("session_id", name="uq_quote_assistant_session_id"),
+        Index("ix_quote_assistant_session_owner_deleted_updated", "owner_user_id", "deleted", "updated_at", "id"),
+    )
+
+
+class QuoteAssistantMessage(Base):
+    """DB-backed timeline message for quote assistant sessions."""
+
+    __tablename__ = "quote_assistant_message_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    message_id = Column(String(64), nullable=False, comment="Public message id")
+    session_id = Column(
+        String(64),
+        ForeignKey("quote_assistant_session_new.session_id", ondelete="CASCADE"),
+        nullable=False,
+        comment="Public session id",
+    )
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+
+    role = Column(String(32), nullable=False, comment="user/assistant/system")
+    content = Column(Text, nullable=False, comment="Message content")
+    metadata_json = Column(JSON, nullable=False, comment="Safe display metadata")
+
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_quote_assistant_message_id"),
+        Index("ix_quote_assistant_message_session_id", "session_id", "id"),
+        Index("ix_quote_assistant_message_owner_session_id", "owner_user_id", "session_id", "id"),
+        Index("ix_quote_assistant_message_created", "created_at", "id"),
     )

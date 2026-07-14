@@ -1,24 +1,32 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import app.services.quote_assistant_service as qas
 from app.models.quote_assistant import QuotePlatformAccount
 from app.services.quote_assistant_service import (
     RESULT_NEED_MORE,
+    RESULT_NOT_READY,
     RESULT_SUCCESS,
+    _cancel_waiting_tasks_for_case,
+    _classify_image_with_optional_ocr,
     _db_safe_image_url,
     _missing_platform_account_fields,
+    _start_sms_task,
     detect_platform_credential_signal,
     detect_quote_signal,
+    extract_quote_fields,
+    handle_quote_message,
     handle_platform_credential_message,
     list_platform_account_schemas,
     redact_quote_sensitive_text,
     save_platform_account_form,
 )
+from app.services.image_slot_classifier import classify_image_slot
 
 
 class QuoteAssistantSignalTests(TestCase):
@@ -61,6 +69,50 @@ class QuoteAssistantSignalTests(TestCase):
         self.assertNotIn("13800138000", redacted)
         self.assertNotIn("pass123", redacted)
 
+    def test_redact_sms_code_keeps_chat_history_safe_when_waiting_sms(self) -> None:
+        self.assertEqual(
+            redact_quote_sensitive_text("123456", hide_unlabeled_sms_code=True),
+            "[短信验证码已隐藏]",
+        )
+        self.assertEqual(redact_quote_sensitive_text("验证码：123456"), "验证码：[已隐藏]")
+        self.assertEqual(redact_quote_sensitive_text("5577"), "5577")
+
+    def test_owner_phone_is_not_saved_as_platform_login_phone(self) -> None:
+        text = (
+            "太平洋报价 车主:张三 车主手机号:13900000001 "
+            "车牌号:赣B12345 VIN:LSVFA49J2A1234567 发动机号:ENG12345 车型:大众朗逸"
+        )
+
+        quote_signal = detect_quote_signal(text)
+        credential_signal = detect_platform_credential_signal(text)
+
+        self.assertEqual(quote_signal["entities"]["owner_phone"], "13900000001")
+        self.assertNotIn("login_phone", credential_signal["credentials"])
+        self.assertFalse(credential_signal["is_credential"])
+
+    def test_extract_quote_fields_handles_compound_owner_name_label(self) -> None:
+        fields = extract_quote_fields(
+            "太平洋报价 车主姓名:报价链路测试 车主手机号:13900000001 "
+            "车牌号:赣A12345 VIN:LSVFA49J2A1234567 发动机号:ENG12345 车型:大众朗逸"
+        )
+
+        self.assertEqual(fields["owner_name"], "报价链路测试")
+        self.assertEqual(fields["owner_phone"], "13900000001")
+        self.assertEqual(fields["plate_no"], "赣A12345")
+        self.assertEqual(fields["vehicle_model"], "大众朗逸")
+
+    def test_extract_quote_fields_does_not_treat_owner_phone_label_as_owner_name(self) -> None:
+        fields = extract_quote_fields("太平洋报价 车主手机号:13900000001 车牌号:赣A12345")
+
+        self.assertNotIn("owner_name", fields)
+        self.assertEqual(fields["owner_phone"], "13900000001")
+
+    def test_extract_quote_fields_does_not_treat_insured_phone_label_as_owner_name(self) -> None:
+        fields = extract_quote_fields("太平洋报价 被保险人手机号:13900000001 车牌号:赣A12345")
+
+        self.assertNotIn("owner_name", fields)
+        self.assertEqual(fields["owner_phone"], "13900000001")
+
     def test_platform_account_schema_supports_different_required_fields(self) -> None:
         schemas = {item["platform_code"]: item for item in list_platform_account_schemas()}
 
@@ -101,6 +153,190 @@ class QuoteAssistantSignalTests(TestCase):
         self.assertNotIn("authorization=", safe_url)
         self.assertNotIn("?", safe_url)
         self.assertTrue(safe_url.endswith("/idcard/a.jpg"))
+
+    def test_image_context_hint_places_image_into_correct_slot(self) -> None:
+        front = classify_image_slot(
+            provided_slot_key="related",
+            original_name="demo.jpg",
+            storage_key="related/demo.jpg",
+            ocr_text="这张是身份证正面",
+        )
+        sub = classify_image_slot(
+            provided_slot_key="related",
+            original_name="demo.jpg",
+            storage_key="related/demo2.jpg",
+            ocr_text="这是行驶证副页照片",
+        )
+
+        self.assertEqual(front.predicted_slot_key, "idcard_front")
+        self.assertEqual(front.method, "context_hint_rule")
+        self.assertGreaterEqual(front.confidence, 0.78)
+        self.assertEqual(sub.predicted_slot_key, "driving_license_sub")
+
+    def test_strong_filename_hint_skips_slow_ocr_path(self) -> None:
+        front = classify_image_slot(
+            provided_slot_key="related",
+            original_name="id-front.jpg",
+            storage_key="related/id-front.jpg",
+        )
+        cert = classify_image_slot(
+            provided_slot_key="related",
+            original_name="vehicle-cert.jpg",
+            storage_key="related/vehicle-cert.jpg",
+        )
+
+        self.assertEqual(front.predicted_slot_key, "idcard_front")
+        self.assertEqual(front.method, "strong_filename_rule")
+        self.assertGreaterEqual(front.confidence, 0.78)
+        self.assertEqual(cert.predicted_slot_key, "vehicle_cert")
+
+
+class _ScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def all(self):
+        return list(self._rows)
+
+
+class QuoteAssistantWaitingTaskTests(IsolatedAsyncioTestCase):
+    async def test_weak_context_hint_does_not_block_real_ocr_classification(self) -> None:
+        raw = {"words_result": [{"words": "机动车行驶证 号牌号码 车辆类型 所有人 品牌型号 发动机号码"}]}
+
+        with patch.object(qas, "call_ocr", Mock(return_value=raw)), patch.object(
+            qas, "_extract_by_type", Mock(return_value={})
+        ):
+            classification, ocr_raw, _ = await _classify_image_with_optional_ocr(
+                image={
+                    "storage_key": "related/demo.jpg",
+                    "url": "https://example.com/demo.jpg",
+                    "context_hint": "张三资料",
+                    "ocr_text": "张三资料",
+                },
+                provided_slot="related",
+                storage_key="related/demo.jpg",
+            )
+
+        self.assertEqual(classification.predicted_slot_key, "driving_license_main")
+        self.assertEqual(classification.method, "ocr_rule")
+        self.assertEqual(ocr_raw, raw)
+
+    async def test_repeated_quote_command_while_waiting_sms_only_prompts_for_code(self) -> None:
+        db = SimpleNamespace(commit=AsyncMock())
+        case = SimpleNamespace(
+            id=11,
+            case_no="QA202605170001",
+            status="waiting_sms",
+            platform_code="TP",
+            platform_name="太平洋",
+            order_id=5571,
+        )
+        task = SimpleNamespace(
+            id=21,
+            status="waiting_sms",
+            login_state="sms_required",
+            sms_phone_mask="138****8000",
+            trace_id="trace-waiting",
+        )
+
+        with patch.object(qas, "_find_waiting_task", new=AsyncMock(return_value=(case, task))), patch.object(
+            qas, "_add_event", new=AsyncMock()
+        ):
+            reply, meta = await handle_quote_message(
+                db,
+                ctx={"current_user_id": 7, "session_id": "quote-session-1"},
+                entities={},
+                text="太平洋报价",
+            )
+
+        self.assertIn("等待短信验证码", reply)
+        self.assertEqual(meta["data"]["result_status"], RESULT_NOT_READY)
+        self.assertEqual(meta["data"]["payload"]["quote_task"]["id"], 21)
+        db.commit.assert_awaited_once()
+
+    async def test_start_sms_task_expires_old_waiting_task_before_creating_new_one(self) -> None:
+        expired = SimpleNamespace(
+            id=31,
+            status="waiting_sms",
+            login_state="sms_required",
+            error_detail=None,
+            started_at=qas._now() - timedelta(seconds=qas.QUOTE_SMS_CODE_TTL_SECONDS + 5),
+            created_at=None,
+            finished_at=None,
+            updated_at=None,
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(return_value=_ScalarResult([expired])),
+            flush=AsyncMock(),
+            add=Mock(),
+        )
+        case = SimpleNamespace(
+            id=12,
+            platform_code="TP",
+            platform_name="太平洋",
+            status="ready",
+            current_task_id=31,
+            updated_at=None,
+        )
+        account = QuotePlatformAccount(
+            id=41,
+            owner_user_id=7,
+            platform_code="TP",
+            platform_name="太平洋",
+            login_phone="13800138000",
+            login_phone_mask="138****8000",
+            credential_payload={},
+            last_login_state="none",
+        )
+
+        with patch.object(qas, "_mark_platform_account_used", new=AsyncMock()), patch.object(
+            qas, "_add_event", new=AsyncMock()
+        ):
+            task = await _start_sms_task(
+                db,
+                case=case,
+                owner_user_id=7,
+                snapshot={"normalized_data": {"plate_no": "赣A12345"}},
+                trace_id="trace-new",
+                platform_account=account,
+            )
+
+        self.assertIsNot(task, expired)
+        self.assertEqual(expired.status, "failed")
+        self.assertEqual(expired.login_state, "failed")
+        self.assertEqual(expired.error_detail, "sms_code_expired")
+        self.assertEqual(case.status, "waiting_sms")
+        db.add.assert_called_once()
+
+    async def test_material_change_cancels_waiting_sms_task(self) -> None:
+        task = SimpleNamespace(
+            id=51,
+            status="waiting_sms",
+            login_state="sms_required",
+            error_detail=None,
+            finished_at=None,
+            updated_at=None,
+        )
+        db = SimpleNamespace(execute=AsyncMock(return_value=_ScalarResult([task])))
+        case = SimpleNamespace(id=13, current_task_id=51, updated_at=None)
+
+        cancelled = await _cancel_waiting_tasks_for_case(
+            db,
+            case=case,
+            reason="cancelled_by_material_change",
+        )
+
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(task.status, "cancelled")
+        self.assertEqual(task.login_state, "failed")
+        self.assertEqual(task.error_detail, "cancelled_by_material_change")
+        self.assertIsNone(case.current_task_id)
 
 
 class QuoteAssistantCredentialFlowTests(IsolatedAsyncioTestCase):

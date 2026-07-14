@@ -17,7 +17,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.db import engine  # noqa: E402
-from app.models.quote_assistant import QuoteCase, QuoteCaseEvent, QuoteCaseImage, QuotePlatformAccount, QuoteTask  # noqa: E402
+from app.models.quote_assistant import (  # noqa: E402
+    QuoteAssistantMessage,
+    QuoteAssistantSession,
+    QuoteCase,
+    QuoteCaseEvent,
+    QuoteCaseImage,
+    QuotePlatformAccount,
+    QuoteTask,
+)
 
 
 TABLES = [
@@ -26,6 +34,8 @@ TABLES = [
     QuoteTask.__table__,
     QuotePlatformAccount.__table__,
     QuoteCaseEvent.__table__,
+    QuoteAssistantSession.__table__,
+    QuoteAssistantMessage.__table__,
 ]
 
 

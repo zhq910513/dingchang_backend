@@ -34,12 +34,11 @@ from app.schemas.ai_assistant import (
     AiRecallSessionImageIn,
 )
 from app.services.ai_assistant_service import (
-    list_sessions as _list_sessions,
-    create_session as _create_session,
-    delete_session as _delete_session,
-    get_session_messages as _get_session_messages,
-    list_messages as _list_messages,
-    recall_session_images as _recall_session_images,
+    db_create_session as _create_session,
+    db_delete_session as _delete_session,
+    db_list_messages as _get_session_messages,
+    db_list_sessions as _list_sessions,
+    db_recall_session_images as _recall_session_images,
     send_message as _send_message,  # async
 )
 from app.services.quote_assistant_service import (
@@ -55,6 +54,42 @@ from app.services.storage import StorageService
 router = APIRouter(prefix="/ai-assistant", tags=["报价助手"])
 storage = StorageService()
 QUOTE_UPLOAD_SLOTS = set(SLOT_KEYS)
+MAX_QUOTE_IMAGE_BYTES = 20 * 1024 * 1024
+ALLOWED_QUOTE_IMAGE_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/bmp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+}
+QUOTE_IMAGE_EXT_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+}
+
+
+def _quote_api_error_detail(error: Exception) -> str:
+    raw = str(error or "").strip() or error.__class__.__name__
+    low = raw.lower()
+    if "doesn't exist" in low or "does not exist" in low or "no such table" in low:
+        return "报价助手平台配置读取失败：数据库缺少报价助手相关表，请先执行 python scripts/create_quote_assistant_tables.py 后重启后端"
+    if "unknown column" in low or "no such column" in low:
+        return f"报价助手平台配置读取失败：数据库表结构与当前代码不一致，缺少字段或字段名不匹配。原始原因：{raw[:260]}"
+    if "can't connect to mysql" in low or "connect to mysql" in low:
+        return "报价助手平台配置读取失败：无法连接 MySQL，请确认数据库容器/服务已启动且连接配置正确"
+    if "access denied" in low:
+        return "报价助手平台配置读取失败：数据库账号权限不足，请检查 MySQL 用户权限"
+    if "timeout" in low:
+        return "报价助手平台配置读取失败：数据库响应超时，请稍后重试或检查数据库负载"
+    return f"报价助手平台配置读取失败：{raw[:300]}"
 
 
 def _pick(obj: Any, *keys: str, default=None):
@@ -147,13 +182,36 @@ def _guess_image_ext(filename: str, content_type: str) -> str:
     return ".jpg"
 
 
+def _filename_quote_image_ext(filename: str) -> str:
+    name = os.path.basename(str(filename or "")).lower()
+    _, ext = os.path.splitext(name)
+    if ext in QUOTE_IMAGE_EXT_CONTENT_TYPES:
+        return ".jpg" if ext == ".jpeg" else ext
+    return ""
+
+
+def _normalize_quote_image_content_type(filename: str, content_type: str) -> Tuple[str, str]:
+    """Accept real images even when browsers omit MIME, but still reject non-images."""
+    ct = (content_type or "").strip().lower()
+    filename_ext = _filename_quote_image_ext(filename)
+    if ct in ALLOWED_QUOTE_IMAGE_TYPES:
+        return ct, filename_ext or _guess_image_ext(filename, ct)
+    if ct in {"", "application/octet-stream", "binary/octet-stream"} and filename_ext:
+        return QUOTE_IMAGE_EXT_CONTENT_TYPES[filename_ext], filename_ext
+    raise HTTPException(status_code=400, detail="只支持 JPG、PNG、WEBP、BMP、GIF、HEIC/HEIF 图片")
+
+
 @router.get("/sessions", response_model=AiSessionListOut)
 async def list_ai_sessions(
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
-    rows = _list_sessions(owner_user_id=owner_user_id) or []
+    try:
+        rows = await _list_sessions(db, owner_user_id=owner_user_id) or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"会话列表读取失败：{str(e) or e.__class__.__name__}")
     items = [_to_session_item(x) for x in rows]
     return AiSessionListOut(total=len(items), items=items)
 
@@ -162,10 +220,16 @@ async def list_ai_sessions(
 async def create_ai_session(
         body: AiCreateSessionIn,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
-    row = _create_session(owner_user_id=owner_user_id, title=(body.title or "").strip() or None)
+    try:
+        row = await _create_session(db, owner_user_id=owner_user_id, title=(body.title or "").strip() or None)
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"会话创建失败：{str(e) or e.__class__.__name__}")
     return {
         "ok": True,
         "data": {
@@ -180,10 +244,17 @@ async def create_ai_session(
 async def delete_ai_session(
         session_id: str,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
-    ok = _delete_session(session_id=session_id, owner_user_id=owner_user_id)
+    try:
+        ok = await _delete_session(db, session_id=session_id, owner_user_id=owner_user_id)
+        if ok:
+            await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"会话删除失败：{str(e) or e.__class__.__name__}")
     if not ok:
         raise HTTPException(status_code=404, detail="会话不存在或无权限")
     return AiDeleteSessionOut(ok=True, session_id=session_id)
@@ -202,7 +273,8 @@ async def recall_ai_session_images(
         raise HTTPException(status_code=400, detail="请选择要撤回的图片")
 
     try:
-        session_result = _recall_session_images(
+        session_result = await _recall_session_images(
+            db,
             owner_user_id=str(owner_user_id),
             session_id=session_id,
             storage_keys=storage_keys,
@@ -237,11 +309,13 @@ async def get_ai_history(
         cursor: str | None = Query(default=None, max_length=64),
         limit: int = Query(default=3, ge=1, le=50),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
     try:
-        page = _get_session_messages(
+        page = await _get_session_messages(
+            db,
             session_id=session_id,
             owner_user_id=owner_user_id,
             cursor=(cursor or "").strip() or None,
@@ -249,7 +323,7 @@ async def get_ai_history(
         ) or {}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e) or "会话不存在或无权限访问")
-    rows = page.get("items") if isinstance(page, dict) else _list_messages(session_id=session_id, owner_user_id=owner_user_id) or []
+    rows = page.get("items") if isinstance(page, dict) else []
     items: List[Dict[str, Any]] = []
     for m in rows:
         items.append(
@@ -275,14 +349,19 @@ async def list_platform_account_schema(
         db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
-    accounts = await _list_platform_accounts_public(db, owner_user_id=owner_user_id)
-    platforms = []
-    for item in _list_platform_account_schemas():
-        row = dict(item)
-        account = accounts.get(str(row.get("platform_code") or "").upper())
-        row["account"] = account or None
-        platforms.append(row)
-    return {"ok": True, "data": {"platforms": platforms}}
+    try:
+        accounts = await _list_platform_accounts_public(db, owner_user_id=owner_user_id)
+        platforms = []
+        for item in _list_platform_account_schemas():
+            row = dict(item)
+            account = accounts.get(str(row.get("platform_code") or "").upper())
+            row["account"] = account or None
+            platforms.append(row)
+        return {"ok": True, "data": {"platforms": platforms}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_quote_api_error_detail(e))
 
 
 @router.post("/images/upload")
@@ -299,16 +378,14 @@ async def upload_ai_assistant_image(
     if not file:
         raise HTTPException(status_code=400, detail="请选择要上传的图片")
 
-    content_type = (file.content_type or "application/octet-stream").strip()
-    if not content_type.lower().startswith("image/"):
-        raise HTTPException(status_code=400, detail="只能上传图片文件")
-
     original_name = (file.filename or "image").strip()
+    content_type, ext = _normalize_quote_image_content_type(original_name, file.content_type or "")
     md5_hex, size = await _compute_upload_md5_and_size(file)
     if size <= 0:
         raise HTTPException(status_code=400, detail="图片文件为空")
+    if size > MAX_QUOTE_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="图片不能超过 20MB")
 
-    ext = _guess_image_ext(original_name, content_type)
     storage_key = storage.build_key_by_md5(scene=sk, md5_hex=md5_hex, ext=ext).lstrip("/")
     if not storage.validate_b1_key(scene=sk, storage_key=storage_key, md5_hex=md5_hex):
         raise HTTPException(status_code=400, detail="图片存储路径校验失败")
@@ -387,21 +464,31 @@ async def bind_platform_account(
 async def ai_chat(
         body: AiChatIn,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
-    result = await _send_message(
-        owner_user_id=owner_user_id,
-        session_id=body.session_id,
-        message=body.message,
-        history=body.history,
-        system_prompt=None,
-        model=None,
-        temperature=None,
-        max_tokens=None,
-        stream=bool(body.stream),
-        context=_chat_context(ctx, body),
-    )
+    try:
+        result = await _send_message(
+            owner_user_id=owner_user_id,
+            session_id=body.session_id,
+            message=body.message,
+            history=body.history,
+            system_prompt=None,
+            model=None,
+            temperature=None,
+            max_tokens=None,
+            stream=bool(body.stream),
+            context=_chat_context(ctx, body),
+            db=db,
+        )
+        await db.commit()
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "消息处理失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"消息处理失败：{str(e) or e.__class__.__name__}")
     reply = str(_pick(result, "reply", "content", "text", default="") or "")
     return AiChatOut(
         reply=reply or "已处理",

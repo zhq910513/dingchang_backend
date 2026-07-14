@@ -25,6 +25,7 @@ from app.core.db import get_db
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
+from app.models.quote_assistant import QuoteAssistantMessage, QuoteAssistantSession
 from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
@@ -78,6 +79,10 @@ RESULT_FAILED = "failed"
 # =============================
 def _now_iso() -> str:
     return datetime.now(TZ_BJ).isoformat()
+
+
+def _now_db() -> datetime:
+    return datetime.now(TZ_BJ).replace(tzinfo=None)
 
 
 def _to_str(v: Any, default: str = "") -> str:
@@ -601,6 +606,320 @@ class _Store:
 
 
 _store = _Store()
+
+
+# =============================
+# DB 会话存储（生产路径）
+# =============================
+def _session_row_to_dict(row: QuoteAssistantSession) -> Dict[str, Any]:
+    return {
+        "session_id": _to_str(getattr(row, "session_id", "")),
+        "owner_user_id": _to_str(getattr(row, "owner_user_id", "")),
+        "title": _to_str(getattr(row, "title", "")) or "新会话",
+        "created_at": _fmt_dt(getattr(row, "created_at", None)),
+        "updated_at": _fmt_dt(getattr(row, "updated_at", None)),
+        "deleted": bool(getattr(row, "deleted", False)),
+        "message_count": int(getattr(row, "message_count", 0) or 0),
+        "last_message_preview": _to_str(getattr(row, "last_message_preview", ""))[:120],
+    }
+
+
+def _message_row_to_dict(row: QuoteAssistantMessage) -> Dict[str, Any]:
+    meta = getattr(row, "metadata_json", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    return {
+        "id": _to_str(getattr(row, "message_id", "")),
+        "role": _to_str(getattr(row, "role", "assistant")) or "assistant",
+        "content": _to_str(getattr(row, "content", "")),
+        "created_at": _fmt_dt(getattr(row, "created_at", None)),
+        "metadata": _safe_metadata_for_history(meta),
+    }
+
+
+async def db_get_session(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+) -> Optional[Dict[str, Any]]:
+    row = await _db_get_session_row(db, owner_user_id=owner_user_id, session_id=session_id)
+    return _session_row_to_dict(row) if row else None
+
+
+async def _db_get_session_row(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+) -> Optional[QuoteAssistantSession]:
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip()
+    if owner <= 0 or not sid:
+        return None
+    stmt = (
+        select(QuoteAssistantSession)
+        .where(
+            QuoteAssistantSession.owner_user_id == owner,
+            QuoteAssistantSession.session_id == sid,
+            QuoteAssistantSession.deleted.is_(False),
+        )
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def db_create_session(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        title: Optional[str] = None,
+) -> Dict[str, Any]:
+    owner = _safe_int(owner_user_id, 0)
+    if owner <= 0:
+        raise ValueError("无法识别当前用户")
+    now = _now_db()
+    row = QuoteAssistantSession(
+        session_id=_new_id(),
+        owner_user_id=owner,
+        title=(_to_str(title).strip() or "新会话")[:128],
+        deleted=False,
+        message_count=0,
+        last_message_preview="",
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    await db.flush()
+    return _session_row_to_dict(row)
+
+
+async def db_get_or_create_session(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: Optional[str] = None,
+        title: Optional[str] = None,
+) -> Dict[str, Any]:
+    if session_id:
+        found = await db_get_session(db, owner_user_id=owner_user_id, session_id=session_id)
+        if found:
+            return found
+    return await db_create_session(db, owner_user_id=owner_user_id, title=title)
+
+
+async def db_list_sessions(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        limit: int = 50,
+) -> List[Dict[str, Any]]:
+    owner = _safe_int(owner_user_id, 0)
+    if owner <= 0:
+        return []
+    lim = max(1, min(int(limit or 50), 200))
+    stmt = (
+        select(QuoteAssistantSession)
+        .where(
+            QuoteAssistantSession.owner_user_id == owner,
+            QuoteAssistantSession.deleted.is_(False),
+        )
+        .order_by(desc(QuoteAssistantSession.updated_at), desc(QuoteAssistantSession.id))
+        .limit(lim)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_session_row_to_dict(row) for row in rows]
+
+
+async def db_delete_session(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+) -> bool:
+    row = await _db_get_session_row(db, owner_user_id=owner_user_id, session_id=session_id)
+    if not row:
+        return False
+    row.deleted = True
+    row.updated_at = _now_db()
+    await db.flush()
+    return True
+
+
+async def db_list_messages(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        cursor: Optional[str] = None,
+        limit: int = 50,
+) -> Dict[str, Any]:
+    owner = _safe_int(owner_user_id, 0)
+    row = await _db_get_session_row(db, owner_user_id=owner, session_id=session_id)
+    if not row:
+        raise ValueError("会话不存在或无权限访问")
+
+    lim = max(1, min(int(limit or 50), 200))
+    cursor_pk: Optional[int] = None
+    cursor_id = _to_str(cursor).strip()
+    if cursor_id:
+        cursor_stmt = (
+            select(QuoteAssistantMessage.id)
+            .where(
+                QuoteAssistantMessage.owner_user_id == owner,
+                QuoteAssistantMessage.session_id == row.session_id,
+                QuoteAssistantMessage.message_id == cursor_id,
+            )
+            .limit(1)
+        )
+        cursor_pk = (await db.execute(cursor_stmt)).scalar_one_or_none()
+
+    stmt = (
+        select(QuoteAssistantMessage)
+        .where(
+            QuoteAssistantMessage.owner_user_id == owner,
+            QuoteAssistantMessage.session_id == row.session_id,
+        )
+    )
+    if cursor_id and cursor_pk is not None:
+        stmt = stmt.where(QuoteAssistantMessage.id < int(cursor_pk))
+
+    stmt = stmt.order_by(desc(QuoteAssistantMessage.id)).limit(lim + 1)
+    rows_desc = (await db.execute(stmt)).scalars().all()
+    has_more = len(rows_desc) > lim
+    page_rows = list(reversed(rows_desc[:lim]))
+    items = [_message_row_to_dict(m) for m in page_rows]
+
+    return {
+        "items": items,
+        "next_cursor": items[0]["id"] if (has_more and items) else None,
+        "has_more": has_more,
+    }
+
+
+async def db_append_message(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        role: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    owner = _safe_int(owner_user_id, 0)
+    row = await _db_get_session_row(db, owner_user_id=owner, session_id=session_id)
+    if not row:
+        raise ValueError("会话不存在或无权限访问")
+
+    now = _now_db()
+    safe_content = _to_str(content)
+    msg = QuoteAssistantMessage(
+        message_id=_new_id(),
+        session_id=row.session_id,
+        owner_user_id=owner,
+        role=_to_str(role) or "assistant",
+        content=safe_content,
+        metadata_json=_safe_metadata_for_history(metadata or {}),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(msg)
+
+    if (row.title in (None, "", "新会话")) and msg.role == "user":
+        row.title = (safe_content.strip() or "新会话")[:24]
+    row.message_count = int(row.message_count or 0) + 1
+    row.last_message_preview = safe_content[:120]
+    row.updated_at = now
+
+    await db.flush()
+    return _message_row_to_dict(msg)
+
+
+async def db_recall_session_images(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        storage_keys: List[str],
+        message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    keys = {str(x or "").strip().lstrip("/") for x in (storage_keys or []) if str(x or "").strip()}
+    if not keys:
+        return {"updated_messages": 0, "updated_images": 0, "storage_keys": []}
+
+    owner = _safe_int(owner_user_id, 0)
+    sess = await _db_get_session_row(db, owner_user_id=owner, session_id=session_id)
+    if not sess:
+        raise ValueError("会话不存在或无权限访问")
+
+    def mark_list(value: Any, recalled_at: str) -> int:
+        changed = 0
+        if not isinstance(value, list):
+            return changed
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            sk = _to_str(item.get("storage_key") or item.get("key")).strip().lstrip("/")
+            if sk and sk in keys and not item.get("recalled"):
+                item["recalled"] = True
+                item["recalled_at"] = recalled_at
+                changed += 1
+        return changed
+
+    stmt = (
+        select(QuoteAssistantMessage)
+        .where(
+            QuoteAssistantMessage.owner_user_id == owner,
+            QuoteAssistantMessage.session_id == sess.session_id,
+        )
+    )
+    msg_id = _to_str(message_id).strip()
+    if msg_id:
+        stmt = stmt.where(QuoteAssistantMessage.message_id == msg_id)
+    stmt = stmt.order_by(QuoteAssistantMessage.id)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    recalled_at = _now_iso()
+    updated_at = _now_db()
+    updated_messages = 0
+    updated_images = 0
+
+    for msg in rows:
+        meta = deepcopy(msg.metadata_json or {})
+        if not isinstance(meta, dict):
+            continue
+
+        before = updated_images
+        updated_images += mark_list(meta.get("images"), recalled_at)
+        page_context = meta.get("page_context")
+        if isinstance(page_context, dict):
+            updated_images += mark_list(page_context.get("images"), recalled_at)
+            updated_images += mark_list(page_context.get("uploaded_images"), recalled_at)
+        data = meta.get("data")
+        payload = data.get("payload") if isinstance(data, dict) else None
+        if isinstance(payload, dict):
+            updated_images += mark_list(payload.get("attached_images"), recalled_at)
+
+        if updated_images > before:
+            old_keys = meta.get("recalled_image_storage_keys")
+            if not isinstance(old_keys, list):
+                old_keys = []
+            meta["recalled_image_storage_keys"] = sorted(set([*old_keys, *keys]))
+            meta["recalled_at"] = recalled_at
+            msg.metadata_json = _safe_metadata_for_history(meta)
+            msg.updated_at = updated_at
+            updated_messages += 1
+
+    if updated_images:
+        sess.updated_at = updated_at
+        await db.flush()
+
+    return {
+        "updated_messages": updated_messages,
+        "updated_images": updated_images,
+        "storage_keys": sorted(keys),
+    }
+
 
 # =============================
 # 指令理解（规则引擎）
@@ -2463,6 +2782,7 @@ async def send_message(
         client_msg_id: Optional[str] = None,
         page_context: Optional[Dict[str, Any]] = None,
         use_stream: Optional[bool] = None,
+        db: Optional[AsyncSession] = None,
 ) -> Dict[str, Any]:
     del history, system_prompt, temperature, max_tokens
 
@@ -2473,37 +2793,82 @@ async def send_message(
     if not final_text:
         raise ValueError("消息内容不能为空")
 
-    sess = _store.get_or_create_session(owner_user_id=_to_str(owner_user_id), session_id=session_id)
+    if db is not None:
+        sess = await db_get_or_create_session(db, owner_user_id=owner_user_id, session_id=session_id)
+    else:
+        sess = _store.get_or_create_session(owner_user_id=_to_str(owner_user_id), session_id=session_id)
     real_session_id = _to_str(sess.get("session_id"))
-
-    user_msg = _store.append_message(
-        owner_user_id=owner_user_id,
-        session_id=real_session_id,
-        role="user",
-        content=redact_quote_sensitive_text(final_text),
-        metadata={
-            "status": "success",
-            "intent": "user_input",
-            "client_msg_id": client_msg_id,
-            "page_context": _safe_context_for_history(final_context),
-            "use_stream": final_stream,
-            "model": _to_str(model, default="rule-engine") or "rule-engine",
-        },
-    )
 
     # 给平台入口一个 session_id 也能用（不强绑）
     if isinstance(final_context, dict):
         final_context["session_id"] = real_session_id
 
+    hide_unlabeled_sms_code = False
+    if looks_like_sms_code(final_text):
+        try:
+            async for sms_db in get_db():
+                hide_unlabeled_sms_code = bool(
+                    await has_waiting_sms_task(sms_db, final_context)
+                    or await has_expired_waiting_sms_task(sms_db, final_context)
+                )
+                break
+        except Exception:
+            hide_unlabeled_sms_code = False
+
+    user_metadata = {
+        "status": "success",
+        "intent": "user_input",
+        "client_msg_id": client_msg_id,
+        "page_context": _safe_context_for_history(final_context),
+        "use_stream": final_stream,
+        "model": _to_str(model, default="rule-engine") or "rule-engine",
+    }
+    if isinstance(final_context, dict) and "display_user_content" in final_context:
+        display_text = _norm_text(final_context.get("display_user_content"))
+    else:
+        display_text = final_text
+    user_content = redact_quote_sensitive_text(
+        display_text,
+        hide_unlabeled_sms_code=hide_unlabeled_sms_code,
+    )
+    if db is not None:
+        user_msg = await db_append_message(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=real_session_id,
+            role="user",
+            content=user_content,
+            metadata=user_metadata,
+        )
+    else:
+        user_msg = _store.append_message(
+            owner_user_id=owner_user_id,
+            session_id=real_session_id,
+            role="user",
+            content=user_content,
+            metadata=user_metadata,
+        )
+
     reply_text, reply_meta = await _dispatch_rule(final_text, final_context)
 
-    assistant_msg = _store.append_message(
-        owner_user_id=owner_user_id,
-        session_id=real_session_id,
-        role="assistant",
-        content=redact_quote_sensitive_text(reply_text),
-        metadata=reply_meta,
-    )
+    assistant_content = redact_quote_sensitive_text(reply_text)
+    if db is not None:
+        assistant_msg = await db_append_message(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=real_session_id,
+            role="assistant",
+            content=assistant_content,
+            metadata=reply_meta,
+        )
+    else:
+        assistant_msg = _store.append_message(
+            owner_user_id=owner_user_id,
+            session_id=real_session_id,
+            role="assistant",
+            content=assistant_content,
+            metadata=reply_meta,
+        )
 
     meta = assistant_msg.get("metadata") or {}
     if not isinstance(meta, dict):
@@ -2533,5 +2898,12 @@ __all__ = [
     "recall_session_images",
     "get_session_messages",
     "list_messages",
+    "db_create_session",
+    "db_delete_session",
+    "db_get_or_create_session",
+    "db_get_session",
+    "db_list_messages",
+    "db_list_sessions",
+    "db_recall_session_images",
     "send_message",
 ]

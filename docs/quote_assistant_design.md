@@ -13,6 +13,8 @@
 - `quote_case_image_new`：报价图片候选池。记录用户上传槽位、系统识别槽位、最终确认槽位和 active/replaced 状态。单图槽只保留一个 active，旧图不删除。
 - `quote_task_new`：一次平台报价任务。保存登录状态、短信状态、提交快照、平台请求/响应/标准化结果。
 - `quote_case_event_new`：报价助手业务记忆与审计事件。保存聊天输入、图片归位、任务状态变化等。
+- `quote_assistant_session_new`：报价助手聊天会话主表。保存归属用户、标题、软删除状态、消息数和最后消息摘要。
+- `quote_assistant_message_new`：报价助手聊天消息表。保存用户/助手消息、展示 metadata、图片撤回状态和分页游标。
 
 ## 图片归位策略
 
@@ -43,7 +45,7 @@ cd /data/backend/dingchang_backend
 python scripts/create_quote_assistant_tables.py
 ```
 
-脚本只创建报价助手五张新表，不会修改已有表结构。
+脚本只创建报价助手七张新表，不会修改已有表结构。
 
 ## 本轮补充
 
@@ -52,6 +54,7 @@ python scripts/create_quote_assistant_tables.py
 - 接口 `/ai-assistant/sessions/{session_id}/history` 默认只返回最新 3 条消息。
 - 向上滚动时，前端继续按 `cursor + limit=5` 拉取更早历史。
 - 后端返回 `next_cursor` 和 `has_more`，最早一页不会重复回卷。
+- 生产接口使用 `quote_assistant_session_new` / `quote_assistant_message_new` 落库，不再依赖本地 JSON 文件保存聊天记忆。
 
 ### 平台登录资料留存
 
@@ -107,3 +110,27 @@ python scripts/create_quote_assistant_tables.py
 - 本地真实接口：`/api/health`、`/api/auth/login`、`/api/ai-assistant/chat`、`/api/ai-assistant/sessions/{session_id}/history` 通过。
 - 长签名图片 URL 实测：聊天返回 `quote_image_collect`，历史接口和 `storage/quote_assistant_sessions.json` 均不含 `authorization` / `x-bce-security-token`，数据库 `image_url` 长度为 82。
 - 平台账号引导实测：未绑定平台账号时返回“绑定账号”动作；绑定账号后可进入短信等待；输入验证码后假报价流程返回成功。
+
+## 2026-05-17 链路打磨补充
+
+### 图片上下文识别
+
+- 用户在输入框补一句“这是身份证正面 / 行驶证副页 / 合格证”等说明后再拖图，后端会把这类上下文作为材料类型强提示参与归位。
+- 弱上下文（例如“张三资料”）不会阻断真实 OCR；后端仍会继续尝试 OCR 分类，避免因为用户随手备注导致图片长期落到相关图片。
+- 文件名或路径出现 `id-front`、`drive-main`、`vehicle-cert` 等明确材料类型时，会高置信直接归位，避免不必要的 OCR 慢调用。
+- OCR 分类增加单次调用和单图总耗时预算，外部 OCR 慢或不可达时不会长期卡住聊天响应。
+
+### 前端与提示
+
+- 报价助手回复进一步精简，草稿号、任务号、trace 等内部信息只保留在结构化 metadata，不主动展示在聊天正文。
+- 前端开发代理支持 `VITE_API_PROXY_TARGET`，本地 8000/8011 切换时无需改代码。
+- 代理无法连接后端时，前端会提示“本地开发代理无法连接后端服务”，不再只显示笼统的“服务器内部错误”。
+- 前端增加低调的流程提示、空会话快捷指令、历史“查看更早消息”、报价命令格式提示、短信验证码提示和上传前文件校验。
+- 图片预览链接失效时显示“无法预览”，不再让默认加载失败文案干扰聊天正文。
+
+### 会话记忆落库
+
+- `/ai-assistant/sessions`、`/sessions/{session_id}/history`、`/chat`、`/images/recall` 已切换为 DB-backed 会话存储。
+- 历史消息继续保持前端原响应结构：`id/role/content/created_at/metadata`，图片 metadata 会继续清理签名 URL、token、密码和内部权限上下文。
+- 原 `storage/quote_assistant_sessions.json` 仅保留为单元测试和临时兜底实现，不作为生产聊天记忆来源。
+- 图片撤回会同时更新聊天消息 metadata 和报价图片候选池，保证用户从会话里撤回后不会继续参与报价材料审查。

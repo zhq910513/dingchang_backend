@@ -4,13 +4,15 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.api.v1 import router as v1_router
@@ -51,9 +53,11 @@ ORDER_FACT_BACKFILL_MAX_BATCHES = int(os.getenv("ORDER_FACT_BACKFILL_MAX_BATCHES
 OCR_POLL_ENABLED = os.getenv("OCR_POLL_ENABLED", "1") == "1"
 OCR_POLL_INTERVAL_SECONDS = int(os.getenv("OCR_POLL_INTERVAL_SECONDS", "3") or "3")
 OCR_POLL_BATCH_SIZE = int(os.getenv("OCR_POLL_BATCH_SIZE", "3") or "3")
+OCR_PROCESSING_STALE_SECONDS = int(os.getenv("OCR_PROCESSING_STALE_SECONDS", "1800") or "1800")
 
 DB_TIME_ZONE = os.getenv("DB_TIME_ZONE", "+08:00")
 DB_SET_TIME_ZONE_ENABLED = os.getenv("DB_SET_TIME_ZONE_ENABLED", "1") == "1"
+BJ_TZ = ZoneInfo("Asia/Shanghai")
 
 # ========= Redis 分布式锁（启动单例守卫） =========
 LOCK_SEED_KEY = os.getenv("STARTUP_LOCK_SEED_KEY", "dingchang:startup:seed")
@@ -112,6 +116,24 @@ async def acquire_lock(key: str, ttl_seconds: int) -> str | None:
         return None
 
 
+async def acquire_lock_checked(key: str, ttl_seconds: int) -> tuple[str | None, str]:
+    r = await _redis_client()
+    if not r:
+        logger.warning("[startup_lock] redis not available, skip lock key=%s", key)
+        return None, "unavailable"
+
+    token = str(uuid4())
+    try:
+        ok = await r.set(key, token, ex=int(ttl_seconds), nx=True)
+        if ok:
+            logger.info("[startup_lock] acquired key=%s ttl=%ss", key, ttl_seconds)
+            return token, "acquired"
+        return None, "busy"
+    except Exception:
+        logger.exception("[startup_lock] acquire failed key=%s", key)
+        return None, "unavailable"
+
+
 async def release_lock(key: str, token: str) -> None:
     r = await _redis_client()
     if not r:
@@ -144,6 +166,97 @@ async def _apply_db_time_zone(obj) -> None:
         logger.exception("SET time_zone failed (tz=%s)", DB_TIME_ZONE)
 
 
+async def _reset_stale_processing_ocr_tasks(db) -> int:
+    stale_seconds = int(OCR_PROCESSING_STALE_SECONDS or 0)
+    if stale_seconds <= 0:
+        return 0
+
+    cutoff = datetime.now(BJ_TZ).replace(tzinfo=None) - timedelta(seconds=stale_seconds)
+    result = await db.execute(
+        update(OcrTask)
+        .where(
+            and_(
+                OcrTask.status == "processing",
+                OcrTask.active_scope_id.isnot(None),
+                OcrTask.updated_at < cutoff,
+            )
+        )
+        .values(
+            status="pending",
+            progress=0,
+            error_message="OCR task recovered from stale processing state",
+        )
+    )
+    await db.commit()
+    count = int(getattr(result, "rowcount", 0) or 0)
+    if count:
+        logger.warning(
+            "[ocr_poller] recovered stale processing tasks count=%s stale_seconds=%s",
+            count,
+            stale_seconds,
+        )
+    return count
+
+
+async def _activate_queued_ocr_followups(db) -> int:
+    stmt = (
+        select(OcrTask)
+        .where(
+            and_(
+                OcrTask.scope_type == "order",
+                OcrTask.status == "pending",
+                OcrTask.active_scope_id.is_(None),
+            )
+        )
+        .order_by(OcrTask.id.asc())
+        .limit(max(1, int(OCR_POLL_BATCH_SIZE)))
+    )
+    queued = (await db.execute(stmt)).scalars().all()
+    activated = 0
+
+    for task in queued:
+        order_id = int(getattr(task, "scope_id", 0) or 0)
+        if order_id <= 0:
+            continue
+
+        active_id = (
+            await db.execute(
+                select(OcrTask.id)
+                .where(and_(OcrTask.scope_type == "order", OcrTask.active_scope_id == order_id))
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if active_id:
+            continue
+
+        try:
+            result = await db.execute(
+                update(OcrTask)
+                .where(
+                    and_(
+                        OcrTask.id == int(task.id),
+                        OcrTask.status == "pending",
+                        OcrTask.active_scope_id.is_(None),
+                    )
+                )
+                .values(
+                    active_scope_id=order_id,
+                    progress=0,
+                    error_message=None,
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0):
+                activated += 1
+        except Exception:
+            logger.exception("[ocr_poller] activate queued followup failed task_id=%s order_id=%s", task.id, order_id)
+
+    if activated:
+        await db.commit()
+        logger.info("[ocr_poller] activated queued followup tasks count=%s", activated)
+
+    return activated
+
+
 async def _ocr_poller_loop(stop_event: asyncio.Event, lock_token: str | None) -> None:
     interval = max(1, int(OCR_POLL_INTERVAL_SECONDS))
     batch_size = max(1, int(OCR_POLL_BATCH_SIZE))
@@ -167,6 +280,8 @@ async def _ocr_poller_loop(stop_event: asyncio.Event, lock_token: str | None) ->
         try:
             async with SessionLocal() as db:
                 await _apply_db_time_zone(db)
+                await _reset_stale_processing_ocr_tasks(db)
+                await _activate_queued_ocr_followups(db)
 
                 stmt = (
                     select(OcrTask.id)
@@ -197,6 +312,37 @@ async def _ocr_poller_loop(stop_event: asyncio.Event, lock_token: str | None) ->
             pass
 
     logger.info("[ocr_poller] stopped")
+
+
+async def _ocr_poller_supervisor(stop_event: asyncio.Event) -> None:
+    retry_delay = max(5, min(60, int(LOCK_POLL_TTL_SECONDS) + 1))
+
+    while not stop_event.is_set():
+        token, lock_state = await acquire_lock_checked(LOCK_POLL_KEY, LOCK_POLL_TTL_SECONDS)
+        if lock_state == "unavailable":
+            logger.warning("[ocr_poller] redis lock unavailable; running without distributed lock")
+            await _ocr_poller_loop(stop_event, None)
+            break
+
+        if token:
+            try:
+                await _ocr_poller_loop(stop_event, token)
+            finally:
+                await release_lock(LOCK_POLL_KEY, token)
+
+            if stop_event.is_set():
+                break
+
+            logger.warning("[ocr_poller] lock lost; retry acquire in %ss", retry_delay)
+        else:
+            logger.info("[ocr_poller] lock not acquired; retry acquire in %ss key=%s", retry_delay, LOCK_POLL_KEY)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=retry_delay)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[ocr_poller] supervisor stopped")
 
 
 async def _run_order_fact_backfill_once() -> None:
@@ -294,16 +440,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("[order_fact_backfill] disabled (ORDER_FACT_BACKFILL_ENABLED=0)")
 
-    poll_token = None
     if OCR_POLL_ENABLED:
-        poll_token = await acquire_lock(LOCK_POLL_KEY, LOCK_POLL_TTL_SECONDS)
-        if poll_token:
-            stop_event = asyncio.Event()
-            app.state.ocr_poller_stop_event = stop_event
-            app.state.ocr_poller_lock_token = poll_token
-            app.state.ocr_poller_task = asyncio.create_task(_ocr_poller_loop(stop_event, poll_token))
-        else:
-            logger.info("[ocr_poller] skipped (lock not acquired) key=%s", LOCK_POLL_KEY)
+        stop_event = asyncio.Event()
+        app.state.ocr_poller_stop_event = stop_event
+        app.state.ocr_poller_task = asyncio.create_task(_ocr_poller_supervisor(stop_event))
     else:
         logger.info("[ocr_poller] disabled (OCR_POLL_ENABLED=0)")
 
@@ -325,11 +465,6 @@ async def lifespan(app: FastAPI):
                     except Exception:
                         pass
 
-            if hasattr(app.state, "ocr_poller_lock_token"):
-                try:
-                    await release_lock(LOCK_POLL_KEY, app.state.ocr_poller_lock_token)
-                except Exception:
-                    logger.exception("release ocr poller lock failed")
         except Exception:
             logger.exception("stop ocr poller failed")
 
