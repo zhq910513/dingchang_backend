@@ -1,20 +1,110 @@
-# Python
+# Dingchang backend ignore rules
+
+# Python bytecode / runtime caches
 __pycache__/
 *.py[cod]
 *$py.class
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.pytest_cache/
+.hypothesis/
+
+# Virtual environments / local dependency caches
+.venv/
+venv/
+env/
+ENV/
+.codex_pip_tmp/
+pip-wheel-metadata/
+
+# Test, coverage, and benchmark artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+test-results/
+pytest-results/
+reports/
+benchmarks/
+
+# Local-only audit docs and test files
+docs/
+tests/
+
+# Local runtime state
+logs/
+storage/
+tmp/
+temp/
+*.log
+*.pid
+*.sock
+
+# Local database files, dumps, and backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql
+*.sql.gz
+*.bak
+*.backup
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+
+# Uploaded/generated media and OCR scratch files
+uploads/
+download/
+downloads/
+screenshots/
+ocr-cache/
+ocr_cache/
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+*.heic
+*.heif
+*.pdf
+
+# Environment and secret files
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+
+# IDE / editor / OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Local command notes / generated tree snapshots
 cmd.txt
 tree-src.txt
+tree.txt
+*.local.txt
 
-# IDE
-.idea/
-.vscode/
-
-# Runtime logs, reports, and local dumps
-logs/
-
-# Local runtime state and secrets
-storage/
-.env
-.env.*
+# Docker / compose local overrides
+docker-compose.override.yml
+compose.override.yml

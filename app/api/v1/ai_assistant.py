@@ -30,7 +30,9 @@ from app.schemas.ai_assistant import (
     AiSessionListOut,
     AiCreateSessionIn,
     AiDeleteSessionOut,
-    AiPlatformAccountBindIn,
+    AiPlatformAccountLoginChallengeIn,
+    AiPlatformAccountProfileIn,
+    AiPlatformAccountTypeIn,
     AiRecallSessionImageIn,
 )
 from app.services.ai_assistant_service import (
@@ -42,11 +44,18 @@ from app.services.ai_assistant_service import (
     send_message as _send_message,  # async
 )
 from app.services.quote_assistant_service import (
+    _account_type_payload,
     _credential_public_payload,
-    list_platform_accounts_public as _list_platform_accounts_public,
-    list_platform_account_schemas as _list_platform_account_schemas,
+    create_platform_account_profile as _create_platform_account_profile,
+    get_platform_account_profile as _get_platform_account_profile,
+    list_platform_account_profiles as _list_platform_account_profiles,
+    list_platform_account_types as _list_platform_account_types,
+    list_quote_platforms as _list_quote_platforms,
     recall_quote_case_images as _recall_quote_case_images,
-    save_platform_account_form as _save_platform_account_form,
+    save_platform_account_type as _save_platform_account_type,
+    start_platform_account_login as _start_platform_account_login,
+    submit_platform_account_login_challenge as _submit_platform_account_login_challenge,
+    update_platform_account_profile as _update_platform_account_profile,
 )
 from app.services.image_slot_classifier import SLOT_KEYS
 from app.services.storage import StorageService
@@ -254,9 +263,9 @@ async def delete_ai_session(
             await db.commit()
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"会话删除失败：{str(e) or e.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="会话删除失败：%s" % (str(e) or e.__class__.__name__))
     if not ok:
-        raise HTTPException(status_code=404, detail="会话不存在或无权限")
+        raise HTTPException(status_code=404, detail="会话不存在或无权删除")
     return AiDeleteSessionOut(ok=True, session_id=session_id)
 
 
@@ -343,23 +352,93 @@ async def get_ai_history(
     }
 
 
-@router.get("/platform-accounts/schema")
-async def list_platform_account_schema(
+@router.get("/platforms")
+async def list_quote_platforms(
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+):
+    _owner_user_id_or_401(ctx)
+    return {"ok": True, "data": {"platforms": _list_quote_platforms()}}
+
+
+@router.get("/platform-account-types")
+async def list_platform_account_types(
+        platform_code: str | None = Query(default=None, max_length=32),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
         db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
     try:
-        accounts = await _list_platform_accounts_public(db, owner_user_id=owner_user_id)
-        platforms = []
-        for item in _list_platform_account_schemas():
-            row = dict(item)
-            account = accounts.get(str(row.get("platform_code") or "").upper())
-            row["account"] = account or None
-            platforms.append(row)
-        return {"ok": True, "data": {"platforms": platforms}}
-    except HTTPException:
-        raise
+        items = await _list_platform_account_types(db, owner_user_id=owner_user_id, platform_code=platform_code)
+        return {"ok": True, "data": {"items": items, "total": len(items)}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_quote_api_error_detail(e))
+
+
+@router.post("/platform-account-types")
+async def create_platform_account_type(
+        body: AiPlatformAccountTypeIn,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        row = await _save_platform_account_type(db, owner_user_id=owner_user_id, values=body.dict())
+        await db.commit()
+        return {"ok": True, "data": {"item": _account_type_payload(row)}}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "账号类型保存失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"账号类型保存失败：{str(e) or e.__class__.__name__}")
+
+
+@router.put("/platform-account-types/{type_id}")
+async def update_platform_account_type(
+        type_id: int,
+        body: AiPlatformAccountTypeIn,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        row = await _save_platform_account_type(db, owner_user_id=owner_user_id, type_id=type_id, values=body.dict())
+        await db.commit()
+        return {"ok": True, "data": {"item": _account_type_payload(row)}}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "账号类型保存失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"账号类型保存失败：{str(e) or e.__class__.__name__}")
+
+
+@router.get("/platform-accounts")
+async def list_platform_accounts(
+        platform_code: str | None = Query(default=None, max_length=32),
+        account_type_name: str | None = Query(default=None, max_length=64),
+        enabled: bool | None = Query(default=None),
+        login_status: str | None = Query(default=None, max_length=32),
+        quota_status: str | None = Query(default=None, max_length=32),
+        keyword: str | None = Query(default=None, max_length=128),
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        result = await _list_platform_account_profiles(
+            db,
+            owner_user_id=owner_user_id,
+            filters={
+                "platform_code": platform_code,
+                "account_type_name": account_type_name,
+                "enabled": enabled,
+                "login_status": login_status,
+                "quota_status": quota_status,
+                "keyword": keyword,
+            },
+        )
+        return {"ok": True, "data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=_quote_api_error_detail(e))
 
@@ -430,34 +509,104 @@ async def upload_ai_assistant_image(
 
 
 @router.post("/platform-accounts")
-async def bind_platform_account(
-        body: AiPlatformAccountBindIn,
+async def create_platform_account(
+        body: AiPlatformAccountProfileIn,
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
         db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
     try:
-        account = await _save_platform_account_form(
+        account = await _create_platform_account_profile(
             db,
             owner_user_id=owner_user_id,
-            platform_code=body.platform_code,
-            platform_name=body.platform_name,
-            values=body.values,
+            values=body.dict(exclude_unset=True),
+            operator_user_id=owner_user_id,
         )
         await db.commit()
+        return {"ok": True, "data": {"account": _credential_public_payload(account) or {}}}
     except ValueError as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=str(e) or "平台账号信息不完整")
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"平台账号保存失败：{str(e) or e.__class__.__name__}")
+        raise HTTPException(status_code=500, detail="平台账号保存失败：%s" % (str(e) or e.__class__.__name__))
 
-    return {
-        "ok": True,
-        "data": {
-            "platform_account": _credential_public_payload(account) or {},
-        },
-    }
+
+@router.put("/platform-accounts/{account_id}")
+async def update_platform_account(
+        account_id: int,
+        body: AiPlatformAccountProfileIn,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        account = await _update_platform_account_profile(
+            db,
+            owner_user_id=owner_user_id,
+            account_id=account_id,
+            values=body.dict(exclude_unset=True),
+            operator_user_id=owner_user_id,
+            confirm_enabled_edit=bool(body.confirm_enabled_edit),
+        )
+        await db.commit()
+        return {"ok": True, "data": {"account": _credential_public_payload(account) or {}}}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "平台账号保存失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="平台账号保存失败：%s" % (str(e) or e.__class__.__name__))
+
+
+@router.post("/platform-accounts/{account_id}/login")
+async def login_platform_account(
+        account_id: int,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        result = await _start_platform_account_login(
+            db,
+            owner_user_id=owner_user_id,
+            account_id=account_id,
+            operator_user_id=owner_user_id,
+        )
+        await db.commit()
+        return {"ok": True, "data": result}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "平台登录失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="平台登录失败：%s" % (str(e) or e.__class__.__name__))
+
+
+@router.post("/platform-account-login-tasks/{task_id}/challenge")
+async def submit_platform_account_login_challenge(
+        task_id: int,
+        body: AiPlatformAccountLoginChallengeIn,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    try:
+        result = await _submit_platform_account_login_challenge(
+            db,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            code=body.code,
+            operator_user_id=owner_user_id,
+        )
+        await db.commit()
+        return {"ok": True, "data": result}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=str(e) or "验证码提交失败")
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"验证码提交失败：{str(e) or e.__class__.__name__}")
 
 
 @router.post("/chat", response_model=AiChatOut)
@@ -507,4 +656,3 @@ async def ai_chat(
 @router.get("/health")
 async def ai_assistant_health():
     return {"ok": True, "module": "quotation_assistant"}
-

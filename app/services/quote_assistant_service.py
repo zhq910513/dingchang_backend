@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import and_, desc, false as sql_false, or_, select, update
+from sqlalchemy import and_, desc, false as sql_false, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import lazyload, selectinload
 
@@ -19,7 +19,16 @@ from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SAL
 from app.models.image_file import ImageFile
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
-from app.models.quote_assistant import QuoteCase, QuoteCaseEvent, QuoteCaseImage, QuotePlatformAccount, QuoteTask
+from app.models.quote_assistant import (
+    QuoteCase,
+    QuoteCaseEvent,
+    QuoteCaseImage,
+    QuotePlatformAccountEvent,
+    QuotePlatformAccountLoginTask,
+    QuotePlatformAccountProfile,
+    QuotePlatformAccountType,
+    QuoteTask,
+)
 from app.models.user import User
 from app.services.image_slot_classifier import (
     SLOT_KEYS,
@@ -29,6 +38,8 @@ from app.services.image_slot_classifier import (
 )
 from app.services.baidu_ocr import OcrCallError, OcrNotConfigured, call_ocr
 from app.services.ocr_worker import _extract_by_type
+from app.services.quote_platforms import runtime as quote_platform_runtime
+from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
 from app.services.quote_secret_box import encrypt_json, encrypt_text
 from app.services.storage import StorageService
 
@@ -107,7 +118,6 @@ DEFAULT_PLATFORM_CREDENTIAL_FIELDS: Tuple[Dict[str, Any], ...] = (
 )
 
 PLATFORM_CREDENTIAL_FIELD_OVERRIDES: Dict[str, Tuple[Dict[str, Any], ...]] = {
-    # 目前真实平台适配器尚未接入，太平洋先按“手机号短信验证优先，账号密码可补充”的口径走。
     "TP": DEFAULT_PLATFORM_CREDENTIAL_FIELDS,
     "PICC": (
         DEFAULT_PLATFORM_CREDENTIAL_FIELDS[0],
@@ -119,6 +129,50 @@ PLATFORM_CREDENTIAL_FIELD_OVERRIDES: Dict[str, Tuple[Dict[str, Any], ...]] = {
         {**DEFAULT_PLATFORM_CREDENTIAL_FIELDS[1], "required": True},
         {**DEFAULT_PLATFORM_CREDENTIAL_FIELDS[2], "required": True},
     ),
+}
+
+ACCOUNT_LOGIN_NOT_LOGGED_IN = "not_logged_in"
+ACCOUNT_LOGIN_LOGGING_IN = "logging_in"
+ACCOUNT_LOGIN_NEEDS_CODE = "needs_code"
+ACCOUNT_LOGIN_AUTHENTICATED = "authenticated"
+ACCOUNT_LOGIN_EXPIRED = "expired"
+ACCOUNT_LOGIN_FAILED = "failed"
+ACCOUNT_LOGIN_DISABLED = "disabled"
+
+ACCOUNT_QUOTA_UNKNOWN = "unknown"
+ACCOUNT_QUOTA_AVAILABLE = "available"
+ACCOUNT_QUOTA_WARNING = "warning"
+ACCOUNT_QUOTA_FULL = "full"
+ACCOUNT_QUOTA_RESET = "reset"
+
+LOGIN_TASK_PENDING = "pending"
+LOGIN_TASK_RUNNING = "running"
+LOGIN_TASK_NEEDS_CODE = "needs_code"
+LOGIN_TASK_SUCCESS = "success"
+LOGIN_TASK_FAILED = "failed"
+LOGIN_TASK_EXPIRED = "expired"
+
+RUNTIME_LOGIN_SUCCESS_STATUSES = {"success", "ok", "authenticated"}
+RUNTIME_LOGIN_CHALLENGE_STATUSES = {
+    "needs_code",
+    "need_code",
+    "sms_required",
+    "requires_sms",
+    "challenge_required",
+    "requires_challenge",
+}
+RUNTIME_QUOTE_SUCCESS_STATUSES = {"success", "ok", "quoted"}
+RUNTIME_QUOTA_FULL_STATUSES = {"quota_full", "quota_exceeded", "limit_exceeded"}
+
+ACCOUNT_SENSITIVE_FIELDS = {
+    "platform_code",
+    "account_type_name",
+    "account_username",
+    "account_password",
+    "login_phone",
+    "email",
+    "account_owner_name",
+    "auto_login",
 }
 
 
@@ -209,6 +263,16 @@ def _fmt_dt(value: Any) -> Optional[str]:
     return _to_str(value) or None
 
 
+def _loaded_value(obj: Any, key: str, default: Any = None) -> Any:
+    values = getattr(obj, "__dict__", None)
+    if isinstance(values, dict):
+        if key in values:
+            return values.get(key)
+        if "_sa_instance_state" in values:
+            return default
+    return getattr(obj, key, default)
+
+
 def _norm_text(value: Any) -> str:
     text = _to_str(value).replace("\u3000", " ").strip()
     text = re.sub(r"\s+", " ", text)
@@ -274,7 +338,7 @@ def _extract_labeled_value(text: str, labels: Tuple[str, ...], *, max_len: int =
     label_expr = "|".join(re.escape(x) for x in sorted(labels, key=len, reverse=True) if x)
     if not label_expr:
         return None
-    pattern = rf"(?:{label_expr})\s*[:：=]?\s*([^\s,，;；。]+)"
+    pattern = rf"(?:{label_expr})\s*[:：=]?\s*([^\s,，,;；。]+)"
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if not match:
         return None
@@ -341,7 +405,7 @@ def redact_quote_sensitive_text(text: Any, *, hide_unlabeled_sms_code: bool = Fa
     if hide_unlabeled_sms_code and re.fullmatch(r"\s*\d{4,8}\s*", out):
         return "[短信验证码已隐藏]"
     out = re.sub(
-        r"((?:登录密码|登陆密码|平台密码|密码|口令|password|pwd)\s*[:：=]?\s*)([^\s,，;；。]+)",
+        r"((?:登录密码|登陆密码|平台密码|密码|口令|password|pwd)\s*[:：=]?\s*)([^\s,，,;；。]+)",
         lambda m: m.group(1) + "[已隐藏]",
         out,
         flags=re.IGNORECASE,
@@ -377,7 +441,7 @@ def _redact_platform_credentials_for_signal(text: Any) -> str:
         if not label_expr:
             continue
         out = re.sub(
-            rf"((?:{label_expr})\s*[:：=]?\s*)([^\s,，;；。]+)",
+            rf"((?:{label_expr})\s*[:：=]?\s*)([^\s,，,;；。]+)",
             lambda m: m.group(1) + "[VALUE]",
             out,
             flags=re.IGNORECASE,
@@ -456,305 +520,782 @@ def detect_platform_credential_signal(text: Any) -> Dict[str, Any]:
     }
 
 
-def _credential_public_payload(row: Optional[QuotePlatformAccount]) -> Optional[Dict[str, Any]]:
-    if row is None:
+def _normalize_platform_code_name(platform_code: Any, platform_name: Optional[Any] = None) -> Tuple[str, str]:
+    code = _to_str(platform_code).strip().upper()
+    if not code:
+        raise ValueError("请选择平台")
+    name = _platform_display_name(code, _to_str(platform_name).strip() or None)
+    return code, name or code
+
+
+def _normalize_account_type_name(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value).strip())
+    return text[:64]
+
+
+def _normalize_login_phone(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    raw = _to_str(value).strip()
+    if not raw:
+        return None, None
+    digits = re.sub(r"\D+", "", raw)
+    if len(digits) != 11:
+        raise ValueError("绑定手机号格式不正确，请填写 11 位手机号")
+    return digits, _mask_phone(digits)
+
+
+def _normalize_email(value: Any) -> Optional[str]:
+    text = _to_str(value).strip()
+    if not text:
         return None
-    values = getattr(row, "__dict__", {}) or {}
-    login_phone = values.get("login_phone")
-    password_ciphertext = values.get("password_ciphertext")
-    credential_payload = _json_obj(values.get("credential_payload"))
+    if len(text) > 128 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", text):
+        raise ValueError("邮箱格式不正确")
+    return text
+
+
+def _account_profile_aad(row: QuotePlatformAccountProfile) -> str:
+    return (
+        f"quote_platform_account_profile:{int(row.owner_user_id or 0)}:"
+        f"{_to_str(row.platform_code).strip().upper()}:{_to_str(row.account_username).strip()}"
+    )
+
+
+def _account_type_payload(row: QuotePlatformAccountType) -> Dict[str, Any]:
     return {
-        "id": values.get("id"),
-        "platform_code": values.get("platform_code"),
-        "platform_name": values.get("platform_name"),
-        "login_phone_mask": values.get("login_phone_mask") or _mask_phone(login_phone),
-        "has_login_phone": bool(_to_str(login_phone).strip()),
-        "account_username": values.get("account_username"),
-        "has_password": bool(_to_str(password_ciphertext).strip()),
-        "configured_fields": credential_payload.get("configured_fields") if isinstance(credential_payload.get("configured_fields"), list) else [],
-        "saved_extra_fields": credential_payload.get("saved_extra_fields") if isinstance(credential_payload.get("saved_extra_fields"), list) else [],
-        "last_login_state": values.get("last_login_state") or "none",
-        "last_sms_at": _fmt_dt(values.get("last_sms_at")),
-        "last_used_at": _fmt_dt(values.get("last_used_at")),
+        "id": _loaded_value(row, "id"),
+        "platform_code": _loaded_value(row, "platform_code"),
+        "platform_name": _loaded_value(row, "platform_name"),
+        "type_name": _loaded_value(row, "type_name"),
+        "description": _loaded_value(row, "description") or "",
+        "match_rules": _json_obj(_loaded_value(row, "match_rules_json")),
+        "is_default": bool(_loaded_value(row, "is_default")),
+        "enabled": bool(_loaded_value(row, "enabled")),
+        "created_at": _fmt_dt(_loaded_value(row, "created_at")),
+        "updated_at": _fmt_dt(_loaded_value(row, "updated_at")),
     }
 
 
-def _platform_account_has_field(
-    account: Optional[QuotePlatformAccount],
-    key: str,
-    field: Optional[Dict[str, Any]] = None,
-) -> bool:
-    if account is None:
-        return False
-    field = field or {}
-    payload = _json_obj(getattr(account, "credential_payload", None))
-    extra_public = _json_obj(payload.get("extra_public"))
-    saved_extra_fields = set(_json_list(payload.get("saved_extra_fields")))
-    if key == "login_phone":
-        return bool(_to_str(getattr(account, "login_phone", None)).strip())
-    if key == "account_username":
-        return bool(_to_str(getattr(account, "account_username", None)).strip())
-    if key == "account_password":
-        return bool(_to_str(getattr(account, "password_ciphertext", None)).strip())
-    if bool(field.get("secret")) or _to_str(field.get("type")).strip().lower() == "password":
-        return key in saved_extra_fields
-    return bool(_to_str(extra_public.get(key)).strip()) or key in saved_extra_fields
+def _credential_public_payload(row: Optional[QuotePlatformAccountProfile]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    login_phone = _loaded_value(row, "login_phone")
+    password_ciphertext = _loaded_value(row, "password_ciphertext")
+    return {
+        "id": _loaded_value(row, "id"),
+        "platform_code": _loaded_value(row, "platform_code"),
+        "platform_name": _loaded_value(row, "platform_name"),
+        "account_type_id": _loaded_value(row, "account_type_id"),
+        "account_type_name": _loaded_value(row, "account_type_name") or "",
+        "account_username": _loaded_value(row, "account_username"),
+        "has_password": bool(_to_str(password_ciphertext).strip()),
+        "login_phone_mask": _loaded_value(row, "login_phone_mask") or _mask_phone(login_phone),
+        "has_login_phone": bool(_to_str(login_phone).strip()),
+        "email": _loaded_value(row, "email") or "",
+        "account_owner_user_id": _loaded_value(row, "account_owner_user_id"),
+        "account_owner_name": _loaded_value(row, "account_owner_name") or "",
+        "auto_login": bool(_loaded_value(row, "auto_login")),
+        "enabled": bool(_loaded_value(row, "enabled")),
+        "login_status": _loaded_value(row, "login_status") or ACCOUNT_LOGIN_NOT_LOGGED_IN,
+        "quota_status": _loaded_value(row, "quota_status") or ACCOUNT_QUOTA_UNKNOWN,
+        "quota_reset_at": _fmt_dt(_loaded_value(row, "quota_reset_at")),
+        "browser_env_key": _loaded_value(row, "browser_env_key"),
+        "last_login_at": _fmt_dt(_loaded_value(row, "last_login_at")),
+        "last_check_at": _fmt_dt(_loaded_value(row, "last_check_at")),
+        "last_used_at": _fmt_dt(_loaded_value(row, "last_used_at")),
+        "last_error": _loaded_value(row, "last_error") or "",
+        "created_at": _fmt_dt(_loaded_value(row, "created_at")),
+        "updated_at": _fmt_dt(_loaded_value(row, "updated_at")),
+    }
 
 
-def _missing_platform_account_fields(
-    account: Optional[QuotePlatformAccount],
-    platform_code: str,
-) -> List[Dict[str, Any]]:
-    missing: List[Dict[str, Any]] = []
-
-    for field in _platform_credential_fields(platform_code):
-        if not bool(field.get("required")):
-            continue
-        key = _to_str(field.get("key")).strip()
-        if not key:
-            continue
-        if not _platform_account_has_field(account, key, field):
-            missing.append(
-                {
-                    "key": key,
-                    "label": _to_str(field.get("label")).strip() or key,
-                    "type": _to_str(field.get("type")).strip() or "text",
-                    "required": True,
-                    "secret": bool(field.get("secret")),
-                }
-            )
-    return missing
+def _account_event_snapshot(row: Optional[QuotePlatformAccountProfile]) -> Dict[str, Any]:
+    return _credential_public_payload(row) or {}
 
 
-def _missing_platform_account_labels(missing: List[Dict[str, Any]]) -> str:
-    labels = [_to_str(x.get("label")).strip() or _to_str(x.get("key")).strip() for x in missing]
-    labels = [x for x in labels if x]
-    return "、".join(labels) if labels else "平台登录资料"
+async def _add_account_event(
+    db: AsyncSession,
+    *,
+    account: QuotePlatformAccountProfile,
+    event_type: str,
+    operator_user_id: Optional[int],
+    before: Optional[Dict[str, Any]] = None,
+    after: Optional[Dict[str, Any]] = None,
+    message: Optional[str] = None,
+) -> None:
+    db.add(
+        QuotePlatformAccountEvent(
+            account_id=int(account.id),
+            event_type=_to_str(event_type).strip()[:32] or "update",
+            operator_user_id=operator_user_id,
+            before_json=before or {},
+            after_json=after or _account_event_snapshot(account),
+            message=_to_str(message).strip()[:1024] or None,
+        )
+    )
 
 
-def list_platform_account_schemas() -> List[Dict[str, Any]]:
-    return [_platform_schema(code, name) for code, (name, _) in PLATFORM_ALIASES.items()]
+def list_quote_platforms() -> List[Dict[str, Any]]:
+    return [
+        {"platform_code": code, "platform_name": name, "aliases": list(aliases)}
+        for code, (name, aliases) in PLATFORM_ALIASES.items()
+    ]
 
 
-async def list_platform_accounts_public(
+async def list_platform_account_types(
     db: AsyncSession,
     *,
     owner_user_id: int,
-) -> Dict[str, Dict[str, Any]]:
+    platform_code: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     if owner_user_id <= 0:
-        return {}
+        return []
+    stmt = select(QuotePlatformAccountType).where(QuotePlatformAccountType.owner_user_id == int(owner_user_id))
+    code = _to_str(platform_code).strip().upper()
+    if code:
+        stmt = stmt.where(QuotePlatformAccountType.platform_code == code)
     rows = (
         await db.execute(
-            select(QuotePlatformAccount)
-            .where(QuotePlatformAccount.owner_user_id == int(owner_user_id))
-            .order_by(QuotePlatformAccount.platform_code.asc(), QuotePlatformAccount.id.desc())
+            stmt.order_by(
+                QuotePlatformAccountType.platform_code.asc(),
+                QuotePlatformAccountType.is_default.desc(),
+                QuotePlatformAccountType.type_name.asc(),
+                QuotePlatformAccountType.id.desc(),
+            )
         )
     ).scalars().all()
-    out: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        code = _to_str(row.platform_code).strip().upper()
-        if code and code not in out:
-            out[code] = _credential_public_payload(row) or {}
-    return out
+    return [_account_type_payload(row) for row in rows]
 
 
-def get_platform_account_schema(platform_code: str, platform_name: Optional[str] = None) -> Dict[str, Any]:
-    code = _to_str(platform_code).strip().upper()
-    if not code:
-        raise ValueError("请选择平台")
-    return _platform_schema(code, platform_name)
-
-
-def _normalize_form_credentials(
-    *,
-    platform_code: str,
-    platform_name: Optional[str],
-    values: Dict[str, Any],
-    existing_account: Optional[QuotePlatformAccount] = None,
-) -> Tuple[str, str, Dict[str, str], Dict[str, Any], Dict[str, str], List[str]]:
-    code = _to_str(platform_code).strip().upper()
-    if not code:
-        raise ValueError("请选择平台")
-    name = _platform_display_name(code, platform_name)
-    raw_values = values if isinstance(values, dict) else {}
-
-    credentials: Dict[str, str] = {}
-    extra_public: Dict[str, Any] = {}
-    extra_secret: Dict[str, str] = {}
-    configured_fields: List[str] = []
-
-    for field in _platform_credential_fields(code):
-        key = _to_str(field.get("key")).strip()
-        if not key:
-            continue
-        label = _to_str(field.get("label")).strip() or key
-        raw = raw_values.get(key)
-        value = _to_str(raw).strip()
-        existing_ok = _platform_account_has_field(existing_account, key, field)
-        if bool(field.get("required")) and not value and not existing_ok:
-            raise ValueError(f"{label}不能为空")
-        if not value:
-            if existing_ok:
-                configured_fields.append(key)
-            continue
-
-        ftype = _to_str(field.get("type")).strip().lower()
-        if ftype == "phone":
-            digits = re.sub(r"\D+", "", value)
-            if len(digits) != 11:
-                raise ValueError(f"{label}格式不正确，请填写 11 位手机号")
-            value = digits
-
-        configured_fields.append(key)
-        if key in {"login_phone", "account_username", "account_password"}:
-            credentials[key] = value
-        elif bool(field.get("secret")) or ftype == "password":
-            extra_secret[key] = value
-        else:
-            extra_public[key] = value
-
-    if not credentials and not extra_public and not extra_secret and not configured_fields:
-        raise ValueError("请至少填写一项平台登录信息")
-
-    return code, name, credentials, extra_public, extra_secret, configured_fields
-
-
-async def save_platform_account_form(
+async def _get_or_create_account_type(
     db: AsyncSession,
     *,
     owner_user_id: int,
     platform_code: str,
-    platform_name: Optional[str] = None,
-    values: Optional[Dict[str, Any]] = None,
-) -> Optional[QuotePlatformAccount]:
-    if owner_user_id <= 0:
-        raise ValueError("无法识别当前用户")
-    existing_account = None
-    if hasattr(db, "execute"):
-        existing_account = await _get_platform_account(
-            db,
-            owner_user_id=owner_user_id,
-            platform_code=platform_code,
+    platform_name: str,
+    type_name: str,
+) -> Optional[QuotePlatformAccountType]:
+    name = _normalize_account_type_name(type_name)
+    if not name:
+        return None
+    row = (
+        await db.execute(
+            select(QuotePlatformAccountType)
+            .where(
+                QuotePlatformAccountType.owner_user_id == int(owner_user_id),
+                QuotePlatformAccountType.platform_code == platform_code,
+                QuotePlatformAccountType.type_name == name,
+            )
+            .limit(1)
         )
-    code, name, credentials, extra_public, extra_secret, configured_fields = _normalize_form_credentials(
+    ).scalars().first()
+    if row:
+        if not bool(row.enabled):
+            row.enabled = True
+            row.updated_at = _now()
+        if not row.platform_name:
+            row.platform_name = platform_name
+        return row
+    row = QuotePlatformAccountType(
+        owner_user_id=int(owner_user_id),
         platform_code=platform_code,
         platform_name=platform_name,
-        values=values or {},
-        existing_account=existing_account,
+        type_name=name,
+        description=None,
+        match_rules_json={},
+        is_default=False,
+        enabled=True,
     )
-
-    account = await _save_platform_credentials(
-        db,
-        owner_user_id=owner_user_id,
-        platform_code=code,
-        platform_name=name,
-        credentials=credentials,
-    )
-    if account is None:
-        account = await _get_platform_account(db, owner_user_id=owner_user_id, platform_code=code)
-    if account is None:
-        account = QuotePlatformAccount(
-            owner_user_id=owner_user_id,
-            platform_code=code,
-            platform_name=name,
-            credential_payload={},
-            last_login_state="none",
-        )
-        db.add(account)
-        await db.flush()
-
-    payload = _json_obj(account.credential_payload).copy()
-    payload["configured_fields"] = configured_fields
-    if extra_public:
-        old_extra = _json_obj(payload.get("extra_public")).copy()
-        old_extra.update(extra_public)
-        payload["extra_public"] = old_extra
-    saved_extra_fields = sorted(set(_json_list(payload.get("saved_extra_fields")) + list(extra_public.keys()) + list(extra_secret.keys())))
-    payload["saved_extra_fields"] = saved_extra_fields
-    payload["schema_version"] = 1
-    payload["secret_storage"] = "encrypted" if (account.password_ciphertext or extra_secret) else payload.get("secret_storage", "none")
-    account.credential_payload = payload
-    if extra_secret:
-        account.secret_payload_ciphertext = encrypt_json(
-            extra_secret,
-            aad=_credential_aad(owner_user_id, code) + ":extra",
-        )
-    account.updated_at = _now()
+    db.add(row)
     await db.flush()
-    return account
+    return row
 
 
-async def _get_platform_account(
+async def save_platform_account_type(
     db: AsyncSession,
     *,
     owner_user_id: int,
-    platform_code: str,
-) -> Optional[QuotePlatformAccount]:
-    code = _to_str(platform_code).strip().upper()
-    if owner_user_id <= 0 or not code:
+    values: Dict[str, Any],
+    type_id: Optional[int] = None,
+) -> QuotePlatformAccountType:
+    if owner_user_id <= 0:
+        raise ValueError("无法识别当前用户")
+    code, platform_name = _normalize_platform_code_name(values.get("platform_code"), values.get("platform_name"))
+    type_name = _normalize_account_type_name(values.get("type_name"))
+    if not type_name:
+        raise ValueError("账号类型不能为空")
+    row = None
+    if type_id:
+        row = (
+            await db.execute(
+                select(QuotePlatformAccountType)
+                .where(
+                    QuotePlatformAccountType.id == int(type_id),
+                    QuotePlatformAccountType.owner_user_id == int(owner_user_id),
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+        if not row:
+            raise ValueError("账号类型不存在或无权修改")
+    else:
+        row = await _get_or_create_account_type(
+            db,
+            owner_user_id=owner_user_id,
+            platform_code=code,
+            platform_name=platform_name,
+            type_name=type_name,
+        )
+    row.platform_code = code
+    row.platform_name = platform_name
+    row.type_name = type_name
+    row.description = _to_str(values.get("description")).strip()[:255] or None
+    row.match_rules_json = values.get("match_rules") if isinstance(values.get("match_rules"), dict) else {}
+    row.enabled = bool(values.get("enabled", True))
+    row.is_default = bool(values.get("is_default", False))
+    row.updated_at = _now()
+    if row.is_default:
+        await db.execute(
+            update(QuotePlatformAccountType)
+            .where(
+                QuotePlatformAccountType.owner_user_id == int(owner_user_id),
+                QuotePlatformAccountType.platform_code == code,
+                QuotePlatformAccountType.id != int(row.id),
+            )
+            .values(is_default=False)
+        )
+    await db.flush()
+    return row
+
+
+async def get_platform_account_profile(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    account_id: int,
+) -> Optional[QuotePlatformAccountProfile]:
+    if owner_user_id <= 0 or account_id <= 0:
         return None
     return (
         await db.execute(
-            select(QuotePlatformAccount)
+            select(QuotePlatformAccountProfile)
             .where(
-                QuotePlatformAccount.owner_user_id == owner_user_id,
-                QuotePlatformAccount.platform_code == code,
+                QuotePlatformAccountProfile.id == int(account_id),
+                QuotePlatformAccountProfile.owner_user_id == int(owner_user_id),
             )
             .limit(1)
         )
     ).scalars().first()
 
 
-async def _save_platform_credentials(
+async def list_platform_account_profiles(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    filters: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if owner_user_id <= 0:
+        return {"total": 0, "items": []}
+    filters = filters or {}
+    stmt = select(QuotePlatformAccountProfile).where(QuotePlatformAccountProfile.owner_user_id == int(owner_user_id))
+    code = _to_str(filters.get("platform_code")).strip().upper()
+    if code:
+        stmt = stmt.where(QuotePlatformAccountProfile.platform_code == code)
+    account_type = _normalize_account_type_name(filters.get("account_type_name") or filters.get("account_type"))
+    if account_type:
+        stmt = stmt.where(QuotePlatformAccountProfile.account_type_name == account_type)
+    if filters.get("enabled") is not None:
+        stmt = stmt.where(QuotePlatformAccountProfile.enabled == bool(filters.get("enabled")))
+    login_status = _to_str(filters.get("login_status")).strip()
+    if login_status:
+        stmt = stmt.where(QuotePlatformAccountProfile.login_status == login_status)
+    quota_status = _to_str(filters.get("quota_status")).strip()
+    if quota_status:
+        stmt = stmt.where(QuotePlatformAccountProfile.quota_status == quota_status)
+    keyword = _to_str(filters.get("keyword")).strip()
+    if keyword:
+        like = f"%{keyword}%"
+        stmt = stmt.where(
+            or_(
+                QuotePlatformAccountProfile.platform_name.like(like),
+                QuotePlatformAccountProfile.account_type_name.like(like),
+                QuotePlatformAccountProfile.account_username.like(like),
+                QuotePlatformAccountProfile.login_phone.like(like),
+                QuotePlatformAccountProfile.email.like(like),
+                QuotePlatformAccountProfile.account_owner_name.like(like),
+            )
+        )
+    total = (await db.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))).scalar_one()
+    rows = (
+        await db.execute(
+            stmt.order_by(
+                QuotePlatformAccountProfile.platform_code.asc(),
+                QuotePlatformAccountProfile.account_type_name.asc(),
+                QuotePlatformAccountProfile.enabled.desc(),
+                desc(QuotePlatformAccountProfile.updated_at),
+                desc(QuotePlatformAccountProfile.id),
+            )
+        )
+    ).scalars().all()
+    return {"total": int(total or 0), "items": [_credential_public_payload(row) for row in rows]}
+
+
+def _normalize_account_profile_input(values: Dict[str, Any], *, is_create: bool) -> Dict[str, Any]:
+    raw = values if isinstance(values, dict) else {}
+    code, platform_name = _normalize_platform_code_name(raw.get("platform_code"), raw.get("platform_name"))
+    username = _to_str(raw.get("account_username")).strip()
+    if not username:
+        raise ValueError("账号不能为空")
+    if len(username) > 128:
+        raise ValueError("账号不能超过 128 个字符")
+    password = _to_str(raw.get("account_password")).strip()
+    if is_create and not password:
+        raise ValueError("密码不能为空")
+    if password and len(password) > 256:
+        raise ValueError("密码不能超过 256 个字符")
+    login_phone, login_phone_mask = _normalize_login_phone(raw.get("login_phone"))
+    return {
+        "platform_code": code,
+        "platform_name": platform_name,
+        "account_type_name": _normalize_account_type_name(raw.get("account_type_name") or raw.get("account_type")) or None,
+        "account_username": username,
+        "account_password": password or None,
+        "login_phone": login_phone,
+        "login_phone_mask": login_phone_mask,
+        "email": _normalize_email(raw.get("email")),
+        "account_owner_user_id": _safe_int(raw.get("account_owner_user_id"), 0) or None,
+        "account_owner_name": _to_str(raw.get("account_owner_name")).strip()[:64] or None,
+        "auto_login": bool(raw.get("auto_login", True)),
+        "enabled": bool(raw.get("enabled", True)),
+    }
+
+
+def _enabled_account_sensitive_changes(row: QuotePlatformAccountProfile, incoming: Dict[str, Any]) -> List[str]:
+    changes: List[str] = []
+    for key, old_value, new_value in (
+        ("platform_code", row.platform_code, incoming["platform_code"]),
+        ("account_type_name", row.account_type_name or None, incoming["account_type_name"]),
+        ("account_username", row.account_username, incoming["account_username"]),
+        ("login_phone", row.login_phone or None, incoming["login_phone"]),
+        ("email", row.email or None, incoming["email"]),
+        ("account_owner_name", row.account_owner_name or None, incoming["account_owner_name"]),
+        ("auto_login", bool(row.auto_login), bool(incoming["auto_login"])),
+    ):
+        if old_value != new_value:
+            changes.append(key)
+    if incoming.get("account_password"):
+        changes.append("account_password")
+    return sorted(set(changes))
+
+
+async def create_platform_account_profile(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    values: Dict[str, Any],
+    operator_user_id: Optional[int] = None,
+) -> QuotePlatformAccountProfile:
+    if owner_user_id <= 0:
+        raise ValueError("无法识别当前用户")
+    incoming = _normalize_account_profile_input(values, is_create=True)
+    account_type = await _get_or_create_account_type(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code=incoming["platform_code"],
+        platform_name=incoming["platform_name"],
+        type_name=incoming["account_type_name"] or "",
+    )
+    row = QuotePlatformAccountProfile(
+        owner_user_id=int(owner_user_id),
+        platform_code=incoming["platform_code"],
+        platform_name=incoming["platform_name"],
+        account_type_id=account_type.id if account_type else None,
+        account_type_name=incoming["account_type_name"],
+        account_username=incoming["account_username"],
+        password_ciphertext="pending",
+        login_phone=incoming["login_phone"],
+        login_phone_mask=incoming["login_phone_mask"],
+        email=incoming["email"],
+        account_owner_user_id=incoming["account_owner_user_id"],
+        account_owner_name=incoming["account_owner_name"],
+        auto_login=incoming["auto_login"],
+        enabled=incoming["enabled"],
+        login_status=ACCOUNT_LOGIN_NOT_LOGGED_IN if incoming["enabled"] else ACCOUNT_LOGIN_DISABLED,
+        quota_status=ACCOUNT_QUOTA_UNKNOWN,
+        browser_env_key=f"{incoming['platform_code'].lower()}_{int(owner_user_id)}_{uuid.uuid4().hex[:12]}",
+        credential_payload={"schema_version": 2, "secret_storage": "encrypted"},
+        secret_payload_ciphertext=None,
+    )
+    db.add(row)
+    await db.flush()
+    row.password_ciphertext = encrypt_text(incoming["account_password"], aad=_account_profile_aad(row))
+    await _add_account_event(
+        db,
+        account=row,
+        event_type="create",
+        operator_user_id=operator_user_id,
+        before={},
+        after=_account_event_snapshot(row),
+        message="创建平台账号",
+    )
+    await db.flush()
+    return row
+
+
+async def update_platform_account_profile(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    account_id: int,
+    values: Dict[str, Any],
+    operator_user_id: Optional[int] = None,
+    confirm_enabled_edit: bool = False,
+) -> QuotePlatformAccountProfile:
+    row = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if not row:
+        raise ValueError("平台账号不存在或无权修改")
+    incoming = _normalize_account_profile_input(values, is_create=False)
+    if "login_phone" not in (values or {}):
+        incoming["login_phone"] = row.login_phone
+        incoming["login_phone_mask"] = row.login_phone_mask
+    before = _account_event_snapshot(row)
+    sensitive_changes = _enabled_account_sensitive_changes(row, incoming)
+    if bool(row.enabled) and sensitive_changes and not confirm_enabled_edit:
+        raise ValueError("该账号当前已启用，修改平台、类型、账号、密码、手机号、邮箱、归属人或自动登录前需要确认")
+    account_type = await _get_or_create_account_type(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code=incoming["platform_code"],
+        platform_name=incoming["platform_name"],
+        type_name=incoming["account_type_name"] or "",
+    )
+    row.platform_code = incoming["platform_code"]
+    row.platform_name = incoming["platform_name"]
+    row.account_type_id = account_type.id if account_type else None
+    row.account_type_name = incoming["account_type_name"]
+    row.account_username = incoming["account_username"]
+    if incoming.get("account_password"):
+        row.password_ciphertext = encrypt_text(incoming["account_password"], aad=_account_profile_aad(row))
+        row.login_status = ACCOUNT_LOGIN_NOT_LOGGED_IN
+        row.last_error = None
+    row.login_phone = incoming["login_phone"]
+    row.login_phone_mask = incoming["login_phone_mask"]
+    row.email = incoming["email"]
+    row.account_owner_user_id = incoming["account_owner_user_id"]
+    row.account_owner_name = incoming["account_owner_name"]
+    row.auto_login = incoming["auto_login"]
+    row.enabled = incoming["enabled"]
+    if not row.enabled:
+        row.login_status = ACCOUNT_LOGIN_DISABLED
+    elif row.login_status == ACCOUNT_LOGIN_DISABLED:
+        row.login_status = ACCOUNT_LOGIN_NOT_LOGGED_IN
+    row.credential_payload = {**_json_obj(row.credential_payload), "schema_version": 2, "secret_storage": "encrypted"}
+    row.updated_at = _now()
+    await _add_account_event(
+        db,
+        account=row,
+        event_type="update",
+        operator_user_id=operator_user_id,
+        before=before,
+        after=_account_event_snapshot(row),
+        message="更新平台账号",
+    )
+    await db.flush()
+    return row
+
+
+def _platform_account_context(account: QuotePlatformAccountProfile) -> PlatformAccountContext:
+    return PlatformAccountContext(
+        platform_code=_to_str(account.platform_code).strip().upper() or "STUB",
+        platform_name=_to_str(account.platform_name).strip() or _to_str(account.platform_code).strip().upper() or "STUB",
+        account_id=int(account.id or 0),
+        account_username=_to_str(account.account_username).strip(),
+        account_type_name=_to_str(account.account_type_name).strip(),
+        browser_env_key=_to_str(account.browser_env_key).strip(),
+        payload={
+            "login_phone": _to_str(account.login_phone).strip(),
+            "login_phone_mask": account.login_phone_mask or _mask_phone(account.login_phone),
+            "email": _to_str(account.email).strip(),
+            "account_owner_name": _to_str(account.account_owner_name).strip(),
+            "credential_payload": _json_obj(account.credential_payload),
+        },
+    )
+
+
+def _runtime_result_payload(result: Optional[PlatformRuntimeResult]) -> Dict[str, Any]:
+    if result is None:
+        return {}
+    return {
+        "status": result.status,
+        "message": result.message,
+        "data": _json_obj(result.data),
+        "challenge_type": result.challenge_type,
+        "challenge_prompt": result.challenge_prompt,
+    }
+
+
+def _runtime_status(result: Optional[PlatformRuntimeResult]) -> str:
+    if result is None:
+        return ""
+    return _to_str(result.status).strip().lower()
+
+
+def _runtime_detail(result: Optional[PlatformRuntimeResult], default_message: str) -> str:
+    status = _runtime_status(result)
+    message = _to_str(getattr(result, "message", "") if result is not None else "").strip()
+    if message and status:
+        return f"{message}（平台返回状态：{status}）"
+    if message:
+        return message
+    if status:
+        return f"{default_message}：平台返回状态 {status}"
+    return f"{default_message}：平台未返回状态"
+
+
+def _is_runtime_login_success(status: str) -> bool:
+    return status in RUNTIME_LOGIN_SUCCESS_STATUSES
+
+
+def _is_runtime_challenge(status: str) -> bool:
+    return status in RUNTIME_LOGIN_CHALLENGE_STATUSES
+
+
+def _is_runtime_quote_success(status: str) -> bool:
+    return status in RUNTIME_QUOTE_SUCCESS_STATUSES
+
+
+def _is_runtime_quota_full(status: str) -> bool:
+    return status in RUNTIME_QUOTA_FULL_STATUSES
+
+
+def _platform_context_from_public_payload(
+    payload: Dict[str, Any],
+    *,
+    platform_code: str,
+    platform_name: str,
+) -> PlatformAccountContext:
+    safe = _json_obj(payload)
+    return PlatformAccountContext(
+        platform_code=_to_str(safe.get("platform_code") or platform_code).strip().upper() or "STUB",
+        platform_name=_to_str(safe.get("platform_name") or platform_name).strip() or platform_code or "STUB",
+        account_id=_safe_int(safe.get("id"), 0),
+        account_username=_to_str(safe.get("account_username")).strip(),
+        account_type_name=_to_str(safe.get("account_type_name")).strip(),
+        browser_env_key=_to_str(safe.get("browser_env_key")).strip(),
+        payload={
+            "login_phone_mask": _to_str(safe.get("login_phone_mask")).strip(),
+            "email": _to_str(safe.get("email")).strip(),
+            "account_owner_name": _to_str(safe.get("account_owner_name")).strip(),
+        },
+    )
+
+
+def _login_task_payload(row: QuotePlatformAccountLoginTask) -> Dict[str, Any]:
+    return {
+        "id": _loaded_value(row, "id"),
+        "account_id": _loaded_value(row, "account_id"),
+        "platform_code": _loaded_value(row, "platform_code"),
+        "platform_name": _loaded_value(row, "platform_name"),
+        "status": _loaded_value(row, "status"),
+        "challenge_type": _loaded_value(row, "challenge_type"),
+        "challenge_prompt": _loaded_value(row, "challenge_prompt"),
+        "challenge_payload": _json_obj(_loaded_value(row, "challenge_payload")),
+        "trace_id": _loaded_value(row, "trace_id"),
+        "error_detail": _loaded_value(row, "error_detail") or "",
+        "started_at": _fmt_dt(_loaded_value(row, "started_at")),
+        "finished_at": _fmt_dt(_loaded_value(row, "finished_at")),
+        "expires_at": _fmt_dt(_loaded_value(row, "expires_at")),
+        "created_at": _fmt_dt(_loaded_value(row, "created_at")),
+        "updated_at": _fmt_dt(_loaded_value(row, "updated_at")),
+    }
+
+
+async def start_platform_account_login(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    account_id: int,
+    operator_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if not account:
+        raise ValueError("平台账号不存在或无权登录")
+    if not bool(account.enabled):
+        raise ValueError("该平台账号已停用，请先启用后再登录")
+    trace_id = _new_trace_id()
+    now = _now()
+    task = QuotePlatformAccountLoginTask(
+        account_id=int(account.id),
+        owner_user_id=int(owner_user_id),
+        platform_code=account.platform_code,
+        platform_name=account.platform_name,
+        status=LOGIN_TASK_RUNNING,
+        challenge_type=None,
+        challenge_prompt=None,
+        challenge_payload={},
+        trace_id=trace_id,
+        started_at=now,
+        expires_at=now + timedelta(seconds=QUOTE_SMS_CODE_TTL_SECONDS),
+    )
+    db.add(task)
+    account.login_status = ACCOUNT_LOGIN_LOGGING_IN
+    account.last_error = None
+    account.last_check_at = now
+    account.updated_at = now
+    await db.flush()
+
+    runtime_result = await quote_platform_runtime.login(_platform_account_context(account))
+    status = _runtime_status(runtime_result)
+    if _is_runtime_challenge(status):
+        task.status = LOGIN_TASK_NEEDS_CODE
+        task.challenge_type = runtime_result.challenge_type or "sms"
+        phone_mask = account.login_phone_mask or _mask_phone(account.login_phone)
+        prompt = runtime_result.challenge_prompt or f"请输入{account.platform_name or account.platform_code}的验证码"
+        if phone_mask and phone_mask not in prompt:
+            prompt = f"{prompt}（发送至 {phone_mask}）"
+        task.challenge_prompt = prompt
+        task.challenge_payload = {
+            "phone_mask": phone_mask or "",
+            "code_length": "4-8",
+            "platform_runtime": _runtime_result_payload(runtime_result),
+        }
+        account.login_status = ACCOUNT_LOGIN_NEEDS_CODE
+    elif _is_runtime_login_success(status):
+        task.status = LOGIN_TASK_SUCCESS
+        task.finished_at = _now()
+        account.login_status = ACCOUNT_LOGIN_AUTHENTICATED
+        account.last_login_at = task.finished_at
+        account.quota_status = ACCOUNT_QUOTA_AVAILABLE if account.quota_status == ACCOUNT_QUOTA_UNKNOWN else account.quota_status
+    else:
+        task.status = LOGIN_TASK_FAILED
+        task.error_detail = _runtime_detail(runtime_result, "平台登录失败")
+        task.finished_at = _now()
+        account.login_status = ACCOUNT_LOGIN_FAILED
+        account.last_error = task.error_detail
+    account.last_check_at = _now()
+    account.updated_at = _now()
+    await _add_account_event(
+        db,
+        account=account,
+        event_type="login",
+        operator_user_id=operator_user_id,
+        before={},
+        after=_account_event_snapshot(account),
+        message="启动平台登录流程",
+    )
+    await db.flush()
+    return {"account": _credential_public_payload(account), "login_task": _login_task_payload(task)}
+
+
+async def submit_platform_account_login_challenge(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    task_id: int,
+    code: str,
+    operator_user_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    clean_code = re.sub(r"\s+", "", _to_str(code))
+    if not re.fullmatch(r"\d{4,8}", clean_code):
+        raise ValueError("验证码格式不正确，请输入 4-8 位数字")
+    task = (
+        await db.execute(
+            select(QuotePlatformAccountLoginTask)
+            .where(
+                QuotePlatformAccountLoginTask.id == int(task_id),
+                QuotePlatformAccountLoginTask.owner_user_id == int(owner_user_id),
+            )
+            .limit(1)
+        )
+    ).scalars().first()
+    if not task:
+        raise ValueError("登录任务不存在或无权操作")
+    account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=int(task.account_id))
+    if not account:
+        raise ValueError("登录账号不存在或无权操作")
+    if task.status != LOGIN_TASK_NEEDS_CODE:
+        raise ValueError("当前登录任务不在等待验证码状态")
+    if task.expires_at and _now() > task.expires_at:
+        task.status = LOGIN_TASK_EXPIRED
+        task.error_detail = "验证码已过期"
+        task.finished_at = _now()
+        account.login_status = ACCOUNT_LOGIN_EXPIRED
+        account.last_error = task.error_detail
+        await db.flush()
+        raise ValueError("验证码已过期，请重新点击登录")
+    before = _account_event_snapshot(account)
+
+    runtime_result = await quote_platform_runtime.submit_challenge(_platform_account_context(account), clean_code)
+    status = _runtime_status(runtime_result)
+    task.challenge_payload = {
+        **_json_obj(task.challenge_payload),
+        "platform_runtime": _runtime_result_payload(runtime_result),
+    }
+    if _is_runtime_login_success(status):
+        task.status = LOGIN_TASK_SUCCESS
+        task.error_detail = None
+        account.login_status = ACCOUNT_LOGIN_AUTHENTICATED
+        account.last_error = None
+        account.last_login_at = _now()
+        account.quota_status = ACCOUNT_QUOTA_AVAILABLE if account.quota_status == ACCOUNT_QUOTA_UNKNOWN else account.quota_status
+    elif _is_runtime_challenge(status):
+        task.status = LOGIN_TASK_NEEDS_CODE
+        task.challenge_type = runtime_result.challenge_type or task.challenge_type or "sms"
+        task.challenge_prompt = runtime_result.challenge_prompt or runtime_result.message or task.challenge_prompt
+        task.error_detail = task.challenge_prompt
+        account.login_status = ACCOUNT_LOGIN_NEEDS_CODE
+        account.last_error = task.error_detail
+    else:
+        task.status = LOGIN_TASK_FAILED
+        task.error_detail = _runtime_detail(runtime_result, "验证码校验失败")
+        account.login_status = ACCOUNT_LOGIN_FAILED
+        account.last_error = task.error_detail
+    if task.status != LOGIN_TASK_NEEDS_CODE:
+        task.finished_at = _now()
+    task.updated_at = _now()
+    account.last_check_at = _now()
+    account.updated_at = _now()
+    await _add_account_event(
+        db,
+        account=account,
+        event_type="login",
+        operator_user_id=operator_user_id,
+        before=before,
+        after=_account_event_snapshot(account),
+        message="提交平台登录验证码",
+    )
+    await db.flush()
+    return {"account": _credential_public_payload(account), "login_task": _login_task_payload(task)}
+
+
+async def _select_quote_platform_account(
     db: AsyncSession,
     *,
     owner_user_id: int,
     platform_code: str,
-    platform_name: str,
-    credentials: Dict[str, str],
-) -> Optional[QuotePlatformAccount]:
+    account_type_name: Optional[str] = None,
+) -> Optional[QuotePlatformAccountProfile]:
     code = _to_str(platform_code).strip().upper()
-    if owner_user_id <= 0 or not code or not credentials:
+    if owner_user_id <= 0 or not code:
         return None
-
-    row = await _get_platform_account(db, owner_user_id=owner_user_id, platform_code=code)
-    if row is None:
-        row = QuotePlatformAccount(
-            owner_user_id=owner_user_id,
-            platform_code=code,
-            platform_name=platform_name or code,
-            credential_payload={},
-            last_login_state="none",
+    stmt = select(QuotePlatformAccountProfile).where(
+        QuotePlatformAccountProfile.owner_user_id == int(owner_user_id),
+        QuotePlatformAccountProfile.platform_code == code,
+        QuotePlatformAccountProfile.enabled == True,  # noqa: E712
+        QuotePlatformAccountProfile.quota_status != ACCOUNT_QUOTA_FULL,
+    )
+    type_name = _normalize_account_type_name(account_type_name)
+    if type_name:
+        stmt = stmt.where(QuotePlatformAccountProfile.account_type_name == type_name)
+    rows = (
+        await db.execute(
+            stmt.order_by(
+                (QuotePlatformAccountProfile.login_status == ACCOUNT_LOGIN_AUTHENTICATED).desc(),
+                QuotePlatformAccountProfile.auto_login.desc(),
+                QuotePlatformAccountProfile.last_used_at.asc(),
+                QuotePlatformAccountProfile.id.asc(),
+            )
         )
-        db.add(row)
-
-    row.platform_name = platform_name or row.platform_name or code
-    payload = _json_obj(row.credential_payload).copy()
-    changed_fields: List[str] = []
-
-    phone = _to_str(credentials.get("login_phone")).strip()
-    if phone:
-        row.login_phone = phone
-        row.login_phone_mask = _mask_phone(phone)
-        payload["login_phone_mask"] = row.login_phone_mask
-        changed_fields.append("login_phone")
-
-    username = _to_str(credentials.get("account_username")).strip()
-    if username:
-        row.account_username = username
-        changed_fields.append("account_username")
-
-    password = _to_str(credentials.get("account_password"))
-    if password:
-        row.password_ciphertext = encrypt_text(password, aad=_credential_aad(owner_user_id, code))
-        changed_fields.append("account_password")
-
-    payload["updated_fields"] = sorted(set(changed_fields))
-    payload["secret_storage"] = "encrypted" if row.password_ciphertext else "none"
-    row.credential_payload = payload
-    row.updated_at = _now()
-    await db.flush()
-    return row
+    ).scalars().all()
+    return rows[0] if rows else None
 
 
 async def _mark_platform_account_used(
@@ -767,24 +1308,32 @@ async def _mark_platform_account_used(
 ) -> None:
     if not account_id:
         return
-    row = (
-        await db.execute(
-            select(QuotePlatformAccount)
-            .where(
-                QuotePlatformAccount.id == int(account_id),
-                QuotePlatformAccount.owner_user_id == int(owner_user_id),
-            )
-            .limit(1)
-        )
-    ).scalars().first()
+    row = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=int(account_id))
     if not row:
         return
-    row.last_login_state = login_state or row.last_login_state
+    row.login_status = login_state or row.login_status
     row.last_used_at = _now()
     if sms_at:
-        row.last_sms_at = _now()
+        row.last_check_at = _now()
+    if login_state == ACCOUNT_LOGIN_AUTHENTICATED:
+        row.last_login_at = _now()
+        row.last_error = None
+        if row.quota_status == ACCOUNT_QUOTA_UNKNOWN:
+            row.quota_status = ACCOUNT_QUOTA_AVAILABLE
     row.updated_at = _now()
     await db.flush()
+
+
+def _extract_account_type_from_quote_text(text: Any, platform_name: str) -> Optional[str]:
+    t = _norm_text(text)
+    platform = _to_str(platform_name).strip()
+    if not t or not platform:
+        return None
+    body = t.replace(" ", "")
+    body = body.replace(platform, "")
+    body = re.sub(r"报价.*$", "", body)
+    body = body.strip("，。；;:")
+    return _normalize_account_type_name(body) or None
 
 
 def detect_quote_signal(text: Any) -> Dict[str, Any]:
@@ -798,16 +1347,6 @@ def detect_quote_signal(text: Any) -> Dict[str, Any]:
             entities["platform_code"] = code
             entities["platform_name"] = name
             break
-
-    if not entities.get("platform_name"):
-        m = re.search(
-            r"(?:^|[\s，,。；;])([\u4e00-\u9fa5A-Za-z0-9]{1,16})(?:保险)?\s*报价(?:$|[\s，,。；;])",
-            t,
-        )
-        if m:
-            platform_name = m.group(1).strip()
-            entities["platform_name"] = platform_name
-            entities["platform_code"] = "STUB"
 
     order_id = _extract_order_id(t)
     if order_id:
@@ -837,8 +1376,8 @@ def _extract_sms_code(text: Any) -> Optional[str]:
 
 def _extract_order_id(text: str) -> Optional[int]:
     for pattern in (
-        r"(?:订单号|订单|order)\s*[:：#]?\s*(\d{1,12})",
-        r"\border\s*[:：#]?\s*(\d{1,12})\b",
+        r"(?:订单号|订单|order)\s*[:：]?\s*(\d{1,12})",
+        r"\border\s*[:：]?\s*(\d{1,12})\b",
     ):
         m = re.search(pattern, text, flags=re.IGNORECASE)
         if m:
@@ -883,18 +1422,18 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
 
     owner_name = _extract_labeled_value(t, _OWNER_NAME_HINTS, max_len=64)
     if not owner_name:
-        name = re.search(r"(?:车主|姓名|被保人|投保人|联系人)\s*[:：=]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", t)
+        name = re.search(r"(?:车主|姓名|被保人|被保险人|投保人|联系人)\s*[:：]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", t)
         if not name:
             name = re.search(r"(?:车主|姓名)\s+([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})(?=\s|$)", t)
         owner_name = name.group(1).strip() if name else None
     if owner_name and owner_name not in {"姓名", "车主", "手机号", "电话", "车牌号", "身份证号"}:
         out["owner_name"] = owner_name.strip()
 
-    model = re.search(r"(?:车型|品牌型号|车辆型号)\s*[:：]?\s*([^\s,，;；]{2,60})", t)
+    model = re.search(r"(?:车型|品牌型号|车辆型号)\s*[:：]?\s*([^\s,，,;；。]{2,60})", t)
     if model:
         out["vehicle_model"] = model.group(1).strip()
 
-    exp_date = re.search(r"(?:保险到期|到期日|保险止期)\s*[:：]?\s*(\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2})", t)
+    exp_date = re.search(r"(?:保险到期|到期日|保险止期)\s*[:：]?\s*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2})", t)
     if exp_date:
         out["insurance_expire_date"] = exp_date.group(1).replace("年", "-").replace("月", "-").replace("日", "")
 
@@ -1004,18 +1543,25 @@ async def _get_or_create_case(
 ) -> QuoteCase:
     order_id = _safe_int(getattr(order, "id", 0), 0) or None
 
-    stmt = select(QuoteCase).where(
+    base_stmt = select(QuoteCase).where(
         QuoteCase.owner_user_id == owner_user_id,
         QuoteCase.status.in_(ACTIVE_CASE_STATUSES),
     )
-    if order_id:
-        stmt = stmt.where(QuoteCase.order_id == order_id)
-    elif session_id:
-        stmt = stmt.where(QuoteCase.session_id == session_id, QuoteCase.order_id.is_(None))
-    else:
-        stmt = stmt.where(QuoteCase.order_id.is_(None))
 
-    case = (await db.execute(stmt.order_by(desc(QuoteCase.id)).limit(1))).scalars().first()
+    case = None
+    if order_id:
+        exact_stmt = base_stmt.where(QuoteCase.order_id == order_id)
+        case = (await db.execute(exact_stmt.order_by(desc(QuoteCase.id)).limit(1))).scalars().first()
+        if not case and session_id:
+            draft_stmt = base_stmt.where(QuoteCase.session_id == session_id, QuoteCase.order_id.is_(None))
+            case = (await db.execute(draft_stmt.order_by(desc(QuoteCase.id)).limit(1))).scalars().first()
+    elif session_id:
+        stmt = base_stmt.where(QuoteCase.session_id == session_id, QuoteCase.order_id.is_(None))
+        case = (await db.execute(stmt.order_by(desc(QuoteCase.id)).limit(1))).scalars().first()
+    else:
+        stmt = base_stmt.where(QuoteCase.order_id.is_(None))
+        case = (await db.execute(stmt.order_by(desc(QuoteCase.id)).limit(1))).scalars().first()
+
     if case:
         changed = False
         if platform_code and case.platform_code != platform_code:
@@ -1608,7 +2154,7 @@ def _case_payload(
     missing: List[Dict[str, Any]],
     attached_images: Optional[List[Dict[str, Any]]] = None,
     task: Optional[QuoteTask] = None,
-    platform_account: Optional[QuotePlatformAccount] = None,
+    platform_account: Optional[QuotePlatformAccountProfile] = None,
 ) -> Dict[str, Any]:
     ready_slots = {key: len(value) for key, value in images_by_slot.items() if value}
     return {
@@ -1734,17 +2280,7 @@ async def has_expired_waiting_sms_task(db: AsyncSession, ctx: Dict[str, Any]) ->
 
 
 async def has_quote_case_waiting_for_login_phone(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
-    owner_user_id = _ctx_current_user_id(ctx)
-    if owner_user_id <= 0:
-        return False
-    session_id = _to_str((ctx or {}).get("session_id")).strip() or None
-    case = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
-    if not case or not case.platform_code:
-        return False
-    account = await _get_platform_account(db, owner_user_id=owner_user_id, platform_code=case.platform_code)
-    if account and _to_str(account.login_phone).strip():
-        return False
-    return case.status in {"collecting", "ready", "waiting_sms"}
+    return False
 
 
 async def _start_sms_task(
@@ -1754,7 +2290,7 @@ async def _start_sms_task(
     owner_user_id: int,
     snapshot: Dict[str, Any],
     trace_id: str,
-    platform_account: QuotePlatformAccount,
+    platform_account: QuotePlatformAccountProfile,
 ) -> QuoteTask:
     waiting = (
         await db.execute(
@@ -1824,7 +2360,7 @@ async def _start_sms_task(
         db,
         account_id=platform_account.id,
         owner_user_id=owner_user_id,
-        login_state="sms_required",
+        login_state=ACCOUNT_LOGIN_NEEDS_CODE,
         sms_at=True,
     )
 
@@ -1891,6 +2427,156 @@ async def _complete_waiting_task(
     platform_code = task.platform_code or case.platform_code or "STUB"
     platform_name = task.platform_name or case.platform_name or platform_code
     snapshot = _json_obj(task.submitted_snapshot)
+    account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
+    account_id = _safe_int(account_payload.get("id"), 0) or None
+    platform_account = (
+        await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+        if account_id
+        else None
+    )
+    platform_ctx = (
+        _platform_account_context(platform_account)
+        if platform_account
+        else _platform_context_from_public_payload(account_payload, platform_code=platform_code, platform_name=platform_name)
+    )
+
+    challenge_result = await quote_platform_runtime.submit_challenge(platform_ctx, sms_code)
+    challenge_status = _runtime_status(challenge_result)
+    if _is_runtime_challenge(challenge_status):
+        task.status = "waiting_sms"
+        task.login_state = "sms_required"
+        task.error_detail = challenge_result.challenge_prompt or challenge_result.message or "平台要求继续验证码校验"
+        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result)}
+        task.updated_at = _now()
+        case.status = "waiting_sms"
+        case.current_task_id = task.id
+        case.updated_at = _now()
+        if platform_account:
+            platform_account.login_status = ACCOUNT_LOGIN_NEEDS_CODE
+            platform_account.last_error = task.error_detail
+            platform_account.last_check_at = _now()
+            platform_account.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={"task_id": task.id, "status": "waiting_sms", "trace_id": trace_id, "reason": task.error_detail},
+        )
+        await db.commit()
+        return (
+            f"{platform_name}还需要继续验证：{task.error_detail}。请在聊天框输入新的 4-8 位验证码。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_NOT_READY,
+                    message=task.error_detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
+                ),
+                "actions": [_mk_action("输入短信验证码")],
+            },
+        )
+
+    if not _is_runtime_login_success(challenge_status):
+        task.status = "failed"
+        task.login_state = "failed"
+        task.error_detail = _runtime_detail(challenge_result, "验证码校验失败")
+        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result)}
+        task.finished_at = _now()
+        task.updated_at = _now()
+        case.status = "ready"
+        case.current_task_id = None
+        case.updated_at = _now()
+        if platform_account:
+            platform_account.login_status = ACCOUNT_LOGIN_FAILED
+            platform_account.last_error = task.error_detail
+            platform_account.last_check_at = _now()
+            platform_account.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={"task_id": task.id, "status": "failed", "trace_id": trace_id, "reason": task.error_detail},
+        )
+        await db.commit()
+        return (
+            f"{platform_name}验证码校验失败：{task.error_detail}。请重新点击报价或账号登录后再试。",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=task.error_detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
+                ),
+            },
+        )
+
+    if platform_account:
+        platform_account.login_status = ACCOUNT_LOGIN_AUTHENTICATED
+        platform_account.last_error = None
+        platform_account.last_login_at = _now()
+        platform_account.last_check_at = _now()
+        platform_account.updated_at = _now()
+        if platform_account.quota_status == ACCOUNT_QUOTA_UNKNOWN:
+            platform_account.quota_status = ACCOUNT_QUOTA_AVAILABLE
+
+    quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot)
+    quote_status = _runtime_status(quote_runtime_result)
+    if not _is_runtime_quote_success(quote_status):
+        task.status = "failed"
+        task.login_state = "authenticated"
+        task.error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
+        task.response_payload = {
+            "stub": True,
+            "sms_code_length": len(sms_code),
+            "challenge": _runtime_result_payload(challenge_result),
+            "quote": _runtime_result_payload(quote_runtime_result),
+        }
+        task.result_payload = {}
+        task.finished_at = _now()
+        task.updated_at = _now()
+        case.status = "ready"
+        case.current_task_id = task.id
+        case.updated_at = _now()
+        if platform_account:
+            platform_account.last_error = task.error_detail
+            platform_account.last_check_at = _now()
+            platform_account.updated_at = _now()
+            if _is_runtime_quota_full(quote_status):
+                platform_account.quota_status = ACCOUNT_QUOTA_FULL
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={"task_id": task.id, "status": "failed", "trace_id": trace_id, "reason": task.error_detail},
+        )
+        await db.commit()
+        return (
+            f"{platform_name}报价失败：{task.error_detail}。请检查平台账号状态或报价资料后重试。",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=task.error_detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
+                ),
+                "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+            },
+        )
     result = _fake_quote_result(snapshot, platform_code=platform_code, platform_name=platform_name, trace_id=trace_id)
 
     task.status = "success"
@@ -1898,8 +2584,8 @@ async def _complete_waiting_task(
     task.response_payload = {
         "stub": True,
         "sms_code_length": len(sms_code),
-        "login": "ok",
-        "quote": "ok",
+        "challenge": _runtime_result_payload(challenge_result),
+        "quote": _runtime_result_payload(quote_runtime_result),
     }
     task.result_payload = result
     task.finished_at = _now()
@@ -1909,12 +2595,11 @@ async def _complete_waiting_task(
     case.quote_count = _safe_int(case.quote_count, 0) + 1
     case.current_task_id = task.id
     case.updated_at = _now()
-    account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
     await _mark_platform_account_used(
         db,
-        account_id=_safe_int(account_payload.get("id"), 0) or None,
+        account_id=account_id,
         owner_user_id=owner_user_id,
-        login_state="authenticated",
+        login_state=ACCOUNT_LOGIN_AUTHENTICATED,
     )
 
     await _add_event(
@@ -1966,6 +2651,192 @@ async def _complete_waiting_task(
             _mk_action("查看当前材料状态"),
             _mk_action(f"{platform_name}报价"),
         ],
+    }
+
+
+async def _complete_quote_without_sms(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_account: QuotePlatformAccountProfile,
+    login_mode: str,
+) -> Tuple[str, Dict[str, Any]]:
+    platform_code = case.platform_code or platform_account.platform_code or "STUB"
+    platform_name = case.platform_name or platform_account.platform_name or platform_code
+    platform_ctx = _platform_account_context(platform_account)
+    quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot)
+    quote_status = _runtime_status(quote_runtime_result)
+    if not _is_runtime_quote_success(quote_status):
+        error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
+        task = QuoteTask(
+            quote_case_id=case.id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            status="failed",
+            login_state="authenticated",
+            sms_phone_mask=platform_account.login_phone_mask,
+            trace_id=trace_id,
+            request_payload={
+                "mode": "stub",
+                "login": login_mode,
+                "owner_user_id": owner_user_id,
+                "platform_account": _credential_public_payload(platform_account),
+            },
+            response_payload={
+                "stub": True,
+                "login": login_mode,
+                "quote": _runtime_result_payload(quote_runtime_result),
+            },
+            result_payload={},
+            submitted_snapshot=snapshot,
+            error_detail=error_detail,
+            started_at=_now(),
+            finished_at=_now(),
+        )
+        db.add(task)
+        await db.flush()
+
+        case.status = "ready"
+        case.current_task_id = task.id
+        case.updated_at = _now()
+        platform_account.last_error = error_detail
+        platform_account.last_check_at = _now()
+        platform_account.updated_at = _now()
+        if _is_runtime_quota_full(quote_status):
+            platform_account.quota_status = ACCOUNT_QUOTA_FULL
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={"task_id": task.id, "status": "failed", "trace_id": trace_id, "reason": error_detail, "login_mode": login_mode},
+        )
+        await db.commit()
+
+        payload = {
+            "quote_case": {
+                "id": case.id,
+                "case_no": case.case_no,
+                "status": case.status,
+                "order_id": case.order_id,
+                "source_type": case.source_type,
+            },
+            "quote_task": {
+                "id": task.id,
+                "status": task.status,
+                "login_state": task.login_state,
+                "trace_id": trace_id,
+                "error_detail": error_detail,
+            },
+            "platform_account": _credential_public_payload(platform_account),
+        }
+        return (
+            f"{platform_name}报价失败：{error_detail}。请检查平台账号状态或报价资料后重试。",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=error_detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload=payload,
+                ),
+                "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+            },
+        )
+
+    result = _fake_quote_result(snapshot, platform_code=platform_code, platform_name=platform_name, trace_id=trace_id)
+    task = QuoteTask(
+        quote_case_id=case.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        status="success",
+        login_state="authenticated",
+        sms_phone_mask=platform_account.login_phone_mask,
+        trace_id=trace_id,
+        request_payload={
+            "mode": "stub",
+            "login": login_mode,
+            "owner_user_id": owner_user_id,
+            "platform_account": _credential_public_payload(platform_account),
+        },
+        response_payload={
+            "stub": True,
+            "login": login_mode,
+            "quote": _runtime_result_payload(quote_runtime_result),
+        },
+        result_payload=result,
+        submitted_snapshot=snapshot,
+        started_at=_now(),
+        finished_at=_now(),
+    )
+    db.add(task)
+    await db.flush()
+
+    case.status = "quoted"
+    case.quote_count = _safe_int(case.quote_count, 0) + 1
+    case.current_task_id = task.id
+    case.updated_at = _now()
+    await _mark_platform_account_used(
+        db,
+        account_id=platform_account.id,
+        owner_user_id=owner_user_id,
+        login_state=ACCOUNT_LOGIN_AUTHENTICATED,
+    )
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={"task_id": task.id, "status": "success", "trace_id": trace_id, "result": result, "login_mode": login_mode},
+    )
+    await db.commit()
+
+    account_label = platform_account.account_type_name or platform_account.account_username or "默认账号"
+    reply = (
+        f"{platform_name}报价流程已跑通（本地假数据）。\n"
+        f"使用账号：{account_label}\n"
+        f"车牌：{result.get('plate_no') or '-'}\n"
+        f"车主：{result.get('owner_name') or '-'}\n"
+        f"商业险：{result['price_items'][0]['amount']:.2f}\n"
+        f"交强险：{result['price_items'][1]['amount']:.2f}\n"
+        f"车船税：{result['price_items'][2]['amount']:.2f}\n"
+        f"合计：{result['premium_total']:.2f}"
+    )
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+        },
+        "platform_account": _credential_public_payload(platform_account),
+        "quote_result": result,
+    }
+    return reply, {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "data": _mk_data(
+            result_status=RESULT_SUCCESS,
+            message="报价流程已完成（当前为平台假数据联调）",
+            entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+            payload=payload,
+        ),
+        "actions": [_mk_action(f"{platform_name}报价")],
     }
 
 
@@ -2075,20 +2946,20 @@ async def handle_quote_images_message(
         if x.get("provided_slot_key") != x.get("confirmed_slot_key")
     ]
     by_slot_count: Dict[str, int] = {}
-    for item in attached_images:
-        sk = _to_str(item.get("confirmed_slot_key")).strip()
-        if sk:
-            by_slot_count[sk] = by_slot_count.get(sk, 0) + 1
+    for sk, rows in (images_by_slot or {}).items():
+        count = len(rows or [])
+        if count:
+            by_slot_count[sk] = count
 
     lines = [
-        f"已收到 {len(attached_images)} 张图片，后台已自动识别并放入报价材料池。",
+        f"已收到 {len(attached_images)} 张图片，已自动识别并放入报价材料。",
     ]
     if by_slot_count:
-        lines.append("- 识别结果：" + "、".join(f"{slot_label(k)}{v}张" for k, v in by_slot_count.items()))
+        lines.append("- 当前有效材料：" + "、".join(f"{slot_label(k)}{v}张" for k, v in by_slot_count.items()))
     if moved:
-        lines.append("- 已按识别结果静默归位：" + "、".join(moved[:5]))
+        lines.append("- 已自动归位：" + "、".join(moved[:5]))
     if cancelled_waiting_tasks:
-        lines.append("- 材料已更新，上一条等待中的验证码已作废；请重新输入平台名+报价触发新验证码。")
+        lines.append("- 材料已更新，上一条等待中的验证码已作废；请重新输入平台名+报价触发新流程。")
     if missing:
         lines.append("- 仍缺少：" + "、".join(item.get("label") or item.get("key") for item in missing[:8]))
     lines.append("下一步请直接输入平台名+报价，例如：太平洋报价。")
@@ -2107,7 +2978,7 @@ async def handle_quote_images_message(
         "trace_id": _new_trace_id(),
         "data": _mk_data(
             result_status=RESULT_SUCCESS if attached_images else RESULT_NEED_MORE,
-            message="图片已进入报价材料池",
+            message="图片已进入报价材料",
             entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
             payload=payload,
         ),
@@ -2342,24 +3213,18 @@ async def handle_quote_message(
             },
         )
 
-    credential_update = _extract_platform_credentials(text)
-    platform_account = None
-    if credential_update:
-        platform_account = await _save_platform_credentials(
-            db,
-            owner_user_id=owner_user_id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-            credentials=credential_update,
-        )
+    account_type_name = _extract_account_type_from_quote_text(text, platform_name)
+    platform_account = await _select_quote_platform_account(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code=platform_code,
+        account_type_name=account_type_name,
+    )
 
     order_id = _safe_int((ctx or {}).get("order_id"), 0) or _safe_int(merged_entities.get("order_id"), 0) or None
     extracted = extract_quote_fields(text)
     plate_no = _to_str(extracted.get("plate_no") or merged_entities.get("plate_no")).strip() or None
     owner_phone = _to_str(extracted.get("owner_phone") or merged_entities.get("owner_phone")).strip() or None
-    if credential_update.get("login_phone") and owner_phone == credential_update.get("login_phone") and not extracted.get("owner_phone"):
-        owner_phone = None
-        merged_entities.pop("owner_phone", None)
     owner_name = _to_str(extracted.get("owner_name") or merged_entities.get("owner_name")).strip() or None
     order = await _find_order(
         db,
@@ -2408,9 +3273,7 @@ async def handle_quote_message(
     images_by_slot = await _active_images_by_slot(db, case.id)
     missing = _missing_requirements(normalized_data, images_by_slot)
     case.missing_requirements = missing
-    if platform_account is None:
-        platform_account = await _get_platform_account(db, owner_user_id=owner_user_id, platform_code=platform_code)
-    missing_account_fields = _missing_platform_account_fields(platform_account, platform_code)
+    missing_account = platform_account is None
 
     if missing:
         case.status = "collecting"
@@ -2430,9 +3293,9 @@ async def handle_quote_message(
         lines = [
             f"{platform_name}报价资料还不完整，暂不触发平台登录。",
         ]
-        if missing_account_fields:
-            lines.append(f"另外，{platform_name}平台账号还未绑定或资料不完整：缺少{_missing_platform_account_labels(missing_account_fields)}。")
-            lines.append("你可以先点击右上角“绑定账号”补齐，资料齐全后再输入报价命令。")
+        if missing_account:
+            type_hint = f"（类型：{account_type_name}）" if account_type_name else ""
+            lines.append(f"另外，{platform_name}{type_hint}还没有可用账号，请先在右上角“平台账号管理”新增或启用账号。")
         if missing_fields:
             lines.append("缺少字段：" + "、".join(missing_fields))
         if missing_images:
@@ -2444,7 +3307,7 @@ async def handle_quote_message(
                 if x.get("provided_slot_key") != x.get("confirmed_slot_key")
             ]
             if moved:
-                lines.append("已静默识别并归位图片：" + "、".join(moved[:5]))
+                lines.append("已自动识别并归位图片：" + "、".join(moved[:5]))
 
         payload = _case_payload(
             case=case,
@@ -2468,14 +3331,14 @@ async def handle_quote_message(
                 *(
                     [
                         _mk_action(
-                            "绑定账号",
-                            "open_account_bind",
-                            "quote_platform_account",
+                            "平台账号管理",
+                            "open_account_manager",
+                            "quote_platform_accounts",
                             platform_code=platform_code,
                             platform_name=platform_name,
                         )
                     ]
-                    if missing_account_fields
+                    if missing_account
                     else []
                 ),
                 _mk_action("查看当前材料状态"),
@@ -2485,7 +3348,7 @@ async def handle_quote_message(
 
     case.status = "ready"
     case.updated_at = _now()
-    if missing_account_fields:
+    if missing_account:
         await _add_event(
             db,
             case=case,
@@ -2496,7 +3359,7 @@ async def handle_quote_message(
                 "status": "ready",
                 "need_platform_account": True,
                 "platform_code": platform_code,
-                "missing_account_fields": missing_account_fields,
+                "account_type_name": account_type_name,
             },
         )
         await db.commit()
@@ -2508,38 +3371,26 @@ async def handle_quote_message(
             attached_images=attached_images,
             platform_account=platform_account,
         )
-        saved_bits = []
-        if platform_account and platform_account.account_username:
-            saved_bits.append(f"账号 {platform_account.account_username}")
-        if platform_account and platform_account.password_ciphertext:
-            saved_bits.append("密码已加密保存")
-        saved_text = "；".join(saved_bits)
-        missing_text = _missing_platform_account_labels(missing_account_fields)
+        type_hint = f"（类型：{account_type_name}）" if account_type_name else ""
         lines = [
-            f"{platform_name}报价资料已齐，但平台账号还不能用于报价。",
-            f"- 缺少登录资料：{missing_text}",
+            f"{platform_name}{type_hint}报价资料已齐，但当前没有可用平台账号。",
+            "请先点击右上角“平台账号管理”，新增/启用账号，或确认账号额度没有满。",
         ]
-        if saved_text:
-            lines.append(f"- 已保存：{saved_text}")
-        if platform_account is None:
-            lines.append("请点击右上角“绑定账号”，选择平台后按表单填写并保存；保存后再输入报价命令。")
-        else:
-            lines.append("请点击右上角“绑定账号”补全该平台资料；保存后再输入报价命令。")
         return "\n".join(lines), {
             "status": "success",
             "intent": "quote",
             "trace_id": _new_trace_id(),
             "data": _mk_data(
                 result_status=RESULT_NEED_MORE,
-                message="报价资料已齐，等待绑定或补全平台账号",
+                message="报价资料已齐，等待配置可用平台账号",
                 entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
                 payload=payload,
             ),
             "actions": [
                 _mk_action(
-                    "绑定账号",
-                    "open_account_bind",
-                    "quote_platform_account",
+                    "平台账号管理",
+                    "open_account_manager",
+                    "quote_platform_accounts",
                     platform_code=platform_code,
                     platform_name=platform_name,
                 ),
@@ -2549,6 +3400,106 @@ async def handle_quote_message(
 
     trace_id = _new_trace_id()
     snapshot = _snapshot_payload(case=case, normalized_data=normalized_data, images_by_slot=images_by_slot)
+    if platform_account.login_status == ACCOUNT_LOGIN_AUTHENTICATED:
+        return await _complete_quote_without_sms(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            login_mode="reuse_authenticated",
+        )
+
+    if not bool(platform_account.auto_login):
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="status",
+            role="assistant",
+            payload={
+                "status": "ready",
+                "need_manual_account_login": True,
+                "platform_account": _credential_public_payload(platform_account),
+            },
+        )
+        await db.commit()
+        payload = _case_payload(
+            case=case,
+            normalized_data=normalized_data,
+            images_by_slot=images_by_slot,
+            missing=[],
+            attached_images=attached_images,
+            platform_account=platform_account,
+        )
+        return (
+            f"{platform_name}报价资料已齐，但所选账号未开启自动登录。请先在右上角“平台账号管理”里点击该账号的“登录”。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message="账号未开启自动登录，等待手动登录",
+                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
+                    payload=payload,
+                ),
+                "actions": [
+                    _mk_action(
+                        "平台账号管理",
+                        "open_account_manager",
+                        "quote_platform_accounts",
+                        platform_code=platform_code,
+                        platform_name=platform_name,
+                    )
+                ],
+            },
+        )
+
+    login_runtime_result = await quote_platform_runtime.login(_platform_account_context(platform_account))
+    login_status = _runtime_status(login_runtime_result)
+    if not _is_runtime_login_success(login_status) and not _is_runtime_challenge(login_status):
+        platform_account.login_status = ACCOUNT_LOGIN_FAILED
+        platform_account.last_error = _runtime_detail(login_runtime_result, "平台登录失败")
+        platform_account.last_check_at = _now()
+        platform_account.updated_at = _now()
+        await db.commit()
+        return (
+            f"{platform_name}登录失败：{platform_account.last_error}。请在平台账号管理中检查账号后重试。",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=platform_account.last_error,
+                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
+                    payload={"platform_account": _credential_public_payload(platform_account)},
+                ),
+                "actions": [
+                    _mk_action(
+                        "平台账号管理",
+                        "open_account_manager",
+                        "quote_platform_accounts",
+                        platform_code=platform_code,
+                        platform_name=platform_name,
+                    )
+                ],
+            },
+        )
+
+    if _is_runtime_login_success(login_status):
+        return await _complete_quote_without_sms(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            login_mode="auto_login_without_code",
+        )
+
     task = await _start_sms_task(
         db,
         case=case,
@@ -2599,107 +3550,36 @@ async def handle_platform_credential_message(
     if owner_user_id <= 0:
         raise ValueError("missing current user id")
 
-    session_id = _to_str((ctx or {}).get("session_id")).strip() or None
     signal = detect_platform_credential_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
-    credentials = _json_obj(signal.get("credentials")) or _extract_platform_credentials(text, allow_loose_phone=True)
-
-    case = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
     platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
     platform_name = _to_str(merged_entities.get("platform_name")).strip()
-    if not platform_code and case and case.platform_code:
-        platform_code = _to_str(case.platform_code).strip().upper()
-    if not platform_name and case and case.platform_name:
-        platform_name = _to_str(case.platform_name).strip()
-    if not platform_code and platform_name:
-        platform_code = "STUB"
     if not platform_name and platform_code:
-        platform_name = PLATFORM_ALIASES.get(platform_code, (platform_code, ()))[0]
-
-    if not platform_code or not platform_name:
-        return (
-            "我可以帮你记住平台登录资料，但还不知道是哪家平台。请这样发：太平洋登录手机号 你的手机号，账号 xxx，密码 xxx。",
-            {
-                "status": "success",
-                "intent": "quote_credential",
-                "trace_id": _new_trace_id(),
-                "data": _mk_data(
-                    result_status=RESULT_NEED_MORE,
-                    message="平台登录资料缺少平台名称",
-                    entities=merged_entities,
-                    payload={},
-                ),
-                "actions": [_mk_action("太平洋登录手机号 你的手机号")],
-            },
-        )
-
-    if not credentials:
-        return (
-            f"已定位到{platform_name}，但还没有识别到可保存的登录资料。你可以输入：{platform_name}登录手机号 你的手机号，账号 xxx，密码 xxx。",
-            {
-                "status": "success",
-                "intent": "quote_credential",
-                "trace_id": _new_trace_id(),
-                "data": _mk_data(
-                    result_status=RESULT_NEED_MORE,
-                    message="没有识别到登录手机号/账号/密码",
-                    entities=merged_entities,
-                    payload={},
-                ),
-                "actions": [_mk_action(f"{platform_name}登录手机号 你的手机号")],
-            },
-        )
-
-    account = await _save_platform_credentials(
-        db,
-        owner_user_id=owner_user_id,
-        platform_code=platform_code,
-        platform_name=platform_name,
-        credentials=credentials,
+        platform_name = _platform_display_name(platform_code)
+    platform_text = f"{platform_name}平台" if platform_name else "对应平台"
+    return (
+        f"为了避免账号资料和报价会话混在一起，{platform_text}账号请统一在右上角“平台账号管理”中新增或编辑；聊天框不再保存账号、密码或手机号。",
+        {
+            "status": "success",
+            "intent": "quote_credential",
+            "trace_id": _new_trace_id(),
+            "data": _mk_data(
+                result_status=RESULT_NEED_MORE,
+                message="平台账号资料请在账号管理中维护",
+                entities=merged_entities,
+                payload={},
+            ),
+            "actions": [
+                _mk_action(
+                    "平台账号管理",
+                    "open_account_manager",
+                    "quote_platform_accounts",
+                    platform_code=platform_code,
+                    platform_name=platform_name,
+                )
+            ],
+        },
     )
-    if case:
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="status",
-            role="assistant",
-            payload={
-                "platform_credential_saved": True,
-                "platform_code": platform_code,
-                "account": _credential_public_payload(account),
-            },
-        )
-    await db.commit()
-
-    public_payload = _credential_public_payload(account) or {}
-    saved_parts = []
-    if credentials.get("login_phone"):
-        saved_parts.append(f"登录手机号 {public_payload.get('login_phone_mask') or _mask_phone(credentials.get('login_phone'))}")
-    if credentials.get("account_username"):
-        saved_parts.append(f"账号 {credentials.get('account_username')}")
-    if credentials.get("account_password"):
-        saved_parts.append("密码已加密保存")
-    saved_text = "、".join(saved_parts) or "登录资料"
-    reply_lines = [
-        f"已为你记住{platform_name}的{saved_text}。",
-        "后续同一账号再走这个平台报价时，我会优先复用这些资料，不会反复向你要。",
-    ]
-    if case and case.status == "ready" and public_payload.get("has_login_phone"):
-        reply_lines.append(f"当前资料已经可以继续触发报价，你可以直接输入：{platform_name}报价。")
-
-    return "\n".join(reply_lines), {
-        "status": "success",
-        "intent": "quote_credential",
-        "trace_id": _new_trace_id(),
-        "data": _mk_data(
-            result_status=RESULT_SUCCESS,
-            message="平台登录资料已保存",
-            entities={**merged_entities, "quote_case_id": case.id if case else None},
-            payload={"platform_account": public_payload},
-        ),
-        "actions": [_mk_action(f"{platform_name}报价"), _mk_action("查看当前材料状态")],
-    }
 
 
 async def handle_quote_material_status(
@@ -2719,7 +3599,7 @@ async def handle_quote_material_status(
     normalized_data = _json_obj(case.normalized_data)
     images_by_slot = await _active_images_by_slot(db, case.id)
     missing = _json_list(case.missing_requirements) or _missing_requirements(normalized_data, images_by_slot)
-    platform_account = await _get_platform_account(
+    platform_account = await _select_quote_platform_account(
         db,
         owner_user_id=owner_user_id,
         platform_code=case.platform_code or "",
@@ -2745,7 +3625,7 @@ async def handle_quote_material_status(
         lines.append("- 必填项已齐，可以继续报价流程。")
     if platform_account:
         account_payload = _credential_public_payload(platform_account) or {}
-        lines.append(f"- 平台登录资料：已记住 {account_payload.get('login_phone_mask') or '登录资料'}")
+        lines.append(f"- 平台账号资料：已记住 {account_payload.get('login_phone_mask') or '登录资料'}")
 
     return "\n".join(lines), {
         "status": "success",

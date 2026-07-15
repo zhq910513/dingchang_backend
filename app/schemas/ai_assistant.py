@@ -58,12 +58,35 @@ class AiDeleteSessionOut(BaseModel):
     session_id: str
 
 
-class AiPlatformAccountBindIn(BaseModel):
-    platform_code: str = Field(..., min_length=1, max_length=32)
-    platform_name: Optional[str] = Field(default=None, max_length=64)
-    values: Dict[str, Any] = Field(default_factory=dict)
-
-
 class AiRecallSessionImageIn(BaseModel):
     storage_keys: List[str] = Field(default_factory=list)
     message_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class AiPlatformAccountTypeIn(BaseModel):
+    platform_code: str = Field(..., min_length=1, max_length=32)
+    platform_name: Optional[str] = Field(default=None, max_length=64)
+    type_name: str = Field(..., min_length=1, max_length=64)
+    description: Optional[str] = Field(default=None, max_length=255)
+    match_rules: Dict[str, Any] = Field(default_factory=dict)
+    is_default: bool = False
+    enabled: bool = True
+
+
+class AiPlatformAccountProfileIn(BaseModel):
+    platform_code: str = Field(..., min_length=1, max_length=32)
+    platform_name: Optional[str] = Field(default=None, max_length=64)
+    account_type_name: Optional[str] = Field(default=None, max_length=64)
+    account_username: str = Field(..., min_length=1, max_length=128)
+    account_password: Optional[str] = Field(default=None, max_length=256)
+    login_phone: Optional[str] = Field(default=None, max_length=32)
+    email: Optional[str] = Field(default=None, max_length=128)
+    account_owner_user_id: Optional[int] = Field(default=None, ge=1)
+    account_owner_name: Optional[str] = Field(default=None, max_length=64)
+    auto_login: bool = True
+    enabled: bool = True
+    confirm_enabled_edit: bool = False
+
+
+class AiPlatformAccountLoginChallengeIn(BaseModel):
+    code: str = Field(..., min_length=4, max_length=8)

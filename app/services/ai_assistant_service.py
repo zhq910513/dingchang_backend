@@ -961,9 +961,6 @@ def _detect_platform_name(text: str) -> Optional[str]:
         for a in aliases:
             if a.lower() in low:
                 return name
-    m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9]{1,12})报价", text)
-    if m:
-        return m.group(1)
     return None
 
 

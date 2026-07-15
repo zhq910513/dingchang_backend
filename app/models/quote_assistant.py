@@ -154,26 +154,20 @@ class QuoteTask(Base):
     )
 
 
-class QuotePlatformAccount(Base):
-    """Saved per-user platform login material for quote assistant."""
+class QuotePlatformAccountType(Base):
+    """Custom account type per user/platform, for example new-car or used-car."""
 
-    __tablename__ = "quote_platform_account_new"
+    __tablename__ = "quote_platform_account_type_new"
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
     owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
     platform_code = Column(String(32), nullable=False, comment="Platform code")
     platform_name = Column(String(64), nullable=True, comment="Platform display name")
-
-    login_phone = Column(String(32), nullable=True, comment="Login/SMS phone")
-    login_phone_mask = Column(String(32), nullable=True, comment="Masked login phone")
-    account_username = Column(String(128), nullable=True, comment="Platform account username")
-    password_ciphertext = Column(Text, nullable=True, comment="Encrypted platform password")
-    secret_payload_ciphertext = Column(Text, nullable=True, comment="Encrypted future token/cookie payload")
-    credential_payload = Column(JSON, nullable=False, comment="Non-secret login metadata")
-
-    last_login_state = Column(String(32), nullable=False, server_default=text("'none'"), comment="none/sms_required/authenticated/failed")
-    last_sms_at = Column(DateTime(timezone=False), nullable=True, comment="Last SMS trigger time")
-    last_used_at = Column(DateTime(timezone=False), nullable=True, comment="Last quote usage time")
+    type_name = Column(String(64), nullable=False, comment="Custom account type name")
+    description = Column(String(255), nullable=True, comment="Description")
+    match_rules_json = Column(JSON, nullable=False, comment="Future auto-match rules")
+    is_default = Column(Boolean, nullable=False, server_default=text("0"), comment="Default type flag")
+    enabled = Column(Boolean, nullable=False, server_default=text("1"), comment="Enabled flag")
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
     updated_at = Column(
         DateTime(timezone=False),
@@ -184,10 +178,118 @@ class QuotePlatformAccount(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("owner_user_id", "platform_code", name="uq_quote_platform_account_owner_platform"),
-        Index("ix_quote_platform_account_owner", "owner_user_id", "id"),
-        Index("ix_quote_platform_account_platform", "platform_code", "id"),
-        Index("ix_quote_platform_account_used", "last_used_at", "id"),
+        UniqueConstraint("owner_user_id", "platform_code", "type_name", name="uq_quote_platform_account_type_owner_platform_name"),
+        Index("ix_quote_platform_account_type_owner_platform", "owner_user_id", "platform_code", "enabled", "id"),
+        Index("ix_quote_platform_account_type_default", "owner_user_id", "platform_code", "is_default", "id"),
+    )
+
+
+class QuotePlatformAccountProfile(Base):
+    """A single usable platform account profile with isolated runtime state."""
+
+    __tablename__ = "quote_platform_account_profile_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+    platform_code = Column(String(32), nullable=False, comment="Platform code")
+    platform_name = Column(String(64), nullable=True, comment="Platform display name")
+
+    account_type_id = Column(Integer, ForeignKey("quote_platform_account_type_new.id", ondelete="SET NULL"), nullable=True, comment="Account type id")
+    account_type_name = Column(String(64), nullable=True, comment="Account type name snapshot")
+    account_username = Column(String(128), nullable=False, comment="Platform account username")
+    password_ciphertext = Column(Text, nullable=False, comment="Encrypted platform password")
+    login_phone = Column(String(32), nullable=True, comment="Login/SMS phone")
+    login_phone_mask = Column(String(32), nullable=True, comment="Masked login phone")
+    email = Column(String(128), nullable=True, comment="Account email")
+    account_owner_user_id = Column(Integer, ForeignKey("user_new.id", ondelete="SET NULL"), nullable=True, comment="Optional account owner user id")
+    account_owner_name = Column(String(64), nullable=True, comment="Optional account owner name")
+
+    auto_login = Column(Boolean, nullable=False, server_default=text("1"), comment="Allow auto login during quote")
+    enabled = Column(Boolean, nullable=False, server_default=text("1"), comment="Enabled flag")
+    login_status = Column(String(32), nullable=False, server_default=text("'not_logged_in'"), comment="Login status")
+    quota_status = Column(String(32), nullable=False, server_default=text("'unknown'"), comment="unknown/available/warning/full/reset")
+    quota_reset_at = Column(DateTime(timezone=False), nullable=True, comment="Quota reset time")
+    browser_env_key = Column(String(128), nullable=False, comment="Browser profile isolation key")
+
+    credential_payload = Column(JSON, nullable=False, comment="Non-secret credential metadata")
+    secret_payload_ciphertext = Column(Text, nullable=True, comment="Encrypted future token/cookie payload")
+    last_login_at = Column(DateTime(timezone=False), nullable=True, comment="Last login at")
+    last_check_at = Column(DateTime(timezone=False), nullable=True, comment="Last account check at")
+    last_used_at = Column(DateTime(timezone=False), nullable=True, comment="Last quote usage at")
+    last_error = Column(String(2048), nullable=True, comment="Last login/quote error")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "platform_code", "account_username", "account_type_name", name="uq_quote_platform_account_profile_owner_platform_user_type"),
+        Index("ix_quote_platform_account_profile_owner", "owner_user_id", "id"),
+        Index("ix_quote_platform_account_profile_platform", "platform_code", "enabled", "id"),
+        Index("ix_quote_platform_account_profile_type", "owner_user_id", "platform_code", "account_type_name", "enabled", "id"),
+        Index("ix_quote_platform_account_profile_status", "owner_user_id", "login_status", "quota_status", "id"),
+        Index("ix_quote_platform_account_profile_used", "last_used_at", "id"),
+    )
+
+
+class QuotePlatformAccountLoginTask(Base):
+    """A login attempt/challenge lifecycle for a platform account profile."""
+
+    __tablename__ = "quote_platform_account_login_task_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    account_id = Column(Integer, ForeignKey("quote_platform_account_profile_new.id", ondelete="CASCADE"), nullable=False, comment="Account profile id")
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+    platform_code = Column(String(32), nullable=False, comment="Platform code")
+    platform_name = Column(String(64), nullable=True, comment="Platform display name")
+    status = Column(String(32), nullable=False, server_default=text("'pending'"), comment="pending/running/needs_code/success/failed/expired")
+    challenge_type = Column(String(32), nullable=True, comment="sms/security_code/captcha")
+    challenge_prompt = Column(String(512), nullable=True, comment="Prompt for operator")
+    challenge_payload = Column(JSON, nullable=False, comment="Safe challenge metadata")
+    trace_id = Column(String(64), nullable=False, comment="Trace id")
+    error_detail = Column(String(2048), nullable=True, comment="Error detail")
+    started_at = Column(DateTime(timezone=False), nullable=True, comment="Started at")
+    finished_at = Column(DateTime(timezone=False), nullable=True, comment="Finished at")
+    expires_at = Column(DateTime(timezone=False), nullable=True, comment="Challenge expires at")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        Index("ix_quote_platform_account_login_task_account", "account_id", "id"),
+        Index("ix_quote_platform_account_login_task_owner_status", "owner_user_id", "status", "id"),
+        Index("ix_quote_platform_account_login_task_trace", "trace_id"),
+        Index("ix_quote_platform_account_login_task_expires", "expires_at", "id"),
+    )
+
+
+class QuotePlatformAccountEvent(Base):
+    """Audit trail for account profile changes and runtime events."""
+
+    __tablename__ = "quote_platform_account_event_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    account_id = Column(Integer, ForeignKey("quote_platform_account_profile_new.id", ondelete="CASCADE"), nullable=False, comment="Account profile id")
+    event_type = Column(String(32), nullable=False, comment="create/update/login/quota/status")
+    operator_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=True, comment="Operator user id")
+    before_json = Column(JSON, nullable=False, comment="Safe before snapshot")
+    after_json = Column(JSON, nullable=False, comment="Safe after snapshot")
+    message = Column(String(1024), nullable=True, comment="Human-readable event message")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+
+    __table_args__ = (
+        Index("ix_quote_platform_account_event_account", "account_id", "id"),
+        Index("ix_quote_platform_account_event_type", "event_type", "id"),
+        Index("ix_quote_platform_account_event_operator", "operator_user_id", "id"),
     )
 
 
