@@ -33,7 +33,10 @@ from app.models.quote_assistant import (  # noqa: F401
     QuotePlatformAccountEvent,
     QuotePlatformAccountLoginTask,
     QuotePlatformAccountProfile,
+    QuotePlatformAccountQuota,
+    QuotePlatformAccountSessionState,
     QuotePlatformAccountType,
+    QuotePlatformDefaultConfig,
     QuoteTask,
 )
 from app.models.role import Role  # noqa: F401
@@ -66,8 +69,11 @@ __all__ = [
     "QuoteTask",
     "QuotePlatformAccountType",
     "QuotePlatformAccountProfile",
+    "QuotePlatformAccountQuota",
+    "QuotePlatformAccountSessionState",
     "QuotePlatformAccountLoginTask",
     "QuotePlatformAccountEvent",
+    "QuotePlatformDefaultConfig",
     "QuoteCaseEvent",
     "QuoteAssistantSession",
     "QuoteAssistantMessage",

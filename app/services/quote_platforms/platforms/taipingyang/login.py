@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
-from app.services.quote_platforms.platforms.taipingyang.quote import TaipingyangQuoteAdapter
+from app.services.quote_platforms.platforms.taipingyang.business import TaipingyangBusinessAdapter
 
 
-class TaipingyangPlatformAdapter(TaipingyangQuoteAdapter):
+class TaipingyangPlatformAdapter(TaipingyangBusinessAdapter):
     async def login(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
         username = str(ctx.account_username or "").lower()
         if "fail" in username or "error" in username:

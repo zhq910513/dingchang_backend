@@ -29,9 +29,12 @@ from app.models.quote_assistant import QuoteAssistantMessage, QuoteAssistantSess
 from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
+from app.services.image_slot_classifier import slot_label
 from app.services.quote_assistant_service import (
     _collect_context_images,
+    _is_explicit_platform_quote_command,
     detect_platform_credential_signal,
+    detect_quote_config_override_signal,
     detect_quote_signal,
     handle_quote_images_message,
     handle_platform_credential_message,
@@ -39,15 +42,18 @@ from app.services.quote_assistant_service import (
     handle_quote_message,
     has_expired_waiting_sms_task,
     has_quote_case_waiting_for_login_phone,
+    has_recent_invalid_sms_task,
     has_waiting_sms_task,
     looks_like_sms_code,
     redact_quote_sensitive_text,
+    sanitize_quote_user_message,
     sanitize_quote_entities,
 )
 from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
 storage = StorageService()
+HISTORY_BEFORE_CURSOR_PREFIX = "__before__:"
 
 # =============================
 # 卡槽配置（报价助手口径）
@@ -83,6 +89,28 @@ def _now_iso() -> str:
 
 def _now_db() -> datetime:
     return datetime.now(TZ_BJ).replace(tzinfo=None)
+
+
+def _today_bounds_db() -> Tuple[datetime, datetime]:
+    start = _now_db().replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def _history_before_cursor(dt: datetime) -> str:
+    return HISTORY_BEFORE_CURSOR_PREFIX + dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_history_before_cursor(cursor: str) -> Optional[datetime]:
+    raw = _to_str(cursor).strip()
+    if not raw.startswith(HISTORY_BEFORE_CURSOR_PREFIX):
+        return None
+    text = raw[len(HISTORY_BEFORE_CURSOR_PREFIX):].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except Exception:
+            continue
+    return None
 
 
 def _to_str(v: Any, default: str = "") -> str:
@@ -141,6 +169,30 @@ def _contains_any(text: str, keys: List[str]) -> bool:
     return any(k in text for k in keys if k)
 
 
+def _looks_like_quote_image_context_hint(text: Any) -> bool:
+    compact = re.sub(r"\s+", "", _to_str(text).strip())
+    if not compact or len(compact) > 36:
+        return False
+    if re.search(r"[查找搜]|订单|车主|报价|状态|多少钱|保费", compact):
+        return False
+    slot_words = (
+        "身份证正面",
+        "身份证反面",
+        "身份证人像面",
+        "身份证国徽面",
+        "行驶证正本",
+        "行驶证主页",
+        "行驶证副页",
+        "行驶证副本",
+        "车辆合格证",
+        "合格证",
+        "驾驶证",
+    )
+    if not any(word in compact for word in slot_words):
+        return False
+    return compact.startswith(("这是", "这个是", "这张是", "图片是", "照片是", "材料是")) or compact in slot_words
+
+
 def _mk_action(label: str, type_: str = "suggest", target: Optional[str] = None, **extra) -> Dict[str, Any]:
     item: Dict[str, Any] = {"type": type_, "label": label}
     if target:
@@ -197,6 +249,7 @@ def _safe_image_meta_for_history(item: Any) -> Any:
         "content_type",
         "original_name",
         "context_hint",
+        "upload_batch_id",
         "confidence",
         "method",
         "reason",
@@ -237,6 +290,57 @@ def _safe_context_for_history(ctx: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[key] = _json_safe(value)
     return out
+
+
+def _context_has_history_images(ctx: Dict[str, Any]) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    for key in ("images", "uploaded_images", "quote_images"):
+        value = ctx.get(key)
+        if isinstance(value, list) and value:
+            return True
+    page = ctx.get("page_context")
+    if isinstance(page, dict):
+        for key in ("images", "uploaded_images", "quote_images"):
+            value = page.get(key)
+            if isinstance(value, list) and value:
+                return True
+    return False
+
+
+def _message_hidden_from_preview(role: Any, metadata: Any) -> bool:
+    """Background organizer messages should not replace the human-visible session preview."""
+
+    if _to_str(role).strip().lower() != "assistant" or not isinstance(metadata, dict):
+        return False
+    data = metadata.get("data")
+    data = data if isinstance(data, dict) else {}
+    payload = data.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    intent = _to_str(metadata.get("intent") or data.get("intent")).strip().lower()
+    if intent == "quote_image_collect":
+        return True
+    for container in (metadata, data, payload):
+        if container.get("silent") is True:
+            return True
+        if _to_str(container.get("silent")).strip().lower() == "true":
+            return True
+        if container.get("ui_visible") is False:
+            return True
+        if _to_str(container.get("ui_visible")).strip().lower() == "false":
+            return True
+    return False
+
+
+def _message_preview_text(role: Any, content: Any, metadata: Any) -> str:
+    if _message_hidden_from_preview(role, metadata):
+        return ""
+    preview = _safe_chat_text_for_display(content).strip()
+    if preview:
+        return preview[:120]
+    if _context_has_history_images(metadata if isinstance(metadata, dict) else {}):
+        return "图片"
+    return ""
 
 
 def _looks_like_image_dict(value: Dict[str, Any]) -> bool:
@@ -284,24 +388,33 @@ def _safe_metadata_for_history(metadata: Optional[Dict[str, Any]]) -> Dict[str, 
     return _safe_history_value(metadata)
 
 
+def _safe_chat_text_for_display(text: Any) -> str:
+    """Return historical chat text in the same user-facing language as live replies."""
+
+    safe = sanitize_quote_user_message(redact_quote_sensitive_text(text), "")
+    return safe or ""
+
+
 def _humanize_exception(e: Exception) -> str:
     raw = (_to_str(e) or e.__class__.__name__).strip()
     lower = raw.lower()
     if "data too long for column" in lower:
-        m = re.search(r"data too long for column ['`\"]?([^'`\"]+)", raw, flags=re.IGNORECASE)
-        col = m.group(1) if m else "数据库字段"
-        return f"数据库字段 {col} 写入内容过长，请检查上传图片链接或文本长度"
+        return "数据库字段写入内容过长，请检查上传图片链接或文本长度"
     if "duplicate entry" in lower:
         return "数据库唯一性冲突，可能是重复提交了同一份数据"
     if "can't connect to mysql" in lower or "connect to mysql" in lower:
-        return "数据库连接失败，请确认 MySQL 服务已启动且配置正确"
+        return "数据库连接失败，请确认数据库服务已启动且配置正确"
+    if "no permission" in lower or "error_code" in lower or "access denied" in lower:
+        return "接口暂无访问权限，请检查账号权限或稍后重试"
+    if "internal server error" in lower:
+        return "服务器处理异常，请稍后重试"
     if "lock timeout" in lower:
         return "会话历史写入锁等待超时，请稍后重试"
     if "timeout" in lower:
         return "外部服务或数据库响应超时，请稍后重试"
     if raw:
-        return raw[:300]
-    return e.__class__.__name__
+        return sanitize_quote_user_message(raw[:300], "处理失败，请稍后重试")
+    return "处理失败，请稍后重试"
 
 
 # =============================
@@ -434,7 +547,17 @@ class _Store:
                     if _to_str(s.get("owner_user_id")) != owner:
                         continue
                     msgs = s.get("messages") or []
-                    preview = _to_str((msgs[-1] or {}).get("content"))[:120] if msgs else ""
+                    preview = ""
+                    for m in reversed(msgs):
+                        if not isinstance(m, dict):
+                            continue
+                        preview = _message_preview_text(
+                            m.get("role"),
+                            m.get("content"),
+                            m.get("metadata") or {},
+                        )
+                        if preview:
+                            break
                     rows.append(
                         {
                             "session_id": s.get("session_id"),
@@ -474,8 +597,23 @@ class _Store:
         if not row:
             raise ValueError("会话不存在或无权限访问")
 
-        msgs = row.get("messages") or []
+        msgs = [
+            m
+            for m in (row.get("messages") or [])
+            if isinstance(m, dict) and not _message_hidden_from_preview(m.get("role"), m.get("metadata") or {})
+        ]
         lim = max(1, min(int(limit or 50), 200))
+
+        def safe_items(values: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                clean = dict(item)
+                clean["content"] = _safe_chat_text_for_display(clean.get("content"))
+                clean["metadata"] = _safe_metadata_for_history(clean.get("metadata") or {})
+                out.append(clean)
+            return out
 
         if cursor:
             idx = -1
@@ -490,12 +628,12 @@ class _Store:
                 sliced = msgs[start: idx]
                 has_more = start > 0
                 next_cursor = sliced[0]["id"] if (has_more and sliced) else None
-                return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
+                return {"items": safe_items(sliced), "next_cursor": next_cursor, "has_more": has_more}
 
         sliced = msgs[-lim:]
         has_more = len(msgs) > len(sliced)
         next_cursor = sliced[0]["id"] if (has_more and sliced) else None
-        return {"items": sliced, "next_cursor": next_cursor, "has_more": has_more}
+        return {"items": safe_items(sliced), "next_cursor": next_cursor, "has_more": has_more}
 
     def append_message(
             self,
@@ -528,6 +666,9 @@ class _Store:
                     row["title"] = (msg["content"].strip() or "新会话")[:24]
 
                 row["updated_at"] = msg["created_at"]
+                preview = _message_preview_text(msg["role"], msg["content"], msg.get("metadata") or {})
+                if preview:
+                    row["last_message_preview"] = preview
                 self._flush()
                 return deepcopy(msg)
 
@@ -620,7 +761,7 @@ def _session_row_to_dict(row: QuoteAssistantSession) -> Dict[str, Any]:
         "updated_at": _fmt_dt(getattr(row, "updated_at", None)),
         "deleted": bool(getattr(row, "deleted", False)),
         "message_count": int(getattr(row, "message_count", 0) or 0),
-        "last_message_preview": _to_str(getattr(row, "last_message_preview", ""))[:120],
+        "last_message_preview": _safe_chat_text_for_display(getattr(row, "last_message_preview", ""))[:120],
     }
 
 
@@ -631,10 +772,17 @@ def _message_row_to_dict(row: QuoteAssistantMessage) -> Dict[str, Any]:
     return {
         "id": _to_str(getattr(row, "message_id", "")),
         "role": _to_str(getattr(row, "role", "assistant")) or "assistant",
-        "content": _to_str(getattr(row, "content", "")),
+        "content": _safe_chat_text_for_display(getattr(row, "content", "")),
         "created_at": _fmt_dt(getattr(row, "created_at", None)),
         "metadata": _safe_metadata_for_history(meta),
     }
+
+
+def _message_row_hidden_from_history(row: QuoteAssistantMessage) -> bool:
+    meta = getattr(row, "metadata_json", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    return _message_hidden_from_preview(getattr(row, "role", ""), meta)
 
 
 async def db_get_session(
@@ -753,6 +901,7 @@ async def db_list_messages(
         session_id: str,
         cursor: Optional[str] = None,
         limit: int = 50,
+        today_only_initial: bool = False,
 ) -> Dict[str, Any]:
     owner = _safe_int(owner_user_id, 0)
     row = await _db_get_session_row(db, owner_user_id=owner, session_id=session_id)
@@ -762,7 +911,13 @@ async def db_list_messages(
     lim = max(1, min(int(limit or 50), 200))
     cursor_pk: Optional[int] = None
     cursor_id = _to_str(cursor).strip()
-    if cursor_id:
+    before_created_at = _parse_history_before_cursor(cursor_id) if cursor_id else None
+    today_start: Optional[datetime] = None
+    today_end: Optional[datetime] = None
+    if today_only_initial and not cursor_id:
+        today_start, today_end = _today_bounds_db()
+
+    if cursor_id and before_created_at is None:
         cursor_stmt = (
             select(QuoteAssistantMessage.id)
             .where(
@@ -773,26 +928,96 @@ async def db_list_messages(
             .limit(1)
         )
         cursor_pk = (await db.execute(cursor_stmt)).scalar_one_or_none()
+        if cursor_pk is None:
+            return {"items": [], "next_cursor": None, "has_more": False}
 
-    stmt = (
-        select(QuoteAssistantMessage)
-        .where(
-            QuoteAssistantMessage.owner_user_id == owner,
-            QuoteAssistantMessage.session_id == row.session_id,
+    # 后台归位/状态消息会被隐藏，不能让它们消耗“默认 3 条/上翻 5 条”的可见额度。
+    rows_desc: List[QuoteAssistantMessage] = []
+    fetch_limit = min(max(lim + 8, lim * 4), 200)
+    scan_before_pk: Optional[int] = None
+    last_raw_cursor: Optional[str] = None
+    raw_exhausted = False
+
+    for _ in range(10):
+        stmt = (
+            select(QuoteAssistantMessage)
+            .where(
+                QuoteAssistantMessage.owner_user_id == owner,
+                QuoteAssistantMessage.session_id == row.session_id,
+            )
         )
-    )
-    if cursor_id and cursor_pk is not None:
-        stmt = stmt.where(QuoteAssistantMessage.id < int(cursor_pk))
+        if before_created_at is not None:
+            stmt = stmt.where(QuoteAssistantMessage.created_at < before_created_at)
+        elif cursor_id and cursor_pk is not None:
+            stmt = stmt.where(QuoteAssistantMessage.id < int(cursor_pk))
+        elif today_start is not None and today_end is not None:
+            stmt = stmt.where(
+                QuoteAssistantMessage.created_at >= today_start,
+                QuoteAssistantMessage.created_at < today_end,
+            )
+        if scan_before_pk is not None:
+            stmt = stmt.where(QuoteAssistantMessage.id < scan_before_pk)
 
-    stmt = stmt.order_by(desc(QuoteAssistantMessage.id)).limit(lim + 1)
-    rows_desc = (await db.execute(stmt)).scalars().all()
-    has_more = len(rows_desc) > lim
+        batch = (
+            await db.execute(stmt.order_by(desc(QuoteAssistantMessage.id)).limit(fetch_limit))
+        ).scalars().all()
+        if not batch:
+            raw_exhausted = True
+            break
+
+        last_raw = batch[-1]
+        scan_before_pk = int(getattr(last_raw, "id", 0) or 0) or None
+        last_raw_cursor = _to_str(getattr(last_raw, "message_id", "")).strip() or None
+
+        for msg_row in batch:
+            if not _message_row_hidden_from_history(msg_row):
+                rows_desc.append(msg_row)
+                if len(rows_desc) > lim:
+                    break
+
+        if len(rows_desc) > lim:
+            break
+        if len(batch) < fetch_limit:
+            raw_exhausted = True
+            break
+
+    has_more = len(rows_desc) > lim or not raw_exhausted
     page_rows = list(reversed(rows_desc[:lim]))
     items = [_message_row_to_dict(m) for m in page_rows]
+    next_cursor = items[0]["id"] if (has_more and items) else (last_raw_cursor if has_more else None)
+
+    if today_start is not None:
+        if items and not has_more:
+            first_row = page_rows[0]
+            older_stmt = (
+                select(QuoteAssistantMessage.id)
+                .where(
+                    QuoteAssistantMessage.owner_user_id == owner,
+                    QuoteAssistantMessage.session_id == row.session_id,
+                    QuoteAssistantMessage.id < int(getattr(first_row, "id", 0) or 0),
+                )
+                .limit(1)
+            )
+            if (await db.execute(older_stmt)).scalar_one_or_none() is not None:
+                has_more = True
+                next_cursor = items[0]["id"]
+        elif not items:
+            older_stmt = (
+                select(QuoteAssistantMessage.id)
+                .where(
+                    QuoteAssistantMessage.owner_user_id == owner,
+                    QuoteAssistantMessage.session_id == row.session_id,
+                    QuoteAssistantMessage.created_at < today_start,
+                )
+                .limit(1)
+            )
+            if (await db.execute(older_stmt)).scalar_one_or_none() is not None:
+                has_more = True
+                next_cursor = _history_before_cursor(today_start)
 
     return {
         "items": items,
-        "next_cursor": items[0]["id"] if (has_more and items) else None,
+        "next_cursor": next_cursor,
         "has_more": has_more,
     }
 
@@ -828,7 +1053,9 @@ async def db_append_message(
     if (row.title in (None, "", "新会话")) and msg.role == "user":
         row.title = (safe_content.strip() or "新会话")[:24]
     row.message_count = int(row.message_count or 0) + 1
-    row.last_message_preview = safe_content[:120]
+    preview = _message_preview_text(msg.role, safe_content, msg.metadata_json)
+    if preview:
+        row.last_message_preview = preview
     row.updated_at = now
 
     await db.flush()
@@ -1115,6 +1342,9 @@ def _detect_intent(text: str) -> Tuple[str, float, Dict[str, Any]]:
     if task_id:
         entities["task_id"] = task_id
 
+    if _looks_like_quote_image_context_hint(t):
+        return "quote_image_hint", 0.90, entities
+
     plate_no = _extract_plate_no(t)
     if plate_no:
         entities["plate_no"] = plate_no
@@ -1161,8 +1391,8 @@ def _detect_intent(text: str) -> Tuple[str, float, Dict[str, Any]]:
     if _contains_any(low, ["help", "帮助", "怎么用", "能做什么", "指令", "菜单"]):
         return "help", 0.99, entities
 
-    if "报价" in t:
-        return ("quote", 0.98, entities) if platform_name else ("quote", 0.78, entities)
+    if platform_name and _is_explicit_platform_quote_command(t, entities.get("platform_code"), platform_name):
+        return "quote", 0.98, entities
 
     if _contains_any(t, ["材料状态", "资料状态", "当前材料", "图片状态", "卡槽状态", "上传了哪些"]):
         return "query_material_status", 0.95, entities
@@ -1667,11 +1897,11 @@ def _get_platform_adapter(platform_code: str) -> AiPlatformAdapter:
 # =============================
 def _help_reply() -> Tuple[str, Dict[str, Any]]:
     msg = (
-        "我是报价助手（规则引擎版），主要负责：材料状态、OCR任务状态、订单/车主查询、平台报价指令分发。\n"
+        "我是报价助手，主要负责：材料状态、识别任务状态、订单/车主查询、平台报价指令分发。\n"
         "你可以这样说：\n"
         "1) 太平洋报价（或 人保报价/平安报价）\n"
         "2) 查看当前材料状态\n"
-        "3) OCR任务123状态（或 查OCR任务 123）\n"
+        "3) 识别任务123状态（或 查识别任务 123）\n"
         "4) 查订单123（或 查订单 赣B12345 / 查订单 13800138000）\n"
         "5) 查车主 赣B12345（或 姓名:张三）"
     )
@@ -1683,7 +1913,7 @@ def _help_reply() -> Tuple[str, Dict[str, Any]]:
         "actions": [
             _mk_action("查看当前材料状态"),
             _mk_action("太平洋报价"),
-            _mk_action("查OCR任务 123"),
+            _mk_action("查识别任务 123"),
             _mk_action("查订单 10086"),
         ],
     }
@@ -1723,12 +1953,12 @@ async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities
 
     lines = [f"材料状态：已覆盖 {ready_slots}/{total_slots} 个槽位。"]
     if required_missing:
-        lines.append("缺少关键材料：" + "、".join(required_missing))
+        lines.append("缺少关键材料：" + "、".join(slot_label(k) for k in required_missing))
     else:
         lines.append("关键材料已齐，可以发起报价指令。")
 
     for k, v in slots.items():
-        lines.append(f"- {k}: {'有图' if v.get('has_image') else '无图'}（{int(v.get('count') or 0)}张）")
+        lines.append(f"- {slot_label(k)}：{'有图' if v.get('has_image') else '无图'}（{int(v.get('count') or 0)}张）")
 
     return (
         "\n".join(lines),
@@ -1753,7 +1983,7 @@ async def _reply_material_status(db: AsyncSession, ctx: Dict[str, Any], entities
             "actions": [
                 _mk_action("太平洋报价"),
                 _mk_action("人保报价"),
-                _mk_action("OCR任务状态"),
+                _mk_action("识别任务状态"),
             ],
         },
     )
@@ -1773,31 +2003,31 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
                                      owner_name=owner_name, ctx=ctx)
         if not order:
             return (
-                "已识别为OCR任务查询，但你没提供任务号，也没定位到订单。你可以发：查OCR任务 123 或 查订单123 再查OCR状态。",
+                "已识别为识别任务查询，但你没提供任务号，也没定位到订单。你可以发：查识别任务 123 或 查订单123 后再查识别状态。",
                 {
                     "status": "success",
                     "intent": "query_ocr_task",
                     "trace_id": _new_id()[:16],
                     "data": _mk_data(
                         result_status=RESULT_NEED_MORE,
-                        message="缺少 task_id 或订单定位信息",
+                        message="缺少识别任务号或订单定位信息",
                         entities=entities,
                         payload={},
                     ),
-                    "actions": [_mk_action("查OCR任务 123"), _mk_action("查订单 10086")],
+                    "actions": [_mk_action("查识别任务 123"), _mk_action("查订单 10086")],
                 },
             )
         latest = await _db_get_latest_ocr_task_for_order(db, int(getattr(order, "id")))
         if not latest:
             return (
-                "当前订单还没有OCR任务。你可以先上传图片并触发识别/报价。",
+                "当前订单还没有识别任务。你可以先上传图片并触发识别或报价。",
                 {
                     "status": "success",
                     "intent": "query_ocr_task",
                     "trace_id": _new_id()[:16],
                     "data": _mk_data(
                         result_status=RESULT_EMPTY,
-                        message="该订单暂无OCR任务",
+                        message="该订单暂无识别任务",
                         entities={**entities, "order_id": _safe_int(getattr(order, "id", 0), 0) or None},
                         payload={},
                     ),
@@ -1809,14 +2039,14 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
     task = await _db_get_ocr_task(db, int(task_id), ctx=ctx)
     if not task:
         return (
-            f"没找到 OCR任务{task_id}。请确认任务号是否正确。",
+            f"没找到识别任务{task_id}。请确认任务号是否正确。",
             {
                 "status": "success",
                 "intent": "query_ocr_task",
                 "trace_id": _new_id()[:16],
                 "data": _mk_data(
                     result_status=RESULT_EMPTY,
-                    message="OCR任务不存在",
+                    message="识别任务不存在",
                     entities={**entities, "task_id": task_id},
                     payload={"task": None},
                 ),
@@ -1849,11 +2079,17 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
             slot_statuses = _ocr_slot_statuses_from_order(order)
 
     lines = [
-        f"OCR任务状态：{status_cn}（{progress}%）",
+        f"识别任务状态：{status_cn}（{progress}%）",
         f"任务号：{_safe_int(getattr(task, 'id', 0), 0) or '未知'}",
     ]
     if scope_type and scope_id:
-        lines.append(f"关联范围：{scope_type} / {scope_id}")
+        scope_label = {
+            "order": "关联订单",
+            "image": "关联图片",
+            "quote_case": "关联报价草稿",
+            "quote": "关联报价",
+        }.get(scope_type, "关联业务")
+        lines.append(f"{scope_label}：{scope_id}")
     if error_message:
         lines.append(f"提示：{error_message[:200]}")
 
@@ -1887,7 +2123,7 @@ async def _reply_ocr_task(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[
             "trace_id": _new_id()[:16],
             "data": _mk_data(
                 result_status=result_status,
-                message="已返回OCR任务状态",
+                message="已返回识别任务状态",
                 entities={**entities, "task_id": task_id},
                 payload=payload,
             ),
@@ -2134,7 +2370,7 @@ def _order_field_lines(order: Order, payload: Dict[str, Any], query_fields: List
         elif key == "id_number":
             out.append(f"身份证号：{dd.get('id_number') or '-'}")
         elif key == "vin":
-            out.append(f"VIN/车架号：{dd.get('vin') or '-'}")
+            out.append(f"车架号：{dd.get('vin') or '-'}")
         elif key == "engine_no":
             out.append(f"发动机号：{dd.get('engine_no') or '-'}")
         elif key == "vehicle_model":
@@ -2167,7 +2403,7 @@ def _order_field_lines(order: Order, payload: Dict[str, Any], query_fields: List
             ready = [f"{k}:{v.get('count')}" for k, v in images.items() if isinstance(v, dict) and v.get("count")]
             out.append(f"图片卡槽：{', '.join(ready) if ready else '-'}")
         elif key == "ocr_summary":
-            out.append(f"OCR状态：{_short_json(ocr)}")
+            out.append(f"图片识别状态：{sanitize_quote_user_message(_short_json(ocr), '-')}")
         elif key == "status":
             out.append(
                 f"状态：完成={_yes_no(order_payload.get('is_finished'))}，回款={_yes_no(order_payload.get('is_paid'))}，返点={_yes_no(order_payload.get('is_rebate'))}"
@@ -2372,7 +2608,7 @@ async def _reply_owner(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
         f"- 车主：{owner_profile.get('owner_name') or '-'}\n"
         f"- 手机号：{owner_profile.get('owner_phone') or '-'}\n"
         f"- 车牌：{owner_profile.get('plate_no') or '-'}\n"
-        f"- VIN：{owner_profile.get('vin') or '-'}\n"
+        f"- 车架号：{owner_profile.get('vin') or '-'}\n"
         f"- 最近订单：{recent_orders[0].get('order_id') or '-'}（可报价：{'是' if platform_quote_ready else '否'}）"
     )
 
@@ -2474,14 +2710,14 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
     task_status = _to_str(getattr(task, "status", None) or "") if task else ""
     if task_status in ("pending", "processing"):
         return (
-            f"已识别报价指令：{platform_name}报价。材料已齐，但OCR还在处理中（{_safe_int(getattr(task, 'progress', 0), 0)}%），稍后可重试。",
+            f"已识别报价指令：{platform_name}报价。材料已齐，但图片识别还在处理中（{_safe_int(getattr(task, 'progress', 0), 0)}%），稍后可重试。",
             {
                 "status": "success",
                 "intent": "quote",
                 "trace_id": _new_id()[:16],
                 "data": _mk_data(
                     result_status=RESULT_NOT_READY,
-                    message="OCR处理中，暂不能报价",
+                    message="图片识别处理中，暂不能报价",
                     entities={**entities, "order_id": _safe_int(getattr(order, "id", 0), 0) or None},
                     payload={
                         "quote_request": {
@@ -2495,7 +2731,7 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
                         }
                     },
                 ),
-                "actions": [_mk_action("OCR任务状态"), _mk_action("查看当前材料状态"),
+                "actions": [_mk_action("识别任务状态"), _mk_action("查看当前材料状态"),
                             _mk_action(f"{platform_name}报价")],
             },
         )
@@ -2604,7 +2840,7 @@ def _fallback_reply() -> Tuple[str, Dict[str, Any]]:
         "你可以试试：\n"
         "- 太平洋报价\n"
         "- 查看当前材料状态\n"
-        "- OCR任务123状态\n"
+        "- 识别任务123状态\n"
         "- 查订单123\n"
         "- 查车主 赣B12345"
     )
@@ -2613,89 +2849,177 @@ def _fallback_reply() -> Tuple[str, Dict[str, Any]]:
         "intent": "fallback",
         "trace_id": _new_id()[:16],
         "data": _mk_data(result_status=RESULT_INVALID, message="无法识别指令"),
-        "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价"), _mk_action("OCR任务状态")],
+        "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价"), _mk_action("识别任务状态")],
+    }
+
+
+def _quote_image_hint_reply() -> Tuple[str, Dict[str, Any]]:
+    return "请把这句说明留在输入框里，再直接拖入对应图片。", {
+        "status": "success",
+        "intent": "quote_image_hint",
+        "trace_id": _new_id()[:16],
+        "data": _mk_data(result_status=RESULT_SUCCESS, message="等待图片上传"),
+        "actions": [],
     }
 
 
 # =============================
 # 分发入口（真查库）
 # =============================
-async def _dispatch_rule(text: str, ctx: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def _dispatch_error_reply(
+        error: Exception,
+        entities: Dict[str, Any],
+        ctx: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    detail = _humanize_exception(error)
+    role_name = _ctx_role_name(ctx or {})
+    can_use_quote = role_name in {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES}
+    actions = [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")] if can_use_quote else [_mk_action("查订单")]
+    fallback_hint = "查看当前材料状态" if can_use_quote else "查订单 车牌号或车主姓名"
+    return (
+        f"这次处理没成功：{detail}。\n请重试一次；如果还不行，先发“{fallback_hint}”。",
+        {
+            "status": "failed",
+            "intent": "system_error",
+            "trace_id": _new_id()[:16],
+            "confidence": 0.0,
+            "data": _mk_data(
+                result_status=RESULT_FAILED,
+                message=f"处理失败：{detail}",
+                entities=entities,
+                payload={"error": detail},
+            ),
+            "actions": actions,
+        },
+    )
+
+
+async def _dispatch_rule_with_db(
+        text: str,
+        ctx: Dict[str, Any],
+        *,
+        db: AsyncSession,
+        intent: str,
+        confidence: float,
+        entities: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    waiting_sms_active = False
+    if intent != "quote":
+        waiting_sms_active = await has_waiting_sms_task(db, ctx)
+    if intent != "quote" and looks_like_sms_code(text) and waiting_sms_active:
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.93)
+    sms_code_like = looks_like_sms_code(text)
+    if intent != "quote" and sms_code_like and await has_expired_waiting_sms_task(db, ctx):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.91)
+    if intent != "quote" and sms_code_like and await has_recent_invalid_sms_task(db, ctx):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.9)
+    if intent != "quote" and re.fullmatch(r"\d{11}", _norm_text(text)) and await has_quote_case_waiting_for_login_phone(db, ctx):
+        intent = "quote_credential"
+        confidence = max(float(confidence or 0.0), 0.91)
+    if intent not in {"quote", "query_material_status", "quote_credential"} and waiting_sms_active:
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.9)
+
+    image_result = None
+    has_context_images = bool(_collect_context_images(ctx))
+    # Any uploaded image should enter the quote material organizer first.
+    # If a platform quote intent is already present, the organizer will
+    # auto-continue into the quote flow once required materials are ready.
+    should_collect_images = has_context_images and intent != "quote_credential"
+    if intent not in {"quote", "quote_credential"} or should_collect_images:
+        image_result = await handle_quote_images_message(db, ctx=ctx, entities=entities, text=text)
+
+    if image_result:
+        reply, meta = image_result
+    elif intent == "help":
+        reply, meta = _help_reply()
+    elif intent == "query_material_status":
+        quote_status = await handle_quote_material_status(db, ctx=ctx, entities=entities)
+        if quote_status:
+            reply, meta = quote_status
+        else:
+            reply, meta = await _reply_material_status(db, ctx, entities)
+    elif intent == "query_ocr_task":
+        reply, meta = await _reply_ocr_task(db, ctx, entities)
+    elif intent == "query_order":
+        reply, meta = await _reply_order(db, ctx, entities)
+    elif intent == "query_owner":
+        reply, meta = await _reply_owner(db, ctx, entities)
+    elif intent == "quote_credential":
+        reply, meta = await handle_platform_credential_message(db, ctx=ctx, entities=entities, text=text)
+    elif intent == "quote":
+        reply, meta = await handle_quote_message(db, ctx=ctx, entities=entities, text=text)
+    elif intent == "quote_image_hint":
+        reply, meta = _quote_image_hint_reply()
+    else:
+        reply, meta = _fallback_reply()
+
+    meta["intent"] = _to_str(meta.get("intent"), intent) or intent
+    meta["confidence"] = float(confidence)
+    data = meta.get("data")
+    if isinstance(data, dict):
+        data.setdefault("entities", entities)
+    return reply, meta
+
+
+async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSession] = None) -> Tuple[str, Dict[str, Any]]:
     intent, confidence, entities = _detect_intent(text)
     quote_signal = detect_quote_signal(text)
-    if quote_signal.get("is_quote"):
+    signal_entities = quote_signal.get("entities")
+    if isinstance(signal_entities, dict):
+        entities.update(signal_entities)
+    quote_platform_code = _to_str(entities.get("platform_code")).strip().upper()
+    quote_platform_name = _to_str(entities.get("platform_name")).strip()
+    if quote_signal.get("is_quote") and _is_explicit_platform_quote_command(text, quote_platform_code, quote_platform_name):
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.96)
-        signal_entities = quote_signal.get("entities")
-        if isinstance(signal_entities, dict):
-            entities.update(signal_entities)
+    quote_override_signal = detect_quote_config_override_signal(text)
+    if quote_override_signal.get("is_override"):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.93)
+        override_entities = quote_override_signal.get("entities")
+        if isinstance(override_entities, dict):
+            entities.update(override_entities)
+
+    if db is not None:
+        try:
+            # Keep quote-state writes in the same API transaction as chat
+            # messages, while allowing a failed dispatch to roll back only the
+            # quote attempt and preserve the user's message.
+            async with db.begin_nested():
+                return await _dispatch_rule_with_db(
+                    text,
+                    ctx,
+                    db=db,
+                    intent=intent,
+                    confidence=confidence,
+                    entities=entities,
+                )
+        except Exception as e:
+            return _dispatch_error_reply(e, entities, ctx=ctx)
 
     async for db in get_db():
         try:
-            if intent != "quote" and looks_like_sms_code(text) and await has_waiting_sms_task(db, ctx):
-                intent = "quote"
-                confidence = max(float(confidence or 0.0), 0.93)
-            if intent != "quote" and looks_like_sms_code(text) and await has_expired_waiting_sms_task(db, ctx):
-                intent = "quote"
-                confidence = max(float(confidence or 0.0), 0.91)
-            if intent != "quote" and re.fullmatch(r"\d{11}", _norm_text(text)) and await has_quote_case_waiting_for_login_phone(db, ctx):
-                intent = "quote_credential"
-                confidence = max(float(confidence or 0.0), 0.91)
-
-            image_result = None
-            has_context_images = bool(_collect_context_images(ctx))
-            should_collect_images = has_context_images and intent != "quote_credential" and not entities.get("platform_name")
-            if intent not in {"quote", "quote_credential"} or should_collect_images:
-                image_result = await handle_quote_images_message(db, ctx=ctx, entities=entities, text=text)
-
-            if image_result:
-                reply, meta = image_result
-            elif intent == "help":
-                reply, meta = _help_reply()
-            elif intent == "query_material_status":
-                quote_status = await handle_quote_material_status(db, ctx=ctx, entities=entities)
-                if quote_status:
-                    reply, meta = quote_status
-                else:
-                    reply, meta = await _reply_material_status(db, ctx, entities)
-            elif intent == "query_ocr_task":
-                reply, meta = await _reply_ocr_task(db, ctx, entities)
-            elif intent == "query_order":
-                reply, meta = await _reply_order(db, ctx, entities)
-            elif intent == "query_owner":
-                reply, meta = await _reply_owner(db, ctx, entities)
-            elif intent == "quote_credential":
-                reply, meta = await handle_platform_credential_message(db, ctx=ctx, entities=entities, text=text)
-            elif intent == "quote":
-                reply, meta = await handle_quote_message(db, ctx=ctx, entities=entities, text=text)
-            else:
-                reply, meta = _fallback_reply()
-
-            meta["intent"] = _to_str(meta.get("intent"), intent) or intent
-            meta["confidence"] = float(confidence)
-            data = meta.get("data")
-            if isinstance(data, dict):
-                data.setdefault("entities", entities)
-            return reply, meta
+            result = await _dispatch_rule_with_db(
+                text,
+                ctx,
+                db=db,
+                intent=intent,
+                confidence=confidence,
+                entities=entities,
+            )
+            await db.commit()
+            return result
 
         except Exception as e:
-            detail = _humanize_exception(e)
-            return (
-                f"这次处理没成功：{detail}。\n请重试一次；如果还不行，先发“查看当前材料状态”。",
-                {
-                    "status": "failed",
-                    "intent": "system_error",
-                    "trace_id": _new_id()[:16],
-                    "confidence": 0.0,
-                    "data": _mk_data(
-                        result_status=RESULT_FAILED,
-                        message=f"处理失败：{detail}",
-                        entities=entities,
-                        payload={"error": detail},
-                    ),
-                    "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")],
-                },
-            )
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            return _dispatch_error_reply(e, entities, ctx=ctx)
 
     return _fallback_reply()
 
@@ -2799,18 +3123,34 @@ async def send_message(
     # 给平台入口一个 session_id 也能用（不强绑）
     if isinstance(final_context, dict):
         final_context["session_id"] = real_session_id
+    suppress_user_message = bool(
+        isinstance(final_context, dict)
+        and (final_context.get("suppress_user_message") or final_context.get("auto_followup"))
+    )
+    has_history_images = _context_has_history_images(final_context)
 
     hide_unlabeled_sms_code = False
     if looks_like_sms_code(final_text):
-        try:
-            async for sms_db in get_db():
+        if db is not None:
+            try:
                 hide_unlabeled_sms_code = bool(
-                    await has_waiting_sms_task(sms_db, final_context)
-                    or await has_expired_waiting_sms_task(sms_db, final_context)
+                    await has_waiting_sms_task(db, final_context)
+                    or await has_expired_waiting_sms_task(db, final_context)
+                    or await has_recent_invalid_sms_task(db, final_context)
                 )
-                break
-        except Exception:
-            hide_unlabeled_sms_code = False
+            except Exception:
+                hide_unlabeled_sms_code = False
+        else:
+            try:
+                async for sms_db in get_db():
+                    hide_unlabeled_sms_code = bool(
+                        await has_waiting_sms_task(sms_db, final_context)
+                        or await has_expired_waiting_sms_task(sms_db, final_context)
+                        or await has_recent_invalid_sms_task(sms_db, final_context)
+                    )
+                    break
+            except Exception:
+                hide_unlabeled_sms_code = False
 
     user_metadata = {
         "status": "success",
@@ -2828,25 +3168,27 @@ async def send_message(
         display_text,
         hide_unlabeled_sms_code=hide_unlabeled_sms_code,
     )
-    if db is not None:
-        user_msg = await db_append_message(
-            db,
-            owner_user_id=owner_user_id,
-            session_id=real_session_id,
-            role="user",
-            content=user_content,
-            metadata=user_metadata,
-        )
-    else:
-        user_msg = _store.append_message(
-            owner_user_id=owner_user_id,
-            session_id=real_session_id,
-            role="user",
-            content=user_content,
-            metadata=user_metadata,
-        )
+    user_msg = None
+    if not suppress_user_message or has_history_images:
+        if db is not None:
+            user_msg = await db_append_message(
+                db,
+                owner_user_id=owner_user_id,
+                session_id=real_session_id,
+                role="user",
+                content=user_content,
+                metadata=user_metadata,
+            )
+        else:
+            user_msg = _store.append_message(
+                owner_user_id=owner_user_id,
+                session_id=real_session_id,
+                role="user",
+                content=user_content,
+                metadata=user_metadata,
+            )
 
-    reply_text, reply_meta = await _dispatch_rule(final_text, final_context)
+    reply_text, reply_meta = await _dispatch_rule(final_text, final_context, db=db)
 
     assistant_content = redact_quote_sensitive_text(reply_text)
     if db is not None:

@@ -1,25 +1,46 @@
 # encoding: utf-8
 from __future__ import annotations
 
+from typing import Any, Awaitable, Callable
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import async_session_factory
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
-from app.services.quote_platforms.registry import get_quote_platform_adapter
+from app.services.quote_platforms.session_manager import session_manager
 
 
-async def login(ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-    return await get_quote_platform_adapter(ctx.platform_code).login(ctx)
+async def _with_db(
+    db: AsyncSession | None,
+    fn: Callable[[AsyncSession], Awaitable[PlatformRuntimeResult]],
+) -> PlatformRuntimeResult:
+    if db is not None:
+        return await fn(db)
+    async with async_session_factory() as session:
+        try:
+            result = await fn(session)
+            await session.commit()
+            return result
+        except Exception:
+            await session.rollback()
+            raise
 
 
-async def submit_challenge(ctx: PlatformAccountContext, challenge: str) -> PlatformRuntimeResult:
-    return await get_quote_platform_adapter(ctx.platform_code).submit_challenge(ctx, challenge)
+async def login(ctx: PlatformAccountContext, db: AsyncSession | None = None) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.login(session, ctx))
 
 
-async def keepalive(ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-    return await get_quote_platform_adapter(ctx.platform_code).keepalive(ctx)
+async def submit_challenge(ctx: PlatformAccountContext, challenge: str, db: AsyncSession | None = None) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.submit_challenge(session, ctx, challenge))
 
 
-async def check_quota(ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-    return await get_quote_platform_adapter(ctx.platform_code).check_quota(ctx)
+async def keepalive(ctx: PlatformAccountContext, db: AsyncSession | None = None) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.keepalive(session, ctx))
 
 
-async def quote(ctx: PlatformAccountContext, quote_payload):
-    return await get_quote_platform_adapter(ctx.platform_code).quote(ctx, quote_payload)
+async def check_quota(ctx: PlatformAccountContext, db: AsyncSession | None = None) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.check_quota(session, ctx))
+
+
+async def quote(ctx: PlatformAccountContext, quote_payload: dict[str, Any], db: AsyncSession | None = None) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.quote(session, ctx, quote_payload))

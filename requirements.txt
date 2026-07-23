@@ -14,6 +14,9 @@ python-dotenv==1.0.1
 
 # HTTP client（OCR 等会用到）
 requests==2.32.3
+cryptography==43.0.3
+Pillow==11.0.0
+playwright==1.49.1
 
 # 上传文件（FastAPI form-data）
 python-multipart==0.0.9

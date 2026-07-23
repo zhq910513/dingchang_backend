@@ -26,7 +26,10 @@ from app.models.quote_assistant import (  # noqa: E402
     QuotePlatformAccountEvent,
     QuotePlatformAccountLoginTask,
     QuotePlatformAccountProfile,
+    QuotePlatformAccountQuota,
+    QuotePlatformAccountSessionState,
     QuotePlatformAccountType,
+    QuotePlatformDefaultConfig,
     QuoteTask,
 )
 
@@ -37,8 +40,11 @@ TABLES = [
     QuoteTask.__table__,
     QuotePlatformAccountType.__table__,
     QuotePlatformAccountProfile.__table__,
+    QuotePlatformAccountQuota.__table__,
+    QuotePlatformAccountSessionState.__table__,
     QuotePlatformAccountLoginTask.__table__,
     QuotePlatformAccountEvent.__table__,
+    QuotePlatformDefaultConfig.__table__,
     QuoteCaseEvent.__table__,
     QuoteAssistantSession.__table__,
     QuoteAssistantMessage.__table__,

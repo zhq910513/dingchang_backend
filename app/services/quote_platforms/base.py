@@ -12,6 +12,8 @@ class PlatformAccountContext:
     platform_name: str
     account_id: int
     account_username: str
+    owner_user_id: int = 0
+    account_password: str = ""
     account_type_name: str = ""
     browser_env_key: str = ""
     profile_dir: Optional[Path] = None
@@ -30,6 +32,8 @@ class PlatformRuntimeResult:
 class QuotePlatformAdapter:
     platform_code = "STUB"
     platform_name = "Stub"
+    requires_browser_runtime = False
+    keep_browser_alive = False
 
     async def validate_account(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="ok")

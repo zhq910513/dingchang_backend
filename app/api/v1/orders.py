@@ -674,10 +674,10 @@ def _num_or_zero(v: Any) -> float:
 
 
 def _recalc_order_info_derived(info: OrderInfo) -> None:
-    commercial = max(0.0, _num_or_zero(getattr(info, "commercial_amount", 0.0)))
-    compulsory = max(0.0, _num_or_zero(getattr(info, "compulsory_amount", 0.0)))
-    vehicle_tax = max(0.0, _num_or_zero(getattr(info, "vehicle_tax_amount", 0.0)))
-    non_vehicle = max(0.0, _num_or_zero(getattr(info, "non_vehicle_amount", 0.0)))
+    commercial = _num_or_zero(getattr(info, "commercial_amount", 0.0))
+    compulsory = _num_or_zero(getattr(info, "compulsory_amount", 0.0))
+    vehicle_tax = _num_or_zero(getattr(info, "vehicle_tax_amount", 0.0))
+    non_vehicle = _num_or_zero(getattr(info, "non_vehicle_amount", 0.0))
 
     info.commercial_amount = commercial
     info.compulsory_amount = compulsory

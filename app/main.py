@@ -63,6 +63,8 @@ BJ_TZ = ZoneInfo("Asia/Shanghai")
 LOCK_SEED_KEY = os.getenv("STARTUP_LOCK_SEED_KEY", "dingchang:startup:seed")
 LOCK_POLL_KEY = os.getenv("STARTUP_LOCK_POLL_KEY", "dingchang:startup:ocr_poller")
 LOCK_FACT_BACKFILL_KEY = os.getenv("STARTUP_LOCK_FACT_BACKFILL_KEY", "dingchang:startup:order_fact_backfill")
+LOCK_QUOTE_ACCOUNT_INSPECT_KEY = os.getenv("QUOTE_ACCOUNT_INSPECT_LOCK_KEY", "dingchang:startup:quote_account_inspect")
+LOCK_QUOTE_SESSION_KEEPALIVE_KEY = os.getenv("QUOTE_SESSION_KEEPALIVE_LOCK_KEY", "dingchang:startup:quote_session_keepalive")
 
 # seed 锁：短一些即可
 LOCK_SEED_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_SEED_TTL_SECONDS", "120") or "120")
@@ -70,6 +72,18 @@ LOCK_SEED_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_SEED_TTL_SECONDS", "120") or
 LOCK_FACT_BACKFILL_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_FACT_BACKFILL_TTL_SECONDS", "600") or "600")
 # poller 锁：需要续租
 LOCK_POLL_TTL_SECONDS = int(os.getenv("STARTUP_LOCK_POLL_TTL_SECONDS", "30") or "30")
+LOCK_QUOTE_ACCOUNT_INSPECT_TTL_SECONDS = int(os.getenv("QUOTE_ACCOUNT_INSPECT_LOCK_TTL_SECONDS", "3600") or "3600")
+LOCK_QUOTE_SESSION_KEEPALIVE_TTL_SECONDS = int(os.getenv("QUOTE_SESSION_KEEPALIVE_LOCK_TTL_SECONDS", "600") or "600")
+
+QUOTE_ACCOUNT_INSPECT_ENABLED = os.getenv("QUOTE_ACCOUNT_INSPECT_ENABLED", "1") == "1"
+QUOTE_ACCOUNT_INSPECT_HOUR = int(os.getenv("QUOTE_ACCOUNT_INSPECT_HOUR", "6") or "6")
+QUOTE_ACCOUNT_INSPECT_MINUTE = int(os.getenv("QUOTE_ACCOUNT_INSPECT_MINUTE", "0") or "0")
+QUOTE_ACCOUNT_INSPECT_RUN_ON_STARTUP = os.getenv("QUOTE_ACCOUNT_INSPECT_RUN_ON_STARTUP", "0") == "1"
+QUOTE_ACCOUNT_INSPECT_MAX_GROUPS = int(os.getenv("QUOTE_ACCOUNT_INSPECT_MAX_GROUPS", "0") or "0")
+QUOTE_SESSION_KEEPALIVE_ENABLED = os.getenv("QUOTE_SESSION_KEEPALIVE_ENABLED", "1") == "1"
+QUOTE_SESSION_KEEPALIVE_RUN_ON_STARTUP = os.getenv("QUOTE_SESSION_KEEPALIVE_RUN_ON_STARTUP", "1") == "1"
+QUOTE_SESSION_KEEPALIVE_INTERVAL_SECONDS = int(os.getenv("QUOTE_SESSION_KEEPALIVE_INTERVAL_SECONDS", "30") or "30")
+QUOTE_SESSION_KEEPALIVE_MAX_ACCOUNTS = int(os.getenv("QUOTE_SESSION_KEEPALIVE_MAX_ACCOUNTS", "0") or "0")
 
 # Lua：仅当 value 匹配时删除（防误删）
 _LUA_RELEASE = """
@@ -372,6 +386,166 @@ async def _run_order_fact_backfill_once() -> None:
     )
 
 
+def _seconds_until_quote_account_inspection(now: datetime | None = None) -> float:
+    current = now or datetime.now(BJ_TZ)
+    hour = max(0, min(23, int(QUOTE_ACCOUNT_INSPECT_HOUR)))
+    minute = max(0, min(59, int(QUOTE_ACCOUNT_INSPECT_MINUTE)))
+    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= current:
+        target = target + timedelta(days=1)
+    return max(1.0, (target - current).total_seconds())
+
+
+async def _run_quote_account_inspection_once() -> None:
+    from app.services.quote_assistant_service import inspect_quote_platform_accounts_once
+
+    started = time.time()
+    async with SessionLocal() as db:
+        await _apply_db_time_zone(db)
+        try:
+            summary = await inspect_quote_platform_accounts_once(
+                db,
+                max_groups=QUOTE_ACCOUNT_INSPECT_MAX_GROUPS or None,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    logger.info(
+        "[quote_account_inspect] finished groups=%s checked=%s ok=%s needs_attention=%s accounts=%s elapsed=%.2fs",
+        summary.get("groups_total"),
+        summary.get("groups_checked"),
+        summary.get("groups_ok"),
+        summary.get("groups_needs_attention"),
+        summary.get("accounts_total"),
+        time.time() - started,
+    )
+
+
+async def _quote_account_inspector_loop(stop_event: asyncio.Event) -> None:
+    logger.info(
+        "[quote_account_inspect] scheduler started time=%02d:%02d run_on_startup=%s",
+        max(0, min(23, int(QUOTE_ACCOUNT_INSPECT_HOUR))),
+        max(0, min(59, int(QUOTE_ACCOUNT_INSPECT_MINUTE))),
+        int(QUOTE_ACCOUNT_INSPECT_RUN_ON_STARTUP),
+    )
+
+    async def run_with_lock() -> None:
+        token, lock_state = await acquire_lock_checked(
+            LOCK_QUOTE_ACCOUNT_INSPECT_KEY,
+            LOCK_QUOTE_ACCOUNT_INSPECT_TTL_SECONDS,
+        )
+        if lock_state == "unavailable":
+            logger.warning("[quote_account_inspect] redis lock unavailable; running without distributed lock")
+            await _run_quote_account_inspection_once()
+            return
+        if not token:
+            logger.info("[quote_account_inspect] skipped (lock not acquired) key=%s", LOCK_QUOTE_ACCOUNT_INSPECT_KEY)
+            return
+        try:
+            await _run_quote_account_inspection_once()
+        finally:
+            await release_lock(LOCK_QUOTE_ACCOUNT_INSPECT_KEY, token)
+
+    if QUOTE_ACCOUNT_INSPECT_RUN_ON_STARTUP:
+        try:
+            await run_with_lock()
+        except Exception:
+            logger.exception("[quote_account_inspect] startup run failed")
+
+    while not stop_event.is_set():
+        delay = _seconds_until_quote_account_inspection()
+        logger.info("[quote_account_inspect] next run in %.0fs", delay)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            await run_with_lock()
+        except Exception:
+            logger.exception("[quote_account_inspect] scheduled run failed")
+
+    logger.info("[quote_account_inspect] scheduler stopped")
+
+
+async def _run_quote_session_keepalive_once(*, startup_restore: bool) -> None:
+    from app.services.quote_assistant_service import maintain_quote_platform_sessions_once
+
+    started = time.time()
+    async with SessionLocal() as db:
+        await _apply_db_time_zone(db)
+        try:
+            summary = await maintain_quote_platform_sessions_once(
+                db,
+                startup_restore=startup_restore,
+                max_accounts=QUOTE_SESSION_KEEPALIVE_MAX_ACCOUNTS or None,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    logger.info(
+        "[quote_session_keepalive] finished startup_restore=%s total=%s checked=%s kept=%s expired=%s degraded=%s missing=%s skipped=%s elapsed=%.2fs",
+        int(startup_restore),
+        summary.get("accounts_total"),
+        summary.get("checked"),
+        summary.get("kept_alive"),
+        summary.get("expired"),
+        summary.get("degraded"),
+        summary.get("missing_snapshot"),
+        summary.get("skipped_not_due"),
+        time.time() - started,
+    )
+
+
+async def _quote_session_keepalive_loop(stop_event: asyncio.Event) -> None:
+    interval = max(5, int(QUOTE_SESSION_KEEPALIVE_INTERVAL_SECONDS or 30))
+    logger.info(
+        "[quote_session_keepalive] scheduler started interval=%ss run_on_startup=%s",
+        interval,
+        int(QUOTE_SESSION_KEEPALIVE_RUN_ON_STARTUP),
+    )
+
+    async def run_with_lock(*, startup_restore: bool) -> None:
+        token, lock_state = await acquire_lock_checked(
+            LOCK_QUOTE_SESSION_KEEPALIVE_KEY,
+            LOCK_QUOTE_SESSION_KEEPALIVE_TTL_SECONDS,
+        )
+        if lock_state == "unavailable":
+            logger.warning("[quote_session_keepalive] redis lock unavailable; running without distributed lock")
+            await _run_quote_session_keepalive_once(startup_restore=startup_restore)
+            return
+        if not token:
+            logger.info("[quote_session_keepalive] skipped (lock not acquired) key=%s", LOCK_QUOTE_SESSION_KEEPALIVE_KEY)
+            return
+        try:
+            await _run_quote_session_keepalive_once(startup_restore=startup_restore)
+        finally:
+            await release_lock(LOCK_QUOTE_SESSION_KEEPALIVE_KEY, token)
+
+    if QUOTE_SESSION_KEEPALIVE_RUN_ON_STARTUP:
+        try:
+            await run_with_lock(startup_restore=True)
+        except Exception:
+            logger.exception("[quote_session_keepalive] startup restore failed")
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            await run_with_lock(startup_restore=False)
+        except Exception:
+            logger.exception("[quote_session_keepalive] scheduled run failed")
+
+    logger.info("[quote_session_keepalive] scheduler stopped")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_redis()
@@ -447,6 +621,20 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("[ocr_poller] disabled (OCR_POLL_ENABLED=0)")
 
+    if QUOTE_SESSION_KEEPALIVE_ENABLED:
+        stop_event = asyncio.Event()
+        app.state.quote_session_keepalive_stop_event = stop_event
+        app.state.quote_session_keepalive_task = asyncio.create_task(_quote_session_keepalive_loop(stop_event))
+    else:
+        logger.info("[quote_session_keepalive] disabled (QUOTE_SESSION_KEEPALIVE_ENABLED=0)")
+
+    if QUOTE_ACCOUNT_INSPECT_ENABLED:
+        stop_event = asyncio.Event()
+        app.state.quote_account_inspector_stop_event = stop_event
+        app.state.quote_account_inspector_task = asyncio.create_task(_quote_account_inspector_loop(stop_event))
+    else:
+        logger.info("[quote_account_inspect] disabled (QUOTE_ACCOUNT_INSPECT_ENABLED=0)")
+
     try:
         yield
     finally:
@@ -467,6 +655,42 @@ async def lifespan(app: FastAPI):
 
         except Exception:
             logger.exception("stop ocr poller failed")
+
+        try:
+            if hasattr(app.state, "quote_session_keepalive_stop_event"):
+                app.state.quote_session_keepalive_stop_event.set()
+
+            if hasattr(app.state, "quote_session_keepalive_task"):
+                task = app.state.quote_session_keepalive_task
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except Exception:
+                    task.cancel()
+                    try:
+                        await task
+                    except Exception:
+                        pass
+
+        except Exception:
+            logger.exception("stop quote session keepalive failed")
+
+        try:
+            if hasattr(app.state, "quote_account_inspector_stop_event"):
+                app.state.quote_account_inspector_stop_event.set()
+
+            if hasattr(app.state, "quote_account_inspector_task"):
+                task = app.state.quote_account_inspector_task
+                try:
+                    await asyncio.wait_for(task, timeout=5)
+                except Exception:
+                    task.cancel()
+                    try:
+                        await task
+                    except Exception:
+                        pass
+
+        except Exception:
+            logger.exception("stop quote account inspector failed")
 
         await close_redis()
 

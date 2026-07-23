@@ -236,6 +236,74 @@ class QuotePlatformAccountProfile(Base):
     )
 
 
+class QuotePlatformAccountQuota(Base):
+    """Business-side query quota for one platform account."""
+
+    __tablename__ = "quote_platform_account_quota_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    account_id = Column(Integer, ForeignKey("quote_platform_account_profile_new.id", ondelete="CASCADE"), nullable=False, comment="Account profile id")
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+    platform_code = Column(String(32), nullable=False, comment="Platform code")
+    period_type = Column(String(16), nullable=False, server_default=text("'day'"), comment="day/week/month")
+    quota_limit = Column(Integer, nullable=False, server_default=text("0"), comment="Quota limit per period")
+    used_count = Column(Integer, nullable=False, server_default=text("0"), comment="Used count in current period")
+    period_start_at = Column(DateTime(timezone=False), nullable=False, comment="Current period start")
+    period_end_at = Column(DateTime(timezone=False), nullable=False, comment="Current period end")
+    last_consumed_at = Column(DateTime(timezone=False), nullable=True, comment="Last successful quote time")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("account_id", name="uq_quote_platform_account_quota_account"),
+        Index("ix_quote_platform_account_quota_owner_platform", "owner_user_id", "platform_code", "period_type", "id"),
+        Index("ix_quote_platform_account_quota_period", "period_end_at", "id"),
+    )
+
+
+class QuotePlatformAccountSessionState(Base):
+    """Safe queryable session summary for an isolated platform account runtime."""
+
+    __tablename__ = "quote_platform_account_session_state_new"
+
+    account_id = Column(Integer, ForeignKey("quote_platform_account_profile_new.id", ondelete="CASCADE"), primary_key=True, comment="Account profile id")
+    owner_user_id = Column(Integer, ForeignKey("user_new.id"), nullable=False, comment="Owner user id")
+    platform_code = Column(String(32), nullable=False, comment="Platform code")
+    status = Column(String(32), nullable=False, server_default=text("'offline'"), comment="offline/logging_in/waiting_challenge/authenticated/expired/disabled/login_failed")
+    session_version = Column(Integer, nullable=False, server_default=text("0"), comment="CAS session version")
+    session_generation = Column(String(64), nullable=False, server_default=text("''"), comment="Login generation id")
+
+    jwt_issued_at = Column(BigInteger, nullable=True, comment="JWT issued timestamp")
+    jwt_expires_at = Column(BigInteger, nullable=True, comment="JWT expires timestamp")
+    last_login_at = Column(DateTime(timezone=False), nullable=True, comment="Last login flow time")
+    last_authenticated_at = Column(DateTime(timezone=False), nullable=True, comment="Last authenticated time")
+    last_keepalive_at = Column(DateTime(timezone=False), nullable=True, comment="Last keepalive time")
+    last_business_at = Column(DateTime(timezone=False), nullable=True, comment="Last business call time")
+    last_refresh_at = Column(DateTime(timezone=False), nullable=True, comment="Last token refresh time")
+    last_validation_at = Column(DateTime(timezone=False), nullable=True, comment="Last validation time")
+    last_error_code = Column(String(128), nullable=True, comment="Last error code")
+    last_error_message = Column(String(2048), nullable=True, comment="Last error message")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        Index("ix_quote_platform_account_session_owner_status", "owner_user_id", "status", "account_id"),
+        Index("ix_quote_platform_account_session_platform_status", "platform_code", "status", "account_id"),
+        Index("ix_quote_platform_account_session_updated", "updated_at", "account_id"),
+    )
+
+
 class QuotePlatformAccountLoginTask(Base):
     """A login attempt/challenge lifecycle for a platform account profile."""
 
@@ -290,6 +358,35 @@ class QuotePlatformAccountEvent(Base):
         Index("ix_quote_platform_account_event_account", "account_id", "id"),
         Index("ix_quote_platform_account_event_type", "event_type", "id"),
         Index("ix_quote_platform_account_event_operator", "operator_user_id", "id"),
+    )
+
+
+class QuotePlatformDefaultConfig(Base):
+    """Global quote default parameters per platform/account type."""
+
+    __tablename__ = "quote_platform_default_config_new"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment="Primary key")
+    platform_code = Column(String(32), nullable=False, comment="Platform code")
+    platform_name = Column(String(64), nullable=True, comment="Platform display name")
+    account_type_name = Column(String(64), nullable=False, server_default=text("''"), comment="Account type name, empty means common")
+    default_values_json = Column(JSON, nullable=False, comment="Default quote request values keyed by platform form field name")
+    enabled = Column(Boolean, nullable=False, server_default=text("1"), comment="Enabled flag")
+    created_by = Column(Integer, ForeignKey("user_new.id", ondelete="SET NULL"), nullable=True, comment="Creator user id")
+    updated_by = Column(Integer, ForeignKey("user_new.id", ondelete="SET NULL"), nullable=True, comment="Updater user id")
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="Created at")
+    updated_at = Column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+        server_onupdate=text("CURRENT_TIMESTAMP"),
+        comment="Updated at",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("platform_code", "account_type_name", name="uq_quote_platform_default_config_platform_type"),
+        Index("ix_quote_platform_default_config_platform", "platform_code", "enabled", "id"),
+        Index("ix_quote_platform_default_config_updated", "updated_at", "id"),
     )
 
 

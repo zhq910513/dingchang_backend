@@ -18,7 +18,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 基础工具：curl(健康检查用) + tzdata(时区)。默认使用国内 Debian 镜像源加速构建。
+# 基础工具：curl(健康检查用) + tzdata(时区) + 中文字体(报价结果图)。默认使用国内 Debian 镜像源加速构建。
 RUN set -eux; \
     . /etc/os-release; \
     codename="${VERSION_CODENAME:-bookworm}"; \
@@ -27,7 +27,7 @@ RUN set -eux; \
     printf 'deb %s %s-updates main\n' "${DEBIAN_MIRROR}" "${codename}" >> /etc/apt/sources.list; \
     printf 'deb %s %s-security main\n' "${DEBIAN_SECURITY_MIRROR}" "${codename}" >> /etc/apt/sources.list; \
     apt-get update \
-    && apt-get install -y --no-install-recommends curl tzdata \
+    && apt-get install -y --no-install-recommends curl tzdata fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装依赖。PIP_INDEX_URL / PIP_TRUSTED_HOST 可在 docker build 时覆盖。

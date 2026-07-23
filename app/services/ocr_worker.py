@@ -368,14 +368,40 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
     vehicle_model = getter("CarModel") or getter("VehicleModel")
     vin = getter("VinNo") or getter("VIN")
     engine_no = getter("EngineNo")
+    vehicle_type = (
+        getter("VehicleType")
+        or getter("CarType")
+        or getter("车辆类型")
+        or getter("VehicleClass")
+    )
+    fuel_type = (
+        getter("FuelType")
+        or getter("Fuel")
+        or getter("燃料种类")
+        or getter("能源种类")
+        or getter("EnergyType")
+    )
+    energy_type = ""
+    fuel_type_compact = re.sub(r"\s+", "", fuel_type)
+    if fuel_type_compact == "电" or re.search(
+        r"新能源|纯电|插电|混动|电动|油电|BEV|PHEV|EV|增程",
+        fuel_type_compact,
+        flags=re.IGNORECASE,
+    ):
+        energy_type = "new_energy"
+    elif fuel_type:
+        energy_type = "fuel"
 
     out: Dict[str, Any] = {
         "vehicle_model": vehicle_model,
+        "vehicle_type": vehicle_type,
         "vin": vin,
         "engine_no": engine_no,
         "approved_passenger_count": getter("SeatingCapacity") or getter("LimitPassenger"),
         "vehicle_brand_name": getter("CarBrand") or getter("BrandModel"),
         "manufacturer_name": getter("Manufacturer"),
+        "fuel_type": fuel_type,
+        "vehicle_energy_type": energy_type,
     }
     return {key: value for key, value in out.items() if _safe_str(value)}
 

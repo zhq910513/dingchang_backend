@@ -109,6 +109,29 @@ class Settings(BaseSettings):
     # 当前先内置 STUB（用于公共入口跑通）
     AI_PLATFORM_ENABLE_STUB: bool = Field(default=True)
 
+    # -----------------------------
+    # PICC 协议报价助手
+    # -----------------------------
+    PICC_BASE_URL: str = Field(default="https://jiangx.yxgl-picc.cn:41001")
+    PICC_PROVINCE: str = Field(default="jiangx")
+    PICC_VERIFY_SSL: bool = Field(default=True)
+    PICC_CONNECT_TIMEOUT: float = Field(default=10.0)
+    PICC_READ_TIMEOUT: float = Field(default=40.0)
+    PICC_KEEPALIVE_SECONDS: int = Field(default=300)
+    PICC_JWT_REFRESH_BEFORE_SECONDS: int = Field(default=25 * 60)
+    PICC_USER_AGENT: str = Field(
+        default=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        )
+    )
+    PICC_CAPTCHA_API_URL: str = Field(default="http://api.ttshitu.com/predict")
+    PICC_CAPTCHA_USERNAME: str = Field(default="")
+    PICC_CAPTCHA_PASSWORD: str = Field(default="")
+    PICC_CAPTCHA_TYPE_ID: int = Field(default=34)
+    PICC_CAPTCHA_TIMEOUT: float = Field(default=10.0)
+    PICC_CAPTCHA_MAX_ROUNDS: int = Field(default=5)
+
     # ---------- 规范化 ----------
     if PYDANTIC_V2:
         @field_validator("ENV", mode="before")

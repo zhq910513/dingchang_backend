@@ -85,8 +85,18 @@ class AiPlatformAccountProfileIn(BaseModel):
     account_owner_name: Optional[str] = Field(default=None, max_length=64)
     auto_login: bool = True
     enabled: bool = True
+    quota_limit: Optional[int] = Field(default=None, ge=0, le=1000000)
+    quota_period_type: Optional[str] = Field(default="day", max_length=16)
     confirm_enabled_edit: bool = False
 
 
 class AiPlatformAccountLoginChallengeIn(BaseModel):
     code: str = Field(..., min_length=4, max_length=8)
+
+
+class AiPlatformDefaultConfigIn(BaseModel):
+    platform_code: str = Field(..., min_length=1, max_length=32)
+    platform_name: Optional[str] = Field(default=None, max_length=64)
+    account_type_name: str = Field(..., min_length=1, max_length=64)
+    default_values: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True

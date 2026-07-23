@@ -89,6 +89,81 @@ SALES（销售）
 
 
 
+报价助手（AI Assistant / 报价流程）
+
+角色入口
+
+所有系统已知角色均可进入报价助手基础会话：
+    super_admin / manager / sales / finance / market
+
+基础会话权限
+
+可创建、查看、删除自己的助手会话：
+    GET /ai-assistant/sessions
+    POST /ai-assistant/sessions
+    DELETE /ai-assistant/sessions/{session_id}
+    GET /ai-assistant/sessions/{session_id}/history
+
+会话、消息均按 owner_user_id + session_id 收口，不能读取其他账号会话。
+图片撤回会改变报价材料池，除 owner_user_id + session_id 收口外，还必须具备“报价使用权限”。
+报价图片进入材料池前必须校验 storage_key 与 md5 的 B1 路径规则，OCR/展示优先使用后端按 storage_key 生成的对象链接，不能信任前端传入的外部 URL。
+历史会话返回时必须按当前角色二次过滤：finance / market 不回显历史报价图片、报价材料池 payload、报价任务 payload 或平台账号动作。
+
+订单数据查询权限
+
+助手内查询订单必须复用订单 ACL：
+    super_admin：可查全部订单
+    sales：仅可查自己名下订单
+    manager：仅可查自己团队范围内订单
+    finance / market：仅可查自己单团队范围内订单
+
+报价使用权限
+
+以下角色可发起报价、上传报价材料、触发平台登录和消耗平台额度：
+    super_admin / manager / sales
+
+以下角色只能使用助手做权限范围内的信息查询，不允许触发报价、上传报价材料或维护报价平台账号：
+    finance / market
+
+查看当前报价材料状态、撤回报价会话图片也属于报价链路动作：
+    仅 super_admin / manager / sales 可使用。
+    finance / market 只能查询权限范围内订单信息，不能查看或修改报价材料池状态。
+助手返回的建议动作也必须按角色过滤：finance / market 只能看到查询类建议，不展示“平台报价 / 查看材料状态 / 输入验证码 / 平台账号管理”等报价链路动作。
+
+平台账号管理权限
+
+以下角色可维护自己的平台账号、账号类型、登录任务和验证码回填：
+    super_admin / manager / sales
+
+账号数据按 owner_user_id 收口：
+    GET /ai-assistant/platform-accounts
+    POST /ai-assistant/platform-accounts
+    PUT /ai-assistant/platform-accounts/{account_id}
+    POST /ai-assistant/platform-accounts/{account_id}/login
+    POST /ai-assistant/platform-account-login-tasks/{task_id}/challenge
+    GET/POST/PUT /ai-assistant/platform-account-types
+
+平台账号密码只允许加密落库，接口返回只暴露 has_password、脱敏手机号、状态、额度等展示字段。
+
+默认报价参数权限
+
+仅 super_admin 可以查看和维护默认报价参数管理明细：
+    GET /ai-assistant/platform-default-configs
+    GET /ai-assistant/platform-default-configs/resolve
+    POST /ai-assistant/platform-default-configs
+    PUT /ai-assistant/platform-default-configs/{config_id}
+    DELETE /ai-assistant/platform-default-configs/{config_id}
+
+报价流程内部可以读取已启用默认参数生成平台请求体，但不会在普通用户会话中直接展示默认参数配置明细。
+
+关键规则
+
+报价 case、报价图片、报价任务、平台账号、账号额度、登录任务均必须带 owner_user_id 或通过 quote_case.owner_user_id 反查收口。
+任何通过 order_id 定位已有订单的场景，必须先经过订单 ACL，不能只按订单号直接绑定。
+短信验证码仅允许提交当前账号、当前会话、等待中的报价任务；材料变化、图片撤回、验证码过期后必须停止旧任务，不能继续写报价成功或扣额度。
+额度扣减仅在平台报价成功后确认；失败、材料变化、平台返回额度满时必须释放预占或自动切换同平台同类型的下一个可用账号。
+
+
 cd /data/backend/dingchang_backend
 git pull
 

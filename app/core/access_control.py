@@ -106,15 +106,54 @@ def normalize_team_names(team_names: Optional[Tuple[str, ...] | List[str]]) -> T
 # =========================
 # 报价助手（AI Assistant / 报价助手）统一权限阀门
 # =========================
+QUOTE_ASSISTANT_ACCESS_ROLES = set(ROLE_ALL)
+QUOTE_ASSISTANT_QUOTE_USE_ROLES = {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES}
+QUOTE_PLATFORM_ACCOUNT_MANAGE_ROLES = {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES}
+QUOTE_DEFAULT_CONFIG_MANAGE_ROLES = {ROLE_SUPER_ADMIN}
+
+
 def require_ai_assistant_access(
         *,
         role_name: Optional[str],
 ) -> None:
     """报价助手统一访问权限：允许系统已知角色进入，数据读取继续按各业务域 ACL 收口。"""
     rn = (role_name or "").strip()
-    if rn in ROLE_ALL:
+    if rn in QUOTE_ASSISTANT_ACCESS_ROLES:
         return
-    raise HTTPException(status_code=403, detail="No permission")
+    raise HTTPException(status_code=403, detail="当前账号无权访问报价助手")
+
+
+def require_quote_assistant_quote_use_access(
+        *,
+        role_name: Optional[str],
+) -> None:
+    """报价/上传材料会消耗平台资源，仅允许业务链路角色使用。"""
+    rn = (role_name or "").strip()
+    if rn in QUOTE_ASSISTANT_QUOTE_USE_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="当前账号无权发起报价或上传报价材料")
+
+
+def require_quote_platform_account_manage_access(
+        *,
+        role_name: Optional[str],
+) -> None:
+    """平台账号会触发登录、保活和额度扣减，仅允许业务链路角色维护。"""
+    rn = (role_name or "").strip()
+    if rn in QUOTE_PLATFORM_ACCOUNT_MANAGE_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="当前账号无权维护报价平台账号")
+
+
+def require_quote_default_config_manage_access(
+        *,
+        role_name: Optional[str],
+) -> None:
+    """默认报价参数影响报价请求体，仅允许超级账号维护和查看管理明细。"""
+    rn = (role_name or "").strip()
+    if rn in QUOTE_DEFAULT_CONFIG_MANAGE_ROLES:
+        return
+    raise HTTPException(status_code=403, detail="只有超级账号可以维护默认报价参数")
 
 
 def require_team_for_non_super_admin(role_name: Optional[str], team_names: Tuple[str, ...]) -> None:
