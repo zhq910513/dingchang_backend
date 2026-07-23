@@ -9,6 +9,7 @@ ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
+    PYTHONPATH=/app \
     DEBIAN_FRONTEND=noninteractive \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST} \
@@ -18,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 基础工具：curl(健康检查用) + tzdata(时区) + 中文字体(报价结果图)。默认使用国内 Debian 镜像源加速构建。
+# Base tools: curl, tzdata, and CJK fonts for result images.
 RUN set -eux; \
     . /etc/os-release; \
     codename="${VERSION_CODENAME:-bookworm}"; \
@@ -30,18 +31,20 @@ RUN set -eux; \
     && apt-get install -y --no-install-recommends curl tzdata fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装依赖。PIP_INDEX_URL / PIP_TRUSTED_HOST 可在 docker build 时覆盖。
+# Install dependencies.
 COPY requirements.txt /app/requirements.txt
 RUN pip install -r /app/requirements.txt
 
-# 拷贝代码（只需要后端代码目录 app）
-COPY app /app/app
+# Shared env loader used by app startup and maintenance scripts.
+COPY env_loader.py /app/env_loader.py
 
-# 确保存储/日志目录存在（也方便挂载）
+# Backend application code.
+COPY app /app/app
+COPY scripts /app/scripts
+
+# Ensure runtime directories exist.
 RUN mkdir -p /app/storage /app/logs
 
 EXPOSE 8000
 
-# 生产启动：Gunicorn + Uvicorn Worker
-# 注意：app.main:app 必须与你的 main.py 中 FastAPI 实例名一致（你现在就是 app=FastAPI(...) ✅）
 CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "app.main:app", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "60", "--graceful-timeout", "30", "--keep-alive", "5"]
