@@ -18,9 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from env_loader import load_backend_env  # noqa: E402
 from app.core.db import Base, engine, ensure_schema_additive_on_startup, load_all_models  # noqa: E402
 from app.services.ocr_cleaner import CLEANING_RULE_VERSION, clean_dynamic_data_for_ocr  # noqa: E402
 from app.services.order_fact_service import build_order_fact_payload  # noqa: E402
+
+load_backend_env()
 
 
 CONFIRM_TEXT = "STANDARDIZE_LOCAL_ONLINE_SNAPSHOT"
@@ -49,10 +52,7 @@ def _json_dumps(value: Any, *, pretty: bool = False) -> str:
 
 
 def _env_value(key: str, default: str = "") -> str:
-    env_path = Path(".env")
-    text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    match = re.search(rf"(?m)^{re.escape(key)}=(.*)$", text)
-    value = match.group(1).strip() if match else os.getenv(key, default)
+    value = os.getenv(key, default)
     return str(value or "").strip().strip('"').strip("'")
 
 

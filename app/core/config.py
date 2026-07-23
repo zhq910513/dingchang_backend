@@ -1,13 +1,17 @@
 # app/core/config.py
 # encoding: utf-8
 """
-应用配置（统一从 .env / 环境变量读取，代码里通过 settings 使用）
+应用配置（统一从 .env.server / .env.local / 环境变量读取，代码里通过 settings 使用）
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
+
+from env_loader import load_backend_env
+
+load_backend_env()
 
 PYDANTIC_V2 = False
 try:
@@ -97,7 +101,7 @@ class Settings(BaseSettings):
     BAIDU_SECRET_KEY: Optional[str] = Field(default=None)
 
     # -----------------------------
-    # ✅ 报价助手：平台模块配置（公共入口 + 开关 + 预留缓存）
+    # 报价助手：平台模块配置（公共入口 + 开关 + 预留缓存）
     # -----------------------------
     # 平台请求超时/重试/缓存 TTL
     AI_PLATFORM_TIMEOUT_SECONDS: int = Field(default=20)
@@ -243,11 +247,10 @@ class Settings(BaseSettings):
         return Path(self.LOG_DIR).expanduser().resolve()
 
     if PYDANTIC_V2:
-        model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
+        model_config = SettingsConfigDict(case_sensitive=True, extra="ignore")
     else:
 
         class Config:
-            env_file = ".env"
             case_sensitive = True
             extra = "ignore"
 

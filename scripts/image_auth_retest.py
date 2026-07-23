@@ -12,6 +12,11 @@ from urllib.parse import urlparse
 import pymysql
 import requests
 
+from env_loader import load_backend_env
+
+
+load_backend_env()
+
 
 BASE = os.getenv("IMAGE_AUTH_TEST_BASE", "http://127.0.0.1:8000/api").rstrip("/")
 RUN_ID = os.getenv("IMAGE_AUTH_TEST_RUN_ID") or datetime.now().strftime("%Y%m%d%H%M%S")
@@ -39,10 +44,7 @@ created: dict = {
 
 
 def _env_value(key: str, default: str = "") -> str:
-    env_path = Path(".env")
-    text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    match = re.search(rf"(?m)^{re.escape(key)}=(.*)$", text)
-    value = match.group(1).strip() if match else os.getenv(key, default)
+    value = os.getenv(key, default)
     return str(value or "").strip().strip('"').strip("'")
 
 

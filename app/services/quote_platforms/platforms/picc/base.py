@@ -10,10 +10,10 @@ from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urljoin, urlsplit
 
 import requests
-from dotenv import load_dotenv
 from requests import Response, Session
 from requests.cookies import RequestsCookieJar, create_cookie
 
+from env_loader import load_backend_env
 from app.core.config import settings
 from app.services.quote_platforms.base import PlatformAccountContext
 from app.services.quote_platforms.session_models import AccountSessionSnapshot, CookieRecord, JwtClaims, iso_now
@@ -23,7 +23,7 @@ PROTOCOL_PLATFORM_CODE = "picc"
 KEEPALIVE_PATH = "/khyx/newFront/um/umtmenu/prepareAll.do"
 KEEPALIVE_PARAMS = {"isnewFront": "1"}
 
-load_dotenv()
+load_backend_env()
 
 
 class PiccProtocolError(RuntimeError):
