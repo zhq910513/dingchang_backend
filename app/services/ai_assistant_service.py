@@ -43,7 +43,11 @@ from app.services.quote_assistant_service import (
     has_expired_waiting_sms_task,
     has_quote_case_waiting_for_login_phone,
     has_recent_invalid_sms_task,
+    has_waiting_duplicate_quote_confirm_task,
     has_waiting_sms_task,
+    looks_like_duplicate_quote_cancel,
+    looks_like_duplicate_quote_confirmation,
+    looks_like_short_quote_command,
     looks_like_sms_code,
     redact_quote_sensitive_text,
     sanitize_quote_user_message,
@@ -318,7 +322,42 @@ def _message_hidden_from_preview(role: Any, metadata: Any) -> bool:
     payload = data.get("payload")
     payload = payload if isinstance(payload, dict) else {}
     intent = _to_str(metadata.get("intent") or data.get("intent")).strip().lower()
+    result_status = _to_str(data.get("result_status")).strip().lower()
+    if intent == "fallback" or result_status == RESULT_INVALID:
+        return True
     if intent == "quote_image_collect":
+        return True
+    if intent == "quote_config_override":
+        return True
+    quote_case = payload.get("quote_case")
+    quote_case = quote_case if isinstance(quote_case, dict) else {}
+    quote_task = payload.get("quote_task")
+    quote_task = quote_task if isinstance(quote_task, dict) else {}
+    entities = data.get("entities")
+    entities = entities if isinstance(entities, dict) else {}
+    platform_name = _to_str(
+        payload.get("platform_name")
+        or entities.get("platform_name")
+        or quote_case.get("platform_name")
+        or quote_task.get("platform_name")
+    ).strip()
+    duplicate_waiting = (
+        payload.get("duplicate_quote_confirm_required") is True
+        or bool(_to_str(payload.get("duplicate_quote_warning")).strip())
+        or _to_str(quote_case.get("status")).strip().lower() == "waiting_duplicate_confirm"
+        or _to_str(quote_task.get("status")).strip().lower() == "waiting_duplicate_confirm"
+    )
+    if intent == "quote" and duplicate_waiting:
+        return True
+    if payload.get("default_config_changed") is True:
+        return True
+    if "默认参数已更新" in _to_str(data.get("message")) or "默认参数已更新" in _to_str(payload.get("message")):
+        return True
+    if (
+        intent == "quote"
+        and payload.get("unsupported_platform") is True
+        and "中止重复" in platform_name
+    ):
         return True
     for container in (metadata, data, payload):
         if container.get("silent") is True:
@@ -856,15 +895,41 @@ async def db_get_or_create_session(
     return await db_create_session(db, owner_user_id=owner_user_id, title=title)
 
 
+async def _db_session_last_visible_preview(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        fallback: str = "",
+) -> str:
+    try:
+        page = await db_list_messages(db, owner_user_id=owner_user_id, session_id=session_id, limit=1)
+    except Exception:
+        return _safe_chat_text_for_display(fallback)[:120]
+    items = page.get("items") if isinstance(page, dict) else []
+    if not items:
+        return _safe_chat_text_for_display(fallback)[:120]
+    item = items[-1]
+    if not isinstance(item, dict):
+        return _safe_chat_text_for_display(fallback)[:120]
+    preview = _safe_chat_text_for_display(item.get("content", "")).strip()
+    if preview:
+        return preview[:120]
+    if _context_has_history_images(item.get("metadata") or {}):
+        return "图片"
+    return _safe_chat_text_for_display(fallback)[:120]
+
+
 async def db_list_sessions(
         db: AsyncSession,
         *,
         owner_user_id: str | int,
         limit: int = 50,
-) -> List[Dict[str, Any]]:
+        cursor: Optional[str] = None,
+) -> Dict[str, Any]:
     owner = _safe_int(owner_user_id, 0)
     if owner <= 0:
-        return []
+        return {"items": [], "next_cursor": None, "has_more": False}
     lim = max(1, min(int(limit or 50), 200))
     stmt = (
         select(QuoteAssistantSession)
@@ -872,11 +937,51 @@ async def db_list_sessions(
             QuoteAssistantSession.owner_user_id == owner,
             QuoteAssistantSession.deleted.is_(False),
         )
-        .order_by(desc(QuoteAssistantSession.updated_at), desc(QuoteAssistantSession.id))
-        .limit(lim)
     )
+
+    cursor_id = _to_str(cursor).strip()
+    if cursor_id:
+        cursor_stmt = (
+            select(QuoteAssistantSession)
+            .where(
+                QuoteAssistantSession.owner_user_id == owner,
+                QuoteAssistantSession.deleted.is_(False),
+                QuoteAssistantSession.session_id == cursor_id,
+            )
+            .limit(1)
+        )
+        cursor_row = (await db.execute(cursor_stmt)).scalar_one_or_none()
+        if not cursor_row:
+            return {"items": [], "next_cursor": None, "has_more": False}
+        stmt = stmt.where(
+            or_(
+                QuoteAssistantSession.updated_at < cursor_row.updated_at,
+                and_(
+                    QuoteAssistantSession.updated_at == cursor_row.updated_at,
+                    QuoteAssistantSession.id < cursor_row.id,
+                ),
+            )
+        )
+
+    stmt = stmt.order_by(desc(QuoteAssistantSession.updated_at), desc(QuoteAssistantSession.id)).limit(lim + 1)
     rows = (await db.execute(stmt)).scalars().all()
-    return [_session_row_to_dict(row) for row in rows]
+    has_more = len(rows) > lim
+    visible_rows = rows[:lim]
+    items: List[Dict[str, Any]] = []
+    for row in visible_rows:
+        item = _session_row_to_dict(row)
+        item["last_message_preview"] = await _db_session_last_visible_preview(
+            db,
+            owner_user_id=owner,
+            session_id=_to_str(getattr(row, "session_id", "")),
+            fallback=_to_str(getattr(row, "last_message_preview", "")),
+        )
+        items.append(item)
+    return {
+        "items": items,
+        "next_cursor": items[-1]["session_id"] if has_more and items else None,
+        "has_more": has_more,
+    }
 
 
 async def db_delete_session(
@@ -2906,6 +3011,13 @@ async def _dispatch_rule_with_db(
     waiting_sms_active = False
     if intent != "quote":
         waiting_sms_active = await has_waiting_sms_task(db, ctx)
+    if (
+        intent != "quote"
+        and looks_like_duplicate_quote_confirmation(text)
+        and await has_waiting_duplicate_quote_confirm_task(db, ctx)
+    ):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.94)
     if intent != "quote" and looks_like_sms_code(text) and waiting_sms_active:
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.93)
@@ -2973,7 +3085,10 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
         entities.update(signal_entities)
     quote_platform_code = _to_str(entities.get("platform_code")).strip().upper()
     quote_platform_name = _to_str(entities.get("platform_name")).strip()
-    if quote_signal.get("is_quote") and _is_explicit_platform_quote_command(text, quote_platform_code, quote_platform_name):
+    if quote_signal.get("is_quote") and (
+        _is_explicit_platform_quote_command(text, quote_platform_code, quote_platform_name)
+        or looks_like_short_quote_command(text)
+    ):
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.96)
     quote_override_signal = detect_quote_config_override_signal(text)
@@ -2983,6 +3098,9 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
         override_entities = quote_override_signal.get("entities")
         if isinstance(override_entities, dict):
             entities.update(override_entities)
+    if looks_like_duplicate_quote_confirmation(text) or looks_like_duplicate_quote_cancel(text):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.94)
 
     if db is not None:
         try:
@@ -3223,6 +3341,8 @@ async def send_message(
         "usage": None,
         "model": _to_str(model, "rule-engine") or "rule-engine",
         "data": meta.get("data") if isinstance(meta.get("data"), dict) else None,
+        "silent": bool(meta.get("silent") is True or _to_str(meta.get("silent")).strip().lower() == "true"),
+        "ui_visible": not (meta.get("ui_visible") is False or _to_str(meta.get("ui_visible")).strip().lower() == "false"),
         "user_message": user_msg,
         "assistant_message": assistant_msg,
         "stream": None,

@@ -27,6 +27,8 @@ class AiChatOut(BaseModel):
     usage: Optional[Dict[str, Any]] = None
     model: Optional[str] = None
     data: Optional[Dict[str, Any]] = None
+    silent: bool = False
+    ui_visible: bool = True
 
 
 class AiSessionItem(BaseModel):
@@ -41,6 +43,8 @@ class AiSessionItem(BaseModel):
 class AiSessionListOut(BaseModel):
     total: int = 0
     items: List[AiSessionItem] = Field(default_factory=list)
+    next_cursor: Optional[str] = None
+    has_more: bool = False
 
 
 # =========================

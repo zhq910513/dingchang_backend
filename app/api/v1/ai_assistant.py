@@ -58,6 +58,7 @@ from app.services.quote_assistant_service import (
     create_platform_account_profile as _create_platform_account_profile,
     delete_platform_default_config as _delete_platform_default_config,
     get_platform_account_profile as _get_platform_account_profile,
+    get_pending_duplicate_quote_confirm_payload as _get_pending_duplicate_quote_confirm_payload,
     list_platform_default_configs as _list_platform_default_configs,
     list_platform_account_profiles as _list_platform_account_profiles,
     list_platform_account_types as _list_platform_account_types,
@@ -435,17 +436,26 @@ def _normalize_quote_image_content_type(filename: str, content_type: str) -> Tup
 
 @router.get("/sessions", response_model=AiSessionListOut)
 async def list_ai_sessions(
+        cursor: str | None = Query(default=None, max_length=128),
+        limit: int = Query(default=10, ge=1, le=50),
         ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
         db: AsyncSession = Depends(get_db),
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
 
     try:
-        rows = await _list_sessions(db, owner_user_id=owner_user_id) or []
+        page = await _list_sessions(db, owner_user_id=owner_user_id, cursor=cursor, limit=limit) or {}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"会话列表读取失败：{sanitize_quote_user_message(str(e) or e.__class__.__name__, '服务器处理异常')}")
+    rows = page.get("items") if isinstance(page, dict) else page
+    rows = rows or []
     items = [_to_session_item(x) for x in rows]
-    return AiSessionListOut(total=len(items), items=items)
+    return AiSessionListOut(
+        total=len(items),
+        items=items,
+        next_cursor=page.get("next_cursor") if isinstance(page, dict) else None,
+        has_more=bool(page.get("has_more")) if isinstance(page, dict) else False,
+    )
 
 
 @router.post("/sessions")
@@ -578,11 +588,19 @@ async def get_ai_history(
                 "metadata": filtered_metadata,
             }
         )
+    pending_duplicate_confirm = None
+    if can_quote_use:
+        pending_duplicate_confirm = await _get_pending_duplicate_quote_confirm_payload(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+        )
     return {
         "session_id": session_id,
         "items": items,
         "next_cursor": page.get("next_cursor") if isinstance(page, dict) else None,
         "has_more": bool(page.get("has_more")) if isinstance(page, dict) else False,
+        "pending_duplicate_confirm": pending_duplicate_confirm,
     }
 
 
@@ -1039,8 +1057,10 @@ async def ai_chat(
     reply = sanitize_quote_user_message(_pick(result, "reply", "content", "text", default="") or "", "")
     if not can_quote_use and _metadata_is_quote_material(raw_response_metadata):
         reply = QUOTE_HIDDEN_MESSAGE
+    silent = bool(_pick(result, "silent", default=False))
+    ui_visible = bool(_pick(result, "ui_visible", default=True))
     return AiChatOut(
-        reply=reply or "已处理",
+        reply=reply if (silent or not ui_visible) else (reply or "已处理"),
         ok=True,
         session_id=_pick(result, "session_id", default=None),
         intent=_pick(result, "intent", default=None),
@@ -1050,6 +1070,8 @@ async def ai_chat(
         usage=_pick(result, "usage", default=None),
         model=_pick(result, "model", default=None),
         data=filtered_response_metadata.get("data") if isinstance(filtered_response_metadata.get("data"), dict) else None,
+        silent=silent,
+        ui_visible=ui_visible,
     )
 
 

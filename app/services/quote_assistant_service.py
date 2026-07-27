@@ -74,18 +74,21 @@ RESULT_NEED_MORE = "need_more_info"
 RESULT_NOT_READY = "not_ready"
 RESULT_FAILED = "failed"
 
-ACTIVE_CASE_STATUSES = ("collecting", "ready", "waiting_sms", "failed", "quoted")
+ACTIVE_CASE_STATUSES = ("collecting", "ready", "waiting_sms", "waiting_duplicate_confirm", "failed", "quoted")
 ACTIVE_IMAGE_STATUS = "active"
 CASE_STATUS_QUOTED = "quoted"
 CASE_STATUS_READY = "ready"
 CASE_STATUS_COLLECTING = "collecting"
 CASE_STATUS_WAITING_SMS = "waiting_sms"
+CASE_STATUS_WAITING_DUPLICATE_CONFIRM = "waiting_duplicate_confirm"
 CASE_STATUS_FAILED = "failed"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_FAILED = "failed"
 TASK_STATUS_WAITING_SMS = "waiting_sms"
+TASK_STATUS_WAITING_DUPLICATE_CONFIRM = "waiting_duplicate_confirm"
 TASK_STATUS_CANCELLED = "cancelled"
 QUOTE_MATERIAL_CHANGED_MESSAGE = "材料已更新，请重新发起报价"
+QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE = "报价调整已更新，请重新确认重复投保"
 QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE = "默认参数已更新，请重新发起报价"
 SINGLE_REQUIRED_SLOTS = ("vehicle_cert", "idcard_front", "driving_license_main")
 QUOTE_IMAGE_AUTO_CONFIRM_MIN_CONFIDENCE = 0.72
@@ -295,6 +298,7 @@ RUNTIME_STATUS_USER_LABELS = {
     "network_error": "网络连接异常",
     "conflict": "账号正在被其他请求处理，请稍后重试",
     "duplicate_quote": "平台提示该车辆已报价过",
+    "duplicate_quote_confirm_required": "平台提示该车辆可能重复投保，等待确认",
     "quota_full": "查询额度已用完",
     "quota_exceeded": "查询额度已用完",
     "limit_exceeded": "查询额度已用完",
@@ -567,6 +571,24 @@ def sanitize_quote_user_message(
         text = text.replace(code, display_name)
     return text or default_message or "处理失败，请稍后重试"
 
+
+def _sanitize_duplicate_quote_warning(value: Any, default_message: str = "") -> str:
+    raw = _to_str(value).strip()
+    if not raw:
+        return default_message
+    text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", "", text)
+    text = re.sub(r"error_code\s*[:=]\s*[-\w.]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"error_msg\s*[:=]\s*[^，。；\n]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"status\s*[:=：]\s*[-\w.]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"token|authorization|cookie|session|trace|stack|payload|debug", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t\r\f\v]+([，。；、）])", r"\1", text)
+    text = re.sub(r"([（：:])[ \t\r\f\v]+", r"\1", text)
+    text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text or default_message
+
+
 def _alias_matches_text(alias: str, low_text: str) -> bool:
     token = _to_str(alias).strip().lower()
     if not token:
@@ -627,6 +649,7 @@ CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE: Dict[str, Tuple[str, ...]] = {
 }
 
 QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途家安顺非车保费")),
     ("机动车损失保险", ("机动车损失保险", "车辆损失险", "车损险", "车损")),
     ("医保外医疗费用责任险（第三者责任险）", ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外")),
     ("第三者责任险", ("第三者责任险", "第三责任险", "三者险", "三者", "三责")),
@@ -1419,11 +1442,18 @@ def _config_numeric_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
+def _quote_config_field_allows_zero(field_name: Any) -> bool:
+    label = re.sub(r"\s+", "", _to_str(field_name).strip())
+    return label in {"途家安顺保费", "途家安顺", "途家安顺非车保费"}
+
+
 def _ensure_positive_numeric_config_value(field_name: Any, value: Any, *, context: str = "默认参数") -> None:
     amount = _config_numeric_decimal(value)
-    if amount is None or amount > 0:
+    if amount is None or amount > 0 or (amount == 0 and _quote_config_field_allows_zero(field_name)):
         return
     label = _to_str(field_name).strip() or "未命名字段"
+    if _quote_config_field_allows_zero(field_name):
+        raise ValueError(f"{context}“{label}”不能小于 0")
     raise ValueError(f"{context}“{label}”必须填写正数，不能小于或等于 0")
 
 
@@ -2200,12 +2230,19 @@ def _credential_public_payload(
         }
     quota_payload = _quota_public_payload(quota)
     inspection_notice = _account_inspection_notice_from_payload(row)
+    login_status = _loaded_value(row, "login_status") or ACCOUNT_LOGIN_NOT_LOGGED_IN
+    if login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}:
+        inspection_notice = {}
     platform_quote_usage = _json_obj(_json_obj(_loaded_value(row, "credential_payload")).get("platform_quote_usage"))
     if platform_quote_usage:
         platform_quote_usage = {
             **platform_quote_usage,
             "platform_status_text": sanitize_quote_user_message(platform_quote_usage.get("platform_status_text")),
         }
+    quota_remaining_display = quota_payload.get("remaining_display")
+    if not quota_payload.get("configured"):
+        today_used_count = _platform_today_used_count(platform_quote_usage)
+        quota_remaining_display = f"已查询{today_used_count if today_used_count is not None else 0}/日"
     active_login_task_payload = _login_task_payload(active_login_task) if active_login_task is not None else None
     if active_login_task_payload and active_login_task_payload.get("status") == LOGIN_TASK_NEEDS_CODE:
         inspection_notice = {
@@ -2234,7 +2271,7 @@ def _credential_public_payload(
         "account_owner_name": _loaded_value(row, "account_owner_name") or "",
         "auto_login": bool(_loaded_value(row, "auto_login")),
         "enabled": bool(_loaded_value(row, "enabled")),
-        "login_status": _loaded_value(row, "login_status") or ACCOUNT_LOGIN_NOT_LOGGED_IN,
+        "login_status": login_status,
         "quota_status": _loaded_value(row, "quota_status") or ACCOUNT_QUOTA_UNKNOWN,
         "quota_reset_at": _fmt_dt(_loaded_value(row, "quota_reset_at")),
         "quota_configured": bool(quota_payload.get("configured")),
@@ -2243,7 +2280,7 @@ def _credential_public_payload(
         "quota_period_label": quota_payload.get("period_label"),
         "quota_used_count": quota_payload.get("used_count"),
         "quota_remaining_count": quota_payload.get("remaining_count"),
-        "quota_remaining_display": quota_payload.get("remaining_display"),
+        "quota_remaining_display": quota_remaining_display,
         "quota_period_start_at": quota_payload.get("period_start_at"),
         "quota_period_end_at": quota_payload.get("period_end_at"),
         "quota_last_consumed_at": quota_payload.get("last_consumed_at"),
@@ -3558,11 +3595,14 @@ def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) 
         return False
     status = _runtime_status(result)
     business_status = _runtime_business_status(result)
-    if status == "duplicate_quote" or business_status == "duplicate_quote":
+    if status in {"duplicate_quote", "duplicate_quote_confirm_required"} or business_status in {
+        "duplicate_quote",
+        "duplicate_quote_confirm_required",
+    }:
         return True
     data = _json_obj(result.data)
     for key in ("error_code", "code", "reason", "business_status"):
-        if _to_str(data.get(key)).strip().lower() == "duplicate_quote":
+        if _to_str(data.get(key)).strip().lower() in {"duplicate_quote", "duplicate_quote_confirm_required"}:
             return True
     raw = " ".join(
         _to_str(x)
@@ -3575,6 +3615,116 @@ def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) 
         if _to_str(x).strip()
     )
     return bool(re.search(r"(?:重复|已报价|已经报价|不能重复).{0,12}(?:报价|投保)?", raw))
+
+
+def _is_runtime_duplicate_quote_confirm_required_result(result: Optional[PlatformRuntimeResult]) -> bool:
+    if result is None:
+        return False
+    status = _runtime_status(result)
+    business_status = _runtime_business_status(result)
+    if status == "duplicate_quote_confirm_required" or business_status == "duplicate_quote_confirm_required":
+        return True
+    data = _json_obj(result.data)
+    for key in ("error_code", "code", "reason", "business_status"):
+        if _to_str(data.get(key)).strip().lower() == "duplicate_quote_confirm_required":
+            return True
+    return False
+
+
+def _duplicate_quote_warning_from_runtime(result: Optional[PlatformRuntimeResult]) -> str:
+    runtime_payload = _runtime_result_payload(result)
+    data = _json_obj(runtime_payload.get("data"))
+    duplicate = _json_obj(data.get("duplicateVin"))
+    warning = _to_str(
+        data.get("duplicate_quote_warning")
+        or duplicate.get("warning")
+        or duplicate.get("message")
+        or getattr(result, "message", "")
+    ).strip()
+    return _sanitize_duplicate_quote_warning(warning, "平台提示该车辆可能重复投保，请核实后再继续报价。")
+
+
+def _is_duplicate_quote_confirmation_text(text: Any) -> bool:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return False
+    return bool(
+        re.fullmatch(r"(确认)?继续(报价|投保)?", compact)
+        or re.fullmatch(r"确认(报价|投保|继续报价|继续投保)", compact)
+        or compact in {"继续报价", "确认继续", "确认继续报价", "确认报价", "继续投保", "确认投保"}
+    )
+
+
+def _is_duplicate_quote_cancel_text(text: Any) -> bool:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return False
+    return bool(
+        compact in {
+            "中止",
+            "取消",
+            "放弃",
+            "停止",
+            "不继续",
+            "不用继续",
+            "中止报价",
+            "取消报价",
+            "放弃报价",
+            "停止报价",
+            "中止重复报价",
+            "取消重复报价",
+            "放弃重复报价",
+            "中止重复投保",
+            "取消重复投保",
+            "放弃重复投保",
+        }
+        or re.fullmatch(r"(不|不用|不要)?(继续|确认)?(中止|取消|放弃|停止)(重复)?(报价|投保)?", compact)
+    )
+
+
+def looks_like_duplicate_quote_confirmation(text: Any) -> bool:
+    return _is_duplicate_quote_confirmation_text(text)
+
+
+def looks_like_duplicate_quote_cancel(text: Any) -> bool:
+    return _is_duplicate_quote_cancel_text(text)
+
+
+def _duplicate_quote_confirmed_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    safe_snapshot = dict(_json_obj(snapshot))
+    safe_snapshot["confirm_duplicate_quote"] = True
+    safe_snapshot["duplicate_quote_confirmed"] = True
+    request_body = dict(_json_obj(safe_snapshot.get("request_body")))
+    preflight = dict(_json_obj(request_body.get("preflight")))
+    preflight["confirmDuplicateQuote"] = True
+    preflight["duplicateQuoteConfirmed"] = True
+    request_body["preflight"] = preflight
+    safe_snapshot["request_body"] = request_body
+    return _snapshot_with_quote_fingerprint(safe_snapshot)
+
+
+def _snapshot_has_duplicate_quote_confirmation(snapshot: Dict[str, Any]) -> bool:
+    safe_snapshot = _json_obj(snapshot)
+    request_body = _json_obj(safe_snapshot.get("request_body"))
+    preflight = _json_obj(request_body.get("preflight"))
+    candidates = (
+        safe_snapshot.get("confirm_duplicate_quote"),
+        safe_snapshot.get("confirmDuplicateQuote"),
+        safe_snapshot.get("duplicate_quote_confirmed"),
+        safe_snapshot.get("duplicateQuoteConfirmed"),
+        safe_snapshot.get("allow_duplicate_quote"),
+        safe_snapshot.get("allowDuplicateQuote"),
+        preflight.get("confirmDuplicateQuote"),
+        preflight.get("duplicateQuoteConfirmed"),
+        preflight.get("allowDuplicateQuote"),
+    )
+    for value in candidates:
+        if value is True:
+            return True
+        text = _to_str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "是", "确认", "继续", "继续报价", "确认报价"}:
+            return True
+    return False
 
 
 def _is_runtime_session_expired_result(result: Optional[PlatformRuntimeResult]) -> bool:
@@ -4511,8 +4661,27 @@ def detect_quote_signal(text: Any) -> Dict[str, Any]:
     extracted = extract_quote_fields(t)
     entities.update({k: v for k, v in extracted.items() if v})
 
-    is_quote = bool(re.search(r"报价|重报|\bquote\b", low))
+    is_quote = bool(re.search(r"报价|重报|\bquote\b", low) or looks_like_short_quote_command(t))
     return {"is_quote": bool(is_quote), "entities": entities}
+
+
+def looks_like_short_quote_command(text: Any) -> bool:
+    """Allow experienced users to type a terse "报" after materials/platform context exists."""
+
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return False
+    return compact in {
+        "报",
+        "报价",
+        "开始报",
+        "开始报价",
+        "直接报",
+        "直接报价",
+        "现在报",
+        "现在报价",
+        "提交报价",
+    }
 
 
 def _is_explicit_platform_quote_command(text: Any, platform_code: str = "", platform_name: str = "") -> bool:
@@ -4584,7 +4753,7 @@ def _is_explicit_platform_quote_command(text: Any, platform_code: str = "", plat
 def _quote_check_context_is_active(case: QuoteCase) -> bool:
     if not case or not _to_str(case.platform_code).strip() or not _to_str(case.platform_name).strip():
         return False
-    if case.status in {CASE_STATUS_READY, CASE_STATUS_WAITING_SMS}:
+    if case.status in {CASE_STATUS_READY, CASE_STATUS_WAITING_SMS, CASE_STATUS_WAITING_DUPLICATE_CONFIRM}:
         return True
     return bool(_json_list(case.missing_requirements))
 
@@ -6477,6 +6646,106 @@ async def _find_waiting_task(
     return row[0], row[1]
 
 
+async def _find_waiting_duplicate_quote_confirm_task(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    for_update: bool = False,
+) -> Optional[Tuple[QuoteCase, QuoteTask]]:
+    stmt = (
+        select(QuoteCase, QuoteTask)
+        .join(QuoteTask, QuoteTask.quote_case_id == QuoteCase.id)
+        .where(
+            QuoteCase.owner_user_id == owner_user_id,
+            QuoteCase.status == CASE_STATUS_WAITING_DUPLICATE_CONFIRM,
+            QuoteTask.status == TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+        )
+    )
+    if session_id:
+        stmt = stmt.where(QuoteCase.session_id == session_id)
+    stmt = stmt.order_by(desc(QuoteTask.id)).limit(1)
+    if for_update:
+        stmt = stmt.with_for_update()
+    row = (await db.execute(stmt)).first()
+    return (row[0], row[1]) if row else None
+
+
+async def get_pending_duplicate_quote_confirm_payload(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Return recoverable duplicate-quote state for UI modal, without exposing a chat bubble."""
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip() or None
+    if owner <= 0 or not sid:
+        return None
+    pair = await _find_waiting_duplicate_quote_confirm_task(
+        db,
+        owner_user_id=owner,
+        session_id=sid,
+        for_update=False,
+    )
+    if not pair:
+        return None
+    case, task = pair
+    request_payload = _json_obj(getattr(task, "request_payload", None))
+    response_payload = _json_obj(getattr(task, "response_payload", None))
+    runtime_payload = _json_obj(response_payload.get("quote"))
+    warning = _sanitize_duplicate_quote_warning(
+        request_payload.get("duplicate_quote_warning")
+        or _duplicate_quote_warning_from_runtime(
+            PlatformRuntimeResult(
+                status="duplicate_quote_confirm_required",
+                message=_to_str(getattr(task, "error_detail", "")).strip(),
+                data=runtime_payload,
+            )
+        )
+        or getattr(task, "error_detail", ""),
+        f"{case.platform_name or case.platform_code or '平台'}提示该车辆可能重复投保，请核实后再继续报价。",
+    )
+    trace_id = _to_str(getattr(task, "trace_id", "")).strip() or _new_trace_id()
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+        },
+        "duplicate_quote_confirm_required": True,
+        "duplicate_quote_warning": warning,
+        "ui_visible": False,
+    }
+    data = _mk_data(
+        result_status=RESULT_NOT_READY,
+        message="平台提示可能重复投保，等待确认",
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return {
+        "duplicate_quote_confirm_required": True,
+        "silent": True,
+        "ui_visible": False,
+        "reply": _duplicate_quote_confirm_reply_text(
+            warning,
+            platform_name=case.platform_name or case.platform_code or "",
+        ),
+        "trace_id": trace_id,
+        "data": data,
+    }
+
+
 def _is_sms_task_expired(task: QuoteTask) -> bool:
     base = getattr(task, "started_at", None) or getattr(task, "created_at", None)
     if not isinstance(base, datetime):
@@ -6686,7 +6955,7 @@ async def _quote_snapshot_default_config_is_current(
     current_platform_default = _json_obj(refreshed.get("platform_default_config"))
     if _to_str(current_platform_default.get("matched")).strip() != _to_str(platform_default.get("matched")).strip():
         return False
-    return _snapshot_quote_fingerprint(snap) == _compute_snapshot_quote_fingerprint(refreshed)
+    return _compute_snapshot_quote_fingerprint(snap) == _compute_snapshot_quote_fingerprint(refreshed)
 
 
 async def _stop_quote_for_material_change(
@@ -6844,17 +7113,21 @@ async def _stop_quote_for_default_config_change(
     )
     payload["default_config_changed"] = True
     return (
-        f"{platform_label}报价默认参数已更新，我已停止本次报价；请重新发起报价以使用最新默认参数。",
+        "",
         {
             "status": "success",
             "intent": "quote",
             "trace_id": trace_id,
+            "silent": True,
+            "ui_visible": False,
             "data": _mk_data(
                 result_status=RESULT_NOT_READY,
                 message=QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE,
                 entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
                 payload=payload,
             ),
+            "silent": True,
+            "ui_visible": False,
             "actions": [_mk_action(f"{platform_label}报价"), _mk_action("查看当前材料状态")],
         },
     )
@@ -6952,16 +7225,14 @@ def _quote_result_lines(result: Dict[str, Any]) -> List[str]:
 
 
 def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, account_label: str = "") -> str:
-    mode = _to_str(result.get("mode")).strip()
-    title = f"{platform_name}报价完成。" if mode.endswith("_real") else f"{platform_name}报价流程已跑通。"
-    lines = [title]
-    if account_label:
-        lines.append(f"使用账号：{account_label}")
-    lines.extend(_quote_result_lines(result))
-    warning = sanitize_quote_user_message(result.get("platform_warning"), "")
-    if warning:
-        lines.append(f"平台提示：{warning}")
-    return "\n".join(line for line in lines if _to_str(line).strip())
+    card = _json_obj(result.get("result_card"))
+    result_platform_code = _to_str(result.get("platform_code") or card.get("platform_code")).strip().upper()
+    result_platform_name = _to_str(result.get("platform_name") or card.get("platform_name") or platform_name).strip()
+    risk_score = _to_str(result.get("risk_score")).strip() or _to_str(card.get("risk_score")).strip()
+    display_name = result_platform_name or platform_name or "平台"
+    if result_platform_code == "PICC" or display_name in {"人保", "中国人保", "PICC"}:
+        display_name = "人保"
+    return f"{display_name}风险水平：{risk_score or '-'} 分"
 
 
 def _quote_card_time_text(value: Optional[datetime] = None) -> str:
@@ -6980,6 +7251,27 @@ def _quote_result_price_amount(result: Mapping[str, Any], keyword: str) -> Any:
     return ""
 
 
+def _quote_money_decimal(value: Any, default: str = "0") -> Decimal:
+    if value in (None, ""):
+        return Decimal(default)
+    try:
+        return Decimal(_to_str(value).replace(",", "").replace("元", "").strip())
+    except Exception:
+        return Decimal(default)
+
+
+def _quote_money_text(value: Any, default: str = "0.00") -> str:
+    try:
+        return str(_quote_money_decimal(value, default).quantize(Decimal("0.01")))
+    except Exception:
+        return default
+
+
+def _quote_compact_money_text(value: Any, default: str = "0") -> str:
+    text = _quote_money_text(value, default=f"{default}.00" if "." not in default else default)
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, Any]:
     if not (result.get("premium_total") or _json_list(result.get("price_items"))):
         return {}
@@ -6992,6 +7284,167 @@ def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, 
         "vehicle_tax": _quote_result_price_amount(result, "车船"),
         "coverage_items": [],
     }
+
+
+def _picc_proposal_display_name(name: Any) -> str:
+    text = _to_str(name).strip()
+    mapping = {
+        "第三者责任险": "机动车第三者责任保险",
+        "车上人员责任险（司机）": "机动车车上人员责任保险（司机）",
+        "车上人员责任险(司机)": "机动车车上人员责任保险（司机）",
+        "车上人员责任险（乘客）": "机动车车上人员责任保险（乘客）",
+        "车上人员责任险(乘客)": "机动车车上人员责任保险（乘客）",
+        "医保外医疗费用责任险（第三者责任险）": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+        "医保外医疗费用责任险(第三者责任险)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+        "医保外医疗费用责任险(三者)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+    }
+    return mapping.get(text, text)
+
+
+def _picc_proposal_amount_text(name: Any, amount: Any, *, seat_count: Any = "") -> str:
+    text = _to_str(name).strip()
+    if amount in (None, ""):
+        return "-"
+    raw = _to_str(amount).strip()
+    if re.search(r"元|万|共享|座|\*", raw):
+        return raw
+    value = _quote_money_decimal(amount)
+    if value <= 0:
+        return "-"
+    if "乘客" in text:
+        seats = max(1, _safe_int(seat_count, 5))
+        quantity = max(1, seats - 1)
+        per_seat = (value / Decimal(quantity)).quantize(Decimal("0.01")) if quantity else value
+        return f"{_quote_compact_money_text(per_seat / Decimal('10000'))}万元/座*{quantity}"
+    if "第三者" in text or "医保外" in text or "司机" in text:
+        return f"{_quote_compact_money_text(value / Decimal('10000'))}万元"
+    return f"{_quote_money_text(value)}元"
+
+
+def _picc_start_datetime_from_request(quote_form: Mapping[str, Any], vehicle: Mapping[str, Any], *, kind: str) -> str:
+    if kind == "ci":
+        date_value = _to_str(
+            quote_form.get("prpCmain.startDateCI")
+            or vehicle.get("startDateCI")
+            or quote_form.get("startDateCI")
+        ).strip()
+        hour_value = _to_str(quote_form.get("prpCmain.starthourci") or quote_form.get("starthourci") or "0").strip()
+        minute_value = _to_str(quote_form.get("prpCmain.startminuteci") or quote_form.get("startminuteci") or "0").strip()
+    else:
+        date_value = _to_str(
+            quote_form.get("prpCmain.startDate")
+            or vehicle.get("startDateBI")
+            or quote_form.get("startDateBI")
+        ).strip()
+        hour_value = _to_str(quote_form.get("prpCmain.starthourbi") or quote_form.get("starthourbi") or "0").strip()
+        minute_value = _to_str(quote_form.get("prpCmain.startminutebi") or quote_form.get("startminutebi") or "0").strip()
+    if not date_value:
+        return "-"
+    if re.search(r"\d{1,2}:\d{2}", date_value):
+        return date_value
+    return f"{date_value} {_safe_int(hour_value, 0):02d}:{_safe_int(minute_value, 0):02d}"
+
+
+def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
+    safe_card = dict(_json_obj(card))
+    if _to_str(safe_card.get("style")).strip() == "picc_proposal_table":
+        return safe_card
+
+    platform_code = _to_str(result.get("platform_code")).strip().upper()
+    platform_name = _to_str(result.get("platform_name")).strip()
+    if platform_code != "PICC" and platform_name not in {"人保", "中国人保", "PICC"}:
+        return safe_card
+
+    request_body = _json_obj(result.get("request_body"))
+    vehicle = _json_obj(request_body.get("vehicleForm"))
+    owner = _json_obj(request_body.get("ownerForm"))
+    quote_form = _json_obj(request_body.get("quoteForm"))
+    coverage_items = _json_list(safe_card.get("proposal_coverage_items") or safe_card.get("coverage_items"))
+    seat_count = vehicle.get("seatCount") or quote_form.get("prpCitemCar.seatCount") or "5"
+    proposal_coverage_items = []
+    for item in coverage_items:
+        row = _json_obj(item)
+        name = _picc_proposal_display_name(row.get("name"))
+        if not name:
+            continue
+        proposal_coverage_items.append(
+            {
+                "name": name,
+                "amount_text": _to_str(row.get("amount_text")).strip()
+                or _picc_proposal_amount_text(name, row.get("amount"), seat_count=seat_count),
+                "premium": _quote_money_text(row.get("premium")),
+            }
+        )
+
+    commercial = _quote_money_text(safe_card.get("commercial_premium") or _quote_result_price_amount(result, "商业"))
+    compulsory = _quote_money_text(safe_card.get("compulsory_premium") or _quote_result_price_amount(result, "交强"))
+    vehicle_tax = _quote_money_text(safe_card.get("vehicle_tax") or _quote_result_price_amount(result, "车船"))
+    joint_premium = _quote_money_text(safe_card.get("joint_sales_premium") or result.get("joint_sales_premium"))
+    joint_amount = _quote_money_text(safe_card.get("joint_sales_amount") or result.get("joint_sales_amount"))
+    total_without_tax = _quote_money_text(
+        safe_card.get("total_without_vehicle_tax")
+        or (_quote_money_decimal(commercial) + _quote_money_decimal(compulsory) + _quote_money_decimal(joint_premium))
+    )
+    total_with_tax = _quote_money_text(
+        safe_card.get("total_with_vehicle_tax")
+        or safe_card.get("total_premium")
+        or result.get("premium_total")
+        or (_quote_money_decimal(total_without_tax) + _quote_money_decimal(vehicle_tax))
+    )
+
+    car_kind_code = _to_str(vehicle.get("carKindCode") or quote_form.get("prpCitemCar.carKindCode") or "A01").strip() or "A01"
+    use_nature_code = _to_str(vehicle.get("useNatureCode") or quote_form.get("prpCitemCar.useNatureCode") or "211").strip()
+    vehicle_type_label = "客车" if car_kind_code == "A01" else "车辆"
+    vehicle_usage_label = "家庭自用汽车" if use_nature_code in {"211", "21"} else "车辆使用"
+    claim_bi = _safe_int(safe_card.get("claim_business_count"), 0)
+    claim_ci = _safe_int(safe_card.get("claim_compulsory_count"), 0)
+
+    upgraded = {
+        **safe_card,
+        "style": "picc_proposal_table",
+        "title": "中国人保投保方案",
+        "total_premium": total_with_tax,
+        "total_without_vehicle_tax": total_without_tax,
+        "total_with_vehicle_tax": total_with_tax,
+        "commercial_premium": commercial,
+        "compulsory_premium": compulsory,
+        "vehicle_tax": vehicle_tax,
+        "vehicle_tax_detail": _json_obj(safe_card.get("vehicle_tax_detail"))
+        or {"current": vehicle_tax, "back": "0.00", "late_fee": "0.00"},
+        "joint_sales_label": "途家安顺",
+        "joint_sales_display_label": "途顺家安组合保险",
+        "joint_sales_premium": joint_premium,
+        "joint_sales_amount": joint_amount,
+        "driver_accident_premium": _quote_money_text(safe_card.get("driver_accident_premium")),
+        "claim_business_count": claim_bi,
+        "claim_compulsory_count": claim_ci,
+        "risk_score": _to_str(result.get("risk_score") or safe_card.get("risk_score") or "-").strip() or "-",
+        "proposal_info": {
+            "insured_name": _to_str(owner.get("ownerName") or result.get("owner_name") or safe_card.get("owner_name") or "-").strip(),
+            "plate_no": _to_str(result.get("plate_no") or vehicle.get("licenseNo") or safe_card.get("plate_no") or "-").strip(),
+            "engine_no": _to_str(vehicle.get("engineNo") or quote_form.get("prpCitemCar.engineNo") or safe_card.get("engine_no") or "-").strip(),
+            "vin": _to_str(vehicle.get("vin") or quote_form.get("prpCitemCar.vinNo") or safe_card.get("vin") or "-").strip(),
+            "vehicle_type": f"{car_kind_code}-{vehicle_type_label}",
+            "vehicle_usage": f"21-{vehicle_usage_label}" if use_nature_code in {"211", "21"} else f"{use_nature_code}-{vehicle_usage_label}",
+            "vehicle_model": _to_str(
+                result.get("vehicle_model")
+                or vehicle.get("selectedModelName")
+                or vehicle.get("modelName")
+                or quote_form.get("prpCitemCar.brandName")
+                or "-"
+            ).strip(),
+            "enroll_date": _to_str(vehicle.get("enrollDate") or quote_form.get("prpCitemCar.enrollDate") or "-").strip(),
+            "ton_count": f"{_quote_compact_money_text(vehicle.get('tonCount') or quote_form.get('prpCitemCar.tonCount') or '0')}千克",
+            "seat_count": f"{_safe_int(seat_count, 5)}人",
+            "purchase_price": f"{_quote_compact_money_text(vehicle.get('purchasePrice') or vehicle.get('actualValue') or result.get('vehicle_actual_value'))}元",
+            "claim_summary": _to_str(safe_card.get("claim_summary")).strip()
+            or f"商业险连续承保年数0年，连续承保期间出险次数{claim_bi}次，交强险{claim_ci}次",
+            "bi_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="bi"),
+            "ci_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="ci"),
+        },
+        "proposal_coverage_items": proposal_coverage_items,
+    }
+    return upgraded
 
 
 def _quote_result_watermark_account(
@@ -7026,6 +7479,7 @@ def _enrich_quote_result_for_display(
     safe_result = dict(_json_obj(result))
     card = _json_obj(safe_result.get("result_card")) or _quote_result_card_from_price_items(safe_result)
     if card:
+        card = _picc_result_card_for_display(safe_result, card)
         display_time = _quote_card_time_text()
         account_label = _quote_result_watermark_account(platform_account, platform_name=platform_name)
         card.setdefault("watermark_account", account_label)
@@ -7057,9 +7511,8 @@ def _already_quoted_response(
     quote_fingerprint: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     result = _json_obj(task.result_payload)
-    lines = [f"这单已经完成过{platform_name}报价，我没有重复提交，避免重复扣减额度。"]
-    lines.extend(_quote_result_lines(result))
-    lines.append(f"如确实需要重新报价，请输入“{platform_name}重新报价”。")
+    display_result = _enrich_quote_result_for_display(result, platform_account=None, platform_name=platform_name)
+    reply = _quote_result_reply_text(display_result, platform_name=platform_name)
     payload = {
         "duplicate_quote_blocked": True,
         "material_fingerprint": material_fingerprint,
@@ -7080,9 +7533,9 @@ def _already_quoted_response(
             "trace_id": task.trace_id,
             "finished_at": _fmt_dt(task.finished_at),
         },
-        "quote_result": result,
+        "quote_result": display_result,
     }
-    return "\n".join(lines), {
+    return reply, {
         "status": "success",
         "intent": "quote",
         "trace_id": task.trace_id or _new_trace_id(),
@@ -7092,7 +7545,7 @@ def _already_quoted_response(
             entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
             payload=payload,
         ),
-        "actions": [_mk_action(f"{platform_name}重新报价"), _mk_action("查看当前材料状态")],
+        "actions": [],
     }
 
 
@@ -7109,21 +7562,21 @@ async def _cancel_waiting_tasks_for_case(
         await db.execute(
             select(QuoteTask).where(
                 QuoteTask.quote_case_id == case.id,
-                QuoteTask.status == TASK_STATUS_WAITING_SMS,
-                QuoteTask.login_state == "sms_required",
+                QuoteTask.status.in_((TASK_STATUS_WAITING_SMS, TASK_STATUS_WAITING_DUPLICATE_CONFIRM)),
             )
         )
     ).scalars().all()
 
     cancelled = 0
     for task in active_waiting_tasks:
+        was_sms_task = task.status == TASK_STATUS_WAITING_SMS or task.login_state == "sms_required"
         task.status = TASK_STATUS_CANCELLED
-        task.login_state = "failed"
+        task.login_state = "failed" if was_sms_task else "authenticated"
         task.error_detail = reason
         task.finished_at = ts
         task.updated_at = ts
         account_id = _quote_task_platform_account_id(task)
-        if owner_user_id > 0 and account_id > 0:
+        if was_sms_task and owner_user_id > 0 and account_id > 0:
             account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
             if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
                 account.login_status = ACCOUNT_LOGIN_EXPIRED
@@ -7144,6 +7597,18 @@ async def has_waiting_sms_task(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
         return False
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
     return await _find_waiting_task(db, owner_user_id=owner_user_id, session_id=session_id) is not None
+
+
+async def has_waiting_duplicate_quote_confirm_task(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
+    owner_user_id = _ctx_current_user_id(ctx)
+    if owner_user_id <= 0:
+        return False
+    session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    return await _find_waiting_duplicate_quote_confirm_task(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+    ) is not None
 
 
 async def has_expired_waiting_sms_task(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
@@ -7280,6 +7745,327 @@ async def _start_sms_task(
     )
     await db.flush()
     return task
+
+
+def _duplicate_quote_confirm_reply_text(warning: str, *, platform_name: str = "") -> str:
+    safe_warning = _sanitize_duplicate_quote_warning(
+        warning,
+        f"{platform_name or '平台'}提示该车辆可能重复投保，请核实后再继续报价。",
+    )
+    return safe_warning
+
+
+async def _start_duplicate_quote_confirm_task(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_account: QuotePlatformAccountProfile,
+    runtime_result: PlatformRuntimeResult,
+    login_mode: str,
+    existing_task: Optional[QuoteTask] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    platform_code = case.platform_code or platform_account.platform_code or "STUB"
+    platform_name = case.platform_name or platform_account.platform_name or platform_code
+    runtime_payload = _runtime_result_payload(runtime_result)
+    runtime_data = _json_obj(runtime_payload.get("data"))
+    request_body = _json_obj(
+        runtime_data.get("request_body")
+        or runtime_data.get("request_body_draft")
+        or _json_obj(snapshot.get("request_body"))
+    )
+    warning = _duplicate_quote_warning_from_runtime(runtime_result)
+    pending_snapshot = dict(_json_obj(snapshot))
+    if request_body:
+        pending_snapshot["request_body"] = request_body
+    pending_snapshot["duplicate_quote_warning"] = warning
+    pending_snapshot["duplicate_quote_pending"] = True
+    pending_snapshot = _snapshot_with_quote_fingerprint(pending_snapshot)
+    request_payload = {
+        "mode": "stub",
+        "login": login_mode,
+        "owner_user_id": owner_user_id,
+        "platform_account": _credential_public_payload(platform_account),
+        "platform_default_config": _json_obj(pending_snapshot.get("platform_default_config")),
+        "default_config_json": _json_obj(pending_snapshot.get("default_config_json")),
+        "vehicle_type_detect": _json_obj(pending_snapshot.get("vehicle_type_detect")),
+        "request_body": request_body,
+        "duplicate_quote_warning": warning,
+    }
+    response_payload = {
+        "quote": runtime_payload,
+        "duplicate_quote_confirm_required": True,
+    }
+    now = _now()
+    task = existing_task
+    if task is None:
+        task = QuoteTask(
+            quote_case_id=case.id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            status=TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+            login_state="authenticated",
+            sms_phone_mask=platform_account.login_phone_mask,
+            trace_id=trace_id,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            result_payload={},
+            submitted_snapshot=pending_snapshot,
+            error_detail=warning[:1800] if warning else None,
+            started_at=now,
+        )
+        db.add(task)
+        await db.flush()
+    else:
+        task.status = TASK_STATUS_WAITING_DUPLICATE_CONFIRM
+        task.login_state = "authenticated"
+        task.sms_phone_mask = platform_account.login_phone_mask
+        task.request_payload = {**_json_obj(task.request_payload), **request_payload}
+        task.response_payload = {**_json_obj(task.response_payload), **response_payload}
+        task.result_payload = {}
+        task.submitted_snapshot = pending_snapshot
+        task.error_detail = warning[:1800] if warning else None
+        task.finished_at = None
+        task.updated_at = now
+
+    case.status = CASE_STATUS_WAITING_DUPLICATE_CONFIRM
+    case.current_task_id = task.id
+    case.updated_at = now
+    platform_account.last_check_at = now
+    platform_account.updated_at = now
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+            "trace_id": trace_id,
+            "duplicate_quote_confirm_required": True,
+            "warning": warning,
+        },
+    )
+    await db.flush()
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+        },
+        "platform_account": _credential_public_payload(platform_account),
+        "duplicate_quote_warning": warning,
+        "quote_runtime": runtime_payload,
+        "ui_visible": False,
+    }
+    data = _mk_data(
+        result_status=RESULT_NOT_READY,
+        message="平台提示可能重复投保，等待确认",
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return _duplicate_quote_confirm_reply_text(warning, platform_name=platform_name), {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "silent": True,
+        "ui_visible": False,
+        "data": data,
+        "actions": [],
+    }
+
+
+async def _complete_waiting_duplicate_quote_task(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+) -> Tuple[str, Dict[str, Any]]:
+    trace_id = task.trace_id or _new_trace_id()
+    platform_code = task.platform_code or case.platform_code or "STUB"
+    platform_name = task.platform_name or case.platform_name or platform_code
+    snapshot = _json_obj(task.submitted_snapshot)
+    account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
+    account_id = _safe_int(account_payload.get("id"), 0) or None
+    platform_account = (
+        await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+        if account_id
+        else None
+    )
+    if platform_account is None:
+        task.status = TASK_STATUS_FAILED
+        task.login_state = "failed"
+        task.error_detail = "平台账号不存在或无权访问，请重新发起报价"
+        task.finished_at = _now()
+        task.updated_at = _now()
+        case.status = CASE_STATUS_READY
+        case.current_task_id = task.id
+        case.updated_at = _now()
+        await db.flush()
+        return (
+            f"{platform_name}报价失败：平台账号不存在或无权访问，请重新发起报价。",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message="平台账号不存在或无权访问",
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
+                ),
+            },
+        )
+    if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
+        return await _stop_quote_for_material_change(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            task=task,
+            platform_account=platform_account,
+        )
+    if not await _quote_snapshot_default_config_is_current(db, snapshot=snapshot, platform_code=platform_code):
+        return await _stop_quote_for_default_config_change(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            task=task,
+            platform_account=platform_account,
+        )
+
+    confirmed_snapshot = _duplicate_quote_confirmed_snapshot(snapshot)
+    task.status = TASK_STATUS_CANCELLED
+    task.login_state = "authenticated"
+    task.error_detail = "用户已确认继续重复投保报价，转入正式报价"
+    task.finished_at = _now()
+    task.updated_at = _now()
+    case.status = CASE_STATUS_READY
+    case.current_task_id = None
+    case.updated_at = _now()
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_CANCELLED,
+            "trace_id": trace_id,
+            "duplicate_quote_confirmed": True,
+        },
+    )
+    await db.flush()
+
+    config_type_name = _normalize_account_type_name(
+        _json_obj(confirmed_snapshot.get("platform_default_config")).get("resolved_type_name")
+        or _json_obj(confirmed_snapshot.get("platform_default_config")).get("account_type_name")
+        or _json_obj(confirmed_snapshot.get("vehicle_type_detect")).get("config_type_name")
+        or platform_account.account_type_name
+    )
+    return await _continue_quote_with_platform_account(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        snapshot=confirmed_snapshot,
+        trace_id=trace_id,
+        platform_account=platform_account,
+        merged_entities={"quote_case_id": case.id, "order_id": case.order_id, "platform_code": platform_code, "platform_name": platform_name},
+        normalized_data=_json_obj(confirmed_snapshot.get("normalized_data")),
+        images_by_slot=_json_obj(confirmed_snapshot.get("images_by_slot")),
+        attached_images=[],
+        config_type_name=config_type_name,
+        attempted_account_ids={account_id} if account_id else None,
+    )
+
+
+async def _cancel_waiting_duplicate_quote_task(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+    reason: str = "用户已中止重复投保报价",
+) -> Tuple[str, Dict[str, Any]]:
+    trace_id = task.trace_id or _new_trace_id()
+    now = _now()
+    task.status = TASK_STATUS_CANCELLED
+    task.login_state = "authenticated"
+    task.error_detail = reason
+    task.finished_at = now
+    task.updated_at = now
+    if case.current_task_id == task.id:
+        case.current_task_id = None
+
+    normalized_data, images_by_slot, missing = await _refresh_quote_case_material_state(
+        db,
+        case,
+        preserve_quoted=False,
+        now=now,
+    )
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_CANCELLED,
+            "trace_id": trace_id,
+            "duplicate_quote_cancelled": True,
+            "reason": reason,
+        },
+    )
+    await db.flush()
+    payload = _case_payload(
+        case=case,
+        normalized_data=normalized_data,
+        images_by_slot=images_by_slot,
+        missing=missing,
+        task=task,
+        platform_account=None,
+    )
+    payload["duplicate_quote_cancelled"] = True
+    payload["ui_visible"] = False
+    data = _mk_data(
+        result_status=RESULT_NOT_READY,
+        message=reason,
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return (
+        "已中止本次重复报价。",
+        {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "silent": True,
+            "ui_visible": False,
+            "data": data,
+            "actions": [],
+        },
+    )
 
 
 async def _mark_quote_account_challenge_attention(
@@ -8168,8 +8954,33 @@ async def _complete_waiting_task(
             )
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     quote_status = _runtime_status(quote_runtime_result)
+    if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return await _start_duplicate_quote_confirm_task(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            runtime_result=quote_runtime_result,
+            login_mode="sms_verified",
+            existing_task=task,
+        )
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        if _is_runtime_duplicate_quote_result(quote_runtime_result) and not _snapshot_has_duplicate_quote_confirmation(snapshot):
+            return await _start_duplicate_quote_confirm_task(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                snapshot=snapshot,
+                trace_id=trace_id,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                login_mode="sms_verified",
+                existing_task=task,
+            )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         task.status = TASK_STATUS_FAILED
         task.login_state = "authenticated"
@@ -8292,27 +9103,6 @@ async def _complete_waiting_task(
             )
             if retry is not None:
                 return retry
-        if _is_runtime_duplicate_quote_result(quote_runtime_result):
-            return (
-                f"{platform_name}提示该车辆已报价过：{task.error_detail}。\n"
-                "如需按新的保额或字段重新报价，请直接发送调整内容，例如“车损 23000”或“机动车损失保险23000”。",
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": trace_id,
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message=task.error_detail,
-                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                        payload={
-                            "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
-                            "platform_account": _credential_public_payload(platform_account),
-                            "quote_runtime": _runtime_result_payload(quote_runtime_result),
-                        },
-                    ),
-                    "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
-                },
-            )
         return (
             f"{platform_name}报价失败：{task.error_detail}。请检查平台账号状态或报价资料后重试。",
             {
@@ -8427,10 +9217,7 @@ async def _complete_waiting_task(
             entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
             payload=payload,
         ),
-        "actions": [
-            _mk_action("查看当前材料状态"),
-            _mk_action(f"{platform_name}报价"),
-        ],
+        "actions": [],
     }
 
 
@@ -8608,8 +9395,31 @@ async def _complete_quote_without_sms(
             response_payload={"quote": _runtime_result_payload(quote_runtime_result)},
         )
     quote_status = _runtime_status(quote_runtime_result)
+    if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return await _start_duplicate_quote_confirm_task(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            runtime_result=quote_runtime_result,
+            login_mode=login_mode,
+        )
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        if _is_runtime_duplicate_quote_result(quote_runtime_result) and not _snapshot_has_duplicate_quote_confirmation(snapshot):
+            return await _start_duplicate_quote_confirm_task(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                snapshot=snapshot,
+                trace_id=trace_id,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                login_mode=login_mode,
+            )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
         task = QuoteTask(
@@ -8779,26 +9589,6 @@ async def _complete_quote_without_sms(
             },
             "platform_account": _credential_public_payload(platform_account),
         }
-        if _is_runtime_duplicate_quote_result(quote_runtime_result):
-            return (
-                f"{platform_name}提示该车辆已报价过：{error_detail}。\n"
-                "如需按新的保额或字段重新报价，请直接发送调整内容，例如“车损 23000”或“机动车损失保险23000”。",
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": trace_id,
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message=error_detail,
-                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                        payload={
-                            **payload,
-                            "quote_runtime": _runtime_result_payload(quote_runtime_result),
-                        },
-                    ),
-                    "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
-                },
-            )
         return (
             f"{platform_name}报价失败：{error_detail}。请检查平台账号状态或报价资料后重试。",
             {
@@ -8920,7 +9710,7 @@ async def _complete_quote_without_sms(
             entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
             payload=payload,
         ),
-        "actions": [_mk_action(f"{platform_name}报价")],
+        "actions": [],
     }
 
 
@@ -9242,7 +10032,12 @@ async def recall_quote_case_images(
         case.normalized_data = normalized_data
         case.draft_order_data = normalized_data
         case.missing_requirements = missing
-        if case.status in {CASE_STATUS_READY, CASE_STATUS_WAITING_SMS, CASE_STATUS_FAILED}:
+        if case.status in {
+            CASE_STATUS_READY,
+            CASE_STATUS_WAITING_SMS,
+            CASE_STATUS_WAITING_DUPLICATE_CONFIRM,
+            CASE_STATUS_FAILED,
+        }:
             case.status = CASE_STATUS_COLLECTING if missing else CASE_STATUS_READY
         case.updated_at = now
         await _add_event(
@@ -9422,6 +10217,141 @@ async def handle_quote_message(
                     payload=payload,
                 ),
                 "actions": [_mk_action("输入短信验证码")],
+                },
+            )
+
+    duplicate_confirm_pair = await _find_waiting_duplicate_quote_confirm_task(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    if duplicate_confirm_pair and quote_field_overrides:
+        case, task = duplicate_confirm_pair
+        if not merged_entities.get("platform_code") and (case.platform_code or task.platform_code):
+            merged_entities["platform_code"] = case.platform_code or task.platform_code
+        if not merged_entities.get("platform_name") and (case.platform_name or task.platform_name):
+            merged_entities["platform_name"] = case.platform_name or task.platform_name
+        if case.order_id and not merged_entities.get("order_id"):
+            merged_entities["order_id"] = case.order_id
+
+        cancelled = await _cancel_waiting_tasks_for_case(
+            db,
+            case=case,
+            reason=QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE,
+        )
+        if cancelled:
+            case.status = CASE_STATUS_READY
+            case.current_task_id = None
+            case.updated_at = _now()
+            await _add_event(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                event_type="task",
+                role="system",
+                payload={
+                    "duplicate_quote_confirm_cancelled": True,
+                    "reason": QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE,
+                    "quote_field_overrides": quote_field_overrides,
+                    "old_task_id": task.id,
+                },
+            )
+            await db.flush()
+        duplicate_confirm_pair = None
+
+    if _is_duplicate_quote_confirmation_text(text) or _is_duplicate_quote_cancel_text(text):
+        if not duplicate_confirm_pair:
+            return (
+                "",
+                {
+                    "status": "success",
+                    "intent": "quote",
+                    "trace_id": _new_trace_id(),
+                    "silent": True,
+                    "ui_visible": False,
+                    "data": _mk_data(
+                        result_status=RESULT_NOT_READY,
+                        message="",
+                        entities={},
+                        payload={},
+                    ),
+                    "actions": [],
+                },
+            )
+
+    if duplicate_confirm_pair and _is_duplicate_quote_cancel_text(text):
+        case, task = duplicate_confirm_pair
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="chat",
+            role="user",
+            content=text,
+            payload={"duplicate_quote_cancelled": True},
+        )
+        return await _cancel_waiting_duplicate_quote_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+        )
+
+    if duplicate_confirm_pair and _is_duplicate_quote_confirmation_text(text):
+        case, task = duplicate_confirm_pair
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="chat",
+            role="user",
+            content=text,
+            payload={"duplicate_quote_confirmed": True},
+        )
+        return await _complete_waiting_duplicate_quote_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+        )
+    if duplicate_confirm_pair and signal.get("is_quote"):
+        case, task = duplicate_confirm_pair
+        warning = _to_str(_json_obj(task.request_payload).get("duplicate_quote_warning") or task.error_detail).strip()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="chat",
+            role="user",
+            content=text,
+            payload={"duplicate_quote_confirm_pending": True},
+        )
+        await db.flush()
+        payload = {
+            "quote_case": {"id": case.id, "case_no": case.case_no, "status": case.status},
+            "quote_task": {"id": task.id, "status": task.status, "trace_id": task.trace_id},
+            "duplicate_quote_warning": warning,
+            "ui_visible": False,
+        }
+        data = _mk_data(
+            result_status=RESULT_NOT_READY,
+            message="平台提示可能重复投保，等待确认",
+            entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+            payload=payload,
+        )
+        data["silent"] = True
+        data["ui_visible"] = False
+        return (
+            _duplicate_quote_confirm_reply_text(warning, platform_name=case.platform_name or case.platform_code or ""),
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": task.trace_id or _new_trace_id(),
+                "silent": True,
+                "ui_visible": False,
+                "data": data,
+                "actions": [],
             },
         )
 
@@ -9435,9 +10365,10 @@ async def handle_quote_message(
     ctx_order_id = _safe_int((ctx or {}).get("order_id"), 0) or None
     entity_order_id = _safe_int(merged_entities.get("order_id"), 0) or None
     explicit_order_id = ctx_order_id or entity_order_id
+    short_quote_command = looks_like_short_quote_command(text)
     inherited_case: Optional[QuoteCase] = None
     inherited_order_id: Optional[int] = None
-    if quote_field_overrides and (not platform_code or not platform_name):
+    if (quote_field_overrides or short_quote_command) and (not platform_code or not platform_name):
         inherited_case = await _latest_reusable_session_case(
             db,
             owner_user_id=owner_user_id,

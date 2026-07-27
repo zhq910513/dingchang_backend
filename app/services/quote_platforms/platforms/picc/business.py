@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import uuid
@@ -51,6 +52,7 @@ TAXABATE_QUERY_PATH = "/khyx/newFront/qtr/price/queryQtTaxabate.do"
 CAL_ACTUAL_VALUE_PATH = "/khyx/newFront/price/calActualVal.do"
 VERIFY_AGENT_CONTROL_PATH = "/khyx/newFront/qth/price/verifyPersonalAgtControl.do"
 DUPLICATE_INSURED_VIN_PATH = "/khyx/newFront/qth/price/duplicateInsuredVinNo.do"
+JOINT_SALE_PLAN_INFO_PATH = "/khyx/newFront/prpall/common/choosePlanInfoForJointSale.do"
 QUERY_QUALITY_FLAG_PATH = "/khyx/newFront/qth/price/queryQualityFlag.do"
 GET_CLUB_GIFT_DISPLAY_INFO_PATH = "/khyx/newFront/qth/price/getClubGiftDisplayInfo.do"
 QUERY_CAR_CHECKER_PATH = "/khyx/newFront/common/queryCarchecker.do"
@@ -74,6 +76,7 @@ PRODUCT_DRIVER = "车上人员责任险（司机）"
 PRODUCT_PASSENGER = "车上人员责任险（乘客）"
 PRODUCT_SHARED_LIMIT = "共享主险限额"
 PRODUCT_MEDICAL_THIRD = "医保外医疗费用责任险（第三者责任险）"
+PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
 
 PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_COMPULSORY: ("交强", "交强险"),
@@ -83,6 +86,22 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_PASSENGER: ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客险", "乘客责任险", "乘客"),
     PRODUCT_SHARED_LIMIT: ("共享主险限额", "主险限额共享"),
     PRODUCT_MEDICAL_THIRD: ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外"),
+    PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途家安顺保费", "途家安顺", "途家安顺非车保费"),
+}
+
+PICC_TUJIA_ANSHUN_RISK_CODE = "LCO"
+PICC_TUJIA_ANSHUN_BRAND_ID = "BTA1"
+PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE = "05"
+
+PICC_KIND_NAME_BY_CODE = {
+    "051050": "机动车损失保险",
+    "051051": "机动车第三者责任保险",
+    "051052": "机动车车上人员责任保险（司机）",
+    "051053": "机动车车上人员责任保险（乘客）",
+    "051063": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+    "051064": "附加机动车增值服务特约条款（道路救援服务）",
+    "051074": "机动车交通事故责任强制保险",
+    "051085": "附加外部电网故障损失险",
 }
 
 PICC_REAL_QUOTE_ACCOUNT_TYPES = {
@@ -233,6 +252,7 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
     profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
     product_defaults = _json_obj(profile.get("product_defaults"))
     return {
+        PRODUCT_TUJIA_ANSHUN_PREMIUM: "398",
         PRODUCT_COMPULSORY: product_defaults.get(PRODUCT_COMPULSORY, "20"),
         PRODUCT_LOSS: product_defaults.get(PRODUCT_LOSS, ""),
         PRODUCT_THIRD_PARTY: product_defaults.get(PRODUCT_THIRD_PARTY, "300"),
@@ -619,9 +639,16 @@ def _wan_or_amount_to_wan_text(value: Any, fallback_wan: str) -> str:
 
 
 def _strip_platform_error_code(message: Any) -> str:
-    text = _to_str(message).strip()
+    text = html.unescape(_to_str(message)).strip()
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</?[^>]+>", "", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"^[A-Za-z0-9_]+\s*\n?[:：]", "", text).strip()
+    text = re.sub(r"[!,，|]*[A-Z]{2,}[A-Z0-9]+(?:\|[A-Z]{2,}[A-Z0-9]+)?$", "", text).strip()
     text = re.sub(r"^[A-Z]{2,}[A-Z0-9]*\d*(?:-\d+)?", "", text).lstrip("-_：:，, ")
-    return text
+    return text.strip()
 
 
 def _platform_status_code(data: Any) -> int:
@@ -640,12 +667,17 @@ def _platform_message(data: Any, default: str = "平台返回业务校验失败"
             return
         if isinstance(value, Mapping):
             for key in (
+                "errorMsg",
                 "errorMessage",
+                "resultMessage",
+                "resultMsg",
                 "businessControlMsg",
                 "businessMsg",
+                "errorInfo",
+                "errorTitle",
+                "normalizeErrorMsg",
                 "message",
                 "msg",
-                "errorMsg",
                 "detail",
                 "reason",
                 "statusText",
@@ -670,7 +702,9 @@ def _platform_message(data: Any, default: str = "平台返回业务校验失败"
         low = text.strip().lower()
         if not text:
             continue
-        if low in {"success", "ok", "fail", "failed", "error"}:
+        if low in {"success", "ok", "fail", "failed", "error", "错误", "错误信息", "业务逻辑异常"}:
+            continue
+        if re.fullmatch(r"[A-Z0-9_|:\-]+", text):
             continue
         return text
     return default
@@ -703,6 +737,115 @@ def _platform_debug_payload(data: Any) -> Dict[str, Any]:
     }
 
 
+def _plan_rows_from_response(data: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            if any(key in value for key in ("planCode", "planName", "planPremium", "planAmount")):
+                rows.append(dict(value))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(_json_obj(_json_obj(data).get("data")).get("planInfoListMap"))
+    return rows
+
+
+def _pick_joint_sale_plan_by_premium(data: Any, premium: Any) -> Dict[str, Any]:
+    target = _money(premium)
+    matches = [
+        row for row in _plan_rows_from_response(data)
+        if _money(row.get("planPremium")) == target
+    ]
+    if not matches:
+        return {}
+    matches.sort(
+        key=lambda row: (
+            _money(row.get("planAmount")),
+            _to_str(row.get("planName")),
+            _to_str(row.get("planCode")),
+        ),
+        reverse=True,
+    )
+    selected = dict(matches[0])
+    selected["_matchCount"] = len(matches)
+    return selected
+
+
+def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
+    premium = _money(_default_value(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM, "398"))
+    if premium <= 0:
+        return {
+            "enabled": False,
+            "premium": "0",
+            "amount": "0",
+            "reason": "途家安顺保费为0，按规则不查询保额",
+        }
+    return {
+        "enabled": True,
+        "premium": _clean_money_text(premium),
+        "amount": "",
+    }
+
+
+def _tujia_anshun_from_request_body(request_body: Mapping[str, Any]) -> Dict[str, Any]:
+    joint_sale = _json_obj(request_body.get("jointSaleForm"))
+    return _json_obj(joint_sale.get("tujiaAnshun"))
+
+
+def _duplicate_kind_name(kind_code: Any) -> str:
+    code = _to_str(kind_code).strip()
+    return PICC_KIND_NAME_BY_CODE.get(code, f"平台险别代码{code}" if code else "")
+
+
+def _duplicate_insured_vin_warning(vin_no: Any, payload: Mapping[str, Any]) -> str:
+    rows = payload.get("list")
+    if not isinstance(rows, list) or not rows:
+        return ""
+    vin = _first_text(vin_no, *(_json_obj(row).get("vinNo") for row in rows))
+    ci_period = ""
+    bi_period = ""
+    kind_names: List[str] = []
+    seen_kinds = set()
+    for raw in rows:
+        row = _json_obj(raw)
+        kind_list = row.get("kindCodeList")
+        kind_codes = [
+            _to_str(_json_obj(item).get("kindCode")).strip()
+            for item in (kind_list if isinstance(kind_list, list) else [])
+        ]
+        period = ""
+        if row.get("startDate") or row.get("endDate"):
+            period = f"{_to_str(row.get('startDate')).strip()}至{_to_str(row.get('endDate')).strip()}"
+        if "051074" in kind_codes:
+            ci_period = ci_period or period
+        else:
+            bi_period = bi_period or period
+        for code in kind_codes:
+            name = _duplicate_kind_name(code)
+            if name and name not in seen_kinds:
+                kind_names.append(name)
+                seen_kinds.add(name)
+    lines = [
+        "重复投保提示",
+        "",
+        f"车辆VIN:{vin}近期已在我司承保，请核实后进行报价，避免重复投保。"
+        if vin
+        else "该车辆近期已在我司承保，请核实后进行报价，避免重复投保。",
+    ]
+    if ci_period:
+        lines.extend(["交强险保险期间:", ci_period])
+    if bi_period:
+        lines.extend(["商业险保险期间:", bi_period])
+    if kind_names:
+        lines.append("承保险别:")
+        lines.extend(f"{idx}.{name}" for idx, name in enumerate(kind_names, start=1))
+    return "\n".join(lines)
+
+
 def _contains_duplicate_quote(data: Any) -> bool:
     raw = _to_str(data)
     return bool(re.search(r"(重复|已报价|重复报价|已经报价|不能重复)", raw))
@@ -724,6 +867,40 @@ def _checked(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _duplicate_quote_confirmed(quote_payload: Mapping[str, Any], request_body: Mapping[str, Any]) -> bool:
+    payload = _json_obj(quote_payload)
+    preflight = _json_obj(request_body.get("preflight"))
+    candidates = (
+        payload.get("confirm_duplicate_quote"),
+        payload.get("confirmDuplicateQuote"),
+        payload.get("duplicate_quote_confirmed"),
+        payload.get("allow_duplicate_quote"),
+        preflight.get("confirmDuplicateQuote"),
+        preflight.get("duplicateQuoteConfirmed"),
+        preflight.get("allowDuplicateQuote"),
+    )
+    return any(_checked(value, default=False) for value in candidates)
+
+
+def _duplicate_quote_confirmation_payload(request_body: Mapping[str, Any]) -> Dict[str, Any]:
+    prechecks = _json_obj(_json_obj(request_body.get("preflight")).get("quotePrechecks"))
+    duplicate = _json_obj(prechecks.get("duplicateVin"))
+    if _safe_int_local(duplicate.get("total"), 0) <= 0:
+        return {}
+    warning = _to_str(duplicate.get("warning") or duplicate.get("message")).strip()
+    if not warning:
+        warning = "平台提示该车辆近期已承保，请核实后再继续报价。"
+    return {
+        "business_status": "duplicate_quote_confirm_required",
+        "error_code": "duplicate_quote_confirm_required",
+        "duplicate_quote_warning": warning,
+        "duplicateVin": duplicate,
+        "request_body": request_body,
+        "request_body_draft": request_body,
+        "offline_request_body": True,
+    }
+
+
 def _vehicle_price(row: Mapping[str, Any]) -> Decimal:
     candidates = (
         row.get("purchasePrice"),
@@ -743,6 +920,62 @@ def _vehicle_rows(data: Any) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows if isinstance(row, Mapping)] if isinstance(rows, list) else []
 
 
+def _compact_vehicle_compare_text(value: Any) -> str:
+    return re.sub(r"\s+", "", _to_str(value).upper())
+
+
+def _vehicle_row_haystack(row: Mapping[str, Any]) -> str:
+    keys = (
+        "vehicleName",
+        "carName",
+        "brandName",
+        "vehicleBrand",
+        "vehicleAlias",
+        "VEHICLE_FGW_CODE",
+        "vehicleFgwCode",
+        "modelIdCode",
+        "platModelCode",
+        "vehicleModelCode",
+        "vehicleId",
+        "modelCode",
+        "vehicleMaker",
+        "manufacturer",
+    )
+    return _compact_vehicle_compare_text(" ".join(_to_str(row.get(key)) for key in keys))
+
+
+def _vehicle_model_code_from_vehicle(vehicle: Mapping[str, Any]) -> str:
+    return _compact_vehicle_compare_text(
+        _first_text(
+            vehicle.get("rawModelName"),
+            vehicle.get("vehicleFgwCode"),
+            vehicle.get("modelName"),
+        )
+    )
+
+
+def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any]) -> int:
+    haystack = _vehicle_row_haystack(row)
+    model_code = _vehicle_model_code_from_vehicle(vehicle)
+    brand = _compact_vehicle_compare_text(_vehicle_brand_prefix(vehicle.get("brandNameHint")))
+    name_hint = _compact_vehicle_compare_text(_vehicle_name_hint(vehicle.get("vehicleNameHint")) or vehicle.get("energyModelSuffix"))
+    score = 0
+    if model_code and model_code in haystack:
+        score += 100
+    if brand and brand in haystack:
+        score += 20
+    if name_hint and name_hint in haystack:
+        score += 15
+    energy_expected = bool(re.search(r"(纯电|电动|新能源|BEV|PHEV|EV)", _compact_vehicle_compare_text(vehicle.get("energyModelSuffix"))))
+    if energy_expected and (
+        re.search(r"(纯电|电动|新能源|BEV|PHEV|EV)", haystack)
+        or _to_str(row.get("energyTypePlat")).strip() == "1"
+        or _to_str(row.get("isEnergyCar")).strip() in {"1", "true", "True"}
+    ):
+        score += 10
+    return score
+
+
 def _is_no_data_platform_response(data: Any) -> bool:
     raw = _to_str(data)
     return bool(re.search(r"(无数据返回|无数据|未查询到|没有查询到|暂无数据|没有数据)", raw))
@@ -752,6 +985,104 @@ def _pick_highest_price_vehicle(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {}
     return max(rows, key=_vehicle_price)
+
+
+def _pick_best_vehicle_candidate(rows: List[Dict[str, Any]], vehicle: Mapping[str, Any]) -> Dict[str, Any]:
+    if not rows:
+        return {}
+    return max(rows, key=lambda row: (_vehicle_candidate_score(row, vehicle), _vehicle_price(row)))
+
+
+PICC_PROPOSAL_KIND_NAME_BY_CODE = {
+    "051050": "机动车损失保险",
+    "051051": "机动车第三者责任保险",
+    "051052": "机动车车上人员责任保险（司机）",
+    "051053": "机动车车上人员责任保险（乘客）",
+    "051063": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+    "051064": "附加机动车增值服务特约条款（道路救援服务）",
+    "051074": "交强险",
+    "051085": "附加外部电网故障损失险",
+}
+
+PICC_CAR_KIND_LABELS = {
+    "A01": "客车",
+    "A02": "货车",
+    "A03": "挂车",
+    "A04": "特种车",
+    "A05": "摩托车",
+    "A06": "拖拉机",
+}
+
+PICC_USE_NATURE_LABELS = {
+    "211": "家庭自用汽车",
+    "212": "非营业企业客车",
+    "213": "非营业机关客车",
+    "220": "营业出租租赁",
+    "230": "营业城市公交",
+    "240": "营业公路客运",
+    "250": "营业货运",
+}
+
+
+def _code_label(code: Any, labels: Mapping[str, str], fallback_label: str = "") -> str:
+    text = _to_str(code).strip()
+    if not text:
+        return fallback_label
+    label = labels.get(text, fallback_label)
+    return f"{text}-{label}" if label else text
+
+
+def _proposal_money_yuan(value: Any, *, keep_decimal: bool = True, default: str = "-") -> str:
+    if value in (None, ""):
+        return default
+    amount = _money(value)
+    if amount == 0 and _to_str(value).strip() not in {"0", "0.0", "0.00"}:
+        return default
+    if keep_decimal:
+        return f"{_money_text(amount)}元"
+    return f"{_clean_money_text(amount)}元"
+
+
+def _proposal_wan_text(value: Any, default: str = "-") -> str:
+    amount = _money(value)
+    if amount <= 0:
+        return default
+    wan = amount / Decimal("10000")
+    return f"{_clean_money_text(wan)}万元"
+
+
+def _proposal_start_datetime(date_value: Any, hour_value: Any = "", minute_value: Any = "") -> str:
+    day = _date_text(date_value)
+    if not day:
+        return ""
+    hour = _safe_int_local(hour_value, 0)
+    minute = _safe_int_local(minute_value, 0)
+    return f"{day} {hour:02d}:{minute:02d}"
+
+
+def _proposal_claim_summary(data: Mapping[str, Any], claim_bi: int, claim_ci: int) -> str:
+    years_bi = _first_text(data.get("noDamYearsBI"), data.get("noDamageYears"), "0")
+    return f"商业险连续承保年数{years_bi}年，连续承保期间出险次数{claim_bi}次，交强险{claim_ci}次"
+
+
+def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "") -> str:
+    code = _to_str(row.get("kindCode")).strip()
+    amount = _money(row.get("amount"))
+    unit_amount = _money(row.get("unitAmount"))
+    seats = max(1, _safe_int_local(seat_count, 5))
+    if code == "051063":
+        return "共享主险限额"
+    if amount <= 0:
+        return "-"
+    if code == "051050":
+        return _proposal_money_yuan(amount, keep_decimal=True)
+    if code == "051053":
+        per_seat = unit_amount if unit_amount > 0 else amount / Decimal(max(seats - 1, 1))
+        quantity = max(1, int((amount / per_seat).quantize(Decimal("1"), rounding=ROUND_HALF_UP))) if per_seat else max(seats - 1, 1)
+        return f"{_proposal_wan_text(per_seat).replace('万元', '')}万元/座*{quantity}"
+    if code in {"051051", "051052", "051074", "051085"}:
+        return _proposal_wan_text(amount)
+    return _proposal_money_yuan(amount, keep_decimal=True)
 
 
 def _ensure_platform_success(data: Any, *, action: str) -> None:
@@ -841,12 +1172,231 @@ def _model_search_code(value: Any) -> str:
     return match.group(0) if match else text.replace("*", "")
 
 
+def _first_positive_money_text(*values: Any, default: Any = "") -> str:
+    for value in values:
+        text = _to_str(value).strip()
+        if not text:
+            continue
+        amount = _money(text)
+        if amount > 0:
+            return _clean_money_text(amount)
+    return _to_str(default).strip()
+
+
+def _vehicle_platform_purchase_price(selected: Mapping[str, Any], precise_vehicle: Mapping[str, Any]) -> str:
+    return _first_positive_money_text(
+        selected.get("purchasePrice"),
+        selected.get("priceP"),
+        selected.get("priceT"),
+        precise_vehicle.get("purchasePrice"),
+        precise_vehicle.get("priceP"),
+        precise_vehicle.get("priceT"),
+    )
+
+
+def _vehicle_platform_brand_id(selected: Mapping[str, Any], precise_vehicle: Mapping[str, Any]) -> str:
+    return _first_text(selected.get("brandId"), precise_vehicle.get("brandId"))
+
+
+def _vehicle_platform_brand_id_new(selected: Mapping[str, Any], precise_vehicle: Mapping[str, Any], brand_id: Any) -> str:
+    brand = _to_str(brand_id).strip()
+    precise_brand = _to_str(precise_vehicle.get("brandId")).strip()
+    selected_brand = _to_str(selected.get("brandId")).strip()
+    selected_brand_new = _to_str(selected.get("brandIDNew")).strip()
+    precise_brand_new = _to_str(precise_vehicle.get("brandIDNew")).strip()
+    if precise_brand_new:
+        return precise_brand_new
+    if selected_brand_new and (not precise_brand or precise_brand == selected_brand or selected_brand_new.startswith(brand)):
+        return selected_brand_new
+    return f"{brand}0" if brand else ""
+
+
+def _vehicle_platform_fgw_code(
+    vehicle: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    precise_vehicle: Mapping[str, Any],
+) -> str:
+    return _first_text(
+        selected.get("VEHICLE_FGW_CODE"),
+        selected.get("vehicleFgwCode"),
+        vehicle.get("vehicleFgwCode"),
+        precise_vehicle.get("VEHICLE_FGW_CODE"),
+        precise_vehicle.get("vehicleFgwCode"),
+        vehicle.get("modelName"),
+    )
+
+
+def _vehicle_platform_search_seqno(selected: Mapping[str, Any], brand_id: Any, vehicle_fgw_code: Any) -> str:
+    search_code = _first_text(selected.get("searchCode"))
+    if search_code:
+        return search_code
+    brand = _to_str(brand_id).strip()
+    fgw = _to_str(vehicle_fgw_code).strip()
+    return f"{brand}-{fgw}" if brand and fgw else fgw
+
+
+def _vehicle_platform_mismatch_message(value: Any) -> bool:
+    text = _to_str(value)
+    return "CZACZBUA0001" in text or ("车型" in text and "平台返回" in text and "不一致" in text)
+
+
+def _vehicle_platform_mismatch_codes(value: Any) -> List[str]:
+    text = _to_str(value)
+    out: List[str] = []
+    for match in re.finditer(r"\b[A-Z][A-Z0-9]{6,}\d\b", text):
+        code = match.group(0).strip().upper()
+        if code.startswith(("KHYX", "HTTP")):
+            continue
+        if code not in out:
+            out.append(code)
+    return out
+
+
+def _vehicle_row_codes(row: Mapping[str, Any]) -> List[str]:
+    out: List[str] = []
+    for key in ("vehicleModelCode", "platModelCode", "modelIdCode", "vehicleId", "modelCode"):
+        code = _to_str(row.get(key)).strip().upper()
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> tuple[Dict[str, Any], bool]:
+    body = dict(_json_obj(request_body))
+    form = dict(_json_obj(body.get("quoteForm")))
+    preflight = dict(_json_obj(body.get("preflight")))
+    vehicle = dict(_json_obj(body.get("vehicleForm")))
+    selected = _json_obj(preflight.get("selectedVehicle"))
+    precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
+    if not form or not precise_vehicle:
+        return body, False
+
+    changed = False
+
+    def set_form(key: str, value: Any) -> None:
+        nonlocal changed
+        text = _to_str(value).strip()
+        if not text:
+            return
+        if _to_str(form.get(key)).strip() != text:
+            form[key] = text
+            changed = True
+
+    def set_vehicle(key: str, value: Any) -> None:
+        nonlocal changed
+        text = _to_str(value).strip()
+        if not text:
+            return
+        if _to_str(vehicle.get(key)).strip() != text:
+            vehicle[key] = text
+            changed = True
+
+    brand_id = _vehicle_platform_brand_id(selected, precise_vehicle)
+    brand_id_new = _vehicle_platform_brand_id_new(selected, precise_vehicle, brand_id)
+    vehicle_fgw_code = _vehicle_platform_fgw_code(vehicle, selected, precise_vehicle)
+    purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
+    model_code = _first_text(
+        vehicle.get("platformModelCode"),
+        precise_vehicle.get("vehicleId"),
+        vehicle.get("modelCode"),
+        selected.get("vehicleId"),
+        selected.get("modelCode"),
+    )
+    vehicle_model_code = _first_text(
+        vehicle.get("platformVehicleModelCode"),
+        precise_vehicle.get("platModelCode"),
+        selected.get("vehicleModelCode"),
+        vehicle.get("platModelCode"),
+    )
+    selected_model_name = _first_text(precise_vehicle.get("vehicleName"), vehicle.get("selectedModelName"), selected.get("vehicleName"), vehicle.get("modelName"))
+    profile = _motor_quote_profile(body.get("accountTypeName"))
+    is_new_car = bool(_profile_text(profile, "new_car_flag")) or _to_str(form.get("newCarFlag")).strip().lower() == "on"
+    actual_value = _first_text(purchase_price if is_new_car else "", form.get("prpCitemCar.actualValue"), vehicle.get("actualValue"), purchase_price)
+
+    set_form("prpCitemCar.brandName", selected_model_name)
+    set_form("prpCitemCar.brandId", brand_id)
+    set_form("prpCitemCar.brandIDNew", brand_id_new)
+    set_form("prpCitemCar.familyId", _first_text(selected.get("familyId"), vehicle.get("familyId")))
+    set_form("prpCitemCar.modelDemandNo", model_code)
+    set_form("prpCitemCar.modelCode", model_code)
+    set_form("prpCmain.vehicleModelCode", vehicle_model_code)
+    set_form("prpCitemCar.vehicleFgwCode", vehicle_fgw_code)
+    set_form("prpCitemCar.searchseqno", _vehicle_platform_search_seqno(selected, brand_id, vehicle_fgw_code))
+    set_form("prpCitemCar.purchasePrice", purchase_price)
+    set_form("prpCitemCar.actualValue", _money_text(actual_value))
+    set_form("prpCitemCar.referenceActualValue", _money_text(actual_value))
+    set_form("prpCitemCar.vehicleMaker", _first_text(selected.get("vehicleMaker"), precise_vehicle.get("vehicleMakerid"), precise_vehicle.get("vehicleMaker")))
+    set_form("prpCitemCar.carLotEquQuality", _first_text(precise_vehicle.get("vehicleWeight"), selected.get("vehicleWeight")))
+    set_form("prpCitemCar.enginePower", _first_text(precise_vehicle.get("enginePower"), selected.get("enginePower")))
+    set_form("prpCitemCar.vehicleFuelType", _first_text(precise_vehicle.get("vehicleFuelType"), selected.get("vehicleFuelType")))
+    set_form("prpCmain.vehicleStyleUniqueId", _first_text(selected.get("vehicleStyleUniqueId"), vehicle.get("vehicleStyleUniqueId")))
+    set_form("prpCmain.presaleCarFlag", _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")))
+
+    defaults = _json_obj(body.get("defaultFields"))
+    if not _to_str(_default_value(defaults, PRODUCT_LOSS)).strip():
+        set_form("prpCitemKindVos[1].amount", _money_text(actual_value))
+
+    set_vehicle("purchasePrice", purchase_price)
+    set_vehicle("actualValue", _money_text(actual_value))
+    set_vehicle("modelCode", model_code)
+    set_vehicle("platModelCode", vehicle_model_code)
+    set_vehicle("selectedModelName", selected_model_name)
+    set_vehicle("selectedVehicleId", model_code)
+    set_vehicle("vehicleFgwCode", _model_search_code(vehicle_fgw_code))
+    set_vehicle("platformBrandId", brand_id)
+    set_vehicle("platformBrandIDNew", brand_id_new)
+
+    preflight["vehicleModelAutoAccepted"] = {
+        "accepted": True,
+        "reason": "平台提示车型不一致，已自动使用精确车型确认接口返回值重试一次",
+        "brandId": brand_id,
+        "vehicleName": selected_model_name,
+        "vehicleId": model_code,
+        "vehicleModelCode": vehicle_model_code,
+        "purchasePrice": purchase_price,
+    }
+    body["quoteForm"] = form
+    body["vehicleForm"] = vehicle
+    body["preflight"] = preflight
+    return body, changed
+
+
 def _vehicle_model_suffix_from_type(value: Any) -> str:
     text = re.sub(r"\s+", "", _to_str(value))
     for suffix in ("轿车", "客车", "货车", "越野车", "牵引车", "专项作业车", "摩托车", "挂车"):
         if suffix in text:
             return suffix
     return ""
+
+
+def _vehicle_brand_prefix(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value).strip())
+    if not text:
+        return ""
+    # OCR usually returns values such as "长安牌"; the platform search box works better without "牌".
+    text = re.sub(r"(品牌|车辆品牌|车辆名称|车辆品牌/车辆名称)", "", text)
+    text = re.sub(r"牌$", "", text)
+    return text.strip()
+
+
+def _vehicle_name_hint(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value).strip())
+    if not text:
+        return ""
+    if re.fullmatch(r"[A-Z0-9_-]{4,}", text, flags=re.I):
+        return ""
+    return text
+
+
+def _join_model_term(prefix: str, base: str, suffix: str = "") -> str:
+    term = re.sub(r"\s+", "", _to_str(base).strip()).strip("*")
+    if not term:
+        return ""
+    if prefix and not term.startswith(prefix):
+        term = f"{prefix}{term}"
+    if suffix and suffix not in term:
+        term = f"{term}{suffix}"
+    return term
 
 
 def _dedupe_model_terms(values: List[str]) -> List[str]:
@@ -864,7 +1414,14 @@ def _dedupe_model_terms(values: List[str]) -> List[str]:
     return out
 
 
-def _used_fuel_model_query_terms(model_name: Any, vehicle_type: Any = "", energy_model_suffix: Any = "") -> List[str]:
+def _used_fuel_model_query_terms(
+    model_name: Any,
+    vehicle_type: Any = "",
+    energy_model_suffix: Any = "",
+    *,
+    brand_name: Any = "",
+    vehicle_name: Any = "",
+) -> List[str]:
     raw = re.sub(r"\s+", "", _to_str(model_name).strip()).strip("*")
     if not raw:
         return []
@@ -877,7 +1434,12 @@ def _used_fuel_model_query_terms(model_name: Any, vehicle_type: Any = "", energy
     if energy_suffix and not re.search(r"(纯电动|插电式|混合动力|新能源)", no_brand_suffix):
         energy_base = re.sub(r"(轿车|客车|货车|越野车|牵引车|专项作业车|摩托车|挂车)$", "", no_brand_suffix)
         energy_typed = f"{energy_base}{energy_suffix}"
-    return _dedupe_model_terms([energy_typed, typed, no_brand_suffix, raw])
+    brand = _vehicle_brand_prefix(brand_name)
+    name_hint = _vehicle_name_hint(vehicle_name) or energy_suffix
+    brand_typed = _join_model_term(brand, no_brand_suffix, name_hint)
+    brand_plain = _join_model_term(brand, no_brand_suffix)
+    named_plain = _join_model_term("", no_brand_suffix, name_hint)
+    return _dedupe_model_terms([brand_typed, brand_plain, named_plain, energy_typed, typed, no_brand_suffix, raw])
 
 
 def _normalize_used_fuel_model_name(model_name: Any, vehicle_type: Any = "") -> str:
@@ -976,6 +1538,96 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
         return result
 
+    def _rebuild_quote_for_platform_vehicle_code(
+        self,
+        client: PiccProtocolClient,
+        request_body: Mapping[str, Any],
+        codes: List[str],
+    ) -> tuple[Dict[str, Any], bool]:
+        body = dict(_json_obj(request_body))
+        if not codes:
+            return body, False
+        defaults = _json_obj(body.get("defaultFields"))
+        vehicle = dict(_json_obj(body.get("vehicleForm")))
+        owner = dict(_json_obj(body.get("ownerForm")))
+        if not defaults or not vehicle or not owner:
+            return body, False
+
+        account_type_name = _normalize_account_type(body.get("accountTypeName") or USED_FUEL_ACCOUNT_TYPE)
+        profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
+        rows = _vehicle_rows(self._query_vehicle_candidates(client, vehicle))
+        selected: Dict[str, Any] = {}
+        selected_code = ""
+        wanted = {code.upper() for code in codes if code}
+        for row in rows:
+            row_codes = _vehicle_row_codes(row)
+            matched = next((code for code in row_codes if code in wanted), "")
+            if matched:
+                selected = dict(row)
+                selected_code = matched
+                break
+        if not selected:
+            return body, False
+
+        precise_result = self._query_precise_vehicle(client, vehicle, defaults, selected, profile=profile)
+        precise_rows = _vehicle_rows(precise_result)
+        precise_vehicle = _pick_best_vehicle_candidate(precise_rows, vehicle) if precise_rows else {}
+        actual_value_result = self._query_actual_value(client, vehicle, defaults, selected, precise_vehicle, profile=profile)
+        platform_purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
+        actual_value = _actual_value_from_response(actual_value_result, platform_purchase_price or selected.get("actualValue"))
+        if _profile_text(profile, "new_car_flag") and platform_purchase_price:
+            actual_value = platform_purchase_price
+
+        selected_price = _money(platform_purchase_price)
+        vehicle_model_code = _first_text(selected_code, selected.get("vehicleModelCode"), precise_vehicle.get("platModelCode"))
+        vehicle.update(
+            {
+                "purchasePrice": str(int(selected_price)) if selected_price == selected_price.to_integral() else str(selected_price),
+                "actualValue": _money_text(actual_value),
+                "modelCode": _first_text(selected.get("vehicleId"), selected.get("modelCode"), precise_vehicle.get("vehicleId")),
+                "platformModelCode": _first_text(selected.get("vehicleId"), selected.get("modelCode"), precise_vehicle.get("vehicleId")),
+                "platModelCode": vehicle_model_code,
+                "platformVehicleModelCode": vehicle_model_code,
+                "selectedModelName": _first_text(selected.get("vehicleName"), precise_vehicle.get("vehicleName"), vehicle.get("modelName")),
+                "selectedVehicleAlias": _first_text(selected.get("vehicleAlias"), precise_vehicle.get("vehicleAlias")),
+                "selectedVehicleId": _first_text(selected.get("vehicleId"), precise_vehicle.get("vehicleId")),
+                "vehicleFgwCode": _model_search_code(_vehicle_platform_fgw_code(vehicle, selected, precise_vehicle)),
+                "platformBrandId": _vehicle_platform_brand_id(selected, precise_vehicle),
+                "platformBrandIDNew": _vehicle_platform_brand_id_new(
+                    selected,
+                    precise_vehicle,
+                    _vehicle_platform_brand_id(selected, precise_vehicle),
+                ),
+            }
+        )
+        products = self._used_fuel_products(defaults, profile=profile, actual_value=actual_value, seat_count=vehicle.get("seatCount"))
+        quote_form = self._build_used_fuel_quote_form(defaults, vehicle, owner, selected, precise_vehicle, products, profile=profile)
+        preflight = dict(_json_obj(body.get("preflight")))
+        preflight.update(
+            {
+                "selectedVehicle": selected,
+                "preciseVehicle": precise_vehicle,
+                "actualValue": actual_value_result,
+                "vehicleModelAutoAccepted": {
+                    "accepted": True,
+                    "reason": "平台提示车型不一致，已自动使用平台返回车型码重试一次",
+                    "platformReturnedCode": selected_code,
+                    "vehicleName": quote_form.get("prpCitemCar.brandName"),
+                    "vehicleId": quote_form.get("prpCitemCar.modelCode"),
+                    "vehicleModelCode": quote_form.get("prpCmain.vehicleModelCode"),
+                    "purchasePrice": quote_form.get("prpCitemCar.purchasePrice"),
+                },
+            }
+        )
+        body["vehicleForm"] = vehicle
+        body["productForm"] = {
+            "products": products,
+            "sharedMainLimit": _checked(_default_value(defaults, PRODUCT_SHARED_LIMIT, True), default=True),
+        }
+        body["quoteForm"] = quote_form
+        body["preflight"] = preflight
+        return body, True
+
     def _quote_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         client: Optional[PiccProtocolClient] = None
         real_account_type = self._real_quote_account_type(ctx, quote_payload)
@@ -1034,8 +1686,28 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if is_real_quote:
                 runtime_stage = "prepare_quote"
                 request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
+                duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
+                if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
+                    return PlatformRuntimeResult(
+                        status="duplicate_quote_confirm_required",
+                        message=_to_str(duplicate_confirm_payload.get("duplicate_quote_warning")),
+                        data=success_data(client, extra=duplicate_confirm_payload),
+                    )
                 runtime_stage = "submit_quote"
-                quote_response = self._submit_used_fuel_quote(client, request_body)
+                try:
+                    quote_response = self._submit_used_fuel_quote(client, request_body)
+                except PiccBusinessRequestError as exc:
+                    platform_text = json.dumps(getattr(exc, "platform_response", None), ensure_ascii=False, default=str)
+                    if not (_vehicle_platform_mismatch_message(str(exc)) or _vehicle_platform_mismatch_message(platform_text)):
+                        raise
+                    platform_codes = _vehicle_platform_mismatch_codes(str(exc)) + _vehicle_platform_mismatch_codes(platform_text)
+                    corrected_body, corrected = self._rebuild_quote_for_platform_vehicle_code(client, request_body, platform_codes)
+                    if not corrected:
+                        corrected_body, corrected = _accept_platform_returned_vehicle_body(request_body)
+                    if not corrected:
+                        raise
+                    request_body = corrected_body
+                    quote_response = self._submit_used_fuel_quote(client, request_body)
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 runtime_stage = "postchecks"
@@ -1123,7 +1795,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             }
             if isinstance(exc, PiccBusinessRequestError):
                 data_payload["platform_response"] = _platform_debug_payload(getattr(exc, "platform_response", None))
-                data_payload["request_body"] = getattr(exc, "request_body", None) or data_payload["request_body"]
+                data_payload["request_body_envelope"] = data_payload["request_body"]
+                data_payload["request_form_body"] = getattr(exc, "request_body", None) or {}
+                data_payload["request_body"] = data_payload["request_form_body"] or data_payload["request_body"]
             if client is not None:
                 data_payload = success_data(client, extra=data_payload)
             return PlatformRuntimeResult(
@@ -1460,6 +2134,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 vehicle["purchasePrice"] = _clean_money_text(purchase_price)
 
         products = self._used_fuel_products(defaults, profile=profile, actual_value=actual_value, seat_count=vehicle.get("seatCount"))
+        joint_sale = _tujia_anshun_config(defaults)
         quote_form_error = ""
         try:
             quote_form = self._build_used_fuel_quote_form(
@@ -1498,6 +2173,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "products": products,
                 "sharedMainLimit": _checked(_default_value(defaults, PRODUCT_SHARED_LIMIT, True), default=True),
             },
+            "jointSaleForm": {
+                "tujiaAnshun": {
+                    **joint_sale,
+                    "offline": True,
+                },
+            },
             "quoteForm": quote_form,
             "defaultFields": defaults,
             "preflight": {
@@ -1512,6 +2193,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "selectedVehicle": selected,
                 "quoteFormError": quote_form_error,
                 "missingDefaultConfig": missing_config,
+                "jointSale": {
+                    "tujiaAnshun": {
+                        **joint_sale,
+                        "offline": True,
+                    },
+                },
             },
         }
 
@@ -1533,7 +2220,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
 
         search_result = self._query_vehicle_candidates(client, vehicle)
         candidates = _vehicle_rows(search_result)
-        selected = _pick_highest_price_vehicle(candidates)
+        selected = _pick_best_vehicle_candidate(candidates, vehicle)
         if not selected:
             tried_terms = [
                 _to_str(item).strip().rstrip("*")
@@ -1545,12 +2232,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
 
         precise_result = self._query_precise_vehicle(client, vehicle, defaults, selected, profile=profile)
         precise_rows = _vehicle_rows(precise_result)
-        precise_vehicle = precise_rows[0] if precise_rows else {}
+        precise_vehicle = _pick_best_vehicle_candidate(precise_rows, vehicle) if precise_rows else {}
         actual_value_result = self._query_actual_value(client, vehicle, defaults, selected, precise_vehicle, profile=profile)
-        actual_value = _actual_value_from_response(actual_value_result, selected.get("actualValue"))
+        platform_purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
+        actual_value = _actual_value_from_response(actual_value_result, platform_purchase_price or selected.get("actualValue"))
+        if _profile_text(profile, "new_car_flag") and platform_purchase_price:
+            actual_value = platform_purchase_price
 
-        selected_price = _money(_first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT")))
-        search_code = _model_search_code(_first_text(selected.get("VEHICLE_FGW_CODE"), selected.get("vehicleFgwCode"), vehicle.get("modelName")))
+        selected_price = _money(platform_purchase_price)
+        search_code = _model_search_code(_vehicle_platform_fgw_code(vehicle, selected, precise_vehicle))
         taxabate_result = {}
         if search_code:
             try:
@@ -1568,12 +2258,18 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             {
                 "purchasePrice": str(int(selected_price)) if selected_price == selected_price.to_integral() else str(selected_price),
                 "actualValue": _money_text(actual_value),
-                "modelCode": _first_text(precise_vehicle.get("vehicleId"), selected.get("vehicleId"), selected.get("modelCode")),
+                "modelCode": _first_text(selected.get("vehicleId"), selected.get("modelCode"), precise_vehicle.get("vehicleId")),
                 "platModelCode": _first_text(precise_vehicle.get("platModelCode"), selected.get("platModelCode")),
                 "selectedModelName": _first_text(precise_vehicle.get("vehicleName"), selected.get("vehicleName"), vehicle.get("modelName")),
                 "selectedVehicleAlias": _first_text(selected.get("vehicleAlias"), precise_vehicle.get("vehicleAlias")),
                 "selectedVehicleId": _first_text(precise_vehicle.get("vehicleId"), selected.get("vehicleId")),
                 "vehicleFgwCode": search_code,
+                "platformBrandId": _vehicle_platform_brand_id(selected, precise_vehicle),
+                "platformBrandIDNew": _vehicle_platform_brand_id_new(
+                    selected,
+                    precise_vehicle,
+                    _vehicle_platform_brand_id(selected, precise_vehicle),
+                ),
             }
         )
         checker_info = self._query_car_checker(client, defaults)
@@ -1583,6 +2279,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         products = self._used_fuel_products(defaults, profile=profile, actual_value=actual_value, seat_count=vehicle.get("seatCount"))
         quote_form = self._build_used_fuel_quote_form(defaults, vehicle, owner, selected, precise_vehicle, products, profile=profile)
         prechecks = self._run_used_fuel_quote_prechecks(client, defaults, quote_form)
+        joint_sale = self._query_tujia_anshun_plan_best_effort(client, defaults, quote_form)
 
         return {
             "requestId": f"{_profile_text(profile, 'request_id_prefix', 'picc-motor')}-{uuid.uuid4().hex}",
@@ -1594,21 +2291,111 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "products": products,
                 "sharedMainLimit": _checked(_default_value(defaults, PRODUCT_SHARED_LIMIT, True), default=True),
             },
+            "jointSaleForm": {
+                "tujiaAnshun": joint_sale,
+            },
             "quoteForm": quote_form,
             "defaultFields": defaults,
             "preflight": {
                 "vehicleSearch": {
                     "candidateCount": len(candidates),
-                    "selectedBy": "highest_purchase_price",
+                    "selectedBy": "model_brand_energy_match_then_highest_purchase_price",
                     "selectedPrice": vehicle.get("purchasePrice"),
+                    "selectedScore": _vehicle_candidate_score(selected, vehicle),
                 },
+                "selectedVehicle": selected,
                 "preciseVehicle": precise_vehicle,
                 "actualValue": actual_value_result,
                 "taxabate": taxabate_result,
                 "carChecker": checker_info,
                 "quotePrechecks": prechecks,
+                "jointSale": {
+                    "tujiaAnshun": joint_sale,
+                },
             },
         }
+
+    def _query_tujia_anshun_plan_best_effort(
+        self,
+        client: PiccProtocolClient,
+        defaults: Mapping[str, Any],
+        quote_form: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        config = _tujia_anshun_config(defaults)
+        if not config.get("enabled"):
+            return {
+                **config,
+                "attempted": False,
+                "success": True,
+                "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
+                "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
+                "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+            }
+        monopoly_code = _to_str(_field_value(defaults, "专管代码", "monopolyCode")).strip()
+        try:
+            data = client.request_json(
+                "GET",
+                JOINT_SALE_PLAN_INFO_PATH,
+                purpose="business",
+                params={
+                    "riskCode": PICC_TUJIA_ANSHUN_RISK_CODE,
+                    "brandId": PICC_TUJIA_ANSHUN_BRAND_ID,
+                    "serviceGroupTypeCode": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+                    "monopolyCode": monopoly_code,
+                },
+                headers={
+                    "Referer": f"{client.config.base_url}/khyxui/my-tools/quotation",
+                },
+            )
+            _ensure_platform_success(data, action="途家安顺保额查询")
+            rows = _plan_rows_from_response(data)
+            selected = _pick_joint_sale_plan_by_premium(data, config.get("premium"))
+            if not selected:
+                return {
+                    **config,
+                    "attempted": True,
+                    "success": False,
+                    "amount": "0",
+                    "candidate_count": len(rows),
+                    "match_count": 0,
+                    "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
+                    "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
+                    "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+                    "message": f"未查询到保费为{config.get('premium')}的途家安顺方案",
+                }
+            amount = _clean_money_text(selected.get("planAmount"), "0")
+            premium = _clean_money_text(selected.get("planPremium"), _to_str(config.get("premium") or "398"))
+            return {
+                **config,
+                "attempted": True,
+                "success": True,
+                "premium": premium,
+                "amount": amount,
+                "candidate_count": len(rows),
+                "match_count": _safe_int_local(selected.get("_matchCount"), 1),
+                "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
+                "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
+                "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+                "selected_plan": {
+                    "planName": _to_str(selected.get("planName")).strip(),
+                    "planCode": _to_str(selected.get("planCode")).strip(),
+                    "planPremium": premium,
+                    "planAmount": amount,
+                },
+                "selection_rule": "同保费多方案时选择保额最高方案",
+            }
+        except Exception as exc:
+            return {
+                **config,
+                "attempted": True,
+                "success": False,
+                "amount": "0",
+                "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
+                "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
+                "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+                "error_code": exc.__class__.__name__,
+                "message": str(exc)[:300] or exc.__class__.__name__,
+            }
 
     def _query_car_checker(self, client: PiccProtocolClient, defaults: Mapping[str, Any]) -> Dict[str, Any]:
         checker_code = _to_str(
@@ -1675,9 +2462,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
             _ensure_platform_success(duplicate_data, action="重复车辆校验")
             duplicate_payload = _json_obj(_json_obj(duplicate_data).get("data"))
-            out["duplicateVin"] = {"total": duplicate_payload.get("total", 0)}
+            duplicate_warning = _duplicate_insured_vin_warning(vin, duplicate_payload)
+            out["duplicateVin"] = {
+                "total": duplicate_payload.get("total", 0),
+                "message": duplicate_warning,
+                "list": duplicate_payload.get("list") if isinstance(duplicate_payload.get("list"), list) else [],
+            }
             if _safe_int_local(duplicate_payload.get("total"), 0) > 0:
-                out["duplicateVin"]["warning"] = "平台返回已有历史记录，本次继续提交并以最终报价接口结果为准"
+                out["duplicateVin"]["warning"] = duplicate_warning or "平台返回已有历史记录，本次继续提交并以最终报价接口结果为准"
         return out
 
     def _build_used_fuel_quote_form(
@@ -1709,19 +2501,29 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         carchecker_name = _first_text(vehicle.get("carchecker"), _field_value(defaults, "验车人姓名", "验车人", "carCeckName"))
         main_com_code = _first_text(vehicle.get("mainComCode"), _field_value(defaults, "归属机构代码", "机构代码", "comCode"))
         query_area = _first_text(_field_value(defaults, "查询区域代码", "queryArea"), (main_com_code[:2] + "0000") if len(main_com_code) >= 2 else "")
-        model_code = _first_text(precise_vehicle.get("vehicleId"), vehicle.get("modelCode"), selected.get("vehicleId"), selected.get("modelCode"))
-        vehicle_model_code = _first_text(precise_vehicle.get("platModelCode"), selected.get("vehicleModelCode"), vehicle.get("platModelCode"))
-        purchase_price = _clean_money_text(vehicle.get("purchasePrice"), "0")
-        actual_value = _money_text(vehicle.get("actualValue"))
-        brand_id = _first_text(selected.get("brandId"), precise_vehicle.get("brandId"))
-        vehicle_fgw_code = _first_text(
-            vehicle.get("vehicleFgwCode"),
-            selected.get("vehicleFgwCode"),
-            precise_vehicle.get("VEHICLE_FGW_CODE"),
+        model_code = _first_text(
+            vehicle.get("platformModelCode"),
+            vehicle.get("modelCode"),
+            selected.get("vehicleId"),
+            selected.get("modelCode"),
+            precise_vehicle.get("vehicleId"),
         )
-        search_code = _first_text(selected.get("searchCode"))
-        if not search_code:
-            search_code = f"{brand_id}-{vehicle_fgw_code}" if brand_id and vehicle_fgw_code else vehicle_fgw_code
+        vehicle_model_code = _first_text(
+            vehicle.get("platformVehicleModelCode"),
+            precise_vehicle.get("platModelCode"),
+            selected.get("vehicleModelCode"),
+            vehicle.get("platModelCode"),
+        )
+        platform_purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
+        purchase_price = _clean_money_text(_first_text(platform_purchase_price, vehicle.get("purchasePrice")), "0")
+        actual_value = _money_text(_first_text(purchase_price if _profile_text(prof, "new_car_flag") else "", vehicle.get("actualValue")))
+        brand_id = _first_text(vehicle.get("platformBrandId"), _vehicle_platform_brand_id(selected, precise_vehicle))
+        brand_id_new = _first_text(
+            vehicle.get("platformBrandIDNew"),
+            _vehicle_platform_brand_id_new(selected, precise_vehicle, brand_id),
+        )
+        vehicle_fgw_code = _vehicle_platform_fgw_code(vehicle, selected, precise_vehicle)
+        search_code = _vehicle_platform_search_seqno(selected, brand_id, vehicle_fgw_code)
         ton_count = _first_text(precise_vehicle.get("tonCount"), selected.get("tonCount"), selected.get("vehicleTonnage"))
         if _money(ton_count) == 0:
             ton_count = ""
@@ -1791,10 +2593,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.useNatureCode": _to_str(vehicle.get("useNatureCode") or "211"),
             "prpCitemCar.enrollDate": _to_str(vehicle.get("enrollDate")),
             "prpCitemCar.useYears": _use_years(vehicle.get("enrollDate")),
-            "prpCitemCar.brandName": _first_text(vehicle.get("modelName"), selected.get("vehicleName")),
+            "prpCitemCar.brandName": _first_text(
+                vehicle.get("selectedModelName"),
+                precise_vehicle.get("vehicleName"),
+                selected.get("vehicleName"),
+                vehicle.get("modelName"),
+            ),
             "prpCitemCar.brandId": brand_id,
-            "prpCitemCar.brandIDNew": _first_text(selected.get("brandIDNew"), f"{brand_id}0" if brand_id else ""),
-            "prpCitemCar.vehicleMaker": _first_text(selected.get("vehicleMaker"), precise_vehicle.get("vehicleMaker")),
+            "prpCitemCar.brandIDNew": brand_id_new,
+            "prpCitemCar.vehicleMaker": _first_text(selected.get("vehicleMaker"), precise_vehicle.get("vehicleMakerid"), precise_vehicle.get("vehicleMaker")),
             "prpCitemCar.familyId": _first_text(selected.get("familyId"), vehicle.get("familyId")),
             "prpCitemCar.modelDemandNo": model_code,
             "prpCitemCar.modelCode": model_code,
@@ -1871,6 +2678,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "softWareEquipments[0].serialNo": "1",
             "hardWareEquipments[0].serialNo": "1",
             "vehicleStyleFlag": "0",
+            "prpCmain.vehicleStyleUniqueId": _first_text(selected.get("vehicleStyleUniqueId"), vehicle.get("vehicleStyleUniqueId")),
+            "prpCmain.presaleCarFlag": _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")),
             "firstQuote": "0",
             "notBindingFlag": "0",
             "energyFlag": _profile_text(prof, "energy_flag", "0"),
@@ -1954,6 +2763,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         next_day = _next_day_text()
         vehicle_type = _first_text(data.get("vehicle_type"), _field_value(defaults, "车辆类型"))
         raw_model_name = _first_text(data.get("vehicle_model"), _field_value(defaults, "车型名称", "品牌型号"))
+        vehicle_brand_name = _first_text(
+            data.get("vehicle_brand_name"),
+            _field_value(defaults, "车辆品牌/车辆名称", "车辆品牌", "品牌名称"),
+        )
+        vehicle_name_hint = _first_text(
+            data.get("vehicle_name"),
+            data.get("car_name"),
+            _field_value(defaults, "车辆名称"),
+        )
         engine_no = _first_text(data.get("engine_no"), _field_value(defaults, "发动机号"))
         vin = _first_text(data.get("vin"), _field_value(defaults, "VIN/车架号", "车架号"))
         license_no = _first_text(data.get("plate_no"), _field_value(defaults, "号牌号码"))
@@ -1966,6 +2784,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if not enroll_date and _profile_text(prof, "enroll_date_fallback") == "today":
             enroll_date = _today_text()
+        model_terms = _used_fuel_model_query_terms(
+            raw_model_name,
+            vehicle_type,
+            "纯电动轿车" if _profile_text(prof, "is_energy_car") == "1" else "",
+            brand_name=vehicle_brand_name,
+            vehicle_name=vehicle_name_hint,
+        )
         return {
             "licenseNo": license_no,
             "licenseType": _first_text(_field_value(defaults, "号牌种类"), "02"),
@@ -1976,8 +2801,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "enrollDate": enroll_date,
             "startDateBI": _first_text(_date_text(data.get("commercial_start_date")), _date_text(_field_value(defaults, "商业起保日期")), next_day),
             "startDateCI": _first_text(_date_text(data.get("compulsory_start_date")), _date_text(_field_value(defaults, "交强起保日期")), next_day),
-            "modelName": _normalize_used_fuel_model_name(raw_model_name, vehicle_type),
+            "modelName": model_terms[0] if model_terms else raw_model_name,
             "rawModelName": raw_model_name,
+            "brandNameHint": vehicle_brand_name,
+            "vehicleNameHint": vehicle_name_hint,
             "vehicleType": vehicle_type,
             "energyModelSuffix": "纯电动轿车" if _profile_text(prof, "is_energy_car") == "1" else "",
             "seatCount": _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"), "5"),
@@ -1991,6 +2818,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             model_name,
             vehicle.get("vehicleType"),
             vehicle.get("energyModelSuffix"),
+            brand_name=vehicle.get("brandNameHint"),
+            vehicle_name=vehicle.get("vehicleNameHint"),
         ) or [model_name]
         last_data: Any = {}
         for term in terms:
@@ -2099,7 +2928,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "enrollDate": vehicle.get("enrollDate") or "",
             "useNatureCode": vehicle.get("useNatureCode") or "211",
             "startDateBI": vehicle.get("startDateBI") or _next_day_text(),
-            "purchasePrice": _first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT")),
+            "purchasePrice": _vehicle_platform_purchase_price(selected, precise_vehicle),
         }
         data = client.request_json(
             "POST",
@@ -2165,6 +2994,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         data = _json_obj(_json_obj(quote_response).get("data"))
         vehicle = _json_obj(request_body.get("vehicleForm"))
         owner = _json_obj(request_body.get("ownerForm"))
+        form = _json_obj(request_body.get("quoteForm"))
+        preflight = _json_obj(request_body.get("preflight"))
+        selected_vehicle = _json_obj(preflight.get("selectedVehicle"))
+        precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
         item_rows = _json_obj(quote_response).get("itemKindTempList")
         if not isinstance(item_rows, list):
             item_rows = data.get("itemKindTempList")
@@ -2187,9 +3020,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             commercial_premium += premium
             coverage_items.append(
                 {
+                    "code": kind_code,
                     "name": name,
                     "amount": _clean_money_text(amount),
+                    "amount_text": _proposal_kind_amount_text(row, seat_count=_first_text(vehicle.get("seatCount"), form.get("prpCitemCar.seatCount"))),
                     "premium": _money_text(premium),
+                    "premium_text": _proposal_money_yuan(premium),
                 }
             )
 
@@ -2215,14 +3051,87 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         picc_score = _to_str(data.get("piccScore")).strip()
         if picc_score:
             risk_score = _safe_int_local(picc_score, 0)
-        warning = _strip_platform_error_code(data.get("errorMessage"))
+        warning_parts = []
+        quote_warning = _strip_platform_error_code(data.get("errorMessage"))
+        if quote_warning:
+            warning_parts.append(quote_warning)
+        duplicate_warning = _to_str(
+            _json_obj(
+                _json_obj(
+                    _json_obj(request_body.get("preflight")).get("quotePrechecks")
+                ).get("duplicateVin")
+            ).get("warning")
+        ).strip()
+        if duplicate_warning:
+            warning_parts.append(duplicate_warning)
+        tujia_anshun = _tujia_anshun_from_request_body(request_body)
+        if tujia_anshun.get("enabled") and tujia_anshun.get("success") is False:
+            msg = _to_str(tujia_anshun.get("message")).strip()
+            warning_parts.append(f"途家安顺保额查询失败：{msg or '平台未返回可用方案'}")
+        warning = "\n".join(part for part in warning_parts if part)
 
         claim_bi = _safe_int_local(_json_obj(data.get("carQuoteRiskItemBIRsp")).get("claimTimes"), _safe_int_local(data.get("lastDamagedBI"), 0))
         claim_ci = _safe_int_local(_json_obj(data.get("carQuoteRiskItemCIRsp")).get("claimTimes"), _safe_int_local(data.get("lastDamagedCI"), 0))
+        joint_sales_premium = _money(data.get("sumYelPremium"))
+        tujia_premium = _money(tujia_anshun.get("premium"))
+        if not joint_sales_premium and tujia_premium:
+            joint_sales_premium = tujia_premium
+        joint_sales_amount = _money(tujia_anshun.get("amount"))
+        total_without_vehicle_tax = commercial_premium + compulsory_premium + joint_sales_premium
+        total_with_vehicle_tax = total_without_vehicle_tax + vehicle_tax
+        # Keep the historical field as the final payable total while exposing both table totals explicitly.
+        total = total_with_vehicle_tax
+        vehicle_type_code = _first_text(form.get("prpCitemCar.carKindCode"), vehicle.get("carKindCode"), "A01")
+        use_nature_code = _first_text(form.get("prpCitemCar.useNatureCode"), vehicle.get("useNatureCode"), "211")
+        ton_value = _first_text(
+            form.get("prpCitemCar.tonCount"),
+            vehicle.get("tonCount"),
+            precise_vehicle.get("tonCount"),
+            selected_vehicle.get("tonCount"),
+            selected_vehicle.get("vehicleTonnage"),
+            "0",
+        )
+        seat_value = _first_text(form.get("prpCitemCar.seatCount"), vehicle.get("seatCount"), selected_vehicle.get("vehicleSeat"), "5")
+        proposal_info = {
+            "insured_name": _first_text(data.get("insueredName"), data.get("insuredName"), owner.get("ownerName"), form.get("carOwner")),
+            "plate_no": _first_text(data.get("licenseNo"), form.get("prpCitemCar.licenseNo"), vehicle.get("licenseNo")),
+            "engine_no": _first_text(data.get("engineNo"), form.get("prpCitemCar.engineNo"), vehicle.get("engineNo")),
+            "vin": _first_text(data.get("vinNo"), data.get("frameNo"), form.get("prpCitemCar.vinNo"), vehicle.get("vin")),
+            "vehicle_type": _code_label(vehicle_type_code, PICC_CAR_KIND_LABELS, "客车"),
+            "vehicle_usage": _code_label(use_nature_code, PICC_USE_NATURE_LABELS, "家庭自用汽车"),
+            "vehicle_model": _first_text(
+                vehicle.get("selectedModelName"),
+                precise_vehicle.get("vehicleName"),
+                selected_vehicle.get("vehicleName"),
+                form.get("prpCitemCar.brandName"),
+                vehicle.get("modelName"),
+            ),
+            "enroll_date": _first_text(_date_text(form.get("prpCitemCar.enrollDate")), _date_text(vehicle.get("enrollDate"))),
+            "ton_count": f"{_clean_money_text(ton_value, '0')}千克",
+            "seat_count": f"{_safe_int_local(seat_value, 0)}人" if _to_str(seat_value).strip() else "-",
+            "purchase_price": _proposal_money_yuan(
+                _first_text(form.get("prpCitemCar.purchasePrice"), vehicle.get("purchasePrice"), selected_vehicle.get("purchasePrice")),
+                keep_decimal=False,
+            ),
+            "claim_summary": _proposal_claim_summary(data, claim_bi, claim_ci),
+            "bi_start_date": _proposal_start_datetime(
+                form.get("prpCmain.startDate"),
+                form.get("prpCmain.starthourbi"),
+                form.get("prpCmain.startminutebi"),
+            ),
+            "ci_start_date": _proposal_start_datetime(
+                form.get("prpCmain.startDateCI"),
+                form.get("prpCmain.starthourci"),
+                form.get("prpCmain.startminuteci"),
+            ),
+        }
         result_card = {
-            "title": "报价结果",
+            "style": "picc_proposal_table",
+            "title": "中国人保投保方案",
             "include_tax": True,
-            "total_premium": _money_text(total),
+            "total_premium": _money_text(total_with_vehicle_tax),
+            "total_without_vehicle_tax": _money_text(total_without_vehicle_tax),
+            "total_with_vehicle_tax": _money_text(total_with_vehicle_tax),
             "commercial_premium": _money_text(commercial_premium),
             "compulsory_premium": _money_text(compulsory_premium),
             "vehicle_tax": _money_text(vehicle_tax),
@@ -2231,14 +3140,34 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "back": _money_text(data.get("prePayTax")),
                 "late_fee": _money_text(data.get("delayPayTax")),
             },
-            "joint_sales_premium": _money_text(data.get("sumYelPremium")),
+            "joint_sales_label": "途家安顺",
+            "joint_sales_display_label": "途顺家安组合保险",
+            "joint_sales_premium": _money_text(joint_sales_premium),
+            "joint_sales_amount": _money_text(joint_sales_amount),
+            "joint_sales_plan_name": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planName")).strip(),
+            "joint_sales_plan_code": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planCode")).strip(),
             "driver_accident_premium": _money_text(data.get("DDAPremium")),
             "claim_business_count": claim_bi,
             "claim_compulsory_count": claim_ci,
             "risk_score": risk_score,
             "coverage_items": coverage_items,
+            "proposal_info": proposal_info,
+            "proposal_coverage_items": [
+                {
+                    **item,
+                    "name": PICC_PROPOSAL_KIND_NAME_BY_CODE.get(_to_str(item.get("code")).strip()) or _to_str(item.get("name")).strip(),
+                }
+                for item in coverage_items
+            ],
             "transfer_available": True,
         }
+        price_items = [
+            {"name": "商业险", "amount": float(commercial_premium)},
+            {"name": "交强险", "amount": float(compulsory_premium)},
+            {"name": "车船税", "amount": float(vehicle_tax)},
+        ]
+        if joint_sales_premium:
+            price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
         return {
             "mode": _profile_text(profile, "mode", "picc_motor_real"),
             "status": "quoted",
@@ -2251,12 +3180,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "owner_name": owner.get("ownerName"),
             "vehicle_model": vehicle.get("selectedModelName") or vehicle.get("modelName"),
             "vehicle_actual_value": _money_text(vehicle.get("actualValue")),
-            "price_items": [
-                {"name": "商业险", "amount": float(commercial_premium)},
-                {"name": "交强险", "amount": float(compulsory_premium)},
-                {"name": "车船税", "amount": float(vehicle_tax)},
-            ],
+            "joint_sales": tujia_anshun,
+            "joint_sales_premium": _money_text(joint_sales_premium),
+            "joint_sales_amount": _money_text(joint_sales_amount),
+            "price_items": price_items,
             "premium_total": float(total),
+            "risk_score": risk_score,
             "result_card": result_card,
             "request_body": request_body,
             "platform_warning": warning,
@@ -2309,6 +3238,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         driver_amount = _money(next((_json_obj(p).get("insuredAmount") for p in products if _json_obj(p).get("name") == PRODUCT_DRIVER), 0))
         passenger_amount = _money(next((_json_obj(p).get("insuredAmount") for p in products if _json_obj(p).get("name") == PRODUCT_PASSENGER), 0))
         medical_amount = _money(next((_json_obj(p).get("insuredAmount") for p in products if _json_obj(p).get("name") == PRODUCT_MEDICAL_THIRD), 0))
+        tujia_anshun = _tujia_anshun_from_request_body(request_body)
+        joint_sales_premium = _money(tujia_anshun.get("premium"))
+        joint_sales_amount = _money(tujia_anshun.get("amount"))
 
         loss_premium = (loss_amount * Decimal("0.01815")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         third_premium = (third_amount / Decimal("10000") * Decimal("4.13")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -2327,6 +3259,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             {"name": PRODUCT_PASSENGER, "amount": str(int(passenger_amount)), "premium": _money_text(passenger_premium)},
             {"name": PRODUCT_MEDICAL_THIRD, "amount": str(int(medical_amount)), "premium": _money_text(medical_premium)},
         ]
+        price_items = [
+            {"name": "商业险", "amount": float(commercial_premium)},
+            {"name": "交强险", "amount": float(compulsory_premium)},
+            {"name": "车船税", "amount": float(vehicle_tax)},
+        ]
+        if joint_sales_premium:
+            price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
         return {
             "mode": _profile_text(profile, "stub_mode", "picc_motor_preflight_stub"),
             "status": "quoted",
@@ -2337,11 +3276,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "owner_name": owner.get("ownerName"),
             "vehicle_model": vehicle.get("selectedModelName") or vehicle.get("modelName"),
             "vehicle_actual_value": _money_text(vehicle.get("actualValue")),
-            "price_items": [
-                {"name": "商业险", "amount": float(commercial_premium)},
-                {"name": "交强险", "amount": float(compulsory_premium)},
-                {"name": "车船税", "amount": float(vehicle_tax)},
-            ],
+            "joint_sales": tujia_anshun,
+            "joint_sales_premium": _money_text(joint_sales_premium),
+            "joint_sales_amount": _money_text(joint_sales_amount),
+            "price_items": price_items,
             "premium_total": float(total),
             "request_body": request_body,
             "result_card": {
@@ -2356,7 +3294,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "back": "0.00",
                     "late_fee": "0.00",
                 },
-                "joint_sales_premium": "0.00",
+                "joint_sales_label": "途家安顺",
+                "joint_sales_premium": _money_text(joint_sales_premium),
+                "joint_sales_amount": _money_text(joint_sales_amount),
+                "joint_sales_plan_name": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planName")).strip(),
+                "joint_sales_plan_code": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planCode")).strip(),
                 "driver_accident_premium": "0.00",
                 "claim_business_count": 0,
                 "claim_compulsory_count": 0,
