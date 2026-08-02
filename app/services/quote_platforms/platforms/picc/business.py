@@ -53,6 +53,7 @@ CAL_ACTUAL_VALUE_PATH = "/khyx/newFront/price/calActualVal.do"
 VERIFY_AGENT_CONTROL_PATH = "/khyx/newFront/qth/price/verifyPersonalAgtControl.do"
 DUPLICATE_INSURED_VIN_PATH = "/khyx/newFront/qth/price/duplicateInsuredVinNo.do"
 JOINT_SALE_PLAN_INFO_PATH = "/khyx/newFront/prpall/common/choosePlanInfoForJointSale.do"
+MONOPOLY_QUERY_PATH = "/khyx/newFront/qth/myinfo/monopoly/query.do"
 QUERY_QUALITY_FLAG_PATH = "/khyx/newFront/qth/price/queryQualityFlag.do"
 GET_CLUB_GIFT_DISPLAY_INFO_PATH = "/khyx/newFront/qth/price/getClubGiftDisplayInfo.do"
 QUERY_CAR_CHECKER_PATH = "/khyx/newFront/common/queryCarchecker.do"
@@ -77,6 +78,7 @@ PRODUCT_PASSENGER = "车上人员责任险（乘客）"
 PRODUCT_SHARED_LIMIT = "共享主险限额"
 PRODUCT_MEDICAL_THIRD = "医保外医疗费用责任险（第三者责任险）"
 PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
+PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
 PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_COMPULSORY: ("交强", "交强险"),
@@ -225,8 +227,15 @@ PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
     "归属机构代码": "36040200",
     "操作机构代码": "36040213",
     "操作配置ID": "QT360402131762390540324",
-    "验车人工号": "A360400761",
-    "验车人姓名": "王飞武",
+    "验车人工号": "24090664",
+    "验车人姓名": "陈宛杰",
+    "送修码启用": "1",
+    "送修码": "3604731000027",
+    "送修码名称": "濂溪区金鑫汽车修理厂",
+    "专管代码": "3604731000027",
+    "专管名称": "濂溪区金鑫汽车修理厂",
+    "monopolyCode": "3604731000027",
+    "monopolyName": "濂溪区金鑫汽车修理厂",
     "查询区域代码": "360000",
     "税务机关代码": "13604010000",
     "税务机关名称": "国家税务总局九江市税务局第一税务分局",
@@ -503,6 +512,50 @@ def _profile_product_default(
 ) -> Any:
     profile_defaults = _json_obj(profile.get("product_defaults"))
     return _default_value(defaults, canonical_name, profile_defaults.get(canonical_name, fallback))
+
+
+def _canonical_product_name(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value).strip())
+    if not text:
+        return ""
+    low = text.lower()
+    for canonical, aliases in PRODUCT_FIELD_ALIASES.items():
+        candidates = {canonical, *aliases}
+        for alias in candidates:
+            alias_text = re.sub(r"\s+", "", _to_str(alias).strip())
+            if alias_text and (text == alias_text or low == alias_text.lower()):
+                return canonical
+    return text
+
+
+def _product_exclusions(defaults: Mapping[str, Any]) -> set[str]:
+    raw = None
+    for key in (PRODUCT_EXCLUSIONS_KEY, "禁用险种", "排除险种"):
+        if key in defaults:
+            raw = defaults.get(key)
+            break
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return set()
+        parsed: Any = None
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+        items = parsed if isinstance(parsed, list) else re.split(r"[,，、;；\s]+", text)
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+    return {name for item in items if (name := _canonical_product_name(item))}
+
+
+def _product_excluded(defaults: Mapping[str, Any], product_name: str) -> bool:
+    return _canonical_product_name(product_name) in _product_exclusions(defaults)
 
 
 def _first_text(*values: Any) -> str:
@@ -860,11 +913,30 @@ def _checked(value: Any, default: bool = True) -> bool:
     text = _to_str(value).strip().lower()
     if not text:
         return default
-    if text in {"0", "false", "no", "n", "否", "不", "不选", "关闭"}:
+    if text in {"0", "false", "no", "n", "否", "不", "不选", "不勾选", "取消", "关闭", "去掉"}:
         return False
-    if text in {"1", "true", "yes", "y", "是", "选", "勾选", "开启"}:
+    if text in {"1", "true", "yes", "y", "是", "选", "勾选", "开启", "打开"}:
         return True
     return default
+
+
+def _repair_code_enabled(defaults: Mapping[str, Any]) -> bool:
+    return _checked(
+        _field_value(defaults, "送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus", fallback="1"),
+        default=True,
+    )
+
+
+def _repair_code_value(defaults: Mapping[str, Any]) -> str:
+    if not _repair_code_enabled(defaults):
+        return ""
+    return _first_text(_field_value(defaults, "送修码", "送修码代码", "专管代码", "monopolyCode"))
+
+
+def _repair_code_name(defaults: Mapping[str, Any]) -> str:
+    if not _repair_code_enabled(defaults):
+        return ""
+    return _first_text(_field_value(defaults, "送修码名称", "送修码机构", "专管名称", "monopolyName"))
 
 
 def _duplicate_quote_confirmed(quote_payload: Mapping[str, Any], request_body: Mapping[str, Any]) -> bool:
@@ -1065,12 +1137,12 @@ def _proposal_claim_summary(data: Mapping[str, Any], claim_bi: int, claim_ci: in
     return f"商业险连续承保年数{years_bi}年，连续承保期间出险次数{claim_bi}次，交强险{claim_ci}次"
 
 
-def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "") -> str:
+def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "", shared_main_limit: bool = True) -> str:
     code = _to_str(row.get("kindCode")).strip()
     amount = _money(row.get("amount"))
     unit_amount = _money(row.get("unitAmount"))
     seats = max(1, _safe_int_local(seat_count, 5))
-    if code == "051063":
+    if code == "051063" and shared_main_limit:
         return "共享主险限额"
     if amount <= 0:
         return "-"
@@ -1080,7 +1152,7 @@ def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "") 
         per_seat = unit_amount if unit_amount > 0 else amount / Decimal(max(seats - 1, 1))
         quantity = max(1, int((amount / per_seat).quantize(Decimal("1"), rounding=ROUND_HALF_UP))) if per_seat else max(seats - 1, 1)
         return f"{_proposal_wan_text(per_seat).replace('万元', '')}万元/座*{quantity}"
-    if code in {"051051", "051052", "051074", "051085"}:
+    if code in {"051051", "051052", "051063", "051074", "051085"}:
         return _proposal_wan_text(amount)
     return _proposal_money_yuan(amount, keep_decimal=True)
 
@@ -1333,7 +1405,7 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     set_form("prpCmain.presaleCarFlag", _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")))
 
     defaults = _json_obj(body.get("defaultFields"))
-    if not _to_str(_default_value(defaults, PRODUCT_LOSS)).strip():
+    if not _product_excluded(defaults, PRODUCT_LOSS) and not _to_str(_default_value(defaults, PRODUCT_LOSS)).strip():
         set_form("prpCitemKindVos[1].amount", _money_text(actual_value))
 
     set_vehicle("purchasePrice", purchase_price)
@@ -1470,6 +1542,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
     async def quote(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await asyncio.to_thread(self._quote_sync, ctx, quote_payload)
 
+    async def query_joint_sales_plan(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await asyncio.to_thread(self._query_joint_sales_plan_sync, ctx, quote_payload)
+
+    async def query_repair_codes(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await asyncio.to_thread(self._query_repair_codes_sync, ctx, quote_payload)
+
     def _client(self, ctx: PlatformAccountContext) -> PiccProtocolClient:
         snapshot = snapshot_from_context(ctx)
         if snapshot is None:
@@ -1537,6 +1615,188 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
             )
         return result
+
+    def _query_joint_sales_plan_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        payload = _json_obj(quote_payload)
+        premium = _money(payload.get("premium"), "0")
+        premium_text = _clean_money_text(premium)
+        if premium <= 0:
+            plan = {
+                "enabled": False,
+                "attempted": False,
+                "success": True,
+                "premium": "0",
+                "amount": "0",
+                "reason": "途家安顺保费为0，按规则不查询保额",
+                "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
+                "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
+                "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
+            }
+            return PlatformRuntimeResult(
+                status="success",
+                message="途家安顺保费为0，保额已按规则置为0",
+                data={"joint_sales_plan": plan, "premium": "0", "amount": "0", "query_skipped": True},
+            )
+
+        client: Optional[PiccProtocolClient] = None
+        try:
+            client = self._client(ctx)
+            probe = client.request_json(
+                "GET",
+                KEEPALIVE_PATH,
+                purpose="business",
+                params=KEEPALIVE_PARAMS,
+                headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
+            )
+            if isinstance(probe, Mapping) and int(probe.get("status", -1)) != 0:
+                status_code = int(probe.get("status", -1))
+                runtime_status = "expired" if status_code == 16 else "failed"
+                return PlatformRuntimeResult(
+                    status=runtime_status,
+                    message=str(probe.get("statusText") or probe),
+                    data=success_data(
+                        client,
+                        extra={
+                            "business_status": probe.get("status"),
+                            "platform_status_text": probe.get("statusText") or "",
+                            "premium": premium_text,
+                        },
+                    ),
+                )
+
+            request_body = _json_obj(payload.get("request_body"))
+            defaults = _picc_business_defaults(payload.get("default_config_json"))
+            request_defaults = _json_obj(request_body.get("defaultFields"))
+            if request_defaults:
+                defaults = _deep_merge(defaults, request_defaults)
+            defaults[PRODUCT_TUJIA_ANSHUN_PREMIUM] = premium_text
+            plan = self._query_tujia_anshun_plan_best_effort(
+                client,
+                defaults,
+                _json_obj(request_body.get("quoteForm")),
+            )
+            if not plan.get("success"):
+                return PlatformRuntimeResult(
+                    status="failed",
+                    message=_to_str(plan.get("message")).strip() or f"未查询到保费为{premium_text}的途家安顺方案",
+                    data=success_data(
+                        client,
+                        extra={
+                            "joint_sales_plan": plan,
+                            "premium": premium_text,
+                            "amount": _clean_money_text(plan.get("amount"), "0"),
+                        },
+                    ),
+                )
+            amount = _clean_money_text(plan.get("amount"), "0")
+            return PlatformRuntimeResult(
+                status="success",
+                message="途家安顺保额查询成功",
+                data=success_data(
+                    client,
+                    extra={
+                        "joint_sales_plan": plan,
+                        "premium": _clean_money_text(plan.get("premium"), premium_text),
+                        "amount": amount,
+                    },
+                ),
+            )
+        except PiccSessionExpiredError as exc:
+            return PlatformRuntimeResult(
+                status="expired",
+                message=str(exc) or "PICC 当前账号没有可用会话，请先登录",
+                data={"business_status": "16", "error_code": exc.__class__.__name__, "premium": premium_text},
+            )
+        except PiccTransientGatewayError as exc:
+            return PlatformRuntimeResult(
+                status="network_error",
+                message=str(exc) or "PICC 平台网关临时异常，请稍后重试",
+                data={"error_code": exc.__class__.__name__, "transient": True, "premium": premium_text},
+            )
+        except Exception as exc:
+            extra: Dict[str, Any] = {"error_code": exc.__class__.__name__, "premium": premium_text}
+            if client is not None:
+                extra = success_data(client, extra=extra)
+            return PlatformRuntimeResult(
+                status="failed",
+                message=str(exc) or exc.__class__.__name__,
+                data=extra,
+            )
+
+    def _query_repair_codes_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        payload = _json_obj(quote_payload)
+        query_text = _to_str(payload.get("query") or payload.get("keyword")).strip()
+        client: Optional[PiccProtocolClient] = None
+        try:
+            client = self._client(ctx)
+            probe = client.request_json(
+                "GET",
+                KEEPALIVE_PATH,
+                purpose="business",
+                params=KEEPALIVE_PARAMS,
+                headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
+            )
+            if isinstance(probe, Mapping) and int(probe.get("status", -1)) != 0:
+                status_code = int(probe.get("status", -1))
+                runtime_status = "expired" if status_code == 16 else "failed"
+                return PlatformRuntimeResult(
+                    status=runtime_status,
+                    message=str(probe.get("statusText") or probe),
+                    data=success_data(
+                        client,
+                        extra={
+                            "business_status": probe.get("status"),
+                            "platform_status_text": probe.get("statusText") or "",
+                            "query": query_text,
+                        },
+                    ),
+                )
+            data = client.request_json(
+                "GET",
+                MONOPOLY_QUERY_PATH,
+                purpose="business",
+                params={"rows": _to_str(payload.get("rows") or "1000")},
+                headers={"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"},
+            )
+            _ensure_platform_success(data, action="送修码查询")
+            response_data = _json_obj(_json_obj(data).get("data"))
+            raw_rows = response_data.get("list") or response_data.get("rows") or response_data.get("items")
+            if raw_rows is None and isinstance(_json_obj(data).get("list"), list):
+                raw_rows = _json_obj(data).get("list")
+            rows = [dict(row) for row in raw_rows if isinstance(row, Mapping)] if isinstance(raw_rows, list) else []
+            return PlatformRuntimeResult(
+                status="success",
+                message="送修码查询成功",
+                data=success_data(
+                    client,
+                    extra={
+                        "query": query_text,
+                        "rows": rows,
+                        "total": len(rows),
+                    },
+                ),
+            )
+        except PiccSessionExpiredError as exc:
+            return PlatformRuntimeResult(
+                status="expired",
+                message=str(exc) or "PICC 当前账号没有可用会话，请先登录",
+                data={"business_status": "16", "error_code": exc.__class__.__name__, "query": query_text},
+            )
+        except PiccTransientGatewayError as exc:
+            return PlatformRuntimeResult(
+                status="network_error",
+                message=str(exc) or "PICC 平台网关临时异常，请稍后重试",
+                data={"error_code": exc.__class__.__name__, "transient": True, "query": query_text},
+            )
+        except Exception as exc:
+            extra: Dict[str, Any] = {"error_code": exc.__class__.__name__, "query": query_text}
+            if client is not None:
+                extra = success_data(client, extra=extra)
+            return PlatformRuntimeResult(
+                status="failed",
+                message=str(exc) or exc.__class__.__name__,
+                data=extra,
+            )
 
     def _rebuild_quote_for_platform_vehicle_code(
         self,
@@ -2331,7 +2591,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
                 "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
             }
-        monopoly_code = _to_str(_field_value(defaults, "专管代码", "monopolyCode")).strip()
+        monopoly_code = _to_str(quote_form.get("monopolyCode") or _repair_code_value(defaults)).strip()
         try:
             data = client.request_json(
                 "GET",
@@ -2435,7 +2695,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             quote_form.get("selectedOperateConfigId") or _field_value(defaults, "操作配置ID", "车型配置ID", "selectedOperateConfigId")
         ).strip()
         checker_code = _to_str(quote_form.get("carcheckerCode") or _field_value(defaults, "验车人工号", "验车人代码", "carcheckerCode")).strip()
-        monopoly_code = _to_str(_field_value(defaults, "专管代码", "monopolyCode")).strip()
+        monopoly_code = _to_str(quote_form.get("monopolyCode") or _repair_code_value(defaults)).strip()
         if selected_operate_config_id and checker_code:
             verify_data = client.request_json(
                 "GET",
@@ -2499,6 +2759,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         ).strip()
         carchecker_code = _to_str(_field_value(defaults, "验车人工号", "验车人代码", "carcheckerCode")).strip()
         carchecker_name = _first_text(vehicle.get("carchecker"), _field_value(defaults, "验车人姓名", "验车人", "carCeckName"))
+        repair_code_enabled = _repair_code_enabled(defaults)
+        repair_code = _repair_code_value(defaults)
+        repair_name = _repair_code_name(defaults)
         main_com_code = _first_text(vehicle.get("mainComCode"), _field_value(defaults, "归属机构代码", "机构代码", "comCode"))
         query_area = _first_text(_field_value(defaults, "查询区域代码", "queryArea"), (main_com_code[:2] + "0000") if len(main_com_code) >= 2 else "")
         model_code = _first_text(
@@ -2530,10 +2793,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
 
         compulsory_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"), "20")
         loss_amount = _money_text(_first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value))
-        third_party_amount = _wan_or_amount_to_wan_text(_profile_product_default(defaults, prof, PRODUCT_THIRD_PARTY, "300"), "300")
+        third_party_config = _profile_product_default(defaults, prof, PRODUCT_THIRD_PARTY, "300")
+        third_party_amount = _wan_or_amount_to_wan_text(third_party_config, "300")
         driver_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_DRIVER, "2"), "2")
         passenger_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_PASSENGER, "2"), "2")
-        medical_third_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, "300"), "300")
+        shared_main_limit = _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True)
+        medical_third_amount = _wan_or_amount_to_amount(
+            _profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, third_party_config),
+            third_party_amount or "300",
+        )
+        if shared_main_limit:
+            medical_third_amount = _wan_or_amount_to_amount(third_party_amount, third_party_amount or "300")
 
         missing_config = []
         if not main_com_code:
@@ -2574,8 +2844,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "energyTypePlatTemp": _to_str(_field_value(defaults, "能源类型名称", "energyTypePlatTemp", fallback=_profile_text(prof, "energy_type_name", "燃油"))),
             "eadinfo.isEAD": "0",
             "transfer": "0",
+            "transferDate": _date_text(vehicle.get("transferDate")),
             "renewed": "0",
-            "groupCodeValidStatus": "0",
+            "groupCodeValidStatus": "1" if repair_code_enabled and repair_code else "0",
+            "monopolyCode": repair_code if repair_code_enabled else "",
+            "monopolyName": repair_name if repair_code_enabled else "",
             "HNfeProjectCode": "0",
             "isNetTransProposal": "0",
             "opVehicleTaxFlag": _to_str(_field_value(defaults, "是否代收车船税", "opVehicleTaxFlag", fallback="1")),
@@ -2694,24 +2967,36 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             form.pop("prpCitemCar.familyId", None)
         if _profile_text(prof, "is_energy_car") == "1" and _money(form.get("prpCitemCar.exhaustScale")) == 0:
             form.pop("prpCitemCar.exhaustScale", None)
-        product_rows = [
-            (0, compulsory_amount, "051074", PRODUCT_COMPULSORY),
-            (1, loss_amount, "051050", PRODUCT_LOSS),
-            (2, third_party_amount, "051051", PRODUCT_THIRD_PARTY),
-            (3, driver_amount, "051052", PRODUCT_DRIVER),
-            (4, passenger_amount, "051053", PRODUCT_PASSENGER),
-            (5, medical_third_amount, "051063", PRODUCT_MEDICAL_THIRD),
+        product_specs = [
+            (compulsory_amount, "051074", PRODUCT_COMPULSORY),
+            (loss_amount, "051050", PRODUCT_LOSS),
+            (third_party_amount, "051051", PRODUCT_THIRD_PARTY),
+            (driver_amount, "051052", PRODUCT_DRIVER),
+            (passenger_amount, "051053", PRODUCT_PASSENGER),
+            (medical_third_amount, "051063", PRODUCT_MEDICAL_THIRD),
         ]
-        for index, amount, kind_code, kind_name in product_rows:
+        excluded_products = _product_exclusions(defaults)
+        product_rows = [
+            (amount, kind_code, kind_name)
+            for amount, kind_code, kind_name in product_specs
+            if _canonical_product_name(kind_name) not in excluded_products
+        ]
+        medical_third_index: Optional[int] = None
+        for index, (amount, kind_code, kind_name) in enumerate(product_rows):
             form[f"prpCitemKindVos[{index}].amount"] = amount
             form[f"prpCitemKindVos[{index}].kindCode"] = kind_code
             form[f"prpCitemKindVos[{index}].kindName"] = kind_name
             form[f"prpCitemKindVos[{index}].chooseFlag"] = "true"
-        form["prpCitemKindVos[5].sharedAmountFlag"] = (
-            "1" if _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True) else "0"
-        )
+            if kind_name == PRODUCT_MEDICAL_THIRD:
+                medical_third_index = index
+        if medical_third_index is not None:
+            form[f"prpCitemKindVos[{medical_third_index}].sharedAmountFlag"] = "1" if shared_main_limit else "0"
         for key in USED_FUEL_QUOTE_EMPTY_FORM_FIELDS:
             form.setdefault(key, "")
+        if PRODUCT_LOSS in excluded_products:
+            for key in list(form.keys()):
+                if key.startswith("prpCitemKindsTemp[1]."):
+                    form.pop(key, None)
         # Allow advanced platform-specific overrides without changing the schema.
         extra_form = _json_obj_loose(defaults.get("PICC报价请求体覆盖") or defaults.get("quoteFormOverrides"))
         for key, value in extra_form.items():
@@ -2777,6 +3062,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         license_no = _first_text(data.get("plate_no"), _field_value(defaults, "号牌号码"))
         if not license_no and _profile_text(prof, "license_no_strategy") == "new_car_placeholder":
             license_no = _new_car_placeholder_license(engine_no, vin)
+        transfer_date = ""
+        if _checked(data.get("is_transfer_vehicle"), default=False):
+            transfer_date = _date_text(_first_text(data.get("transfer_date"), data.get("issue_date")))
         enroll_date = _first_text(
             _date_text(data.get("first_register_date")),
             _date_text(data.get("issue_date")),
@@ -2796,6 +3084,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "licenseType": _first_text(_field_value(defaults, "号牌种类"), "02"),
             "engineNo": engine_no,
             "vin": vin,
+            "transferDate": transfer_date,
             "carKindCode": _first_text(_field_value(defaults, "车辆种类"), "A01"),
             "useNatureCode": _first_text(_field_value(defaults, "使用性质细分种类", "使用性质"), "211"),
             "enrollDate": enroll_date,
@@ -2956,15 +3245,28 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         passenger_per_seat = Decimal(_wan_or_amount_to_amount(passenger_default, "2"))
         passenger_amount = str(int((passenger_per_seat * Decimal(max(seats - 1, 1))).quantize(Decimal("1"))))
         loss_amount = _first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value, "0")
-        return [
+        third_party_default = _profile_product_default(defaults, prof, PRODUCT_THIRD_PARTY, "300")
+        third_party_amount = _wan_or_amount_to_amount(third_party_default, "300")
+        shared_main_limit = _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True)
+        medical_third_amount = _wan_or_amount_to_amount(
+            _profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, third_party_default),
+            _wan_or_amount_to_wan_text(third_party_default, "300"),
+        )
+        if shared_main_limit:
+            medical_third_amount = third_party_amount
+        rows = [
             {"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))},
             {"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)},
-            {"code": "BI051", "name": PRODUCT_THIRD_PARTY, "required": True, "insuredAmount": _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_THIRD_PARTY, "300"), "300")},
+            {"code": "BI051", "name": PRODUCT_THIRD_PARTY, "required": True, "insuredAmount": third_party_amount},
             {"code": "BI060", "name": PRODUCT_DRIVER, "required": True, "insuredAmount": driver_amount},
             {"code": "BI061", "name": PRODUCT_PASSENGER, "required": True, "insuredAmount": passenger_amount},
-            {"code": "BI_SHARED", "name": PRODUCT_SHARED_LIMIT, "required": True, "checked": _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True)},
-            {"code": "BI_MEDICAL_THIRD", "name": PRODUCT_MEDICAL_THIRD, "required": True, "insuredAmount": _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, "300"), "300")},
+            {"code": "BI_SHARED", "name": PRODUCT_SHARED_LIMIT, "required": True, "checked": shared_main_limit},
+            {"code": "BI_MEDICAL_THIRD", "name": PRODUCT_MEDICAL_THIRD, "required": True, "insuredAmount": medical_third_amount},
         ]
+        exclusions = _product_exclusions(defaults)
+        if exclusions:
+            rows = [row for row in rows if _canonical_product_name(row.get("name")) not in exclusions]
+        return rows
 
     def _display_kind_name(self, kind_name: Any) -> str:
         text = _to_str(kind_name).strip()
@@ -2995,6 +3297,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle = _json_obj(request_body.get("vehicleForm"))
         owner = _json_obj(request_body.get("ownerForm"))
         form = _json_obj(request_body.get("quoteForm"))
+        shared_main_limit = _checked(form.get("prpCitemKindVos[5].sharedAmountFlag"), default=True)
         preflight = _json_obj(request_body.get("preflight"))
         selected_vehicle = _json_obj(preflight.get("selectedVehicle"))
         precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
@@ -3023,7 +3326,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "code": kind_code,
                     "name": name,
                     "amount": _clean_money_text(amount),
-                    "amount_text": _proposal_kind_amount_text(row, seat_count=_first_text(vehicle.get("seatCount"), form.get("prpCitemCar.seatCount"))),
+                    "amount_text": _proposal_kind_amount_text(
+                        row,
+                        seat_count=_first_text(vehicle.get("seatCount"), form.get("prpCitemCar.seatCount")),
+                        shared_main_limit=shared_main_limit,
+                    ),
                     "premium": _money_text(premium),
                     "premium_text": _proposal_money_yuan(premium),
                 }
@@ -3252,13 +3559,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle_tax = Decimal("300.00")
         total = commercial_premium + compulsory_premium + vehicle_tax
 
-        coverage_items = [
-            {"name": PRODUCT_LOSS, "amount": _money_text(loss_amount), "premium": _money_text(loss_premium)},
+        product_names = {_canonical_product_name(_json_obj(p).get("name")) for p in products}
+        coverage_items = []
+        if PRODUCT_LOSS in product_names:
+            coverage_items.append({"name": PRODUCT_LOSS, "amount": _money_text(loss_amount), "premium": _money_text(loss_premium)})
+        coverage_items.extend([
             {"name": PRODUCT_THIRD_PARTY, "amount": str(int(third_amount)), "premium": _money_text(third_premium)},
             {"name": PRODUCT_DRIVER, "amount": str(int(driver_amount)), "premium": _money_text(driver_premium)},
             {"name": PRODUCT_PASSENGER, "amount": str(int(passenger_amount)), "premium": _money_text(passenger_premium)},
             {"name": PRODUCT_MEDICAL_THIRD, "amount": str(int(medical_amount)), "premium": _money_text(medical_premium)},
-        ]
+        ])
         price_items = [
             {"name": "商业险", "amount": float(commercial_premium)},
             {"name": "交强险", "amount": float(compulsory_premium)},

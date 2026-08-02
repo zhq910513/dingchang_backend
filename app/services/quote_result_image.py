@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -44,8 +45,93 @@ def _safe_card_payload(card: Mapping[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(dict(card or {}), ensure_ascii=False, default=str))
 
 
+def _render_scale() -> int:
+    try:
+        value = int(float(os.getenv("QUOTE_RESULT_IMAGE_SCALE", "2") or "2"))
+    except Exception:
+        value = 2
+    return max(1, min(3, value))
+
+
+def _quote_result_target_size() -> Tuple[int, int]:
+    try:
+        width = int(float(os.getenv("QUOTE_RESULT_IMAGE_WIDTH", "1350") or "1350"))
+    except Exception:
+        width = 1350
+    try:
+        height = int(float(os.getenv("QUOTE_RESULT_IMAGE_HEIGHT", "650") or "650"))
+    except Exception:
+        height = 650
+    return max(1, width), max(1, height)
+
+
+def _s(value: Any, scale: int) -> int:
+    try:
+        return int(round(float(value) * scale))
+    except Exception:
+        return 0
+
+
+def _line_width(scale: int, value: int = 1) -> int:
+    return max(1, _s(value, scale))
+
+
+def _scaled_points(points: Iterable[Tuple[int, int]], scale: int) -> List[Tuple[int, int]]:
+    return [(_s(x, scale), _s(y, scale)) for x, y in points]
+
+
+def _resize_resample_filter() -> Any:
+    from PIL import Image
+
+    try:
+        return Image.Resampling.LANCZOS
+    except Exception:
+        return Image.LANCZOS
+
+
+def _fit_quote_result_image(image: Any, *, background: str = "#ffffff") -> Any:
+    from PIL import Image
+
+    target_w, target_h = _quote_result_target_size()
+    if not image:
+        return Image.new("RGB", (target_w, target_h), background)
+    source = image.convert("RGB")
+    if source.size == (target_w, target_h):
+        return source
+
+    source_w, source_h = source.size
+    if source_w <= 0 or source_h <= 0:
+        return Image.new("RGB", (target_w, target_h), background)
+    ratio = min(target_w / source_w, target_h / source_h)
+    resized_w = max(1, int(round(source_w * ratio)))
+    resized_h = max(1, int(round(source_h * ratio)))
+    resized = source.resize((resized_w, resized_h), _resize_resample_filter())
+    canvas = Image.new("RGB", (target_w, target_h), background)
+    canvas.paste(resized, ((target_w - resized_w) // 2, (target_h - resized_h) // 2))
+    return canvas
+
+
+def _png_bytes(image: Any, *, background: str = "#ffffff") -> bytes:
+    from io import BytesIO
+
+    output = BytesIO()
+    final_image = _fit_quote_result_image(image, background=background)
+    final_image.save(output, format="PNG", compress_level=4)
+    return output.getvalue()
+
+
 def _quote_result_rel_path(card: Mapping[str, Any], trace_id: str = "") -> Path:
-    raw = json.dumps({"trace_id": trace_id, "card": _safe_card_payload(card)}, ensure_ascii=False, sort_keys=True)
+    target_w, target_h = _quote_result_target_size()
+    raw = json.dumps(
+        {
+            "trace_id": trace_id,
+            "render_scale": _render_scale(),
+            "target_size": [target_w, target_h],
+            "card": _safe_card_payload(card),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
     return Path(_storage.build_key_by_md5(scene="related", md5_hex=digest, ext=".png"))
 
@@ -165,16 +251,20 @@ def _draw_cell_text(
 ) -> None:
     left, top, right, bottom = box
     use_font = bold_font or font
-    lines = _wrap_text(draw, text, font=use_font, max_width=max(10, right - left - 14), max_lines=max_lines)
-    line_height = _text_height(draw, "国", use_font) + 4
-    total_height = line_height * len(lines) - 4
+    font_size = max(12, int(getattr(use_font, "size", 14) or 14))
+    pad_x = max(8, int(round(font_size * 0.7)))
+    inner_x = max(4, int(round(font_size * 0.4)))
+    line_gap = max(4, int(round(font_size * 0.2)))
+    lines = _wrap_text(draw, text, font=use_font, max_width=max(10, right - left - pad_x), max_lines=max_lines)
+    line_height = _text_height(draw, "国", use_font) + line_gap
+    total_height = line_height * len(lines) - line_gap
     y = top + max(0, (bottom - top - total_height) // 2)
     for line in lines:
         if align == "left":
-            x = left + 8
+            x = left + inner_x
             anchor = "lm"
         elif align == "right":
-            x = right - 8
+            x = right - inner_x
             anchor = "rm"
         else:
             x = (left + right) // 2
@@ -184,25 +274,9 @@ def _draw_cell_text(
 
 
 def _draw_badge(draw: Any, x: int, y: int, label: str, color: str, font: Any) -> None:
-    draw.ellipse((x, y, x + 16, y + 16), fill=color, outline="#ffffff", width=1)
-    _draw_text(draw, (x + 8, y + 7), label, font=font, fill="#ffffff", anchor="mm")
-
-
-def _draw_rotated_watermark(image: Any, text: str, x: int, y: int, *, font: Any, opacity: int = 44) -> None:
-    from PIL import Image, ImageDraw
-
-    if not text:
-        return
-    box_width = max(260, _text_width(ImageDraw.Draw(image), text, font) + 24)
-    layer = Image.new("RGBA", (box_width, 70), (255, 255, 255, 0))
-    layer_draw = ImageDraw.Draw(layer)
-    layer_draw.text((0, 0), text, font=font, fill=(150, 150, 150, opacity))
-    try:
-        resample = Image.Resampling.BICUBIC
-    except Exception:
-        resample = Image.BICUBIC
-    rotated = layer.rotate(-22, expand=True, resample=resample)
-    image.paste(rotated, (x, y), rotated)
+    size = max(16, int(getattr(font, "size", 12) or 12) + 4)
+    draw.ellipse((x, y, x + size, y + size), fill=color, outline="#ffffff", width=max(1, size // 16))
+    _draw_text(draw, (x + size // 2, y + size // 2 - max(0, size // 16)), label, font=font, fill="#ffffff", anchor="mm")
 
 
 def _coverage_items(card: Mapping[str, Any]) -> Iterable[Dict[str, Any]]:
@@ -232,13 +306,6 @@ def _render_legacy_quote_card_png(card: Mapping[str, Any]) -> bytes:
     draw.rectangle((0, 0, width, 31), fill="#eeeeee")
     draw.rectangle((0, 31, 18, height), fill="#e7e7e7")
     draw.line((18, 31, 18, height), fill="#f0c8be", width=1)
-
-    watermark = _to_str(safe_card.get("watermark_text")).strip()
-    if not watermark:
-        account = _to_str(safe_card.get("watermark_user") or safe_card.get("watermark_account") or "报价助手").strip()
-        watermark = f"{account} {_to_str(safe_card.get('watermark_time')).strip()}".strip()
-    for x, y in [(38, 132), (178, 66), (392, 88), (246, 230), (48, 360), (286, 456), (404, 332)]:
-        _draw_rotated_watermark(image, watermark, x, y, font=font15)
 
     ribbon = [(48, 16), (221, 16), (228, 35), (221, 54), (48, 54), (41, 35)]
     draw.polygon(ribbon, fill="#e84f42")
@@ -336,9 +403,7 @@ def _render_legacy_quote_card_png(card: Mapping[str, Any]) -> bytes:
     _draw_text(draw, (left, y + 10), "人保风险水平", font=font14)
     _draw_right(draw, right, y + 8, f"{_to_str(safe_card.get('risk_score') or '-')} 分", font=font16b, fill="#ff0000")
 
-    output = BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
+    return _png_bytes(image, background="#ffffff")
 
 
 def _proposal_info_rows(card: Mapping[str, Any]) -> List[Tuple[str, str, str, str]]:
@@ -380,29 +445,36 @@ def _render_picc_proposal_table_png(card: Mapping[str, Any]) -> bytes:
     info_rows = _proposal_info_rows(safe_card)
     coverage_rows = _proposal_coverage_rows(safe_card)
 
-    width = int(safe_card.get("image_width") or 1323)
+    scale = _render_scale()
+    base_width = int(safe_card.get("image_width") or 1323)
+    width = _s(base_width, scale)
     line = "#8a8a8a"
-    title_h = 48
-    info_row_h = 28
-    spacer_h = 20
-    header_h = 46
-    summary_h = 28
-    content_font = _font(20, serif=True)
-    small_font = _font(18, serif=True)
-    bold_font = _font(20, bold=True, serif=True)
-    header_font = _font(28, bold=True, serif=True)
-    title_font = _font(30, bold=True, serif=True)
-    watermark_font = _font(24, serif=True)
+    title_h = _s(48, scale)
+    info_row_h = _s(28, scale)
+    spacer_h = _s(20, scale)
+    header_h = _s(46, scale)
+    summary_h = _s(28, scale)
+    content_font = _font(_s(20, scale), serif=True)
+    small_font = _font(_s(18, scale), serif=True)
+    bold_font = _font(_s(20, scale), bold=True, serif=True)
+    header_font = _font(_s(28, scale), bold=True, serif=True)
+    title_font = _font(_s(30, scale), bold=True, serif=True)
 
     # Table columns match the captured page: four columns above, three columns below.
-    info_x = [0, 217, 451, 667, width - 1]
-    quote_x = [0, 476, 1138, width - 1]
+    info_x = [0, _s(217, scale), _s(451, scale), _s(667, scale), width - 1]
+    quote_x = [0, _s(476, scale), _s(1138, scale), width - 1]
 
     row_heights: List[int] = []
     measure = ImageDraw.Draw(Image.new("RGB", (width, 100), "#ffffff"))
     for row in coverage_rows:
-        name_lines = _wrap_text(measure, row.get("name"), font=content_font, max_width=quote_x[1] - quote_x[0] - 14, max_lines=3)
-        row_heights.append(54 if len(name_lines) >= 2 else 28)
+        name_lines = _wrap_text(
+            measure,
+            row.get("name"),
+            font=content_font,
+            max_width=quote_x[1] - quote_x[0] - _s(14, scale),
+            max_lines=3,
+        )
+        row_heights.append(_s(54 if len(name_lines) >= 2 else 28, scale))
 
     summary_rows = [
         ("commercial_total", "商业车险合计", "", safe_card.get("commercial_premium"), True),
@@ -435,51 +507,38 @@ def _render_picc_proposal_table_png(card: Mapping[str, Any]) -> bytes:
         + header_h
         + sum(row_heights)
         + len(summary_rows) * summary_h
-        + 4
+        + _s(4, scale)
     )
     image = Image.new("RGB", (width, height), "#ffffff")
     draw = ImageDraw.Draw(image)
 
-    watermark = _to_str(safe_card.get("watermark_text")).strip()
-    if not watermark:
-        account = _to_str(safe_card.get("watermark_user") or safe_card.get("watermark_account") or "报价助手").strip()
-        watermark = f"{account} {_to_str(safe_card.get('watermark_time')).strip()}".strip()
-    for x, y in [
-        (-10, 126),
-        (420, 126),
-        (900, 126),
-        (-10, 440),
-        (420, 438),
-        (900, 438),
-    ]:
-        _draw_rotated_watermark(image, watermark, x, y, font=watermark_font, opacity=34)
-
-    y = 4
-    draw.rectangle((0, y, width - 1, y + title_h - 1), outline=line, width=1)
+    line_w = _line_width(scale)
+    y = _s(4, scale)
+    draw.rectangle((0, y, width - 1, y + title_h - 1), outline=line, width=line_w)
     _draw_cell_text(draw, (0, y, width - 1, y + title_h - 1), safe_card.get("title") or "中国人保投保方案", font=title_font, bold_font=title_font)
     y += title_h
 
     for label1, value1, label2, value2 in info_rows:
         top = y
         bottom = y + info_row_h
-        draw.rectangle((0, top, width - 1, bottom), outline=line, width=1)
+        draw.rectangle((0, top, width - 1, bottom), outline=line, width=line_w)
         for x in info_x[1:-1]:
-            draw.line((x, top, x, bottom), fill=line, width=1)
+            draw.line((x, top, x, bottom), fill=line, width=line_w)
         _draw_cell_text(draw, (info_x[0], top, info_x[1], bottom), label1, font=content_font, max_lines=1)
         _draw_cell_text(draw, (info_x[1], top, info_x[2], bottom), value1, font=content_font, max_lines=1)
         _draw_cell_text(draw, (info_x[2], top, info_x[3], bottom), label2, font=content_font, max_lines=1)
-        value_font = small_font if _text_width(draw, _to_str(value2), content_font) > (info_x[4] - info_x[3] - 14) else content_font
+        value_font = small_font if _text_width(draw, _to_str(value2), content_font) > (info_x[4] - info_x[3] - _s(14, scale)) else content_font
         _draw_cell_text(draw, (info_x[3], top, info_x[4], bottom), value2, font=value_font, max_lines=2)
         y += info_row_h
 
-    draw.rectangle((0, y, width - 1, y + spacer_h), outline=line, width=1)
+    draw.rectangle((0, y, width - 1, y + spacer_h), outline=line, width=line_w)
     y += spacer_h
 
     top = y
     bottom = y + header_h
-    draw.rectangle((0, top, width - 1, bottom), outline=line, width=1)
+    draw.rectangle((0, top, width - 1, bottom), outline=line, width=line_w)
     for x in quote_x[1:-1]:
-        draw.line((x, top, x, bottom), fill=line, width=1)
+        draw.line((x, top, x, bottom), fill=line, width=line_w)
     _draw_cell_text(draw, (quote_x[0], top, quote_x[1], bottom), "险别名称", font=header_font, bold_font=header_font)
     _draw_cell_text(draw, (quote_x[1], top, quote_x[2], bottom), "保额（元）", font=header_font, bold_font=header_font)
     _draw_cell_text(draw, (quote_x[2], top, quote_x[3], bottom), "保费（元）", font=header_font, bold_font=header_font)
@@ -488,9 +547,9 @@ def _render_picc_proposal_table_png(card: Mapping[str, Any]) -> bytes:
     for row, row_h in zip(coverage_rows, row_heights):
         top = y
         bottom = y + row_h
-        draw.rectangle((0, top, width - 1, bottom), outline=line, width=1)
+        draw.rectangle((0, top, width - 1, bottom), outline=line, width=line_w)
         for x in quote_x[1:-1]:
-            draw.line((x, top, x, bottom), fill=line, width=1)
+            draw.line((x, top, x, bottom), fill=line, width=line_w)
         _draw_cell_text(draw, (quote_x[0], top, quote_x[1], bottom), row.get("name"), font=content_font, max_lines=3)
         _draw_cell_text(draw, (quote_x[1], top, quote_x[2], bottom), row.get("amount_text") or row.get("amount"), font=content_font, max_lines=2)
         _draw_cell_text(draw, (quote_x[2], top, quote_x[3], bottom), _money_yuan(row.get("premium")), font=content_font, align="right", max_lines=1)
@@ -499,21 +558,19 @@ def _render_picc_proposal_table_png(card: Mapping[str, Any]) -> bytes:
     for kind, label, amount_text, premium, merged in summary_rows:
         top = y
         bottom = y + summary_h
-        draw.rectangle((0, top, width - 1, bottom), outline=line, width=1)
+        draw.rectangle((0, top, width - 1, bottom), outline=line, width=line_w)
         if merged:
-            draw.line((quote_x[2], top, quote_x[2], bottom), fill=line, width=1)
+            draw.line((quote_x[2], top, quote_x[2], bottom), fill=line, width=line_w)
             _draw_cell_text(draw, (quote_x[0], top, quote_x[2], bottom), label, font=content_font, bold_font=bold_font, max_lines=1)
         else:
             for x in quote_x[1:-1]:
-                draw.line((x, top, x, bottom), fill=line, width=1)
+                draw.line((x, top, x, bottom), fill=line, width=line_w)
             _draw_cell_text(draw, (quote_x[0], top, quote_x[1], bottom), label, font=content_font, max_lines=1)
             _draw_cell_text(draw, (quote_x[1], top, quote_x[2], bottom), amount_text, font=content_font, max_lines=1)
         _draw_cell_text(draw, (quote_x[2], top, quote_x[3], bottom), _money_yuan(premium), font=content_font, bold_font=bold_font, align="right", max_lines=1)
         y += summary_h
 
-    output = BytesIO()
-    image.save(output, format="PNG")
-    return output.getvalue()
+    return _png_bytes(image, background="#ffffff")
 
 
 def render_quote_result_card_png(card: Mapping[str, Any]) -> bytes:
@@ -526,6 +583,8 @@ def render_quote_result_card_png(card: Mapping[str, Any]) -> bytes:
 def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(card, Mapping) or not card:
         return None
+    render_scale = _render_scale()
+    target_w, target_h = _quote_result_target_size()
     rel_path = _quote_result_rel_path(card, trace_id=trace_id)
     storage_key = rel_path.as_posix()
     png_bytes = render_quote_result_card_png(card)
@@ -545,4 +604,7 @@ def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "")
         "content_type": "image/png",
         "provider": "bos",
         "size": len(png_bytes),
+        "render_scale": render_scale,
+        "width": target_w,
+        "height": target_h,
     }

@@ -32,6 +32,7 @@ from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, Stub
 from app.services.image_slot_classifier import slot_label
 from app.services.quote_assistant_service import (
     _collect_context_images,
+    _extract_transfer_vehicle_command,
     _is_explicit_platform_quote_command,
     detect_platform_credential_signal,
     detect_quote_config_override_signal,
@@ -3098,6 +3099,13 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
         override_entities = quote_override_signal.get("entities")
         if isinstance(override_entities, dict):
             entities.update(override_entities)
+    transfer_vehicle_command = _extract_transfer_vehicle_command(text)
+    if transfer_vehicle_command:
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.93)
+        for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_override"):
+            if transfer_vehicle_command.get(key) not in (None, ""):
+                entities[key] = transfer_vehicle_command.get(key)
     if looks_like_duplicate_quote_confirmation(text) or looks_like_duplicate_quote_cancel(text):
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.94)

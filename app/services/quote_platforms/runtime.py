@@ -44,3 +44,19 @@ async def check_quota(ctx: PlatformAccountContext, db: AsyncSession | None = Non
 
 async def quote(ctx: PlatformAccountContext, quote_payload: dict[str, Any], db: AsyncSession | None = None) -> PlatformRuntimeResult:
     return await _with_db(db, lambda session: session_manager.quote(session, ctx, quote_payload))
+
+
+async def query_joint_sales_plan(
+    ctx: PlatformAccountContext,
+    quote_payload: dict[str, Any],
+    db: AsyncSession | None = None,
+) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.query_joint_sales_plan(session, ctx, quote_payload))
+
+
+async def query_repair_codes(
+    ctx: PlatformAccountContext,
+    quote_payload: dict[str, Any],
+    db: AsyncSession | None = None,
+) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.query_repair_codes(session, ctx, quote_payload))

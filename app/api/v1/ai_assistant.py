@@ -230,6 +230,7 @@ def _metadata_is_quote_material(metadata: Any) -> bool:
                 "images_by_slot",
                 "normalized_data",
                 "quote_field_overrides",
+                "platform_dialog",
             }
             if quote_keys.intersection(payload.keys()):
                 return True

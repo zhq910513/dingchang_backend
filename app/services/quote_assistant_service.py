@@ -6,10 +6,12 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from sqlalchemy import and_, desc, false as sql_false, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +70,13 @@ from app.core.config import settings
 
 TZ_BJ = timezone(timedelta(hours=8))
 storage = StorageService()
+
+
+def _elapsed_ms(start: float) -> int:
+    try:
+        return max(0, int(round((time.perf_counter() - start) * 1000)))
+    except Exception:
+        return 0
 
 RESULT_SUCCESS = "success"
 RESULT_NEED_MORE = "need_more_info"
@@ -345,6 +354,10 @@ def _quote_platform_name_from_command(text: Any) -> str:
     raw = _norm_text(text)
     if not raw:
         return ""
+    professional = _detect_professional_quote_command(raw)
+    professional_entities = _json_obj(professional.get("entities"))
+    if professional.get("is_quote") and professional_entities.get("platform_name"):
+        return _to_str(professional_entities.get("platform_name")).strip()
     stop_words = {"报价", "重新", "再次", "再", "重报", "平台"}
     for line in re.split(r"[\r\n]+", raw):
         compact = re.sub(r"\s+", "", _to_str(line))
@@ -589,6 +602,241 @@ def _sanitize_duplicate_quote_warning(value: Any, default_message: str = "") -> 
     return text or default_message
 
 
+PLATFORM_DIALOG_MESSAGE_KEYS = (
+    "platform_dialog",
+    "businessControlMsg",
+    "businessMsg",
+    "errorMessage",
+    "errorMsg",
+    "resultMessage",
+    "resultMsg",
+    "normalizeErrorMsg",
+    "statusText",
+    "message",
+    "msg",
+    "detail",
+    "reason",
+)
+
+
+def _sanitize_platform_dialog_message(
+    value: Any,
+    default_message: str = "",
+    *,
+    platform_code: str = "",
+    platform_name: str = "",
+) -> str:
+    text = _sanitize_duplicate_quote_warning(value, default_message)
+    if not text:
+        return default_message
+    text = re.sub(r"^[A-Z]{2,}[A-Z0-9_]*(?:[-_]\d+)?\s*[-_：:，,;；]?", "", text).strip()
+    text = sanitize_quote_user_message(
+        text,
+        default_message or text,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    text = re.sub(r"^\s*\d+\s*(?=当前|该|此|请|业务|错误|提示)", "", text).strip()
+    text = re.sub(r"(?:。)?请检查平台账号状态或报价资料后重试[。.]?$", "", text).strip()
+    text = "\n".join(
+        line
+        for line in text.splitlines()
+        if not re.fullmatch(r"\s*(?:错误标识码|错误码|标识码)\s*[:：]?\s*", line)
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text or default_message
+
+
+def _platform_dialog_candidate_texts(value: Any, *, depth: int = 0) -> List[str]:
+    if depth > 5:
+        return []
+    out: List[str] = []
+    if isinstance(value, Mapping):
+        for key in PLATFORM_DIALOG_MESSAGE_KEYS:
+            item = value.get(key)
+            if item in (None, "", {}, []):
+                continue
+            if isinstance(item, (Mapping, list, tuple)):
+                out.extend(_platform_dialog_candidate_texts(item, depth=depth + 1))
+            else:
+                text = _to_str(item).strip()
+                if text:
+                    out.append(text)
+        for item in value.values():
+            if isinstance(item, (Mapping, list, tuple)):
+                out.extend(_platform_dialog_candidate_texts(item, depth=depth + 1))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            out.extend(_platform_dialog_candidate_texts(item, depth=depth + 1))
+    elif value not in (None, ""):
+        text = _to_str(value).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _runtime_platform_dialog_message(
+    result: Optional[PlatformRuntimeResult],
+    default_message: str,
+    *,
+    platform_code: str = "",
+    platform_name: str = "",
+) -> str:
+    data = _json_obj(getattr(result, "data", None) if result is not None else None)
+    candidates: List[Any] = []
+    platform_response = _json_obj(data.get("platform_response"))
+    platform_dialog = _json_obj(data.get("platform_dialog"))
+    candidates.extend(
+        [
+            platform_dialog.get("message"),
+            platform_dialog.get("content"),
+            platform_response.get("message"),
+            platform_response.get("statusText"),
+            platform_response.get("errorMessage"),
+            _json_obj(platform_response.get("response")).get("businessControlMsg"),
+            _json_obj(platform_response.get("response")).get("businessMsg"),
+            _json_obj(platform_response.get("response")).get("errorMessage"),
+            _json_obj(platform_response.get("response")).get("statusText"),
+            data.get("platform_status_text"),
+            data.get("error_message"),
+            data.get("message"),
+        ]
+    )
+    candidates.extend(_platform_dialog_candidate_texts(platform_response))
+    candidates.extend(_platform_dialog_candidate_texts(data.get("response")))
+    if result is not None:
+        candidates.append(getattr(result, "message", ""))
+
+    seen: Set[str] = set()
+    for raw in candidates:
+        text = _sanitize_platform_dialog_message(
+            raw,
+            "",
+            platform_code=platform_code,
+            platform_name=platform_name,
+        )
+        compact = re.sub(r"\s+", "", text)
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        if compact.lower() in {"success", "ok", "fail", "failed", "error", "错误", "错误信息"}:
+            continue
+        return text
+    return _sanitize_platform_dialog_message(
+        default_message,
+        default_message,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+
+
+def _platform_dialog_id(
+    *,
+    subtype: str,
+    message: str,
+    trace_id: str = "",
+    task_id: Any = None,
+    case_id: Any = None,
+) -> str:
+    base = "|".join(
+        [
+            _to_str(subtype).strip() or "platform_notice",
+            _to_str(task_id).strip(),
+            _to_str(trace_id).strip(),
+            _to_str(case_id).strip(),
+            _to_str(message).strip()[:240],
+        ]
+    )
+    digest = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    anchor = _to_str(task_id).strip() or _to_str(trace_id).strip() or _to_str(case_id).strip() or digest
+    return f"platform_dialog:{_to_str(subtype).strip() or 'platform_notice'}:{anchor}:{digest}"
+
+
+def _make_platform_dialog(
+    *,
+    message: Any,
+    title: str = "报价提示",
+    subtype: str = "platform_notice",
+    severity: str = "warning",
+    confirm_required: bool = False,
+    trace_id: str = "",
+    task_id: Any = None,
+    case_id: Any = None,
+    confirm_text: str = "",
+    cancel_text: str = "",
+    close_text: str = "",
+    confirm_command: str = "",
+    cancel_command: str = "",
+    platform_code: str = "",
+    platform_name: str = "",
+) -> Dict[str, Any]:
+    if subtype == "duplicate_quote":
+        safe_message = _sanitize_duplicate_quote_warning(
+            message,
+            "平台提示该车辆可能重复投保，请核实后再继续报价。",
+        )
+    else:
+        safe_message = _sanitize_platform_dialog_message(
+            message,
+            "平台返回报价提示，请核实后再继续。",
+            platform_code=platform_code,
+            platform_name=platform_name,
+        )
+    dialog = {
+        "id": _platform_dialog_id(
+            subtype=subtype,
+            message=safe_message,
+            trace_id=trace_id,
+            task_id=task_id,
+            case_id=case_id,
+        ),
+        "type": "confirm" if confirm_required else "notice",
+        "subtype": subtype,
+        "title": title or "报价提示",
+        "message": safe_message,
+        "severity": severity or "warning",
+        "confirm_required": bool(confirm_required),
+        "confirm_text": confirm_text or ("继续报价" if confirm_required else "确定"),
+        "cancel_text": cancel_text or ("中止" if confirm_required else ""),
+        "close_text": close_text or ("关闭" if not confirm_required else ""),
+        "platform_code": _to_str(platform_code).strip().upper(),
+        "platform_name": _platform_display_name(platform_code, platform_name) if (platform_code or platform_name) else "",
+        "ui_visible": True,
+    }
+    if confirm_command:
+        dialog["confirm_action"] = {"command": confirm_command}
+    if cancel_command:
+        dialog["cancel_action"] = {"command": cancel_command}
+    return dialog
+
+
+def _duplicate_quote_platform_dialog(
+    *,
+    warning: str,
+    platform_code: str = "",
+    platform_name: str = "",
+    trace_id: str = "",
+    task_id: Any = None,
+    case_id: Any = None,
+) -> Dict[str, Any]:
+    return _make_platform_dialog(
+        message=warning,
+        title="重复投保提示",
+        subtype="duplicate_quote",
+        severity="warning",
+        confirm_required=True,
+        trace_id=trace_id,
+        task_id=task_id,
+        case_id=case_id,
+        confirm_text="继续报价",
+        cancel_text="中止",
+        confirm_command="继续报价",
+        cancel_command="中止重复报价",
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+
+
 def _alias_matches_text(alias: str, low_text: str) -> bool:
     token = _to_str(alias).strip().lower()
     if not token:
@@ -649,15 +897,38 @@ CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE: Dict[str, Tuple[str, ...]] = {
 }
 
 QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途家安顺非车保费")),
+    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车")),
     ("机动车损失保险", ("机动车损失保险", "车辆损失险", "车损险", "车损")),
     ("医保外医疗费用责任险（第三者责任险）", ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外")),
-    ("第三者责任险", ("第三者责任险", "第三责任险", "三者险", "三者", "三责")),
+    ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者", "三责")),
     ("车上人员责任险（司机）", ("车上人员责任险（司机）", "车上人员责任险(司机)", "司机责任险", "司机险", "司机")),
     ("车上人员责任险（乘客）", ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客责任险", "乘客险", "乘客")),
     ("交强", ("交强险", "交强")),
     ("共享主险限额", ("共享主险限额", "主险限额共享")),
 )
+
+QUOTE_THIRD_PARTY_LABEL = "第三者责任险"
+QUOTE_MEDICAL_THIRD_LABEL = "医保外医疗费用责任险（第三者责任险）"
+QUOTE_SHARED_LIMIT_LABEL = "共享主险限额"
+QUOTE_LOSS_LABEL = "机动车损失保险"
+QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
+
+PICC_FULL_COVER_COMMANDS = {
+    "全保",
+    "人保全保",
+    "全保报价",
+    "人保全保报价",
+    "全保重报",
+    "人保全保重报",
+}
+PICC_JIAOSAN_COMMANDS = {
+    "交三",
+    "人保交三",
+    "交三报价",
+    "人保交三报价",
+    "交三重报",
+    "人保交三重报",
+}
 
 QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
     "车牌号",
@@ -675,6 +946,13 @@ QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
     "车型",
     "车型名称",
     "品牌型号",
+    "送修码",
+    "送修码代码",
+    "送修码名称",
+    "专管代码",
+    "专管名称",
+    "monopolyCode",
+    "monopolyName",
 }
 
 QUOTE_IMAGE_FIELDS_BY_SLOT: Dict[str, Tuple[str, ...]] = {
@@ -878,6 +1156,95 @@ def _quote_labeled_plate_no_present(value: Any) -> bool:
     return bool(re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)[:：=]?[\u4e00-\u9fff][A-Z][A-Z0-9]{4,6}", text))
 
 
+def _quote_date_obj(value: Any) -> Optional[datetime]:
+    text = _normalize_quote_date_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _one_calendar_year_ago(value: datetime) -> datetime:
+    try:
+        return value.replace(year=value.year - 1)
+    except ValueError:
+        # 2/29 falls back to 2/28 for the "one calendar year" boundary.
+        return value.replace(year=value.year - 1, day=28)
+
+
+def _recent_driving_license_issue_date(value: Any, *, now: Optional[datetime] = None) -> Tuple[str, bool, Optional[int]]:
+    issue_dt = _quote_date_obj(value)
+    if issue_dt is None:
+        return "", False, None
+    today = (now or _now()).replace(hour=0, minute=0, second=0, microsecond=0)
+    issue_day = issue_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if issue_day > today:
+        return issue_day.strftime("%Y-%m-%d"), False, None
+    age_days = (today - issue_day).days
+    return issue_day.strftime("%Y-%m-%d"), issue_day > _one_calendar_year_ago(today), age_days
+
+
+def _extract_transfer_vehicle_command(text: Any) -> Dict[str, Any]:
+    raw = _norm_text(text)
+    compact = re.sub(r"\s+", "", raw)
+    if not compact or "过户车" not in compact:
+        return {}
+    if re.search(r"(?:非|不是|并非|不算|不要|不用|取消|撤销|去掉|关闭)过户车|过户车(?:取消|撤销|不要|不用|否|不是)", compact):
+        return {
+            "is_command": True,
+            "is_transfer_vehicle": False,
+            "transfer_vehicle_override": "not_transfer",
+            "raw_text": raw,
+        }
+    if re.search(r"(?:按|是|属于|改成|改为|设置为|设为|确认)?过户车", compact):
+        transfer_date = _normalize_quote_date_text(raw)
+        return {
+            "is_command": True,
+            "is_transfer_vehicle": True,
+            "transfer_vehicle_override": "transfer",
+            "transfer_date": transfer_date,
+            "raw_text": raw,
+        }
+    return {}
+
+
+def _apply_transfer_vehicle_state(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(_json_obj(data))
+    override = _to_str(out.get("transfer_vehicle_override")).strip()
+    issue_date, recent_issue, age_days = _recent_driving_license_issue_date(out.get("issue_date"))
+
+    if override == "not_transfer":
+        out["is_transfer_vehicle"] = False
+        out["transfer_date"] = ""
+        out["transfer_vehicle_source"] = "user_override"
+        out["transfer_vehicle_reason"] = "用户指定非过户车"
+        return _compact_quote_data(out)
+
+    if override == "transfer":
+        transfer_date = _normalize_quote_date_text(out.get("transfer_date")) or issue_date
+        out["is_transfer_vehicle"] = True
+        out["transfer_date"] = transfer_date
+        out["transfer_vehicle_source"] = "user_override"
+        out["transfer_vehicle_reason"] = "用户指定过户车"
+        return _compact_quote_data(out)
+
+    if recent_issue and issue_date:
+        out["is_transfer_vehicle"] = True
+        out["transfer_date"] = issue_date
+        out["transfer_vehicle_source"] = "driving_license_issue_date"
+        out["transfer_vehicle_reason"] = f"行驶证发证日期距今{age_days}天，不满一年，按过户车处理"
+    else:
+        # Clear stale auto-derived transfer state when materials are replaced or recalled.
+        if _to_str(out.get("transfer_vehicle_source")).strip() in {"", "driving_license_issue_date"}:
+            out["is_transfer_vehicle"] = False
+            out.pop("transfer_date", None)
+            out.pop("transfer_vehicle_source", None)
+            out.pop("transfer_vehicle_reason", None)
+    return _compact_quote_data(out)
+
+
 def _clean_quote_dynamic_data(data: Dict[str, Any], *, derive_owner_name: bool = True) -> Dict[str, Any]:
     cleaned = clean_dynamic_data_for_ocr(_json_obj(data))
     if "owner_phone" in (data or {}) or "owner_phone" in cleaned:
@@ -980,7 +1347,8 @@ def _normalize_quote_case_data(
     base = _drop_uploaded_image_managed_fields(base, images_by_slot)
     image_data = _active_image_extracted_data(images_by_slot)
     text_clean = _clean_quote_dynamic_data(_json_obj(text_data))
-    return _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean))
+    merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean))
+    return _apply_transfer_vehicle_state(merged)
 
 
 def _same_material_text(left: Any, right: Any) -> bool:
@@ -1444,7 +1812,35 @@ def _config_numeric_decimal(value: Any) -> Optional[Decimal]:
 
 def _quote_config_field_allows_zero(field_name: Any) -> bool:
     label = re.sub(r"\s+", "", _to_str(field_name).strip())
-    return label in {"途家安顺保费", "途家安顺", "途家安顺非车保费"}
+    return label in {"途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车", "送修码启用"}
+
+
+def _quote_false_text() -> str:
+    return "false"
+
+
+def _quote_true_text() -> str:
+    return "true"
+
+
+def _quote_config_alias_pattern(alias: str) -> str:
+    if alias == "三者":
+        return r"(?<!第)三者"
+    return re.escape(alias)
+
+
+def _expand_third_party_medical_overrides(overrides: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = dict(_json_obj(overrides))
+    has_third = QUOTE_THIRD_PARTY_LABEL in merged
+    has_medical_third = QUOTE_MEDICAL_THIRD_LABEL in merged
+    if has_third and not has_medical_third:
+        merged[QUOTE_MEDICAL_THIRD_LABEL] = merged[QUOTE_THIRD_PARTY_LABEL]
+    elif has_medical_third and not has_third:
+        merged[QUOTE_THIRD_PARTY_LABEL] = merged[QUOTE_MEDICAL_THIRD_LABEL]
+    if has_third or has_medical_third:
+        # PICC keeps this checked; the page copies the third-party main amount to the attached medical coverage.
+        merged[QUOTE_SHARED_LIMIT_LABEL] = _quote_true_text()
+    return merged
 
 
 def _ensure_positive_numeric_config_value(field_name: Any, value: Any, *, context: str = "默认参数") -> None:
@@ -1472,17 +1868,72 @@ def _canonical_quote_config_override_label(value: Any) -> str:
     return label[:128]
 
 
+def _normalize_quote_product_exclusions(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        parsed: Any = None
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+        items = parsed if isinstance(parsed, list) else re.split(r"[,，、;；\s]+", raw)
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+
+    exclusions: List[str] = []
+    for item in items:
+        label = _canonical_quote_config_override_label(item)
+        if label == QUOTE_LOSS_LABEL and label not in exclusions:
+            exclusions.append(label)
+    return exclusions
+
+
+def _detect_professional_quote_command(text: Any) -> Dict[str, Any]:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return {}
+    if compact in PICC_JIAOSAN_COMMANDS:
+        return {
+            "is_quote": True,
+            "entities": {
+                "platform_code": "PICC",
+                "platform_name": "人保",
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: [QUOTE_LOSS_LABEL],
+                "quote_command_mode": "交三",
+            },
+        }
+    if compact in PICC_FULL_COVER_COMMANDS:
+        return {
+            "is_quote": True,
+            "entities": {
+                "platform_code": "PICC",
+                "platform_name": "人保",
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: [],
+                "quote_command_mode": "全保",
+            },
+        }
+    return {}
+
+
 def extract_quote_config_overrides(text: Any) -> Dict[str, Any]:
     t = _norm_text(text)
     compact = re.sub(r"\s+", "", t)
     overrides: Dict[str, Any] = {}
     consumed_spans: List[Tuple[int, int]] = []
     connector = r"(?:保额|金额|额度|限额|改成|改为|调整为|调整到|调成|改到|设置为|设为|变成|调整|改|到|为)?"
+    separator = r"(?:[:：=+＋])?"
     number = r"(-?\d+(?:[,，]\d{3})*(?:\.\d+)?)"
 
     for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:
         for alias in sorted(aliases, key=len, reverse=True):
-            pattern = rf"{re.escape(alias)}\s*[:：=]?\s*{connector}\s*[:：=]?\s*{number}\s*(万|元)?"
+            pattern = rf"{_quote_config_alias_pattern(alias)}\s*{separator}\s*{connector}\s*{separator}\s*{number}\s*(万|元)?"
             match = next(
                 (
                     item
@@ -1530,7 +1981,7 @@ def _merge_quote_config_overrides(*items: Any, validate_positive: bool = True) -
             if validate_positive:
                 _ensure_positive_numeric_config_value(label, value, context="报价调整字段")
             merged[label] = value
-    return merged
+    return _expand_third_party_medical_overrides(merged)
 
 
 def _quote_override_summary(overrides: Any) -> str:
@@ -1541,6 +1992,198 @@ def _quote_override_summary(overrides: Any) -> str:
         if label and text:
             pairs.append(f"{label}={text}")
     return "、".join(pairs[:8])
+
+
+def _extract_quote_repair_code_command(text: Any) -> Dict[str, Any]:
+    raw = _norm_text(text)
+    compact = re.sub(r"\s+", "", raw)
+    if not compact:
+        return {}
+    if re.search(r"(?:取消|非|不要|不用|不使用|关闭|去掉)送修码", compact):
+        return {"is_command": True, "enabled": False, "raw_text": raw}
+    match = re.search(r"送\s*修\s*码", raw)
+    if not match:
+        return {}
+    body = raw[match.end() :].strip()
+    body = re.sub(r"^[：:=\-—－,，;；\s]+", "", body).strip()
+    body = re.sub(r"\s*(?:人保|PICC|picc|太平洋|平安)?\s*报价\s*$", "", body).strip()
+    if not body:
+        return {"is_command": True, "enabled": True, "query": "", "raw_text": raw}
+    code_match = re.search(r"\d{6,20}", body)
+    code = code_match.group(0) if code_match else ""
+    name = body
+    if code:
+        name = name.replace(code, " ")
+    name = re.sub(r"^[：:=\-—－,，;；\s]+|[：:=\-—－,，;；\s]+$", "", name).strip()
+    return {
+        "is_command": True,
+        "enabled": True,
+        "query": body,
+        "code": code,
+        "name": name,
+        "raw_text": raw,
+    }
+
+
+def _repair_code_match_key(value: Any) -> str:
+    return re.sub(r"[\s:：=+\-—－_,，,;；。·（）()【】\\[\\]{}]+", "", _to_str(value).strip()).lower()
+
+
+def _is_repair_code_subsequence(needle: str, haystack: str) -> bool:
+    if not needle or not haystack:
+        return False
+    pos = 0
+    for char in haystack:
+        if pos < len(needle) and char == needle[pos]:
+            pos += 1
+    return pos == len(needle)
+
+
+def _repair_code_fuzzy_score(needle: Any, haystack: Any) -> int:
+    needle_key = _repair_code_match_key(needle)
+    haystack_key = _repair_code_match_key(haystack)
+    if not needle_key or not haystack_key:
+        return 0
+    if needle_key == haystack_key:
+        return 120
+    if needle_key in haystack_key:
+        return 100
+    if haystack_key in needle_key and len(haystack_key) >= 2:
+        return 90
+    if len(needle_key) >= 2 and _is_repair_code_subsequence(needle_key, haystack_key):
+        return 80
+    needle_chars = [char for char in needle_key if not char.isdigit()]
+    if len(needle_chars) >= 2:
+        hit = sum(1 for char in needle_chars if char in haystack_key)
+        coverage = hit / max(len(needle_chars), 1)
+        if coverage >= 0.8:
+            return int(60 + coverage * 10)
+    return 0
+
+
+def _repair_code_overrides(*, enabled: bool, code: str = "", name: str = "") -> Dict[str, Any]:
+    if not enabled:
+        return {"送修码启用": "0"}
+    return {
+        "送修码启用": "1",
+        "送修码": code,
+        "送修码名称": name,
+        "专管代码": code,
+        "专管名称": name,
+        "monopolyCode": code,
+        "monopolyName": name,
+    }
+
+
+def _pick_repair_code_row(rows: Iterable[Any], command: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    safe_rows = [
+        {
+            "flag": _to_str(_json_obj(row).get("flag")).strip(),
+            "monopolyCode": _to_str(_json_obj(row).get("monopolyCode")).strip(),
+            "monopolyName": _to_str(_json_obj(row).get("monopolyName")).strip(),
+        }
+        for row in rows
+        if _to_str(_json_obj(row).get("monopolyCode")).strip() or _to_str(_json_obj(row).get("monopolyName")).strip()
+    ]
+    code = _to_str(command.get("code")).strip()
+    name_key = _repair_code_match_key(command.get("name"))
+    query_key = _repair_code_match_key(command.get("query"))
+
+    scored_matches: List[Tuple[int, Dict[str, Any]]] = []
+    if code:
+        for row in safe_rows:
+            if _to_str(row.get("monopolyCode")).strip() != code:
+                continue
+            score = 200
+            if name_key:
+                score += _repair_code_fuzzy_score(name_key, row.get("monopolyName"))
+            if name_key and score <= 200:
+                continue
+            scored_matches.append((score, row))
+        if not scored_matches:
+            return {}, safe_rows[:8]
+    else:
+        needle = name_key or query_key
+        if not needle:
+            return {}, safe_rows[:8]
+        for row in safe_rows:
+            haystack = _repair_code_match_key(f"{row.get('monopolyCode')}{row.get('monopolyName')}")
+            score = max(
+                _repair_code_fuzzy_score(needle, haystack),
+                _repair_code_fuzzy_score(needle, row.get("monopolyName")),
+                _repair_code_fuzzy_score(needle, row.get("monopolyCode")),
+            )
+            if score > 0:
+                scored_matches.append((score, row))
+    scored_matches.sort(
+        key=lambda item: (
+            0 if _to_str(item[1].get("flag")).strip() == "1" else 1,
+            -item[0],
+            len(_to_str(item[1].get("monopolyName")).strip()),
+            _to_str(item[1].get("monopolyCode")).strip(),
+        )
+    )
+    matches = [row for _, row in scored_matches]
+    return (matches[0] if matches else {}), matches[:8] if matches else safe_rows[:8]
+
+
+async def _resolve_quote_repair_code_command(
+    db: AsyncSession,
+    *,
+    ctx: Dict[str, Any],
+    owner_user_id: int,
+    command: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if not command:
+        return {}
+    if not bool(command.get("enabled")):
+        return {
+            "overrides": _repair_code_overrides(enabled=False),
+            "summary": "已取消送修码",
+            "query": "",
+            "matched": None,
+        }
+
+    account = await _select_quote_platform_account(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code="PICC",
+        account_type_name=None,
+    )
+    if account is None:
+        raise ValueError("当前没有可用的人保平台账号，无法查询送修码列表")
+    runtime_result = await quote_platform_runtime.query_repair_codes(
+        _platform_account_context(account),
+        {"query": command.get("query") or command.get("raw_text") or "", "rows": 1000},
+        db=db,
+    )
+    if _is_runtime_session_expired_result(runtime_result):
+        _apply_platform_account_runtime_status(account, runtime_result, default_error="送修码查询失败")
+        raise ValueError(_runtime_detail(runtime_result, "送修码查询失败"))
+    if _runtime_status(runtime_result) not in {"success", "ok"}:
+        raise ValueError(_runtime_detail(runtime_result, "送修码查询失败"))
+    runtime_payload = _runtime_result_payload(runtime_result)
+    rows = _json_list(_json_obj(runtime_payload.get("data")).get("rows"))
+    matched, candidates = _pick_repair_code_row(rows, command)
+    if not matched:
+        query_text = _to_str(command.get("query") or command.get("raw_text")).strip()
+        tips = [
+            f"{row.get('monopolyCode')}-{row.get('monopolyName')}"
+            for row in candidates[:5]
+            if _to_str(row.get("monopolyCode")).strip() or _to_str(row.get("monopolyName")).strip()
+        ]
+        suffix = f"。可选示例：{'；'.join(tips)}" if tips else ""
+        raise ValueError(f"未在平台送修码列表中匹配到“{query_text or '空'}”{suffix}")
+    code = _to_str(matched.get("monopolyCode")).strip()
+    name = _to_str(matched.get("monopolyName")).strip()
+    return {
+        "overrides": _repair_code_overrides(enabled=True, code=code, name=name),
+        "summary": f"送修码={code}-{name}",
+        "query": _to_str(command.get("query")).strip(),
+        "matched": matched,
+        "candidates": candidates,
+        "platform_account": _credential_public_payload(account),
+    }
 
 
 def _normalize_login_phone(value: Any) -> Tuple[Optional[str], Optional[str]]:
@@ -2411,6 +3054,7 @@ def detect_quote_vehicle_type(
     images_by_slot: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
     data = _json_obj(normalized_data)
+    transfer_state = _apply_transfer_vehicle_state(data)
     slots = images_by_slot or {}
     haystack = _quote_detect_haystack(data, slots)
     compact = re.sub(r"\s+", "", haystack).lower()
@@ -2541,6 +3185,9 @@ def detect_quote_vehicle_type(
         "vehicle_energy_type": energy_type,
         "vehicle_energy_type_name": energy_name,
         "config_type_name": config_type_name,
+        "is_transfer_vehicle": bool(transfer_state.get("is_transfer_vehicle")),
+        "transfer_date": _to_str(transfer_state.get("transfer_date")).strip(),
+        "transfer_vehicle_source": _to_str(transfer_state.get("transfer_vehicle_source")).strip(),
         "source": source,
         "confidence": round(confidence, 4),
     }
@@ -2860,6 +3507,11 @@ async def apply_platform_default_config_to_snapshot(
     default_values = dict(builtin_defaults)
     default_values.update(resolved_defaults)
     default_values.update(quote_field_overrides)
+    quote_product_exclusions = _normalize_quote_product_exclusions(
+        normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
+    )
+    if quote_product_exclusions:
+        default_values[QUOTE_PRODUCT_EXCLUSIONS_KEY] = quote_product_exclusions
     safe_snapshot["vehicle_type_detect"] = vehicle_type_detect
     safe_snapshot["vehicle_usage_type"] = vehicle_type_detect.get("vehicle_usage_type") or "unknown"
     safe_snapshot["vehicle_energy_type"] = vehicle_type_detect.get("vehicle_energy_type") or "unknown"
@@ -2871,6 +3523,7 @@ async def apply_platform_default_config_to_snapshot(
         "resolved_type_name": resolved_type_name,
         "account_type_name": _normalize_account_type_name(account_type_name),
         "quote_field_overrides": quote_field_overrides,
+        QUOTE_PRODUCT_EXCLUSIONS_KEY: quote_product_exclusions,
     }
     safe_snapshot["platform_default_params"] = default_values
     safe_snapshot["request_body"] = _build_quote_request_body(default_values, normalized_data)
@@ -3731,6 +4384,114 @@ def _is_runtime_session_expired_result(result: Optional[PlatformRuntimeResult]) 
     status = _runtime_status(result)
     business_status = _runtime_business_status(result)
     return status in RUNTIME_SESSION_EXPIRED_STATUSES or business_status == "16"
+
+
+def _quote_platform_dialog_response(
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    platform_account: Optional[QuotePlatformAccountProfile],
+    runtime_result: Optional[PlatformRuntimeResult],
+    platform_code: str,
+    platform_name: str,
+    trace_id: str,
+    error_detail: str,
+    result_status: str = RESULT_FAILED,
+    response_status: str = "failed",
+    title: str = "",
+    subtype: str = "",
+    severity: str = "",
+    actions: Optional[List[Dict[str, Any]]] = None,
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    if not subtype:
+        if _is_runtime_session_expired_result(runtime_result):
+            subtype = "session_expired"
+        elif _is_runtime_quota_full_result(runtime_result):
+            subtype = "quota_full"
+        else:
+            subtype = "quote_business_error"
+    if not title:
+        if subtype == "session_expired":
+            title = f"{platform_name or '平台'}登录已过期"
+        elif subtype == "quota_full":
+            title = "查询额度已用完"
+        else:
+            title = f"{platform_name or '平台'}报价提示"
+    if not severity:
+        severity = "error" if result_status == RESULT_FAILED else "warning"
+    runtime_data = _json_obj(getattr(runtime_result, "data", None) if runtime_result is not None else None)
+    source_dialog = _json_obj(runtime_data.get("platform_dialog"))
+    source_confirm_action = _json_obj(source_dialog.get("confirm_action"))
+    source_cancel_action = _json_obj(source_dialog.get("cancel_action"))
+    source_confirm_required = (
+        source_dialog.get("confirm_required") is True
+        or _to_str(source_dialog.get("type")).strip().lower() == "confirm"
+    )
+    message = _runtime_platform_dialog_message(
+        runtime_result,
+        error_detail or "平台返回报价提示，请核实后再继续。",
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    dialog = _make_platform_dialog(
+        message=message,
+        title=_to_str(source_dialog.get("title")).strip() or title,
+        subtype=_to_str(source_dialog.get("subtype")).strip() or subtype,
+        severity=_to_str(source_dialog.get("severity")).strip() or severity,
+        confirm_required=source_confirm_required,
+        trace_id=trace_id,
+        task_id=getattr(task, "id", None),
+        case_id=getattr(case, "id", None),
+        confirm_text=_to_str(source_dialog.get("confirm_text")).strip(),
+        cancel_text=_to_str(source_dialog.get("cancel_text")).strip(),
+        close_text=_to_str(source_dialog.get("close_text")).strip() or "关闭",
+        confirm_command=_to_str(source_confirm_action.get("command") or source_dialog.get("confirm_command")).strip(),
+        cancel_command=_to_str(source_cancel_action.get("command") or source_dialog.get("cancel_command")).strip(),
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+            "error_detail": error_detail,
+        },
+        "platform_account": _credential_public_payload(platform_account),
+        "platform_dialog": dialog,
+        "quote_runtime": _runtime_result_payload(runtime_result),
+        "ui_visible": False,
+    }
+    payload.update(_json_obj(extra_payload))
+    data = _mk_data(
+        result_status=result_status,
+        message=message,
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return (
+        "",
+        {
+            "status": response_status,
+            "intent": "quote",
+            "trace_id": trace_id,
+            "silent": True,
+            "ui_visible": False,
+            "data": data,
+            "actions": actions or [],
+        },
+    )
 
 
 def _apply_platform_account_runtime_status(
@@ -4647,12 +5408,14 @@ def detect_quote_signal(text: Any) -> Dict[str, Any]:
     low = t.lower()
     platform_low = _redact_platform_credentials_for_signal(t).lower()
     entities: Dict[str, Any] = {}
+    professional = _detect_professional_quote_command(t)
 
     for code, (name, aliases) in PLATFORM_ALIASES.items():
         if any(_alias_matches_text(alias, platform_low) for alias in aliases):
             entities["platform_code"] = code
             entities["platform_name"] = name
             break
+    entities.update(_json_obj(professional.get("entities")))
 
     order_id = _extract_order_id(t)
     if order_id:
@@ -4661,7 +5424,7 @@ def detect_quote_signal(text: Any) -> Dict[str, Any]:
     extracted = extract_quote_fields(t)
     entities.update({k: v for k, v in extracted.items() if v})
 
-    is_quote = bool(re.search(r"报价|重报|\bquote\b", low) or looks_like_short_quote_command(t))
+    is_quote = bool(professional.get("is_quote") or re.search(r"报价|重报|\bquote\b", low) or looks_like_short_quote_command(t))
     return {"is_quote": bool(is_quote), "entities": entities}
 
 
@@ -4681,11 +5444,26 @@ def looks_like_short_quote_command(text: Any) -> bool:
         "现在报",
         "现在报价",
         "提交报价",
+        "全保",
+        "人保全保",
+        "全保报价",
+        "人保全保报价",
+        "交三",
+        "人保交三",
+        "交三报价",
+        "人保交三报价",
     }
 
 
 def _is_explicit_platform_quote_command(text: Any, platform_code: str = "", platform_name: str = "") -> bool:
     raw_text = _norm_text(text)
+    professional = _detect_professional_quote_command(raw_text)
+    professional_entities = _json_obj(professional.get("entities"))
+    if professional.get("is_quote"):
+        professional_code = _to_str(professional_entities.get("platform_code")).strip().upper()
+        code = _to_str(platform_code).strip().upper()
+        if professional_code and (not code or professional_code == code):
+            return True
     compact_candidates = [re.sub(r"\s+", "", raw_text)]
     compact_candidates.extend(
         re.sub(r"\s+", "", line)
@@ -4754,6 +5532,8 @@ def _quote_check_context_is_active(case: QuoteCase) -> bool:
     if not case or not _to_str(case.platform_code).strip() or not _to_str(case.platform_name).strip():
         return False
     if case.status in {CASE_STATUS_READY, CASE_STATUS_WAITING_SMS, CASE_STATUS_WAITING_DUPLICATE_CONFIRM}:
+        return True
+    if case.status == CASE_STATUS_COLLECTING:
         return True
     return bool(_json_list(case.missing_requirements))
 
@@ -4860,6 +5640,12 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
         if value:
             out["first_register_date"] = value
 
+    issue_date = re.search(r"(?:行驶证发证日期|发证日期|发证时间)\s*[:：]?\s*" + quote_date_pattern, t)
+    if issue_date:
+        value = _normalize_quote_date_text(issue_date.group(1))
+        if value:
+            out["issue_date"] = value
+
     commercial_start = re.search(r"(?:商业起保日期|商业险起保日期|商业起保|商业险起期)\s*[:：]?\s*" + quote_date_pattern, t)
     if commercial_start:
         value = _normalize_quote_date_text(commercial_start.group(1))
@@ -4884,7 +5670,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
     product_aliases: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
         ("机动车损失保险", ("机动车损失保险", "车辆损失险", "车损险", "车损")),
         ("医保外医疗费用责任险（第三者责任险）", ("附加医保外医疗费用责任险（机动车第三者责任保险）", "医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外")),
-        ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "三者险", "三者")),
+        ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者")),
         ("车上人员责任险（司机）", ("机动车车上人员责任保险（司机）", "车上人员责任险（司机）", "车上人员责任险(司机)", "司机责任险", "司机险")),
         ("车上人员责任险（乘客）", ("机动车车上人员责任保险（乘客）", "车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客责任险", "乘客险")),
         ("交强", ("交强险", "交强")),
@@ -4892,7 +5678,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
     consumed_spans: List[Tuple[int, int]] = []
     for canonical, aliases in product_aliases:
         for alias in sorted(aliases, key=len, reverse=True):
-            pattern = rf"{re.escape(alias)}\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*(万|元)?"
+            pattern = rf"{_quote_config_alias_pattern(alias)}\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*(万|元)?"
             m = next(
                 (
                     item
@@ -4909,13 +5695,23 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
                 consumed_spans.append(m.span())
             break
     if "共享主险限额" in t:
-        quote_overrides.setdefault("共享主险限额", "true")
+        compact_shared = re.sub(r"\s+", "", t)
+        if re.search(r"(?:取消|不要|不用|不使用|关闭|去掉|不勾选|非).{0,8}共享主险限额|共享主险限额.{0,8}(?:取消|不要|不用|不使用|关闭|去掉|不勾选|非)", compact_shared):
+            quote_overrides[QUOTE_SHARED_LIMIT_LABEL] = _quote_false_text()
+        else:
+            quote_overrides.setdefault(QUOTE_SHARED_LIMIT_LABEL, "true")
     if quote_overrides:
         out["quote_field_overrides"] = _merge_quote_config_overrides(
             out.get("quote_field_overrides"),
             quote_overrides,
             validate_positive=False,
         )
+    transfer_command = _extract_transfer_vehicle_command(t)
+    if transfer_command:
+        out["transfer_vehicle_override"] = transfer_command.get("transfer_vehicle_override")
+        out["is_transfer_vehicle"] = transfer_command.get("is_transfer_vehicle")
+        if _to_str(transfer_command.get("transfer_date")).strip():
+            out["transfer_date"] = transfer_command.get("transfer_date")
 
     return out
 
@@ -6317,6 +7113,11 @@ QUOTE_ENTITY_FIELD_KEYS = tuple(
             "quote_vehicle_type",
             "vehicle_usage_type",
             "vehicle_kind",
+            "is_transfer_vehicle",
+            "transfer_date",
+            "transfer_vehicle_override",
+            QUOTE_PRODUCT_EXCLUSIONS_KEY,
+            "quote_command_mode",
         }
     )
 )
@@ -6707,6 +7508,16 @@ async def get_pending_duplicate_quote_confirm_payload(
         f"{case.platform_name or case.platform_code or '平台'}提示该车辆可能重复投保，请核实后再继续报价。",
     )
     trace_id = _to_str(getattr(task, "trace_id", "")).strip() or _new_trace_id()
+    platform_code = case.platform_code or task.platform_code or ""
+    platform_name = case.platform_name or task.platform_name or platform_code
+    dialog = _duplicate_quote_platform_dialog(
+        warning=warning,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        trace_id=trace_id,
+        task_id=task.id,
+        case_id=case.id,
+    )
     payload = {
         "quote_case": {
             "id": case.id,
@@ -6723,6 +7534,7 @@ async def get_pending_duplicate_quote_confirm_payload(
         },
         "duplicate_quote_confirm_required": True,
         "duplicate_quote_warning": warning,
+        "platform_dialog": dialog,
         "ui_visible": False,
     }
     data = _mk_data(
@@ -7447,28 +8259,6 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
     return upgraded
 
 
-def _quote_result_watermark_account(
-    platform_account: Optional[QuotePlatformAccountProfile],
-    *,
-    platform_name: str = "",
-) -> str:
-    if not platform_account:
-        return _to_str(platform_name).strip() or "报价助手"
-    username = _to_str(_loaded_value(platform_account, "account_username")).strip()
-    owner = _to_str(_loaded_value(platform_account, "account_owner_name")).strip()
-    account_type = _normalize_account_type_name(_loaded_value(platform_account, "account_type_name"))
-    parts: List[str] = []
-    if username:
-        parts.append(username)
-    if owner and owner not in parts:
-        parts.append(owner)
-    if not parts and account_type:
-        parts.append(account_type)
-    if not parts:
-        parts.append(_to_str(platform_name).strip() or "报价助手")
-    return " ".join(parts)
-
-
 def _enrich_quote_result_for_display(
     result: Dict[str, Any],
     *,
@@ -7481,16 +8271,14 @@ def _enrich_quote_result_for_display(
     if card:
         card = _picc_result_card_for_display(safe_result, card)
         display_time = _quote_card_time_text()
-        account_label = _quote_result_watermark_account(platform_account, platform_name=platform_name)
-        card.setdefault("watermark_account", account_label)
-        card.setdefault("watermark_user", account_label)
-        card.setdefault("watermark_name", account_label)
-        card.setdefault("watermark_time", display_time)
         card.setdefault("quote_time", display_time)
-        card.setdefault("watermark_text", f"{account_label} {display_time}".strip())
+        for key in ("watermark_account", "watermark_user", "watermark_name", "watermark_time", "watermark_text"):
+            card.pop(key, None)
         safe_result["result_card"] = card
         try:
+            image_started = time.perf_counter()
             image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
+            safe_result["result_image_ms"] = _elapsed_ms(image_started)
             if image_payload:
                 safe_result["result_image"] = image_payload
         except Exception as exc:
@@ -7500,6 +8288,492 @@ def _enrich_quote_result_for_display(
         safe_result.setdefault("account_username", _to_str(_loaded_value(platform_account, "account_username")).strip())
         safe_result.setdefault("account_owner_name", _to_str(_loaded_value(platform_account, "account_owner_name")).strip())
     return safe_result
+
+
+def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
+    """Parse image-only non-car premium adjustments, without triggering platform requote."""
+    raw = _norm_text(text)
+    compact = re.sub(r"\s+", "", raw)
+    if not compact or "报价" in compact or "重报" in compact:
+        return {}
+    aliases = ("途家安顺保费", "途家安顺非车保费", "途顺家安保费", "途家安顺", "途顺家安", "非车")
+    alias_group = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+    number = r"(-?\d+(?:[,，]\d{3})*(?:\.\d+)?)"
+    pattern = rf"^(?:请)?(?:把|将)?(?:{alias_group})(?:保费|金额|保额)?(?:[:：=+＋]|改成|改为|调整为|调整到|调成|改到|设置为|设为|变成|调整|改|到|为)?{number}(万|元)?$"
+    match = re.fullmatch(pattern, compact, flags=re.IGNORECASE)
+    if not match:
+        return {}
+    value = _normalize_quote_config_override_value(match.group(1), match.group(2))
+    _ensure_positive_numeric_config_value("途家安顺保费", value, context="非车金额")
+    return {"field_name": "途家安顺保费", "field_value": value}
+
+
+def _result_has_quote_card(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return bool(_json_obj(result.get("result_card") or result.get("resultCard")))
+
+
+async def _latest_success_quote_task_for_session(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    ctx: Optional[Dict[str, Any]] = None,
+    for_update: bool = False,
+) -> Optional[Tuple[QuoteCase, QuoteTask]]:
+    if owner_user_id <= 0 or not session_id:
+        return None
+    stmt = (
+        select(QuoteCase, QuoteTask)
+        .join(QuoteTask, QuoteTask.quote_case_id == QuoteCase.id)
+        .where(
+            QuoteCase.owner_user_id == owner_user_id,
+            QuoteCase.session_id == session_id,
+            QuoteTask.status == TASK_STATUS_SUCCESS,
+        )
+        .order_by(desc(QuoteTask.id))
+        .limit(30)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    rows = (await db.execute(stmt)).all()
+    for case, task in rows:
+        if ctx is not None and not await _case_order_is_readable(db, ctx=ctx, case=case):
+            continue
+        if _result_has_quote_card(_json_obj(task.result_payload)):
+            return case, task
+    return None
+
+
+def _quote_adjusted_money_text(value: Any, delta: Decimal) -> str:
+    return _quote_money_text(_quote_money_decimal(value) + delta)
+
+
+def _update_joint_sales_price_items(result: Dict[str, Any], premium: Decimal) -> None:
+    items = []
+    found = False
+    for item in _json_list(result.get("price_items")):
+        row = dict(_json_obj(item))
+        name = _to_str(row.get("name")).strip()
+        if name and any(keyword in name for keyword in ("途家", "途顺", "非车")):
+            row["amount"] = float(premium)
+            found = True
+        items.append(row)
+    if not found:
+        items.append({"name": "途家安顺", "amount": float(premium)})
+    result["price_items"] = items
+
+
+def _result_joint_sales_amount_source(result: Mapping[str, Any]) -> Any:
+    card = _json_obj(result.get("result_card") or result.get("resultCard"))
+    joint_sales = _json_obj(result.get("joint_sales"))
+    return (
+        result.get("joint_sales_original_amount")
+        or result.get("joint_sales_base_amount")
+        or card.get("joint_sales_original_amount")
+        or card.get("joint_sales_amount")
+        or result.get("joint_sales_amount")
+        or joint_sales.get("amount")
+    )
+
+
+async def _resolve_joint_sales_base_amount(
+    db: AsyncSession,
+    *,
+    case_id: int,
+    source_task: QuoteTask,
+    max_depth: int = 8,
+) -> Any:
+    """Find the original non-zero joint-sale coverage when the latest task is only an image redraw."""
+    task: Optional[QuoteTask] = source_task
+    seen: Set[int] = set()
+    depth = 0
+    while task is not None and depth < max_depth:
+        task_id = int(getattr(task, "id", 0) or 0)
+        if task_id and task_id in seen:
+            break
+        if task_id:
+            seen.add(task_id)
+
+        result = _json_obj(getattr(task, "result_payload", None))
+        amount = _result_joint_sales_amount_source(result)
+        if _quote_money_decimal(amount) > 0:
+            return amount
+
+        request_payload = _json_obj(getattr(task, "request_payload", None))
+        source_task_id = _safe_int(request_payload.get("source_task_id") or result.get("source_quote_task_id"), 0)
+        if source_task_id <= 0 or source_task_id in seen:
+            break
+        parent = await db.get(QuoteTask, source_task_id)
+        if not parent or int(getattr(parent, "quote_case_id", 0) or 0) != int(case_id or 0):
+            break
+        task = parent
+        depth += 1
+    return None
+
+
+def _quote_task_account_type_name(task: QuoteTask) -> str:
+    snapshot = _json_obj(getattr(task, "submitted_snapshot", None))
+    platform_default = _json_obj(snapshot.get("platform_default_config"))
+    vehicle_type_detect = _json_obj(snapshot.get("vehicle_type_detect"))
+    return _normalize_account_type_name(
+        platform_default.get("resolved_type_name")
+        or platform_default.get("account_type_name")
+        or vehicle_type_detect.get("config_type_name")
+    )
+
+
+def _joint_sales_query_snapshot_payload(source_task: QuoteTask, premium_value: Any) -> Dict[str, Any]:
+    snapshot = _json_obj(getattr(source_task, "submitted_snapshot", None))
+    request_payload = _json_obj(getattr(source_task, "request_payload", None))
+    result = _json_obj(getattr(source_task, "result_payload", None))
+    request_body = _json_obj(
+        result.get("request_body")
+        or snapshot.get("request_body")
+        or request_payload.get("request_body")
+    )
+    return {
+        "mode": "query_joint_sales_plan",
+        "source_task_id": _safe_int(getattr(source_task, "id", 0), 0),
+        "premium": _quote_money_text(premium_value),
+        "default_config_json": _json_obj(snapshot.get("default_config_json")),
+        "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
+        "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
+        "request_body": request_body,
+    }
+
+
+async def _query_joint_sales_amount_for_image_adjustment(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    source_task: QuoteTask,
+    premium_value: Any,
+) -> Tuple[str, Dict[str, Any], Optional[QuotePlatformAccountProfile]]:
+    premium = _quote_money_decimal(premium_value)
+    if premium <= 0:
+        return (
+            "0.00",
+            {
+                "attempted": False,
+                "success": True,
+                "premium": "0.00",
+                "amount": "0.00",
+                "reason": "途家安顺保费为0，按规则不查询保额",
+            },
+            None,
+        )
+
+    platform_code = _to_str(source_task.platform_code).strip().upper() or "PICC"
+    platform_name = _to_str(source_task.platform_name).strip() or platform_code
+    if platform_code != "PICC":
+        raise ValueError(f"{platform_name}暂不支持通过“非车 金额”重新查询途家安顺保额")
+
+    account_id = _quote_task_platform_account_id(source_task)
+    if account_id <= 0:
+        raise ValueError("最近一次报价缺少平台账号留档，无法查询途家安顺保额")
+    platform_account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if platform_account is None:
+        raise ValueError("最近一次报价使用的平台账号已不存在或当前账号无权访问")
+    if not bool(_loaded_value(platform_account, "enabled")):
+        raise ValueError("最近一次报价使用的平台账号已停用，无法查询途家安顺保额")
+
+    account_type_name = _quote_task_account_type_name(source_task)
+    platform_ctx = _platform_account_quote_context(platform_account, account_type_name=account_type_name)
+    query_payload = _joint_sales_query_snapshot_payload(source_task, premium_value)
+    runtime_result = await quote_platform_runtime.query_joint_sales_plan(platform_ctx, query_payload, db=db)
+    if _is_runtime_session_expired_result(runtime_result):
+        _apply_platform_account_runtime_status(platform_account, runtime_result, default_error="途家安顺保额查询失败")
+        raise ValueError(_runtime_detail(runtime_result, "途家安顺保额查询失败"))
+
+    runtime_status = _runtime_status(runtime_result)
+    runtime_payload = _runtime_result_payload(runtime_result)
+    data = _json_obj(runtime_payload.get("data"))
+    plan = _json_obj(data.get("joint_sales_plan"))
+    amount = data.get("amount") or plan.get("amount")
+    if runtime_status not in {"success", "ok"} or not plan.get("success"):
+        detail = _runtime_detail(runtime_result, "途家安顺保额查询失败")
+        plan_message = _to_str(plan.get("message")).strip()
+        raise ValueError(plan_message or detail)
+    if _quote_money_decimal(amount) <= 0:
+        raise ValueError(f"未查询到保费为{_quote_money_text(premium)}的途家安顺保额")
+
+    return (
+        _quote_money_text(amount),
+        {
+            "attempted": True,
+            "success": True,
+            "premium": _quote_money_text(data.get("premium") or plan.get("premium") or premium),
+            "amount": _quote_money_text(amount),
+            "candidate_count": _safe_int(plan.get("candidate_count"), 0),
+            "match_count": _safe_int(plan.get("match_count"), 0),
+            "selected_plan": _json_obj(plan.get("selected_plan")),
+            "selection_rule": _to_str(plan.get("selection_rule")).strip(),
+            "runtime": runtime_payload,
+        },
+        platform_account,
+    )
+
+
+def _apply_joint_sales_image_adjustment(
+    result: Dict[str, Any],
+    *,
+    premium_value: Any,
+    base_joint_sales_amount: Any = None,
+) -> Dict[str, Any]:
+    adjusted = deepcopy(_json_obj(result))
+    card = deepcopy(_json_obj(adjusted.get("result_card") or adjusted.get("resultCard")))
+    if not card:
+        raise ValueError("最近一次报价结果缺少图片数据，无法只重绘报价图")
+
+    premium = _quote_money_decimal(premium_value)
+    old_premium = _quote_money_decimal(card.get("joint_sales_premium") or adjusted.get("joint_sales_premium"))
+    delta = premium - old_premium
+    premium_text = _quote_money_text(premium)
+
+    joint_sales = deepcopy(_json_obj(adjusted.get("joint_sales")))
+    old_amount_source = (
+        card.get("joint_sales_amount")
+        or adjusted.get("joint_sales_amount")
+        or joint_sales.get("amount")
+    )
+    original_amount_source = (
+        base_joint_sales_amount
+        or adjusted.get("joint_sales_original_amount")
+        or card.get("joint_sales_original_amount")
+        or adjusted.get("joint_sales_base_amount")
+        or old_amount_source
+    )
+    original_amount_text = _quote_money_text(original_amount_source)
+    amount_text = "0.00" if premium == 0 else original_amount_text
+
+    card["joint_sales_label"] = "途家安顺"
+    card["joint_sales_display_label"] = "途顺家安组合保险"
+    card["joint_sales_premium"] = premium_text
+    card["joint_sales_amount"] = amount_text
+    card["joint_sales_original_amount"] = original_amount_text
+    adjusted["joint_sales_premium"] = premium_text
+    adjusted["joint_sales_amount"] = amount_text
+    adjusted["joint_sales_original_amount"] = original_amount_text
+    if joint_sales:
+        joint_sales["premium"] = premium_text
+        joint_sales["amount"] = amount_text
+        joint_sales["original_amount"] = original_amount_text
+        adjusted["joint_sales"] = joint_sales
+
+    for key in ("total_without_vehicle_tax", "total_with_vehicle_tax", "total_premium"):
+        if card.get(key) not in (None, ""):
+            card[key] = _quote_adjusted_money_text(card.get(key), delta)
+    if not card.get("total_without_vehicle_tax"):
+        card["total_without_vehicle_tax"] = _quote_money_text(
+            _quote_money_decimal(card.get("commercial_premium"))
+            + _quote_money_decimal(card.get("compulsory_premium"))
+            + premium
+        )
+    if not card.get("total_with_vehicle_tax"):
+        card["total_with_vehicle_tax"] = _quote_money_text(
+            _quote_money_decimal(card.get("total_without_vehicle_tax"))
+            + _quote_money_decimal(card.get("vehicle_tax"))
+        )
+    card["total_premium"] = _quote_money_text(card.get("total_with_vehicle_tax") or card.get("total_premium"))
+
+    if adjusted.get("premium_total") not in (None, ""):
+        adjusted["premium_total"] = float(_quote_money_decimal(adjusted.get("premium_total")) + delta)
+    else:
+        adjusted["premium_total"] = float(_quote_money_decimal(card.get("total_premium")))
+
+    _update_joint_sales_price_items(adjusted, premium)
+    adjusted["result_card"] = card
+    adjusted.pop("result_image", None)
+    adjusted.pop("resultImage", None)
+    adjusted["joint_sales_image_adjustment"] = {
+        "field_name": "途家安顺保费",
+        "field_value": premium_text,
+        "source": "chat_command",
+    }
+    return adjusted
+
+
+async def _handle_joint_sales_image_adjustment_message(
+    db: AsyncSession,
+    *,
+    ctx: Dict[str, Any],
+    owner_user_id: int,
+    session_id: Optional[str],
+    text: str,
+    adjustment: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    source_pair = await _latest_success_quote_task_for_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        ctx=ctx,
+        for_update=True,
+    )
+    if not source_pair:
+        return (
+            "请先完成一次报价后，再发送“非车 金额”调整报价结果图。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message="没有可复用的报价结果",
+                    entities={},
+                    payload={"joint_sales_image_adjustment": adjustment},
+                ),
+                "actions": [],
+            },
+        )
+
+    case, source_task = source_pair
+    case = await _lock_quote_case(db, case)
+    trace_id = _new_trace_id()
+    premium_value = adjustment.get("field_value")
+    try:
+        joint_sales_amount, joint_sales_amount_query, platform_account = await _query_joint_sales_amount_for_image_adjustment(
+            db,
+            owner_user_id=owner_user_id,
+            source_task=source_task,
+            premium_value=premium_value,
+        )
+    except Exception as exc:
+        detail = sanitize_quote_user_message(exc, "途家安顺保额查询失败")
+        reply = f"途家安顺保额查询失败：{detail}，本次没有更新报价结果图。"
+        return (
+            reply,
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=reply,
+                    entities={"quote_case_id": case.id, "order_id": case.order_id},
+                    payload={
+                        "quote_case": {
+                            "id": case.id,
+                            "case_no": case.case_no,
+                            "status": case.status,
+                            "order_id": case.order_id,
+                            "source_type": case.source_type,
+                        },
+                        "source_task_id": source_task.id,
+                        "joint_sales_image_adjustment": adjustment,
+                    },
+                ),
+                "actions": [],
+            },
+        )
+    adjusted_result = _apply_joint_sales_image_adjustment(
+        _json_obj(source_task.result_payload),
+        premium_value=premium_value,
+        base_joint_sales_amount=joint_sales_amount,
+    )
+    adjusted_result["trace_id"] = trace_id
+    adjusted_result["source_quote_task_id"] = source_task.id
+    adjusted_result["joint_sales_amount_query"] = joint_sales_amount_query
+    platform_name = _to_str(source_task.platform_name or case.platform_name or adjusted_result.get("platform_name")).strip()
+    display_result = _enrich_quote_result_for_display(
+        adjusted_result,
+        platform_account=platform_account,
+        platform_name=platform_name,
+    )
+
+    submitted_snapshot = deepcopy(_json_obj(source_task.submitted_snapshot))
+    submitted_snapshot["joint_sales_image_adjustment"] = {
+        "source_task_id": source_task.id,
+        "field_name": "途家安顺保费",
+        "field_value": _quote_money_text(premium_value),
+        "resolved_amount": _quote_money_text(joint_sales_amount),
+        "raw_text": text,
+    }
+    request_payload = {
+        "mode": "result_image_adjustment",
+        "source_task_id": source_task.id,
+        "owner_user_id": owner_user_id,
+        "platform_account": _json_obj(_json_obj(source_task.request_payload).get("platform_account")),
+        "joint_sales_image_adjustment": submitted_snapshot["joint_sales_image_adjustment"],
+        "resolved_joint_sales_amount": _quote_money_text(joint_sales_amount),
+        "joint_sales_amount_query": joint_sales_amount_query,
+    }
+    now = _now()
+    task = QuoteTask(
+        quote_case_id=case.id,
+        platform_code=source_task.platform_code or case.platform_code or adjusted_result.get("platform_code") or "PICC",
+        platform_name=platform_name or source_task.platform_code or case.platform_code,
+        status=TASK_STATUS_SUCCESS,
+        login_state=source_task.login_state or "authenticated",
+        sms_phone_mask=source_task.sms_phone_mask,
+        trace_id=trace_id,
+        request_payload=request_payload,
+        response_payload={
+            "reused_quote_result": True,
+            "source_task_id": source_task.id,
+            "joint_sales_amount_query": joint_sales_amount_query,
+        },
+        result_payload=display_result,
+        submitted_snapshot=submitted_snapshot,
+        started_at=now,
+        finished_at=now,
+    )
+    db.add(task)
+    await db.flush()
+
+    case.status = CASE_STATUS_QUOTED
+    case.current_task_id = task.id
+    case.updated_at = now
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_SUCCESS,
+            "trace_id": trace_id,
+            "result": display_result,
+            "source_task_id": source_task.id,
+            "joint_sales_image_adjustment": request_payload["joint_sales_image_adjustment"],
+            "joint_sales_amount_query": joint_sales_amount_query,
+        },
+    )
+    await db.flush()
+
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+            "source_task_id": source_task.id,
+        },
+        "quote_result": display_result,
+        "joint_sales_image_adjustment": request_payload["joint_sales_image_adjustment"],
+        "joint_sales_amount_query": joint_sales_amount_query,
+    }
+    return _quote_result_reply_text(display_result, platform_name=platform_name), {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "data": _mk_data(
+            result_status=RESULT_SUCCESS,
+            message="报价结果图已更新",
+            entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+            payload=payload,
+        ),
+        "actions": [],
+    }
 
 
 def _already_quoted_response(
@@ -7850,6 +9124,14 @@ async def _start_duplicate_quote_confirm_task(
         },
     )
     await db.flush()
+    dialog = _duplicate_quote_platform_dialog(
+        warning=warning,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        trace_id=trace_id,
+        task_id=task.id,
+        case_id=case.id,
+    )
     payload = {
         "quote_case": {
             "id": case.id,
@@ -7865,7 +9147,9 @@ async def _start_duplicate_quote_confirm_task(
             "trace_id": trace_id,
         },
         "platform_account": _credential_public_payload(platform_account),
+        "duplicate_quote_confirm_required": True,
         "duplicate_quote_warning": warning,
+        "platform_dialog": dialog,
         "quote_runtime": runtime_payload,
         "ui_visible": False,
     }
@@ -7898,6 +9182,8 @@ async def _complete_waiting_duplicate_quote_task(
     trace_id = task.trace_id or _new_trace_id()
     platform_code = task.platform_code or case.platform_code or "STUB"
     platform_name = task.platform_name or case.platform_name or platform_code
+    perf_started = time.perf_counter()
+    perf: Dict[str, Any] = {"login_mode": "sms_verified"}
     snapshot = _json_obj(task.submitted_snapshot)
     account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
     account_id = _safe_int(account_payload.get("id"), 0) or None
@@ -8745,7 +10031,9 @@ async def _complete_waiting_task(
             platform_account=platform_account,
         )
 
+    challenge_started = time.perf_counter()
     challenge_result = await quote_platform_runtime.submit_challenge(platform_ctx, sms_code, db=db)
+    perf["challenge_ms"] = _elapsed_ms(challenge_started)
     challenge_status = _runtime_status(challenge_result)
     challenge_preserved_session = bool(
         challenge_status in RUNTIME_SESSION_DEGRADED_STATUSES
@@ -8761,7 +10049,8 @@ async def _complete_waiting_task(
             platform_code=platform_code,
             platform_name=platform_name,
         )
-        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result)}
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result), "perf": perf}
         task.updated_at = _now()
         case.status = CASE_STATUS_WAITING_SMS
         case.current_task_id = task.id
@@ -8807,7 +10096,8 @@ async def _complete_waiting_task(
         task.status = TASK_STATUS_FAILED
         task.login_state = "failed"
         task.error_detail = _runtime_detail(challenge_result, "验证码校验失败")
-        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result)}
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result), "perf": perf}
         task.finished_at = _now()
         task.updated_at = _now()
         case.status = CASE_STATUS_READY
@@ -8886,12 +10176,15 @@ async def _complete_waiting_task(
     }
     quota_reservation: Dict[str, Any] = {"configured": False, "available": True, "reserved": False}
     if platform_account:
+        quota_started = time.perf_counter()
         quota_reservation = await _reserve_account_quota_for_quote(db, account=platform_account)
+        perf["quota_reserve_ms"] = _elapsed_ms(quota_started)
         if not quota_reservation.get("available", True):
             task.status = TASK_STATUS_FAILED
             task.login_state = "authenticated"
             task.error_detail = _quote_quota_exhausted_message(platform_name, platform_account)
-            task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result)}
+            perf["total_ms"] = _elapsed_ms(perf_started)
+            task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result), "perf": perf}
             task.finished_at = _now()
             task.updated_at = _now()
             case.status = CASE_STATUS_READY
@@ -8952,7 +10245,9 @@ async def _complete_waiting_task(
                     ],
                 },
             )
+    platform_quote_started = time.perf_counter()
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
+    perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     quote_status = _runtime_status(quote_runtime_result)
     if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
@@ -8990,6 +10285,7 @@ async def _complete_waiting_task(
             "sms_code_length": len(sms_code),
             "challenge": _runtime_result_payload(challenge_result),
             "quote": _runtime_result_payload(quote_runtime_result),
+            "perf": {**perf, "total_ms": _elapsed_ms(perf_started)},
         }
         task.result_payload = {}
         task.finished_at = _now()
@@ -9059,34 +10355,31 @@ async def _complete_waiting_task(
                     + "、".join(missing_default_config[:8])
                     + "。"
                 )
-            return (
-                "\n".join(reply_lines),
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": trace_id,
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message="平台登录已过期，等待重新登录",
-                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                        payload={
-                            "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
-                            "platform_account": _credential_public_payload(platform_account),
-                            "request_body": request_body_draft,
-                            "quote_runtime": runtime_payload,
-                        },
+            return _quote_platform_dialog_response(
+                case=case,
+                task=task,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                platform_code=platform_code,
+                platform_name=platform_name,
+                trace_id=trace_id,
+                error_detail="\n".join(reply_lines),
+                result_status=RESULT_NOT_READY,
+                response_status="success",
+                title=f"{platform_name}登录已过期",
+                subtype="session_expired",
+                severity="warning",
+                actions=[
+                    _mk_action(
+                        "平台账号管理",
+                        "open_account_manager",
+                        "quote_platform_accounts",
+                        platform_code=platform_code,
+                        platform_name=platform_name,
                     ),
-                    "actions": [
-                        _mk_action(
-                            "平台账号管理",
-                            "open_account_manager",
-                            "quote_platform_accounts",
-                            platform_code=platform_code,
-                            platform_name=platform_name,
-                        ),
-                        _mk_action(f"{platform_name}报价"),
-                    ],
-                },
+                    _mk_action(f"{platform_name}报价"),
+                ],
+                extra_payload={"request_body": request_body_draft},
             )
         if _is_runtime_quota_full_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -9103,20 +10396,16 @@ async def _complete_waiting_task(
             )
             if retry is not None:
                 return retry
-        return (
-            f"{platform_name}报价失败：{task.error_detail}。请检查平台账号状态或报价资料后重试。",
-            {
-                "status": "failed",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_FAILED,
-                    message=task.error_detail,
-                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
-                ),
-                "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
-            },
+        return _quote_platform_dialog_response(
+            case=case,
+            task=task,
+            platform_account=platform_account,
+            runtime_result=quote_runtime_result,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            error_detail=task.error_detail,
+            actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
         )
     result = _quote_result_from_runtime_or_fake(
         quote_runtime_result,
@@ -9125,12 +10414,17 @@ async def _complete_waiting_task(
         platform_name=platform_name,
         trace_id=trace_id,
     )
+    display_started = time.perf_counter()
     result = _enrich_quote_result_for_display(
         result,
         platform_account=platform_account,
         platform_name=platform_name,
     )
+    perf["result_display_ms"] = _elapsed_ms(display_started)
+    if result.get("result_image_ms") is not None:
+        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
+        perf["total_ms"] = _elapsed_ms(perf_started)
         return await _stop_quote_for_material_change(
             db,
             case=case,
@@ -9140,9 +10434,10 @@ async def _complete_waiting_task(
             task=task,
             platform_account=platform_account,
             quota_reservation=quota_reservation,
-            response_payload={"quote": _runtime_result_payload(quote_runtime_result)},
+            response_payload={"quote": _runtime_result_payload(quote_runtime_result), "perf": perf},
         )
 
+    perf["total_ms"] = _elapsed_ms(perf_started)
     task.status = TASK_STATUS_SUCCESS
     task.login_state = "authenticated"
     task.response_payload = {
@@ -9150,6 +10445,7 @@ async def _complete_waiting_task(
         "sms_code_length": len(sms_code),
         "challenge": _runtime_result_payload(challenge_result),
         "quote": _runtime_result_payload(quote_runtime_result),
+        "perf": perf,
     }
     task.result_payload = result
     task.finished_at = _now()
@@ -9167,6 +10463,7 @@ async def _complete_waiting_task(
         consume_quota=False,
     )
     if platform_account:
+        quota_update_started = time.perf_counter()
         await _record_account_quota_consumed(
             db,
             account=platform_account,
@@ -9179,6 +10476,9 @@ async def _complete_waiting_task(
             runtime_result=quote_runtime_result,
             operator_user_id=owner_user_id,
         )
+        perf["quota_update_ms"] = _elapsed_ms(quota_update_started)
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
 
     await _add_event(
         db,
@@ -9235,6 +10535,8 @@ async def _complete_quote_without_sms(
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "STUB"
     platform_name = case.platform_name or platform_account.platform_name or platform_code
+    perf_started = time.perf_counter()
+    perf: Dict[str, Any] = {"login_mode": login_mode}
     snapshot_account_type_name = _normalize_account_type_name(
         account_type_name
         or _json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
@@ -9255,9 +10557,12 @@ async def _complete_quote_without_sms(
             trace_id=trace_id,
             platform_account=platform_account,
         )
+    quota_started = time.perf_counter()
     quota_reservation = await _reserve_account_quota_for_quote(db, account=platform_account)
+    perf["quota_reserve_ms"] = _elapsed_ms(quota_started)
     if not quota_reservation.get("available", True):
         error_detail = _quote_quota_exhausted_message(platform_name, platform_account)
+        perf["total_ms"] = _elapsed_ms(perf_started)
         task = QuoteTask(
             quote_case_id=case.id,
             platform_code=platform_code,
@@ -9276,7 +10581,7 @@ async def _complete_quote_without_sms(
                 "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
                 "request_body": _json_obj(snapshot.get("request_body")),
             },
-            response_payload={},
+            response_payload={"perf": perf},
             result_payload={},
             submitted_snapshot=snapshot,
             error_detail=error_detail,
@@ -9349,8 +10654,11 @@ async def _complete_quote_without_sms(
                 ],
             },
         )
+    platform_quote_started = time.perf_counter()
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
+    perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
+        perf["total_ms"] = _elapsed_ms(perf_started)
         task = QuoteTask(
             quote_case_id=case.id,
             platform_code=platform_code,
@@ -9374,6 +10682,7 @@ async def _complete_quote_without_sms(
                 "login": login_mode,
                 "quote": _runtime_result_payload(quote_runtime_result),
                 "material_changed": True,
+                "perf": perf,
             },
             result_payload={},
             submitted_snapshot=snapshot,
@@ -9422,6 +10731,7 @@ async def _complete_quote_without_sms(
             )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
+        perf["total_ms"] = _elapsed_ms(perf_started)
         task = QuoteTask(
             quote_case_id=case.id,
             platform_code=platform_code,
@@ -9444,6 +10754,7 @@ async def _complete_quote_without_sms(
                 "stub": True,
                 "login": login_mode,
                 "quote": _runtime_result_payload(quote_runtime_result),
+                "perf": perf,
             },
             result_payload={},
             submitted_snapshot=snapshot,
@@ -9515,47 +10826,31 @@ async def _complete_quote_without_sms(
                     + "、".join(missing_default_config[:8])
                     + "。"
                 )
-            return (
-                "\n".join(reply_lines),
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": trace_id,
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message="平台登录已过期，等待重新登录",
-                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                        payload={
-                            "quote_case": {
-                                "id": case.id,
-                                "case_no": case.case_no,
-                                "status": case.status,
-                                "order_id": case.order_id,
-                                "source_type": case.source_type,
-                            },
-                            "quote_task": {
-                                "id": task.id,
-                                "status": task.status,
-                                "login_state": task.login_state,
-                                "trace_id": trace_id,
-                                "error_detail": error_detail,
-                            },
-                            "platform_account": _credential_public_payload(platform_account),
-                            "request_body": request_body_draft,
-                            "quote_runtime": runtime_payload,
-                        },
+            return _quote_platform_dialog_response(
+                case=case,
+                task=task,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                platform_code=platform_code,
+                platform_name=platform_name,
+                trace_id=trace_id,
+                error_detail="\n".join(reply_lines),
+                result_status=RESULT_NOT_READY,
+                response_status="success",
+                title=f"{platform_name}登录已过期",
+                subtype="session_expired",
+                severity="warning",
+                actions=[
+                    _mk_action(
+                        "平台账号管理",
+                        "open_account_manager",
+                        "quote_platform_accounts",
+                        platform_code=platform_code,
+                        platform_name=platform_name,
                     ),
-                    "actions": [
-                        _mk_action(
-                            "平台账号管理",
-                            "open_account_manager",
-                            "quote_platform_accounts",
-                            platform_code=platform_code,
-                            platform_name=platform_name,
-                        ),
-                        _mk_action(f"{platform_name}报价"),
-                    ],
-                },
+                    _mk_action(f"{platform_name}报价"),
+                ],
+                extra_payload={"request_body": request_body_draft},
             )
         if _is_runtime_quota_full_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -9589,20 +10884,17 @@ async def _complete_quote_without_sms(
             },
             "platform_account": _credential_public_payload(platform_account),
         }
-        return (
-            f"{platform_name}报价失败：{error_detail}。请检查平台账号状态或报价资料后重试。",
-            {
-                "status": "failed",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_FAILED,
-                    message=error_detail,
-                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                    payload=payload,
-                ),
-                "actions": [_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
-            },
+        return _quote_platform_dialog_response(
+            case=case,
+            task=task,
+            platform_account=platform_account,
+            runtime_result=quote_runtime_result,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            error_detail=error_detail,
+            actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+            extra_payload=payload,
         )
 
     result = _quote_result_from_runtime_or_fake(
@@ -9612,11 +10904,16 @@ async def _complete_quote_without_sms(
         platform_name=platform_name,
         trace_id=trace_id,
     )
+    display_started = time.perf_counter()
     result = _enrich_quote_result_for_display(
         result,
         platform_account=platform_account,
         platform_name=platform_name,
     )
+    perf["result_display_ms"] = _elapsed_ms(display_started)
+    if result.get("result_image_ms") is not None:
+        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
+    perf["total_ms"] = _elapsed_ms(perf_started)
     task = QuoteTask(
         quote_case_id=case.id,
         platform_code=platform_code,
@@ -9639,6 +10936,7 @@ async def _complete_quote_without_sms(
             "stub": True,
             "login": login_mode,
             "quote": _runtime_result_payload(quote_runtime_result),
+            "perf": perf,
         },
         result_payload=result,
         submitted_snapshot=snapshot,
@@ -9659,6 +10957,7 @@ async def _complete_quote_without_sms(
         login_state=ACCOUNT_LOGIN_AUTHENTICATED,
         consume_quota=False,
     )
+    quota_update_started = time.perf_counter()
     await _record_account_quota_consumed(
         db,
         account=platform_account,
@@ -9671,6 +10970,9 @@ async def _complete_quote_without_sms(
         runtime_result=quote_runtime_result,
         operator_user_id=owner_user_id,
     )
+    perf["quota_update_ms"] = _elapsed_ms(quota_update_started)
+    perf["total_ms"] = _elapsed_ms(perf_started)
+    task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
     await _add_event(
         db,
         case=case,
@@ -10079,15 +11381,53 @@ async def handle_quote_message(
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    transfer_vehicle_command = _extract_transfer_vehicle_command(text)
+    if transfer_vehicle_command:
+        for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_override"):
+            if transfer_vehicle_command.get(key) not in (None, ""):
+                merged_entities[key] = transfer_vehicle_command.get(key)
     override_signal = detect_quote_config_override_signal(text)
     quote_field_overrides = _json_obj(override_signal.get("overrides"))
+    repair_code_command = _extract_quote_repair_code_command(text)
+    repair_code_resolution: Dict[str, Any] = {}
+    if repair_code_command:
+        try:
+            repair_code_resolution = await _resolve_quote_repair_code_command(
+                db,
+                ctx=ctx,
+                owner_user_id=owner_user_id,
+                command=repair_code_command,
+            )
+        except Exception as exc:
+            detail = sanitize_quote_user_message(exc, "送修码查询失败")
+            return (
+                f"送修码设置失败：{detail}",
+                {
+                    "status": "success",
+                    "intent": "quote_config_override",
+                    "trace_id": _new_trace_id(),
+                    "data": _mk_data(
+                        result_status=RESULT_FAILED,
+                        message=detail,
+                        entities={},
+                        payload={"repair_code_command": repair_code_command},
+                    ),
+                    "actions": [],
+                },
+            )
+        quote_field_overrides = _merge_quote_config_overrides(
+            quote_field_overrides,
+            repair_code_resolution.get("overrides"),
+            validate_positive=False,
+        )
+    joint_sales_image_adjustment = _extract_joint_sales_image_adjustment(text)
     if quote_field_overrides:
         merged_entities = {
             **merged_entities,
             "quote_field_overrides": quote_field_overrides,
             "force_requote": True,
         }
-    override_summary = _quote_override_summary(quote_field_overrides)
+    override_summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(quote_field_overrides)
     override_reply_prefix = f"已按本次调整重报：{override_summary}\n" if override_summary else ""
     sms_code = _extract_sms_code(text)
 
@@ -10164,6 +11504,25 @@ async def handle_quote_message(
                 },
             )
 
+    if joint_sales_image_adjustment and waiting_pair:
+        case, task = waiting_pair
+        await db.flush()
+        return (
+            f"{case.platform_name or case.platform_code or '平台'}报价仍在等待验证码，请先输入验证码完成报价，再调整非车金额。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": task.trace_id or _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NOT_READY,
+                    message="当前报价仍在等待验证码",
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"joint_sales_image_adjustment": joint_sales_image_adjustment},
+                ),
+                "actions": [_mk_action("输入短信验证码")],
+            },
+        )
+
     if waiting_pair and quote_field_overrides:
         case, task = waiting_pair
         await _expire_waiting_sms_task(
@@ -10226,6 +11585,33 @@ async def handle_quote_message(
         session_id=session_id,
         for_update=True,
     )
+    if joint_sales_image_adjustment and duplicate_confirm_pair:
+        case, task = duplicate_confirm_pair
+        await db.flush()
+        return (
+            "当前正在等待是否继续重复投保，请先在弹窗中确认或取消后，再调整非车金额。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": task.trace_id or _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NOT_READY,
+                    message="当前正在等待重复投保确认",
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={"joint_sales_image_adjustment": joint_sales_image_adjustment},
+                ),
+                "actions": [],
+            },
+        )
+    if joint_sales_image_adjustment:
+        return await _handle_joint_sales_image_adjustment_message(
+            db,
+            ctx=ctx,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            text=text,
+            adjustment=joint_sales_image_adjustment,
+        )
     if duplicate_confirm_pair and quote_field_overrides:
         case, task = duplicate_confirm_pair
         if not merged_entities.get("platform_code") and (case.platform_code or task.platform_code):
@@ -10366,9 +11752,14 @@ async def handle_quote_message(
     entity_order_id = _safe_int(merged_entities.get("order_id"), 0) or None
     explicit_order_id = ctx_order_id or entity_order_id
     short_quote_command = looks_like_short_quote_command(text)
+    transfer_vehicle_text_data = {
+        key: merged_entities.get(key)
+        for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_override")
+        if merged_entities.get(key) not in (None, "")
+    }
     inherited_case: Optional[QuoteCase] = None
     inherited_order_id: Optional[int] = None
-    if (quote_field_overrides or short_quote_command) and (not platform_code or not platform_name):
+    if (quote_field_overrides or short_quote_command or transfer_vehicle_text_data) and (not platform_code or not platform_name):
         inherited_case = await _latest_reusable_session_case(
             db,
             owner_user_id=owner_user_id,
@@ -10387,7 +11778,7 @@ async def handle_quote_message(
                 inherited_order_id = _safe_int(inherited_case.order_id, 0) or None
                 merged_entities["order_id"] = inherited_order_id
 
-    if not platform_name and quote_field_overrides:
+    if not platform_name and (quote_field_overrides or transfer_vehicle_text_data):
         case = inherited_case or await _get_or_create_case(
             db,
             owner_user_id=owner_user_id,
@@ -10403,11 +11794,17 @@ async def handle_quote_message(
             old_draft.get("quote_field_overrides"),
             quote_field_overrides,
         )
-        next_draft = dict(old_draft)
-        next_draft["quote_field_overrides"] = merged_overrides
-        next_normalized = dict(_json_obj(case.normalized_data))
-        next_normalized["quote_field_overrides"] = merged_overrides
-        case.draft_order_data = next_draft
+        text_patch: Dict[str, Any] = dict(transfer_vehicle_text_data)
+        if merged_overrides:
+            text_patch["quote_field_overrides"] = merged_overrides
+        images_by_slot = await _active_images_by_slot(db, case.id)
+        next_normalized = _normalize_quote_case_data(
+            base_data=_json_obj(case.normalized_data) or old_draft,
+            order_data={},
+            text_data=text_patch,
+            images_by_slot=images_by_slot,
+        )
+        case.draft_order_data = next_normalized
         case.normalized_data = next_normalized
         case.updated_at = _now()
         await _add_event(
@@ -10417,10 +11814,16 @@ async def handle_quote_message(
             event_type="chat",
             role="user",
             content=text,
-            payload={"quote_field_overrides": merged_overrides, "deferred_quote": True},
+            payload={
+                "quote_field_overrides": merged_overrides,
+                "transfer_vehicle": transfer_vehicle_text_data,
+                "deferred_quote": True,
+            },
         )
         await db.flush()
-        summary = _quote_override_summary(merged_overrides)
+        summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(merged_overrides)
+        if not summary and transfer_vehicle_text_data:
+            summary = "已按过户车处理" if bool(transfer_vehicle_text_data.get("is_transfer_vehicle")) else "已按非过户车处理"
         return (
             f"已记录：{summary}。",
             {
@@ -10431,7 +11834,18 @@ async def handle_quote_message(
                     result_status=RESULT_SUCCESS,
                     message="已记录报价调整",
                     entities={"quote_case_id": case.id, "order_id": case.order_id},
-                    payload={"quote_field_overrides": merged_overrides},
+                    payload={
+                        "quote_field_overrides": merged_overrides,
+                        "transfer_vehicle": {
+                            key: next_normalized.get(key)
+                            for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_source", "transfer_vehicle_override")
+                            if next_normalized.get(key) not in (None, "")
+                        },
+                        "repair_code": {
+                            "matched": repair_code_resolution.get("matched"),
+                            "query": repair_code_resolution.get("query"),
+                        } if repair_code_resolution else {},
+                    },
                 ),
                 "actions": [],
             },

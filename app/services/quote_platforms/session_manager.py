@@ -799,7 +799,7 @@ def _snapshot_from_business_runtime(
         snapshot.session_generation = uuid4().hex
 
     now = iso_now()
-    if action == "quote":
+    if action in {"quote", "query_joint_sales_plan", "query_repair_codes"}:
         snapshot.last_business_at = now
     elif action == "keepalive":
         snapshot.last_keepalive_at = now
@@ -1123,6 +1123,20 @@ class AccountSessionActor:
         finally:
             self._business_waiters -= 1
 
+    async def query_joint_sales_plan(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        self._business_waiters += 1
+        try:
+            return await self._execute_business_like(db, ctx, action="query_joint_sales_plan", payload=quote_payload)
+        finally:
+            self._business_waiters -= 1
+
+    async def query_repair_codes(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        self._business_waiters += 1
+        try:
+            return await self._execute_business_like(db, ctx, action="query_repair_codes", payload=quote_payload)
+        finally:
+            self._business_waiters -= 1
+
     async def _execute_business_like(
         self,
         db: AsyncSession,
@@ -1186,7 +1200,7 @@ class AccountSessionActor:
                         message=f"浏览器容器启动失败：{str(exc) or exc.__class__.__name__}",
                         data={"error_code": exc.__class__.__name__},
                     )
-                    if action == "quote":
+                    if action in {"quote", "query_joint_sales_plan", "query_repair_codes"}:
                         snapshot.last_business_at = iso_now()
                     elif action == "keepalive":
                         snapshot.last_keepalive_at = iso_now()
@@ -1209,6 +1223,26 @@ class AccountSessionActor:
                         result = PlatformRuntimeResult(
                             status="failed",
                             message=f"平台报价执行异常：{str(exc) or exc.__class__.__name__}",
+                            data={"error_code": exc.__class__.__name__},
+                        )
+                    snapshot.last_business_at = iso_now()
+                elif action == "query_joint_sales_plan":
+                    try:
+                        result = await _await_runtime_result(action, adapter.query_joint_sales_plan(runtime_ctx, payload))
+                    except Exception as exc:
+                        result = PlatformRuntimeResult(
+                            status="failed",
+                            message=f"平台途家安顺保额查询异常：{str(exc) or exc.__class__.__name__}",
+                            data={"error_code": exc.__class__.__name__},
+                        )
+                    snapshot.last_business_at = iso_now()
+                elif action == "query_repair_codes":
+                    try:
+                        result = await _await_runtime_result(action, adapter.query_repair_codes(runtime_ctx, payload))
+                    except Exception as exc:
+                        result = PlatformRuntimeResult(
+                            status="failed",
+                            message=f"平台送修码查询异常：{str(exc) or exc.__class__.__name__}",
                             data={"error_code": exc.__class__.__name__},
                         )
                     snapshot.last_business_at = iso_now()
@@ -1305,6 +1339,12 @@ class QuotePlatformSessionManager:
 
     async def quote(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await (await self.actor(ctx.platform_code, ctx.account_id)).quote(db, ctx, quote_payload)
+
+    async def query_joint_sales_plan(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await (await self.actor(ctx.platform_code, ctx.account_id)).query_joint_sales_plan(db, ctx, quote_payload)
+
+    async def query_repair_codes(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await (await self.actor(ctx.platform_code, ctx.account_id)).query_repair_codes(db, ctx, quote_payload)
 
     async def clear(self, db: AsyncSession, account: QuotePlatformAccountProfile, *, status: str = SESSION_STATUS_OFFLINE) -> None:
         await self.store.clear(db, account, status=status)
