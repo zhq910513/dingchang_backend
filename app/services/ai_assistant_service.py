@@ -438,6 +438,19 @@ def _safe_chat_text_for_display(text: Any) -> str:
     return safe or ""
 
 
+def _looks_like_garbled_exception_detail(text: str) -> bool:
+    detail = _to_str(text).strip()
+    if not detail:
+        return True
+    if re.search(r"[\u4e00-\u9fff]", detail):
+        return False
+    meaningful = re.sub(r"[\s'\"`.,;:，。；：、!?！？()\[\]{}<>\\/_+=|~-]+", "", detail)
+    if len(meaningful) < 8:
+        return True
+    # The assistant chat should not expose raw English stack/error fragments.
+    return bool(re.fullmatch(r"[A-Za-z0-9-]+", meaningful))
+
+
 def _humanize_exception(e: Exception) -> str:
     raw = (_to_str(e) or e.__class__.__name__).strip()
     lower = raw.lower()
@@ -456,7 +469,10 @@ def _humanize_exception(e: Exception) -> str:
     if "timeout" in lower:
         return "外部服务或数据库响应超时，请稍后重试"
     if raw:
-        return sanitize_quote_user_message(raw[:300], "处理失败，请稍后重试")
+        detail = sanitize_quote_user_message(raw[:300], "处理失败，请稍后重试")
+        if _looks_like_garbled_exception_detail(detail):
+            return "处理失败，请稍后重试"
+        return detail
     return "处理失败，请稍后重试"
 
 
@@ -2985,8 +3001,11 @@ def _dispatch_error_reply(
     can_use_quote = role_name in {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES}
     actions = [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")] if can_use_quote else [_mk_action("查订单")]
     fallback_hint = "查看当前材料状态" if can_use_quote else "查订单 车牌号或车主姓名"
+    first_line = "这次处理没成功。"
+    if detail and detail != "处理失败，请稍后重试":
+        first_line = f"这次处理没成功：{detail}。"
     return (
-        f"这次处理没成功：{detail}。\n请重试一次；如果还不行，先发“{fallback_hint}”。",
+        f"{first_line}\n请重试一次；如果还不行，先发“{fallback_hint}”。",
         {
             "status": "failed",
             "intent": "system_error",

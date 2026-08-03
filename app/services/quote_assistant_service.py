@@ -3051,8 +3051,46 @@ def _quote_account_label(account: Optional[QuotePlatformAccountProfile]) -> str:
     return f"{account_type}账号"
 
 
-def _quote_quota_exhausted_message(platform_name: str, account: Optional[QuotePlatformAccountProfile]) -> str:
-    return f"{platform_name}{_quote_account_label(account)}查询额度已用完，请切换同平台其他账号，或在右上角“平台账号管理”调整额度。"
+def _quote_account_needs_admin_contact(role_name: Any) -> bool:
+    role = _to_str(role_name).strip()
+    return bool(role) and role != ROLE_SUPER_ADMIN
+
+
+def _quote_account_action_text(role_name: Any, admin_text: str, contact_text: str = "请联系管理员处理。") -> str:
+    return contact_text if _quote_account_needs_admin_contact(role_name) else admin_text
+
+
+def _quote_platform_account_manage_actions(
+    role_name: Any,
+    *,
+    platform_code: str,
+    platform_name: str,
+) -> List[Dict[str, Any]]:
+    if _quote_account_needs_admin_contact(role_name):
+        return []
+    return [
+        _mk_action(
+            "平台账号管理",
+            "open_account_manager",
+            "quote_platform_accounts",
+            platform_code=platform_code,
+            platform_name=platform_name,
+        )
+    ]
+
+
+def _quote_quota_exhausted_message(
+    platform_name: str,
+    account: Optional[QuotePlatformAccountProfile],
+    *,
+    operator_role_name: Any = "",
+) -> str:
+    admin_text = f"{platform_name}{_quote_account_label(account)}查询额度已用完，请切换同平台其他账号，或在右上角“平台账号管理”调整额度。"
+    return _quote_account_action_text(
+        operator_role_name,
+        admin_text,
+        f"{platform_name}{_quote_account_label(account)}查询额度已用完，请联系管理员处理。",
+    )
 
 
 def _credential_public_payload(
@@ -3924,6 +3962,22 @@ async def get_platform_account_profile(
     ).scalars().first()
 
 
+async def _get_platform_account_profile_by_id(
+    db: AsyncSession,
+    *,
+    account_id: int,
+) -> Optional[QuotePlatformAccountProfile]:
+    if account_id <= 0:
+        return None
+    return (
+        await db.execute(
+            select(QuotePlatformAccountProfile)
+            .where(QuotePlatformAccountProfile.id == int(account_id))
+            .limit(1)
+        )
+    ).scalars().first()
+
+
 async def list_platform_account_profiles(
     db: AsyncSession,
     *,
@@ -4618,6 +4672,7 @@ def _quote_platform_dialog_response(
     severity: str = "",
     actions: Optional[List[Dict[str, Any]]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
+    operator_role_name: Any = "",
 ) -> Tuple[str, Dict[str, Any]]:
     if not subtype:
         if _is_runtime_session_expired_result(runtime_result):
@@ -4649,6 +4704,12 @@ def _quote_platform_dialog_response(
         platform_code=platform_code,
         platform_name=platform_name,
     )
+    if _quote_account_needs_admin_contact(operator_role_name) and subtype in {"session_expired", "quota_full"}:
+        if subtype == "session_expired":
+            message = f"{platform_name or '平台'}账号登录已过期，请联系管理员处理。"
+        else:
+            message = f"{platform_name or '平台'}平台账号查询额度已用完，请联系管理员处理。"
+        actions = []
     dialog = _make_platform_dialog(
         message=message,
         title=_to_str(source_dialog.get("title")).strip() or title,
@@ -5080,7 +5141,6 @@ async def _select_quote_platform_account(
         return None
     excluded = {int(x) for x in (exclude_account_ids or []) if _safe_int(x, 0)}
     stmt = select(QuotePlatformAccountProfile).where(
-        QuotePlatformAccountProfile.owner_user_id == int(owner_user_id),
         QuotePlatformAccountProfile.platform_code == code,
         QuotePlatformAccountProfile.enabled == True,  # noqa: E712
     )
@@ -5106,7 +5166,7 @@ async def _select_quote_platform_account(
     if type_name:
         preferred_type_names = set(_account_type_db_names(type_name))
 
-        def account_rank(row: QuotePlatformAccountProfile) -> Tuple[int, int, int, str, int]:
+        def account_rank(row: QuotePlatformAccountProfile) -> Tuple[int, int, int, int, str, int]:
             status = _to_str(_loaded_value(row, "login_status")).strip()
             if status == ACCOUNT_LOGIN_AUTHENTICATED:
                 login_rank = 0
@@ -5121,9 +5181,10 @@ async def _select_quote_platform_account(
                 type_rank = 1
             else:
                 type_rank = 2
+            owner_rank = 0 if _safe_int(_loaded_value(row, "owner_user_id"), 0) == int(owner_user_id) else 1
             auto_rank = 0 if bool(_loaded_value(row, "auto_login")) else 1
             last_used = _to_str(_loaded_value(row, "last_used_at")).strip()
-            return (login_rank, type_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
+            return (login_rank, type_rank, owner_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
 
         rows.sort(key=account_rank)
     account_ids = [int(row.id) for row in rows if getattr(row, "id", None)]
@@ -5131,7 +5192,14 @@ async def _select_quote_platform_account(
     quota_by_account = await _load_account_quota_map(db, account_ids, accounts_by_id=account_by_id)
     now = _now()
     for row in rows:
-        if row.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
+        login_status = _to_str(_loaded_value(row, "login_status")).strip()
+        if login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
+            continue
+        if (
+            login_status not in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}
+            and not bool(_loaded_value(row, "auto_login"))
+            and _safe_int(_loaded_value(row, "owner_user_id"), 0) != int(owner_user_id)
+        ):
             continue
         quota = quota_by_account.get(int(row.id))
         if quota is not None and (_quota_remaining_count(quota) or 0) <= 0:
@@ -5160,7 +5228,6 @@ async def _has_enabled_quote_platform_account(
     if owner_user_id <= 0 or not code:
         return False
     stmt = select(func.count()).select_from(QuotePlatformAccountProfile).where(
-        QuotePlatformAccountProfile.owner_user_id == int(owner_user_id),
         QuotePlatformAccountProfile.platform_code == code,
         QuotePlatformAccountProfile.enabled == True,  # noqa: E712
     )
@@ -5572,7 +5639,7 @@ async def _mark_platform_account_used(
 ) -> None:
     if not account_id:
         return
-    row = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=int(account_id))
+    row = await _get_platform_account_profile_by_id(db, account_id=int(account_id))
     if not row:
         return
     row.login_status = login_state or row.login_status
@@ -7946,7 +8013,7 @@ async def _expire_waiting_sms_task(
     await _refresh_quote_case_material_state(db, case, preserve_quoted=True, now=ts)
     account_id = _quote_task_platform_account_id(task)
     if account_id:
-        account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+        account = await _get_platform_account_profile_by_id(db, account_id=account_id)
         if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
             account.login_status = ACCOUNT_LOGIN_EXPIRED
             account.last_error = reason
@@ -8115,11 +8182,7 @@ async def _stop_quote_for_material_change(
     if platform_account is None and task is not None:
         account_id = _quote_task_platform_account_id(task)
         if account_id > 0:
-            platform_account = await get_platform_account_profile(
-                db,
-                owner_user_id=owner_user_id,
-                account_id=account_id,
-            )
+            platform_account = await _get_platform_account_profile_by_id(db, account_id=account_id)
     await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation or {})
     normalized_data, images_by_slot, missing = await _refresh_quote_case_material_state(
         db,
@@ -8200,11 +8263,7 @@ async def _stop_quote_for_default_config_change(
     if platform_account is None and task is not None:
         account_id = _quote_task_platform_account_id(task)
         if account_id > 0:
-            platform_account = await get_platform_account_profile(
-                db,
-                owner_user_id=owner_user_id,
-                account_id=account_id,
-            )
+            platform_account = await _get_platform_account_profile_by_id(db, account_id=account_id)
     normalized_data, images_by_slot, missing = await _refresh_quote_case_material_state(
         db,
         case,
@@ -8905,9 +8964,9 @@ async def _query_joint_sales_amount_for_image_adjustment(
     account_id = _quote_task_platform_account_id(source_task)
     if account_id <= 0:
         raise ValueError("最近一次报价缺少平台账号留档，无法查询途家安顺保额")
-    platform_account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    platform_account = await _get_platform_account_profile_by_id(db, account_id=account_id)
     if platform_account is None:
-        raise ValueError("最近一次报价使用的平台账号已不存在或当前账号无权访问")
+        raise ValueError("最近一次报价使用的平台账号已不存在")
     if not bool(_loaded_value(platform_account, "enabled")):
         raise ValueError("最近一次报价使用的平台账号已停用，无法查询途家安顺保额")
 
@@ -9388,7 +9447,7 @@ async def _cancel_waiting_tasks_for_case(
         task.updated_at = ts
         account_id = _quote_task_platform_account_id(task)
         if was_sms_task and owner_user_id > 0 and account_id > 0:
-            account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+            account = await _get_platform_account_profile_by_id(db, account_id=account_id)
             if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
                 account.login_status = ACCOUNT_LOGIN_EXPIRED
                 account.last_error = "材料已更新，请重新发起报价"
@@ -9447,7 +9506,7 @@ async def _cancel_active_quote_tasks_for_case(
         task.updated_at = ts
         account_id = _quote_task_platform_account_id(task)
         if was_sms_task and owner_user_id > 0 and account_id > 0:
-            account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+            account = await _get_platform_account_profile_by_id(db, account_id=account_id)
             if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
                 account.login_status = ACCOUNT_LOGIN_EXPIRED
                 account.last_error = reason
@@ -9832,6 +9891,7 @@ async def _complete_waiting_duplicate_quote_task(
     case: QuoteCase,
     task: QuoteTask,
     owner_user_id: int,
+    operator_role_name: Any = "",
 ) -> Tuple[str, Dict[str, Any]]:
     trace_id = task.trace_id or _new_trace_id()
     platform_code = task.platform_code or case.platform_code or "STUB"
@@ -9842,14 +9902,14 @@ async def _complete_waiting_duplicate_quote_task(
     account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
     account_id = _safe_int(account_payload.get("id"), 0) or None
     platform_account = (
-        await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+        await _get_platform_account_profile_by_id(db, account_id=account_id)
         if account_id
         else None
     )
     if platform_account is None:
         task.status = TASK_STATUS_FAILED
         task.login_state = "failed"
-        task.error_detail = "平台账号不存在或无权访问，请重新发起报价"
+        task.error_detail = "平台账号不存在，请重新发起报价"
         task.finished_at = _now()
         task.updated_at = _now()
         case.status = CASE_STATUS_READY
@@ -9857,14 +9917,14 @@ async def _complete_waiting_duplicate_quote_task(
         case.updated_at = _now()
         await db.flush()
         return (
-            f"{platform_name}报价失败：平台账号不存在或无权访问，请重新发起报价。",
+            f"{platform_name}报价失败：平台账号不存在，请重新发起报价。",
             {
                 "status": "failed",
                 "intent": "quote",
                 "trace_id": trace_id,
                 "data": _mk_data(
                     result_status=RESULT_FAILED,
-                    message="平台账号不存在或无权访问",
+                    message="平台账号不存在",
                     entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
                     payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
                 ),
@@ -9934,6 +9994,7 @@ async def _complete_waiting_duplicate_quote_task(
         attached_images=[],
         config_type_name=config_type_name,
         attempted_account_ids={account_id} if account_id else None,
+        operator_role_name=operator_role_name,
     )
 
 
@@ -10216,6 +10277,7 @@ async def _continue_quote_with_platform_account(
     config_type_name: Optional[str] = None,
     attempted_account_ids: Optional[Iterable[int]] = None,
     reply_prefix: str = "",
+    operator_role_name: Any = "",
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "STUB"
     platform_name = case.platform_name or platform_account.platform_name or platform_code
@@ -10296,6 +10358,7 @@ async def _continue_quote_with_platform_account(
             login_mode="reuse_authenticated",
             attempted_account_ids=attempted_account_ids,
             account_type_name=config_type_name,
+            operator_role_name=operator_role_name,
         )
         return f"{reply_prefix}{reply}", meta
 
@@ -10314,6 +10377,7 @@ async def _continue_quote_with_platform_account(
             attached_images=attached_images,
             attempted_account_ids=attempted_account_ids,
             reason_text="未开启自动登录",
+            operator_role_name=operator_role_name,
         )
         if retry is not None:
             return retry
@@ -10338,8 +10402,9 @@ async def _continue_quote_with_platform_account(
             attached_images=attached_images or [],
             platform_account=platform_account,
         )
+        admin_text = f"{platform_name}报价资料已齐，但所选账号未开启自动登录。请先在右上角“平台账号管理”里点击该账号的“登录”。"
         return (
-            f"{reply_prefix}{platform_name}报价资料已齐，但所选账号未开启自动登录。请先在右上角“平台账号管理”里点击该账号的“登录”。",
+            f"{reply_prefix}{_quote_account_action_text(operator_role_name, admin_text, f'{platform_name}报价资料已齐，但平台账号需要管理员登录处理，请联系管理员处理。')}",
             {
                 "status": "success",
                 "intent": "quote",
@@ -10350,15 +10415,11 @@ async def _continue_quote_with_platform_account(
                     entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
                     payload=payload,
                 ),
-                "actions": [
-                    _mk_action(
-                        "平台账号管理",
-                        "open_account_manager",
-                        "quote_platform_accounts",
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                    )
-                ],
+                "actions": _quote_platform_account_manage_actions(
+                    operator_role_name,
+                    platform_code=platform_code,
+                    platform_name=platform_name,
+                ),
             },
         )
 
@@ -10382,6 +10443,7 @@ async def _continue_quote_with_platform_account(
             login_mode="preserved_session_after_login_failure",
             attempted_account_ids=attempted_account_ids,
             account_type_name=config_type_name,
+            operator_role_name=operator_role_name,
         )
         return f"{reply_prefix}{platform_name}新登录失败，但已保留原有可用会话，继续尝试报价。\n{reply}", meta
     if not _is_runtime_login_success(login_status) and not _is_runtime_challenge(login_status):
@@ -10404,11 +10466,13 @@ async def _continue_quote_with_platform_account(
             attached_images=attached_images,
             attempted_account_ids=attempted_account_ids,
             reason_text=f"登录失败：{platform_account.last_error}",
+            operator_role_name=operator_role_name,
         )
         if retry is not None:
             return retry
+        admin_text = f"{platform_name}登录失败：{platform_account.last_error}。请在平台账号管理中检查账号后重试。"
         return (
-            f"{reply_prefix}{platform_name}登录失败：{platform_account.last_error}。请在平台账号管理中检查账号后重试。",
+            f"{reply_prefix}{_quote_account_action_text(operator_role_name, admin_text, f'{platform_name}登录失败，请联系管理员处理。')}",
             {
                 "status": "failed",
                 "intent": "quote",
@@ -10419,15 +10483,11 @@ async def _continue_quote_with_platform_account(
                     entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
                     payload={"platform_account": _credential_public_payload(platform_account)},
                 ),
-                "actions": [
-                    _mk_action(
-                        "平台账号管理",
-                        "open_account_manager",
-                        "quote_platform_accounts",
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                    )
-                ],
+                "actions": _quote_platform_account_manage_actions(
+                    operator_role_name,
+                    platform_code=platform_code,
+                    platform_name=platform_name,
+                ),
             },
         )
 
@@ -10442,6 +10502,7 @@ async def _continue_quote_with_platform_account(
             login_mode="auto_login_without_code",
             attempted_account_ids=attempted_account_ids,
             account_type_name=config_type_name,
+            operator_role_name=operator_role_name,
         )
         return f"{reply_prefix}{reply}", meta
 
@@ -10466,9 +10527,52 @@ async def _continue_quote_with_platform_account(
         attached_images=attached_images,
         attempted_account_ids=attempted_account_ids,
         reason_text=f"需要验证码：{challenge_prompt}",
+        operator_role_name=operator_role_name,
     )
     if retry is not None:
         return retry
+
+    if _quote_account_needs_admin_contact(operator_role_name):
+        case.status = CASE_STATUS_READY
+        case.current_task_id = None
+        case.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="status",
+            role="assistant",
+            payload={
+                "status": "ready",
+                "need_admin_platform_account_login": True,
+                "platform_account_id": platform_account.id,
+                "platform_code": platform_code,
+            },
+        )
+        await db.flush()
+        payload = _case_payload(
+            case=case,
+            normalized_data=normalized_data,
+            images_by_slot=images_by_slot,
+            missing=[],
+            attached_images=attached_images or [],
+            platform_account=platform_account,
+        )
+        return (
+            f"{reply_prefix}{platform_name}报价资料已齐，但平台账号需要验证码或安全码，请联系管理员处理。",
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message="平台账号需要管理员处理",
+                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
+                    payload=payload,
+                ),
+                "actions": [],
+            },
+        )
 
     task = await _start_sms_task(
         db,
@@ -10528,6 +10632,7 @@ async def _retry_quote_with_next_platform_account(
     attached_images: Optional[List[Dict[str, Any]]] = None,
     attempted_account_ids: Optional[Iterable[int]] = None,
     reason_text: str = "查询额度已用完",
+    operator_role_name: Any = "",
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     if current_account is None:
         return None
@@ -10580,6 +10685,7 @@ async def _retry_quote_with_next_platform_account(
         config_type_name=selected_type,
         attempted_account_ids=attempted,
         reply_prefix=prefix,
+        operator_role_name=operator_role_name,
     )
 
 
@@ -10644,6 +10750,7 @@ async def _complete_waiting_task(
     task: QuoteTask,
     owner_user_id: int,
     sms_code: str,
+    operator_role_name: Any = "",
 ) -> Tuple[str, Dict[str, Any]]:
     trace_id = task.trace_id or _new_trace_id()
     platform_code = task.platform_code or case.platform_code or "STUB"
@@ -10652,7 +10759,7 @@ async def _complete_waiting_task(
     account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
     account_id = _safe_int(account_payload.get("id"), 0) or None
     platform_account = (
-        await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+        await _get_platform_account_profile_by_id(db, account_id=account_id)
         if account_id
         else None
     )
@@ -10802,8 +10909,13 @@ async def _complete_waiting_task(
             payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": task.error_detail},
         )
         await db.flush()
+        admin_text = f"{platform_name}验证码校验失败：{task.error_detail}。请重新点击报价或账号登录后再试。"
         return (
-            f"{platform_name}验证码校验失败：{task.error_detail}。请重新点击报价或账号登录后再试。",
+            _quote_account_action_text(
+                operator_role_name,
+                admin_text,
+                f"{platform_name}验证码校验失败，请联系管理员处理。",
+            ),
             {
                 "status": "failed",
                 "intent": "quote",
@@ -10863,7 +10975,11 @@ async def _complete_waiting_task(
         if not quota_reservation.get("available", True):
             task.status = TASK_STATUS_FAILED
             task.login_state = "authenticated"
-            task.error_detail = _quote_quota_exhausted_message(platform_name, platform_account)
+            task.error_detail = _quote_quota_exhausted_message(
+                platform_name,
+                platform_account,
+                operator_role_name=operator_role_name,
+            )
             perf["total_ms"] = _elapsed_ms(perf_started)
             task.response_payload = {"platform_challenge": _runtime_result_payload(challenge_result), "perf": perf}
             task.finished_at = _now()
@@ -10895,6 +11011,7 @@ async def _complete_waiting_task(
                 or (platform_account.account_type_name if platform_account else None),
                 attempted_account_ids={account_id} if account_id else None,
                 reason_text="查询额度已用完",
+                operator_role_name=operator_role_name,
             )
             if retry is not None:
                 return retry
@@ -10915,14 +11032,12 @@ async def _complete_waiting_task(
                         },
                     ),
                     "actions": [
-                        _mk_action(
-                            "平台账号管理",
-                            "open_account_manager",
-                            "quote_platform_accounts",
+                        *_quote_platform_account_manage_actions(
+                            operator_role_name,
                             platform_code=platform_code,
                             platform_name=platform_name,
                         ),
-                        _mk_action(f"{platform_name}报价"),
+                        *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
                     ],
                 },
             )
@@ -11004,6 +11119,7 @@ async def _complete_waiting_task(
                 or (platform_account.account_type_name if platform_account else None),
                 attempted_account_ids={account_id} if account_id else None,
                 reason_text="登录已过期",
+                operator_role_name=operator_role_name,
             )
             if retry is not None:
                 return retry
@@ -11033,6 +11149,11 @@ async def _complete_waiting_task(
                 f"{platform_name}{account_label}登录已过期，本次没有继续提交报价。",
                 f"已完成资料解析和{draft_account_type}请求体草稿组装，重新登录该平台账号后可直接重新发起报价。",
             ]
+            if _quote_account_needs_admin_contact(operator_role_name):
+                reply_lines = [
+                    f"{platform_name}账号登录已过期，本次没有继续提交报价。",
+                    "请联系管理员重新登录平台账号后再发起报价。",
+                ]
             if missing_default_config:
                 reply_lines.append(
                     "重新报价前还需要在右上角“默认参数配置”补齐："
@@ -11054,16 +11175,15 @@ async def _complete_waiting_task(
                 subtype="session_expired",
                 severity="warning",
                 actions=[
-                    _mk_action(
-                        "平台账号管理",
-                        "open_account_manager",
-                        "quote_platform_accounts",
+                    *_quote_platform_account_manage_actions(
+                        operator_role_name,
                         platform_code=platform_code,
                         platform_name=platform_name,
                     ),
-                    _mk_action(f"{platform_name}报价"),
+                    *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
                 ],
                 extra_payload={"request_body": request_body_draft},
+                operator_role_name=operator_role_name,
             )
         if _is_runtime_quota_full_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -11077,6 +11197,7 @@ async def _complete_waiting_task(
                 or (platform_account.account_type_name if platform_account else None),
                 attempted_account_ids={account_id} if account_id else None,
                 reason_text="平台提示查询额度已用完",
+                operator_role_name=operator_role_name,
             )
             if retry is not None:
                 return retry
@@ -11090,6 +11211,7 @@ async def _complete_waiting_task(
             trace_id=trace_id,
             error_detail=task.error_detail,
             actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+            operator_role_name=operator_role_name,
         )
     result = _quote_result_from_runtime_or_fake(
         quote_runtime_result,
@@ -11230,6 +11352,7 @@ async def _complete_quote_without_sms(
     login_mode: str,
     attempted_account_ids: Optional[Iterable[int]] = None,
     account_type_name: Optional[str] = None,
+    operator_role_name: Any = "",
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "STUB"
     platform_name = case.platform_name or platform_account.platform_name or platform_code
@@ -11295,7 +11418,11 @@ async def _complete_quote_without_sms(
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     if not quota_reservation.get("available", True):
-        error_detail = _quote_quota_exhausted_message(platform_name, platform_account)
+        error_detail = _quote_quota_exhausted_message(
+            platform_name,
+            platform_account,
+            operator_role_name=operator_role_name,
+        )
         perf["total_ms"] = _elapsed_ms(perf_started)
         task.status = TASK_STATUS_FAILED
         task.error_detail = error_detail
@@ -11328,6 +11455,7 @@ async def _complete_quote_without_sms(
             config_type_name=account_type_name or platform_account.account_type_name,
             attempted_account_ids=attempted,
             reason_text="查询额度已用完",
+            operator_role_name=operator_role_name,
         )
         if retry is not None:
             return retry
@@ -11355,14 +11483,12 @@ async def _complete_quote_without_sms(
                     },
                 ),
                 "actions": [
-                    _mk_action(
-                        "平台账号管理",
-                        "open_account_manager",
-                        "quote_platform_accounts",
+                    *_quote_platform_account_manage_actions(
+                        operator_role_name,
                         platform_code=platform_code,
                         platform_name=platform_name,
                     ),
-                    _mk_action(f"{platform_name}报价"),
+                    *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
                 ],
             },
         )
@@ -11463,6 +11589,7 @@ async def _complete_quote_without_sms(
                 config_type_name=account_type_name or platform_account.account_type_name,
                 attempted_account_ids=attempted,
                 reason_text="登录已过期",
+                operator_role_name=operator_role_name,
             )
             if retry is not None:
                 return retry
@@ -11490,6 +11617,11 @@ async def _complete_quote_without_sms(
                 f"{platform_name}（账号：{platform_account.account_username or platform_account.id}）登录已过期，本次没有继续提交报价。",
                 f"已完成资料解析和{draft_account_type}请求体草稿组装，重新登录该平台账号后可直接重新发起报价。",
             ]
+            if _quote_account_needs_admin_contact(operator_role_name):
+                reply_lines = [
+                    f"{platform_name}账号登录已过期，本次没有继续提交报价。",
+                    "请联系管理员重新登录平台账号后再发起报价。",
+                ]
             if missing_default_config:
                 reply_lines.append(
                     "重新报价前还需要在右上角“默认参数配置”补齐："
@@ -11511,16 +11643,15 @@ async def _complete_quote_without_sms(
                 subtype="session_expired",
                 severity="warning",
                 actions=[
-                    _mk_action(
-                        "平台账号管理",
-                        "open_account_manager",
-                        "quote_platform_accounts",
+                    *_quote_platform_account_manage_actions(
+                        operator_role_name,
                         platform_code=platform_code,
                         platform_name=platform_name,
                     ),
-                    _mk_action(f"{platform_name}报价"),
+                    *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
                 ],
                 extra_payload={"request_body": request_body_draft},
+                operator_role_name=operator_role_name,
             )
         if _is_runtime_quota_full_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -11533,6 +11664,7 @@ async def _complete_quote_without_sms(
                 config_type_name=account_type_name or platform_account.account_type_name,
                 attempted_account_ids=attempted,
                 reason_text="平台提示查询额度已用完",
+                operator_role_name=operator_role_name,
             )
             if retry is not None:
                 return retry
@@ -11565,6 +11697,7 @@ async def _complete_quote_without_sms(
             error_detail=error_detail,
             actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
             extra_payload=payload,
+            operator_role_name=operator_role_name,
         )
 
     result = _quote_result_from_runtime_or_fake(
@@ -12094,6 +12227,7 @@ async def handle_quote_message(
     if owner_user_id <= 0:
         raise ValueError("missing current user id")
     _ensure_quote_flow_access(ctx)
+    operator_role_name = _ctx_role_name(ctx)
 
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
     await _expire_stale_running_quote_tasks_for_owner_session(
@@ -12193,7 +12327,14 @@ async def handle_quote_message(
             content="[短信验证码已输入]",
             payload={"sms_code_length": len(sms_code)},
         )
-        return await _complete_waiting_task(db, case=case, task=task, owner_user_id=owner_user_id, sms_code=sms_code)
+        return await _complete_waiting_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            sms_code=sms_code,
+            operator_role_name=_ctx_role_name(ctx),
+        )
 
     if sms_code:
         expired_pair = await _find_waiting_task(
@@ -12480,6 +12621,7 @@ async def handle_quote_message(
             case=case,
             task=task,
             owner_user_id=owner_user_id,
+            operator_role_name=_ctx_role_name(ctx),
         )
     if duplicate_confirm_pair and signal.get("is_quote"):
         case, task = duplicate_confirm_pair
@@ -12837,10 +12979,22 @@ async def handle_quote_message(
         if override_summary:
             lines.append(f"已记录本次调整：{override_summary}")
         if missing_account and account_pool_unavailable:
-            lines.append(f"另外，{platform_name}同平台账号暂不可用，请确认账号已登录、未等待验证码且额度未用完。")
+            lines.append(
+                _quote_account_action_text(
+                    operator_role_name,
+                    f"另外，{platform_name}同平台账号暂不可用，请确认账号已登录、未等待验证码且额度未用完。",
+                    f"另外，{platform_name}平台账号暂不可用，请联系管理员处理。",
+                )
+            )
         if missing_account and not account_pool_unavailable:
             type_hint = f"（类型：{selected_account_type_name or account_type_name}）" if (selected_account_type_name or account_type_name) else ""
-            lines.append(f"另外，{platform_name}{type_hint}还没有可用账号，请先在右上角“平台账号管理”新增或启用账号。")
+            lines.append(
+                _quote_account_action_text(
+                    operator_role_name,
+                    f"另外，{platform_name}{type_hint}还没有可用账号，请先在右上角“平台账号管理”新增或启用账号。",
+                    f"另外，{platform_name}{type_hint}还没有可用账号，请联系管理员新增、启用或登录账号。",
+                )
+            )
         if missing_fields:
             lines.append("缺少字段：" + "、".join(missing_fields))
         if missing_images:
@@ -12879,20 +13033,16 @@ async def handle_quote_message(
             ),
             "actions": [
                 *(
-                    [
-                        _mk_action(
-                            "平台账号管理",
-                            "open_account_manager",
-                            "quote_platform_accounts",
-                            platform_code=platform_code,
-                            platform_name=platform_name,
-                        )
-                    ]
+                    _quote_platform_account_manage_actions(
+                        operator_role_name,
+                        platform_code=platform_code,
+                        platform_name=platform_name,
+                    )
                     if missing_account
                     else []
                 ),
                 _mk_action("查看当前材料状态"),
-                _mk_action(f"{platform_name}报价"),
+                *([] if (missing_account and _quote_account_needs_admin_contact(operator_role_name)) else [_mk_action(f"{platform_name}报价")]),
             ],
         }
 
@@ -12925,12 +13075,20 @@ async def handle_quote_message(
         if account_pool_unavailable:
             lines = [
                 f"{platform_name}{type_hint}报价资料已齐，但同平台账号暂不可用。",
-                "请在右上角“平台账号管理”确认账号已登录、未等待验证码且额度未用完。",
+                _quote_account_action_text(
+                    operator_role_name,
+                    "请在右上角“平台账号管理”确认账号已登录、未等待验证码且额度未用完。",
+                    "请联系管理员确认账号已登录、未等待验证码且额度未用完。",
+                ),
             ]
         else:
             lines = [
                 f"{platform_name}{type_hint}报价资料已齐，但当前没有可用平台账号。",
-                "请先点击右上角“平台账号管理”，新增/启用账号，或确认账号额度没有满。",
+                _quote_account_action_text(
+                    operator_role_name,
+                    "请先点击右上角“平台账号管理”，新增/启用账号，或确认账号额度没有满。",
+                    "请联系管理员新增、启用或登录平台账号，并确认账号额度没有满。",
+                ),
             ]
         if override_summary:
             lines.insert(0, f"已记录本次调整：{override_summary}")
@@ -12945,14 +13103,12 @@ async def handle_quote_message(
                 payload=payload,
             ),
             "actions": [
-                _mk_action(
-                    "平台账号管理",
-                    "open_account_manager",
-                    "quote_platform_accounts",
+                *_quote_platform_account_manage_actions(
+                    operator_role_name,
                     platform_code=platform_code,
                     platform_name=platform_name,
                 ),
-                _mk_action(f"{platform_name}报价"),
+                *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
             ],
         }
 
@@ -13033,6 +13189,7 @@ async def handle_quote_message(
         attached_images=attached_images,
         config_type_name=selected_account_type_name,
         reply_prefix=override_reply_prefix,
+        operator_role_name=operator_role_name,
     )
 
 
@@ -13216,10 +13373,24 @@ async def handle_quote_material_status(
     elif case.platform_code:
         platform_label = case.platform_name or case.platform_code
         if account_pool_unavailable:
-            lines.append(f"- 平台账号：{platform_label}同平台账号暂不可用，请确认账号已登录、未等待验证码且额度未用完。")
+            lines.append(
+                "- 平台账号："
+                + _quote_account_action_text(
+                    _ctx_role_name(ctx),
+                    f"{platform_label}同平台账号暂不可用，请确认账号已登录、未等待验证码且额度未用完。",
+                    f"{platform_label}平台账号暂不可用，请联系管理员处理。",
+                )
+            )
         else:
             type_hint = f"（类型：{selected_account_type_name}）" if selected_account_type_name else ""
-            lines.append(f"- 平台账号：{platform_label}{type_hint}暂无可用账号，请在右上角“平台账号管理”新增、启用或调整额度。")
+            lines.append(
+                "- 平台账号："
+                + _quote_account_action_text(
+                    _ctx_role_name(ctx),
+                    f"{platform_label}{type_hint}暂无可用账号，请在右上角“平台账号管理”新增、启用或调整额度。",
+                    f"{platform_label}{type_hint}暂无可用账号，请联系管理员新增、启用或调整额度。",
+                )
+            )
 
     return "\n".join(lines), {
         "status": "success",
