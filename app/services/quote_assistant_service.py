@@ -8619,10 +8619,84 @@ def _picc_start_datetime_from_request(quote_form: Mapping[str, Any], vehicle: Ma
     return f"{date_value} {_safe_int(hour_value, 0):02d}:{_safe_int(minute_value, 0):02d}"
 
 
+def _quote_value_is_false(value: Any) -> bool:
+    text = _to_str(value).strip().lower()
+    return text in {"0", "false", "no", "n", "否", "不", "不要", "不用", "关闭"}
+
+
+def _quote_first_positive_money_text(*values: Any) -> str:
+    for value in values:
+        if not _quote_has_text(value):
+            continue
+        amount = _quote_money_decimal(value)
+        if amount > 0:
+            return _quote_money_text(amount)
+    return ""
+
+
+def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
+    safe_card = dict(_json_obj(card))
+    request_body = _json_obj(result.get("request_body"))
+    vehicle = _json_obj(request_body.get("vehicleForm"))
+    quote_form = _json_obj(request_body.get("quoteForm"))
+    proposal_info = dict(_json_obj(safe_card.get("proposal_info")))
+    joint_sales = _json_obj(result.get("joint_sales"))
+    joint_disabled = joint_sales and (
+        joint_sales.get("enabled") is False or _quote_value_is_false(joint_sales.get("enabled"))
+    )
+    original_joint_premium = _quote_money_decimal(safe_card.get("joint_sales_premium"))
+    if joint_disabled:
+        joint_premium = ""
+        joint_amount = ""
+    else:
+        joint_premium = _quote_first_positive_money_text(
+            result.get("joint_sales_premium"),
+            joint_sales.get("premium"),
+            safe_card.get("joint_sales_premium"),
+        )
+        joint_amount = _quote_first_positive_money_text(
+            result.get("joint_sales_amount"),
+            joint_sales.get("amount"),
+            safe_card.get("joint_sales_amount"),
+        )
+        if not joint_premium:
+            joint_amount = ""
+    next_joint_premium = _quote_money_decimal(joint_premium)
+    if next_joint_premium != original_joint_premium:
+        delta = next_joint_premium - original_joint_premium
+        for key in ("total_without_vehicle_tax", "total_with_vehicle_tax", "total_premium"):
+            if safe_card.get(key) not in (None, ""):
+                safe_card[key] = _quote_adjusted_money_text(safe_card.get(key), delta)
+    safe_card["joint_sales_label"] = "途家安顺"
+    safe_card["joint_sales_display_label"] = "途顺家安组合保险"
+    safe_card["joint_sales_premium"] = joint_premium
+    safe_card["joint_sales_amount"] = joint_amount
+
+    bi_start = _quote_first_text(
+        result.get("bi_start_date"),
+        result.get("commercial_start_date"),
+        proposal_info.get("bi_start_date"),
+        _picc_start_datetime_from_request(quote_form, vehicle, kind="bi"),
+    )
+    ci_start = _quote_first_text(
+        result.get("ci_start_date"),
+        result.get("compulsory_start_date"),
+        proposal_info.get("ci_start_date"),
+        _picc_start_datetime_from_request(quote_form, vehicle, kind="ci"),
+    )
+    if bi_start:
+        proposal_info["bi_start_date"] = bi_start
+    if ci_start:
+        proposal_info["ci_start_date"] = ci_start
+    if proposal_info:
+        safe_card["proposal_info"] = proposal_info
+    return safe_card
+
+
 def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
     safe_card = dict(_json_obj(card))
     if _to_str(safe_card.get("style")).strip() == "picc_proposal_table":
-        return safe_card
+        return _picc_existing_proposal_table_card_for_display(result, safe_card)
 
     platform_code = _to_str(result.get("platform_code")).strip().upper()
     platform_name = _to_str(result.get("platform_name")).strip()
@@ -8659,8 +8733,13 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
     vehicle_tax = _quote_money_text_or_empty(
         _quote_first_text(safe_card.get("vehicle_tax"), _quote_result_price_amount(result, "车船"))
     )
-    joint_premium = _quote_money_text_or_empty(_quote_first_text(safe_card.get("joint_sales_premium"), result.get("joint_sales_premium")))
-    joint_amount = _quote_money_text_or_empty(_quote_first_text(safe_card.get("joint_sales_amount"), result.get("joint_sales_amount")))
+    joint_sales = _json_obj(result.get("joint_sales"))
+    joint_premium = _quote_money_text_or_empty(
+        _quote_first_text(result.get("joint_sales_premium"), joint_sales.get("premium"), safe_card.get("joint_sales_premium"))
+    )
+    joint_amount = _quote_money_text_or_empty(
+        _quote_first_text(result.get("joint_sales_amount"), joint_sales.get("amount"), safe_card.get("joint_sales_amount"))
+    )
     if _quote_money_decimal(joint_premium) <= 0:
         joint_premium = ""
         joint_amount = ""
@@ -8733,12 +8812,60 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
             if _quote_first_text(vehicle.get("purchasePrice"), vehicle.get("actualValue"), result.get("vehicle_actual_value"))
             else "",
             "claim_summary": claim_summary,
-            "bi_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="bi"),
-            "ci_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="ci"),
+            "bi_start_date": _quote_first_text(
+                result.get("bi_start_date"),
+                result.get("commercial_start_date"),
+                _picc_start_datetime_from_request(quote_form, vehicle, kind="bi"),
+            ),
+            "ci_start_date": _quote_first_text(
+                result.get("ci_start_date"),
+                result.get("compulsory_start_date"),
+                _picc_start_datetime_from_request(quote_form, vehicle, kind="ci"),
+            ),
         },
         "proposal_coverage_items": proposal_coverage_items,
     }
     return upgraded
+
+
+def _sync_quote_result_with_display_card(result: Dict[str, Any], card: Mapping[str, Any]) -> None:
+    """Keep the stored quote payload consistent with the card used to render the image."""
+    safe_card = _json_obj(card)
+    if not safe_card:
+        return
+
+    joint_premium = _to_str(safe_card.get("joint_sales_premium")).strip()
+    joint_amount = _to_str(safe_card.get("joint_sales_amount")).strip()
+    if "joint_sales_premium" in safe_card:
+        result["joint_sales_premium"] = joint_premium
+    if "joint_sales_amount" in safe_card:
+        result["joint_sales_amount"] = joint_amount
+
+    if "joint_sales_premium" in safe_card or "joint_sales_amount" in safe_card:
+        premium_decimal = _quote_money_decimal(joint_premium)
+        joint_sales = deepcopy(_json_obj(result.get("joint_sales")))
+        joint_sales["enabled"] = premium_decimal > 0
+        joint_sales["premium"] = _quote_money_text(premium_decimal) if premium_decimal > 0 else "0.00"
+        joint_sales["amount"] = joint_amount if premium_decimal > 0 else ""
+        result["joint_sales"] = joint_sales
+        _update_joint_sales_price_items(result, premium_decimal)
+
+    total_text = _quote_first_text(
+        safe_card.get("total_premium"),
+        safe_card.get("total_with_vehicle_tax"),
+    )
+    if total_text:
+        result["premium_total"] = float(_quote_money_decimal(total_text))
+
+    proposal_info = _json_obj(safe_card.get("proposal_info"))
+    bi_start = _quote_first_text(proposal_info.get("bi_start_date"), safe_card.get("bi_start_date"))
+    ci_start = _quote_first_text(proposal_info.get("ci_start_date"), safe_card.get("ci_start_date"))
+    if bi_start:
+        result["bi_start_date"] = bi_start
+        result["commercial_start_date"] = bi_start
+    if ci_start:
+        result["ci_start_date"] = ci_start
+        result["compulsory_start_date"] = ci_start
 
 
 def _enrich_quote_result_for_display(
@@ -8752,6 +8879,7 @@ def _enrich_quote_result_for_display(
     card = _json_obj(safe_result.get("result_card")) or _quote_result_card_from_price_items(safe_result)
     if card:
         card = _picc_result_card_for_display(safe_result, card)
+        _sync_quote_result_with_display_card(safe_result, card)
         display_time = _quote_card_time_text()
         card.setdefault("quote_time", display_time)
         for key in ("watermark_account", "watermark_user", "watermark_name", "watermark_time", "watermark_text"):
@@ -12270,6 +12398,12 @@ async def handle_quote_message(
     quote_field_overrides = _json_obj(override_signal.get("overrides"))
     repair_code_command = _extract_quote_repair_code_command(text)
     repair_code_resolution: Dict[str, Any] = {}
+    extracted = extract_quote_fields(text)
+    quote_date_overrides = {
+        key: extracted.get(key)
+        for key in ("commercial_start_date", "compulsory_start_date")
+        if extracted.get(key) not in (None, "")
+    }
     if repair_code_command:
         try:
             repair_code_resolution = await _resolve_quote_repair_code_command(
@@ -12318,6 +12452,7 @@ async def handle_quote_message(
         or quote_command_mode in {"全保", "交三"}
         or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities
         or transfer_vehicle_command
+        or quote_date_overrides
     )
     override_summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(quote_field_overrides)
     override_reply_prefix = f"已按本次调整重报：{override_summary}\n" if override_summary else ""
@@ -12432,7 +12567,7 @@ async def handle_quote_message(
     else:
         waiting_product_state_changed = False
 
-    if waiting_pair and (quote_field_overrides or transfer_vehicle_command or waiting_product_state_changed):
+    if waiting_pair and (quote_field_overrides or transfer_vehicle_command or quote_date_overrides or waiting_product_state_changed):
         case, task = waiting_pair
         await _expire_waiting_sms_task(
             db,
@@ -12540,7 +12675,7 @@ async def handle_quote_message(
     else:
         duplicate_product_state_changed = False
 
-    if duplicate_confirm_pair and (quote_field_overrides or transfer_vehicle_command or duplicate_product_state_changed):
+    if duplicate_confirm_pair and (quote_field_overrides or transfer_vehicle_command or quote_date_overrides or duplicate_product_state_changed):
         case, task = duplicate_confirm_pair
         if not merged_entities.get("platform_code") and (case.platform_code or task.platform_code):
             merged_entities["platform_code"] = case.platform_code or task.platform_code
@@ -12568,6 +12703,7 @@ async def handle_quote_message(
                     "duplicate_quote_confirm_cancelled": True,
                     "reason": QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE,
                     "quote_field_overrides": quote_field_overrides,
+                    "quote_date_overrides": quote_date_overrides,
                     QUOTE_PRODUCT_EXCLUSIONS_KEY: quote_product_exclusions,
                     "old_task_id": task.id,
                 },
@@ -12734,7 +12870,7 @@ async def handle_quote_message(
             old_draft.get("quote_field_overrides"),
             quote_field_overrides,
         )
-        text_patch: Dict[str, Any] = dict(transfer_vehicle_text_data)
+        text_patch: Dict[str, Any] = {**quote_date_overrides, **transfer_vehicle_text_data}
         if merged_overrides:
             text_patch["quote_field_overrides"] = merged_overrides
         old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
@@ -12771,6 +12907,7 @@ async def handle_quote_message(
             payload={
                 "quote_field_overrides": merged_overrides,
                 QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
+                "quote_date_overrides": quote_date_overrides,
                 "transfer_vehicle": transfer_vehicle_text_data,
                 "deferred_quote": True,
                 "cancelled_active_quote_tasks": cancelled_active_quote_tasks,
@@ -12791,6 +12928,7 @@ async def handle_quote_message(
             payload={
                 "quote_field_overrides": merged_overrides,
                 QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
+                "quote_date_overrides": quote_date_overrides,
                 "transfer_vehicle": {
                     key: next_normalized.get(key)
                     for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_source", "transfer_vehicle_override")
@@ -12856,7 +12994,6 @@ async def handle_quote_message(
     ) or _extract_account_type_from_quote_text(text, platform_name, platform_code)
 
     order_id = explicit_order_id or inherited_order_id or None
-    extracted = extract_quote_fields(text)
     text_data = _quote_text_data_from_entities(extracted, merged_entities)
     plate_no = _to_str(extracted.get("plate_no") or merged_entities.get("plate_no")).strip() or None
     owner_phone = _to_str(extracted.get("owner_phone") or merged_entities.get("owner_phone")).strip() or None

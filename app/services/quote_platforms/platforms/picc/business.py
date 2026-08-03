@@ -828,11 +828,26 @@ def _platform_datetime_text(value: Any) -> str:
         return text
 
 
-def _platform_quote_date_command(value: Any) -> str:
+def _platform_effective_quote_date(value: Any) -> str:
     day = _date_text(value)
     if not day:
         return ""
-    return f"商业起保日期：{day}\n人保报价"
+    try:
+        parsed = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return day
+    # 人保 0 点起保不能早于当前时间；历史建议日按次日 0 点重报更稳。
+    min_day = date.today() + timedelta(days=1)
+    if parsed < min_day:
+        parsed = min_day
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _platform_quote_date_command(value: Any) -> str:
+    day = _platform_effective_quote_date(value)
+    if not day:
+        return ""
+    return f"商业起保日期：{day}\n交强起保日期：{day}\n人保报价"
 
 
 def _format_reinsure_items_prompt(items: Any) -> str:
@@ -900,6 +915,7 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         return {}
     first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
     advise_start = _first_text(first_reinsure.get("adviseStartDate"), first_reinsure.get("effectiveDate"))
+    adjusted_start = _platform_effective_quote_date(advise_start)
     confirm_command = _platform_quote_date_command(advise_start)
     return {
         "type": "confirm" if confirm_command else "notice",
@@ -912,7 +928,8 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         "cancel_text": "关闭" if confirm_command else "",
         "close_text": "关闭",
         "confirm_action": {"command": confirm_command} if confirm_command else {},
-        "suggested_commercial_start_date": _date_text(advise_start),
+        "suggested_commercial_start_date": adjusted_start or _date_text(advise_start),
+        "suggested_compulsory_start_date": adjusted_start or _date_text(advise_start),
         "reinsure_items": reinsure_items[:3] if reinsure_items else [],
     }
 
@@ -1371,6 +1388,66 @@ def _proposal_start_datetime(date_value: Any, hour_value: Any = "", minute_value
     hour = _safe_int_local(hour_value, 0)
     minute = _safe_int_local(minute_value, 0)
     return f"{day} {hour:02d}:{minute:02d}"
+
+
+def _find_quote_response_date(data: Mapping[str, Any], *, kind: str) -> str:
+    payload = _json_obj(data)
+    if kind == "ci":
+        exact_keys = (
+            "startDateCI",
+            "ciStartDate",
+            "cistartDate",
+            "compulsoryStartDate",
+            "compulsory_start_date",
+            "jqStartDate",
+            "jqxStartDate",
+            "startDateC",
+        )
+    else:
+        exact_keys = (
+            "startDateBI",
+            "biStartDate",
+            "bistartDate",
+            "commercialStartDate",
+            "commercial_start_date",
+            "businessStartDate",
+            "bizStartDate",
+            "startDateB",
+        )
+    for key in exact_keys:
+        day = _date_text(payload.get(key))
+        if day:
+            return day
+    return ""
+
+
+def _proposal_start_datetime_from_quote_response(
+    data: Mapping[str, Any],
+    form: Mapping[str, Any],
+    *,
+    kind: str,
+) -> str:
+    is_ci = kind == "ci"
+    response_day = _find_quote_response_date(data, kind=kind)
+    if response_day:
+        return _proposal_start_datetime(
+            response_day,
+            _first_text(
+                data.get("startHourCI" if is_ci else "startHourBI"),
+                data.get("starthourci" if is_ci else "starthourbi"),
+                form.get("prpCmain.starthourci" if is_ci else "prpCmain.starthourbi"),
+            ),
+            _first_text(
+                data.get("startMinuteCI" if is_ci else "startMinuteBI"),
+                data.get("startminuteci" if is_ci else "startminutebi"),
+                form.get("prpCmain.startminuteci" if is_ci else "prpCmain.startminutebi"),
+            ),
+        )
+    return _proposal_start_datetime(
+        form.get("prpCmain.startDateCI" if is_ci else "prpCmain.startDate"),
+        form.get("prpCmain.starthourci" if is_ci else "prpCmain.starthourbi"),
+        form.get("prpCmain.startminuteci" if is_ci else "prpCmain.startminutebi"),
+    )
 
 
 def _proposal_claim_summary(data: Mapping[str, Any], claim_bi: Any, claim_ci: Any) -> str:
@@ -3694,15 +3771,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         claim_ci_raw = _first_text(ci_risk.get("claimTimes"), data.get("lastDamagedCI"))
         claim_bi = _safe_int_local(claim_bi_raw, 0) if _has_text(claim_bi_raw) else ""
         claim_ci = _safe_int_local(claim_ci_raw, 0) if _has_text(claim_ci_raw) else ""
-        joint_sales_premium_present = _has_text(data.get("sumYelPremium"))
-        joint_sales_premium = _money(data.get("sumYelPremium")) if joint_sales_premium_present else Decimal("0")
+        platform_joint_sales_premium_present = _has_text(data.get("sumYelPremium"))
+        platform_joint_sales_premium = _money(data.get("sumYelPremium")) if platform_joint_sales_premium_present else Decimal("0")
+        joint_sales_premium_present = platform_joint_sales_premium_present
+        joint_sales_premium = platform_joint_sales_premium
         tujia_premium = _money(tujia_anshun.get("premium"))
-        if not joint_sales_premium_present and tujia_premium:
+        joint_sales_premium_from_plan = False
+        if tujia_premium > 0 and (not joint_sales_premium_present or joint_sales_premium <= 0):
             joint_sales_premium = tujia_premium
             joint_sales_premium_present = True
+            joint_sales_premium_from_plan = True
         joint_sales_amount = _money(tujia_anshun.get("amount")) if _has_text(tujia_anshun.get("amount")) else Decimal("0")
+        joint_sales_amount_present = joint_sales_premium > 0 and joint_sales_amount > 0
         if _has_text(data.get("sumPremium")):
             total_without_vehicle_tax: Optional[Decimal] = _money(data.get("sumPremium"))
+            if joint_sales_premium_from_plan and platform_joint_sales_premium <= 0:
+                total_without_vehicle_tax += joint_sales_premium
         elif commercial_premium_value is not None and compulsory_premium_value is not None:
             total_without_vehicle_tax = commercial_premium_value + compulsory_premium_value + (joint_sales_premium if joint_sales_premium_present else Decimal("0"))
         else:
@@ -3752,16 +3836,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 keep_decimal=False,
             ),
             "claim_summary": _proposal_claim_summary(data, claim_bi, claim_ci),
-            "bi_start_date": _proposal_start_datetime(
-                form.get("prpCmain.startDate"),
-                form.get("prpCmain.starthourbi"),
-                form.get("prpCmain.startminutebi"),
-            ),
-            "ci_start_date": _proposal_start_datetime(
-                form.get("prpCmain.startDateCI"),
-                form.get("prpCmain.starthourci"),
-                form.get("prpCmain.startminuteci"),
-            ),
+            "bi_start_date": _proposal_start_datetime_from_quote_response(data, form, kind="bi"),
+            "ci_start_date": _proposal_start_datetime_from_quote_response(data, form, kind="ci"),
         }
         result_card = {
             "style": "picc_proposal_table",
@@ -3781,7 +3857,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "joint_sales_label": "途家安顺",
             "joint_sales_display_label": "途顺家安组合保险",
             "joint_sales_premium": _money_text(joint_sales_premium) if joint_sales_premium_present else "",
-            "joint_sales_amount": _money_text(joint_sales_amount) if _has_text(tujia_anshun.get("amount")) else "",
+            "joint_sales_amount": _money_text(joint_sales_amount) if joint_sales_amount_present else "",
             "joint_sales_plan_name": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planName")).strip(),
             "joint_sales_plan_code": _to_str(_json_obj(tujia_anshun.get("selected_plan")).get("planCode")).strip(),
             "driver_accident_premium": _money_text_or_empty(data.get("DDAPremium")),
@@ -3822,7 +3898,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "vehicle_actual_value": _money_text_or_empty(vehicle.get("actualValue")),
             "joint_sales": tujia_anshun,
             "joint_sales_premium": _money_text(joint_sales_premium) if joint_sales_premium_present else "",
-            "joint_sales_amount": _money_text(joint_sales_amount) if _has_text(tujia_anshun.get("amount")) else "",
+            "joint_sales_amount": _money_text(joint_sales_amount) if joint_sales_amount_present else "",
+            "bi_start_date": proposal_info.get("bi_start_date"),
+            "ci_start_date": proposal_info.get("ci_start_date"),
+            "commercial_start_date": proposal_info.get("bi_start_date"),
+            "compulsory_start_date": proposal_info.get("ci_start_date"),
             "price_items": price_items,
             "premium_total": float(total) if total is not None else None,
             "risk_score": risk_score,
