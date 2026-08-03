@@ -23,7 +23,7 @@ def _to_str(value: Any, default: str = "") -> str:
 
 def _num_text(value: Any, *, money: bool = False) -> str:
     if value in (None, ""):
-        return "0.00" if money else "-"
+        return "-"
     try:
         n = float(_to_str(value).replace(",", ""))
     except Exception:
@@ -35,7 +35,7 @@ def _num_text(value: Any, *, money: bool = False) -> str:
     return f"{n:.2f}".rstrip("0").rstrip(".")
 
 
-def _money_yuan(value: Any, *, zero: str = "0.00元") -> str:
+def _money_yuan(value: Any, *, zero: str = "-") -> str:
     if value in (None, ""):
         return zero
     return f"{_num_text(value, money=True)}元"
@@ -373,15 +373,17 @@ def _render_legacy_quote_card_png(card: Mapping[str, Any]) -> bytes:
         _draw_text(draw, (left + 310, y), f"滞纳金{_num_text(tax_detail.get('late_fee'), money=True)}", font=font14, fill="#7f899c")
         y += 25
 
-    joint_label = _to_str(safe_card.get("joint_sales_label")).strip() or "联合销售"
-    _draw_text(draw, (left, y), joint_label, font=font14)
-    _draw_right(draw, right, y, _num_text(safe_card.get("joint_sales_premium"), money=True), font=font16b, fill="#ff0000")
-    y += 25
+    joint_premium = _to_str(safe_card.get("joint_sales_premium")).strip()
     joint_amount = _to_str(safe_card.get("joint_sales_amount")).strip()
-    if joint_amount:
-        _draw_text(draw, (left + 12, y), "途家安顺保额", font=font14, fill="#7f899c")
-        _draw_right(draw, right, y, _num_text(joint_amount), font=font14, fill="#7f899c")
+    if joint_premium or joint_amount:
+        joint_label = _to_str(safe_card.get("joint_sales_label")).strip() or "联合销售"
+        _draw_text(draw, (left, y), joint_label, font=font14)
+        _draw_right(draw, right, y, _num_text(joint_premium, money=True), font=font16b, fill="#ff0000")
         y += 25
+        if joint_amount:
+            _draw_text(draw, (left + 12, y), "途家安顺保额", font=font14, fill="#7f899c")
+            _draw_right(draw, right, y, _num_text(joint_amount), font=font14, fill="#7f899c")
+            y += 25
 
     _draw_text(draw, (left, y), "驾意险", font=font14)
     _draw_right(draw, right, y, _num_text(safe_card.get("driver_accident_premium"), money=True), font=font16b, fill="#ff0000")
@@ -414,7 +416,7 @@ def _proposal_info_rows(card: Mapping[str, Any]) -> List[Tuple[str, str, str, st
             ("发动机号", _to_str(info.get("engine_no") or "-"), "车架号", _to_str(info.get("vin") or "-")),
             ("车辆类型", _to_str(info.get("vehicle_type") or "-"), "车辆性质", _to_str(info.get("vehicle_usage") or "-")),
             ("车辆型号", _to_str(info.get("vehicle_model") or "-"), "初登日期", _to_str(info.get("enroll_date") or "-")),
-            ("核定载质量", _to_str(info.get("ton_count") or "0千克"), "核定载客量(包括司机)", _to_str(info.get("seat_count") or "-")),
+            ("核定载质量", _to_str(info.get("ton_count") or "-"), "核定载客量(包括司机)", _to_str(info.get("seat_count") or "-")),
             ("新车购置价", _to_str(info.get("purchase_price") or "-"), "承保年数、出险次数", _to_str(info.get("claim_summary") or "-")),
             ("商业险起保日期", _to_str(info.get("bi_start_date") or "-"), "交强险起保日期", _to_str(info.get("ci_start_date") or "-")),
         ]
@@ -423,7 +425,7 @@ def _proposal_info_rows(card: Mapping[str, Any]) -> List[Tuple[str, str, str, st
         ("发动机号", _to_str(card.get("engine_no") or "-"), "车架号", _to_str(card.get("vin") or "-")),
         ("车辆类型", _to_str(card.get("vehicle_type") or "-"), "车辆性质", _to_str(card.get("vehicle_usage") or "-")),
         ("车辆型号", _to_str(card.get("vehicle_model") or "-"), "初登日期", _to_str(card.get("enroll_date") or "-")),
-        ("核定载质量", _to_str(card.get("ton_count") or "0千克"), "核定载客量(包括司机)", _to_str(card.get("seat_count") or "-")),
+        ("核定载质量", _to_str(card.get("ton_count") or "-"), "核定载客量(包括司机)", _to_str(card.get("seat_count") or "-")),
         ("新车购置价", _to_str(card.get("purchase_price") or "-"), "承保年数、出险次数", _to_str(card.get("claim_summary") or "-")),
         ("商业险起保日期", _to_str(card.get("bi_start_date") or "-"), "交强险起保日期", _to_str(card.get("ci_start_date") or "-")),
     ]

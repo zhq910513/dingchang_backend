@@ -93,12 +93,14 @@ CASE_STATUS_WAITING_DUPLICATE_CONFIRM = "waiting_duplicate_confirm"
 CASE_STATUS_FAILED = "failed"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_FAILED = "failed"
+TASK_STATUS_RUNNING = "running"
 TASK_STATUS_WAITING_SMS = "waiting_sms"
 TASK_STATUS_WAITING_DUPLICATE_CONFIRM = "waiting_duplicate_confirm"
 TASK_STATUS_CANCELLED = "cancelled"
 QUOTE_MATERIAL_CHANGED_MESSAGE = "材料已更新，请重新发起报价"
 QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE = "报价调整已更新，请重新确认重复投保"
 QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE = "默认参数已更新，请重新发起报价"
+QUOTE_SUPERSEDED_MESSAGE = "报价参数已更新，旧报价已停止"
 SINGLE_REQUIRED_SLOTS = ("vehicle_cert", "idcard_front", "driving_license_main")
 QUOTE_IMAGE_AUTO_CONFIRM_MIN_CONFIDENCE = 0.72
 QUOTE_IMAGE_OCR_CLASSIFY_ENABLED = os.getenv("QUOTE_IMAGE_OCR_CLASSIFY_ENABLED", "1") == "1"
@@ -125,6 +127,13 @@ try:
     QUOTE_SMS_CODE_TTL_SECONDS = max(60, int(os.getenv("QUOTE_SMS_CODE_TTL_SECONDS", "600") or "600"))
 except Exception:
     QUOTE_SMS_CODE_TTL_SECONDS = 600
+try:
+    QUOTE_RUNNING_TASK_STALE_SECONDS = max(
+        300,
+        int(os.getenv("QUOTE_RUNNING_TASK_STALE_SECONDS", "900") or "900"),
+    )
+except Exception:
+    QUOTE_RUNNING_TASK_STALE_SECONDS = 900
 try:
     PICC_SECURITY_CODE_TTL_SECONDS = max(30, int(os.getenv("PICC_SECURITY_CODE_TTL_SECONDS", "55") or "55"))
 except Exception:
@@ -629,13 +638,25 @@ def _sanitize_platform_dialog_message(
     text = _sanitize_duplicate_quote_warning(value, default_message)
     if not text:
         return default_message
-    text = re.sub(r"^[A-Z]{2,}[A-Z0-9_]*(?:[-_]\d+)?\s*[-_：:，,;；]?", "", text).strip()
-    text = sanitize_quote_user_message(
+    display_name = _platform_display_name(platform_code, platform_name) if (platform_code or platform_name) else ""
+    low = text.lower()
+    if (
+        re.search(r"\b(?:502|503|504)\b", text)
+        or re.search(r"\b(?:bad gateway|gateway timeout|service unavailable)\b", low, flags=re.IGNORECASE)
+        or re.search(r"</?(?:html|head|body|center|h1)\b", low, flags=re.IGNORECASE)
+    ):
+        prefix = f"{display_name}平台" if display_name else "平台"
+        return f"{prefix}网关临时异常，请稍后重试"
+    text = re.sub(r"token|authorization|cookie|session|trace|stack|payload|debug", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:KeyError|ValueError|TypeError|RuntimeError|Traceback|AxiosError|TimeoutError|ConnectionError|Exception)\b",
+        "",
         text,
-        default_message or text,
-        platform_code=platform_code,
-        platform_name=platform_name,
+        flags=re.IGNORECASE,
     )
+    text = re.sub(r"\bERR_[A-Z_]+\b", "", text)
+    text = re.sub(r"Network Error", "网络连接异常", text, flags=re.IGNORECASE)
+    text = re.sub(r"Request failed", "请求处理失败", text, flags=re.IGNORECASE)
     text = re.sub(r"^\s*\d+\s*(?=当前|该|此|请|业务|错误|提示)", "", text).strip()
     text = re.sub(r"(?:。)?请检查平台账号状态或报价资料后重试[。.]?$", "", text).strip()
     text = "\n".join(
@@ -686,17 +707,21 @@ def _runtime_platform_dialog_message(
     candidates: List[Any] = []
     platform_response = _json_obj(data.get("platform_response"))
     platform_dialog = _json_obj(data.get("platform_dialog"))
+    platform_response_body = _json_obj(platform_response.get("response"))
     candidates.extend(
         [
             platform_dialog.get("message"),
             platform_dialog.get("content"),
+            platform_response.get("raw_message"),
+            platform_response_body.get("normalizeErrorMsg"),
+            platform_response_body.get("errorMsg"),
+            platform_response_body.get("errorMessage"),
+            platform_response_body.get("businessControlMsg"),
+            platform_response_body.get("businessMsg"),
             platform_response.get("message"),
             platform_response.get("statusText"),
             platform_response.get("errorMessage"),
-            _json_obj(platform_response.get("response")).get("businessControlMsg"),
-            _json_obj(platform_response.get("response")).get("businessMsg"),
-            _json_obj(platform_response.get("response")).get("errorMessage"),
-            _json_obj(platform_response.get("response")).get("statusText"),
+            platform_response_body.get("statusText"),
             data.get("platform_status_text"),
             data.get("error_message"),
             data.get("message"),
@@ -810,6 +835,46 @@ def _make_platform_dialog(
     return dialog
 
 
+def _platform_dialog_from_source(
+    source: Any,
+    *,
+    trace_id: str = "",
+    task_id: Any = None,
+    case_id: Any = None,
+    platform_code: str = "",
+    platform_name: str = "",
+) -> Dict[str, Any]:
+    source_dialog = _json_obj(source)
+    if not source_dialog:
+        return {}
+    source_confirm_action = _json_obj(source_dialog.get("confirm_action"))
+    source_cancel_action = _json_obj(source_dialog.get("cancel_action"))
+    source_confirm_required = (
+        source_dialog.get("confirm_required") is True
+        or _to_str(source_dialog.get("type")).strip().lower() == "confirm"
+    )
+    message = _to_str(source_dialog.get("message")).strip() or _to_str(source_dialog.get("content")).strip()
+    if not message:
+        return {}
+    return _make_platform_dialog(
+        message=message,
+        title=_to_str(source_dialog.get("title")).strip() or "报价提示",
+        subtype=_to_str(source_dialog.get("subtype")).strip() or "platform_notice",
+        severity=_to_str(source_dialog.get("severity")).strip() or "warning",
+        confirm_required=source_confirm_required,
+        trace_id=trace_id,
+        task_id=task_id,
+        case_id=case_id,
+        confirm_text=_to_str(source_dialog.get("confirm_text")).strip(),
+        cancel_text=_to_str(source_dialog.get("cancel_text")).strip(),
+        close_text=_to_str(source_dialog.get("close_text")).strip(),
+        confirm_command=_to_str(source_confirm_action.get("command") or source_dialog.get("confirm_command")).strip(),
+        cancel_command=_to_str(source_cancel_action.get("command") or source_dialog.get("cancel_command")).strip(),
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+
+
 def _duplicate_quote_platform_dialog(
     *,
     warning: str,
@@ -911,13 +976,21 @@ QUOTE_THIRD_PARTY_LABEL = "第三者责任险"
 QUOTE_MEDICAL_THIRD_LABEL = "医保外医疗费用责任险（第三者责任险）"
 QUOTE_SHARED_LIMIT_LABEL = "共享主险限额"
 QUOTE_LOSS_LABEL = "机动车损失保险"
+QUOTE_DRIVER_LABEL = "车上人员责任险（司机）"
+QUOTE_PASSENGER_LABEL = "车上人员责任险（乘客）"
 QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
 PICC_FULL_COVER_COMMANDS = {
     "全保",
     "人保全保",
+    "人保报价",
+    "中国人保报价",
+    "PICC报价",
     "全保报价",
     "人保全保报价",
+    "人保重报",
+    "中国人保重报",
+    "PICC重报",
     "全保重报",
     "人保全保重报",
 }
@@ -929,6 +1002,39 @@ PICC_JIAOSAN_COMMANDS = {
     "交三重报",
     "人保交三重报",
 }
+
+
+def _picc_quote_command_mode_from_compact(compact: str) -> str:
+    text = re.sub(r"\s+", "", _to_str(compact))
+    if not text:
+        return ""
+    if text in PICC_JIAOSAN_COMMANDS:
+        return "交三"
+    if text in PICC_FULL_COVER_COMMANDS:
+        return "全保"
+    if (
+        "交三" in text
+        and (
+            text.startswith("交三")
+            or "人保交三" in text
+            or "中国人保交三" in text
+            or "PICC交三" in text.upper()
+        )
+    ):
+        return "交三"
+    if (
+        "全保" in text
+        and (
+            text.startswith("全保")
+            or "人保全保" in text
+            or "中国人保全保" in text
+            or "PICC全保" in text.upper()
+        )
+    ):
+        return "全保"
+    if any(keyword in text.upper() for keyword in ("人保报价", "中国人保报价", "PICC报价", "人保重报", "中国人保重报", "PICC重报")):
+        return "全保"
+    return ""
 
 QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
     "车牌号",
@@ -1784,8 +1890,18 @@ def _normalize_quote_config_override_value(value: Any, unit: Any = "") -> str:
     if unit_text and not text.endswith(unit_text):
         text = f"{text}{unit_text}"
     text = re.sub(r"\s+", "", text)
-    if text.endswith("元"):
-        text = text[:-1]
+    is_wan = text.endswith("万") or text.endswith("万元")
+    text = re.sub(r"(?:万元|万|元)$", "", text)
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            amount = Decimal(text)
+            if is_wan:
+                amount *= Decimal("10000")
+            if amount == amount.to_integral():
+                return str(int(amount))[:128]
+            return format(amount.normalize(), "f").rstrip("0").rstrip(".")[:128]
+        except Exception:
+            pass
     return text[:128]
 
 
@@ -1888,18 +2004,67 @@ def _normalize_quote_product_exclusions(value: Any) -> List[str]:
         items = [value]
 
     exclusions: List[str] = []
+    removable = {
+        QUOTE_LOSS_LABEL,
+        QUOTE_THIRD_PARTY_LABEL,
+        QUOTE_DRIVER_LABEL,
+        QUOTE_PASSENGER_LABEL,
+        QUOTE_MEDICAL_THIRD_LABEL,
+    }
     for item in items:
         label = _canonical_quote_config_override_label(item)
-        if label == QUOTE_LOSS_LABEL and label not in exclusions:
+        if label in removable and label not in exclusions:
             exclusions.append(label)
+    if QUOTE_THIRD_PARTY_LABEL in exclusions and QUOTE_MEDICAL_THIRD_LABEL not in exclusions:
+        exclusions.append(QUOTE_MEDICAL_THIRD_LABEL)
     return exclusions
+
+
+def _extract_quote_product_exclusions(text: Any) -> List[str]:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return []
+    remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "非")
+    remove_group = "|".join(re.escape(word) for word in remove_words)
+    removable = {
+        QUOTE_LOSS_LABEL,
+        QUOTE_THIRD_PARTY_LABEL,
+        QUOTE_DRIVER_LABEL,
+        QUOTE_PASSENGER_LABEL,
+        QUOTE_MEDICAL_THIRD_LABEL,
+    }
+    exclusions: List[str] = []
+    for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:
+        label = _canonical_quote_config_override_label(canonical)
+        if label not in removable:
+            continue
+        for alias in sorted(aliases, key=len, reverse=True):
+            alias_norm = re.sub(r"\s+", "", _to_str(alias).strip())
+            if not alias_norm:
+                continue
+            pattern = rf"(?:{remove_group}){re.escape(alias_norm)}|{re.escape(alias_norm)}(?:{remove_group})"
+            if re.search(pattern, compact):
+                if label not in exclusions:
+                    exclusions.append(label)
+                break
+    seat_aliases = ("司乘", "司乘险", "司机乘客", "司机和乘客", "车上人员")
+    for alias in seat_aliases:
+        alias_norm = re.sub(r"\s+", "", alias)
+        pattern = rf"(?:{remove_group}){re.escape(alias_norm)}|{re.escape(alias_norm)}(?:{remove_group})"
+        if re.search(pattern, compact):
+            for label in (QUOTE_DRIVER_LABEL, QUOTE_PASSENGER_LABEL):
+                if label not in exclusions:
+                    exclusions.append(label)
+            break
+    return _normalize_quote_product_exclusions(exclusions)
 
 
 def _detect_professional_quote_command(text: Any) -> Dict[str, Any]:
     compact = re.sub(r"\s+", "", _norm_text(text))
     if not compact:
         return {}
-    if compact in PICC_JIAOSAN_COMMANDS:
+    mode = _picc_quote_command_mode_from_compact(compact)
+    if mode == "交三":
         return {
             "is_quote": True,
             "entities": {
@@ -1909,7 +2074,7 @@ def _detect_professional_quote_command(text: Any) -> Dict[str, Any]:
                 "quote_command_mode": "交三",
             },
         }
-    if compact in PICC_FULL_COVER_COMMANDS:
+    if mode == "全保":
         return {
             "is_quote": True,
             "entities": {
@@ -1927,9 +2092,18 @@ def extract_quote_config_overrides(text: Any) -> Dict[str, Any]:
     compact = re.sub(r"\s+", "", t)
     overrides: Dict[str, Any] = {}
     consumed_spans: List[Tuple[int, int]] = []
-    connector = r"(?:保额|金额|额度|限额|改成|改为|调整为|调整到|调成|改到|设置为|设为|变成|调整|改|到|为)?"
+    connector = r"(?:保额|金额|额度|限额|改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置为|设为|变成|变为|变到|调整|改|变|到|为)?"
     separator = r"(?:[:：=+＋])?"
-    number = r"(-?\d+(?:[,，]\d{3})*(?:\.\d+)?)"
+    number = r"(\d+(?:[,，]\d{3})*(?:\.\d+)?)"
+
+    seat_pattern = rf"(?:司乘|司乘险|司机乘客|司机和乘客|车上人员)\s*{separator}\s*{connector}\s*{separator}\s*{number}\s*(万|元)?"
+    seat_match = re.search(seat_pattern, compact, flags=re.IGNORECASE)
+    if seat_match:
+        value = _normalize_quote_config_override_value(seat_match.group(1), seat_match.group(2))
+        if value:
+            overrides[QUOTE_DRIVER_LABEL] = value
+            overrides[QUOTE_PASSENGER_LABEL] = value
+            consumed_spans.append(seat_match.span())
 
     for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:
         for alias in sorted(aliases, key=len, reverse=True):
@@ -1992,6 +2166,47 @@ def _quote_override_summary(overrides: Any) -> str:
         if label and text:
             pairs.append(f"{label}={text}")
     return "、".join(pairs[:8])
+
+
+def _quote_product_exclusion_summary(exclusions: Any) -> str:
+    labels = _normalize_quote_product_exclusions(exclusions)
+    if not labels:
+        return ""
+    return "去掉" + "、".join(labels[:6])
+
+
+def _snapshot_quote_product_exclusions(snapshot: Any) -> List[str]:
+    snap = _json_obj(snapshot)
+    normalized = _json_obj(snap.get("normalized_data"))
+    platform_default = _json_obj(snap.get("platform_default_config"))
+    default_json = _json_obj(snap.get("default_config_json"))
+    for source in (normalized, default_json, platform_default):
+        labels = _normalize_quote_product_exclusions(source.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+        if labels:
+            return labels
+        if QUOTE_PRODUCT_EXCLUSIONS_KEY in source:
+            return []
+    return []
+
+
+def _quote_product_state_changes_current(
+    *,
+    quote_command_mode: str,
+    quote_product_exclusions: Any,
+    current_exclusions: Any,
+) -> bool:
+    current = _normalize_quote_product_exclusions(current_exclusions)
+    incoming = _normalize_quote_product_exclusions(quote_product_exclusions)
+    mode = _to_str(quote_command_mode).strip()
+    if mode == "全保":
+        desired = incoming
+    elif mode == "交三":
+        desired = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *incoming])
+    elif incoming:
+        desired = _normalize_quote_product_exclusions([*current, *incoming])
+    else:
+        return False
+    return desired != current
 
 
 def _extract_quote_repair_code_command(text: Any) -> Dict[str, Any]:
@@ -5659,7 +5874,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
             out["compulsory_start_date"] = value
 
     quote_overrides: Dict[str, Any] = {}
-    purchase = re.search(r"(?:新车购置价|购置价)\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*元?", t)
+    purchase = re.search(r"(?:新车购置价|购置价)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*元?", t)
     if purchase:
         quote_overrides["新车购置价"] = purchase.group(1)
 
@@ -5678,7 +5893,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
     consumed_spans: List[Tuple[int, int]] = []
     for canonical, aliases in product_aliases:
         for alias in sorted(aliases, key=len, reverse=True):
-            pattern = rf"{_quote_config_alias_pattern(alias)}\s*[:：]?\s*(-?\d+(?:\.\d+)?)\s*(万|元)?"
+            pattern = rf"{_quote_config_alias_pattern(alias)}\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(万|元)?"
             m = next(
                 (
                     item
@@ -5857,9 +6072,11 @@ async def _latest_reusable_session_case(
     session_id: Optional[str],
     ctx: Optional[Dict[str, Any]] = None,
     reuse_quoted: bool = True,
+    exclude_case_ids: Optional[Iterable[int]] = None,
 ) -> Optional[QuoteCase]:
     if owner_user_id <= 0 or not session_id:
         return None
+    excluded = {_safe_int(x, 0) for x in (exclude_case_ids or []) if _safe_int(x, 0) > 0}
     stmt = (
         select(QuoteCase)
         .where(
@@ -5870,6 +6087,8 @@ async def _latest_reusable_session_case(
     )
     if not reuse_quoted:
         stmt = stmt.where(QuoteCase.status != CASE_STATUS_QUOTED)
+    if excluded:
+        stmt = stmt.where(QuoteCase.id.notin_(excluded))
     rows = (await db.execute(stmt.order_by(desc(QuoteCase.id)).limit(10))).scalars().all()
     fallback_case: Optional[QuoteCase] = None
     for case in rows:
@@ -5916,8 +6135,10 @@ async def _get_or_create_case(
     platform_name: str,
     ctx: Optional[Dict[str, Any]] = None,
     reuse_quoted: bool = True,
+    exclude_case_ids: Optional[Iterable[int]] = None,
 ) -> QuoteCase:
     order_id = _safe_int(getattr(order, "id", 0), 0) or None
+    excluded = {_safe_int(x, 0) for x in (exclude_case_ids or []) if _safe_int(x, 0) > 0}
 
     base_stmt = select(QuoteCase).where(
         QuoteCase.owner_user_id == owner_user_id,
@@ -5925,6 +6146,8 @@ async def _get_or_create_case(
     )
     if not reuse_quoted:
         base_stmt = base_stmt.where(QuoteCase.status != CASE_STATUS_QUOTED)
+    if excluded:
+        base_stmt = base_stmt.where(QuoteCase.id.notin_(excluded))
 
     case = None
     if order_id:
@@ -5941,6 +6164,7 @@ async def _get_or_create_case(
                 session_id=session_id,
                 ctx=ctx,
                 reuse_quoted=reuse_quoted,
+                exclude_case_ids=excluded,
             )
         else:
             stmt = base_stmt.where(QuoteCase.session_id == session_id, QuoteCase.order_id.is_(None))
@@ -7348,6 +7572,20 @@ async def _lock_quote_case(db: AsyncSession, case: QuoteCase) -> QuoteCase:
     return locked or case
 
 
+async def _lock_quote_task(db: AsyncSession, task: QuoteTask) -> QuoteTask:
+    task_id = _safe_int(getattr(task, "id", 0), 0)
+    if task_id <= 0:
+        return task
+    locked = (
+        await db.execute(
+            select(QuoteTask)
+            .where(QuoteTask.id == task_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+    return locked or task
+
+
 def _snapshot_payload(
     *,
     case: QuoteCase,
@@ -7600,6 +7838,94 @@ async def _refresh_quote_case_material_state(
     return normalized_data, images_by_slot, missing
 
 
+def _quote_task_stale_base_time(task: QuoteTask) -> Optional[datetime]:
+    for value in (
+        getattr(task, "started_at", None),
+        getattr(task, "updated_at", None),
+        getattr(task, "created_at", None),
+    ):
+        if isinstance(value, datetime):
+            return value
+    return None
+
+
+def _quote_task_is_stale(task: QuoteTask, *, now: Optional[datetime] = None) -> bool:
+    base = _quote_task_stale_base_time(task)
+    if not base:
+        return False
+    return ((now or _now()) - base).total_seconds() > QUOTE_RUNNING_TASK_STALE_SECONDS
+
+
+async def _expire_stale_running_quote_tasks_for_owner_session(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    for_update: bool = False,
+) -> int:
+    """Recover quote attempts left running after a crash/thread stall.
+
+    Quota is intentionally not decremented here: once a platform call may have
+    been sent, the safest accounting choice is to reconcile with platform usage
+    later rather than undercount a real successful query.
+    """
+
+    if owner_user_id <= 0:
+        return 0
+    stmt = (
+        select(QuoteCase, QuoteTask)
+        .join(QuoteTask, QuoteTask.quote_case_id == QuoteCase.id)
+        .where(
+            QuoteCase.owner_user_id == owner_user_id,
+            QuoteTask.status.in_(("pending", TASK_STATUS_RUNNING)),
+        )
+        .order_by(desc(QuoteTask.id))
+    )
+    if session_id:
+        stmt = stmt.where(QuoteCase.session_id == session_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    rows = (await db.execute(stmt)).all()
+    if not rows:
+        return 0
+
+    now = _now()
+    expired = 0
+    for case, task in rows:
+        if not _quote_task_is_stale(task, now=now):
+            continue
+        task.status = TASK_STATUS_FAILED
+        task.error_detail = "报价任务超时，已自动清理"
+        task.response_payload = {
+            **_json_obj(task.response_payload),
+            "stale_running_task_cleaned": True,
+            "stale_seconds": QUOTE_RUNNING_TASK_STALE_SECONDS,
+            "quota_not_adjusted": True,
+        }
+        task.finished_at = now
+        task.updated_at = now
+        if case.current_task_id == task.id:
+            case.current_task_id = None
+        await _refresh_quote_case_material_state(db, case, preserve_quoted=True, now=now)
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": TASK_STATUS_FAILED,
+                "reason": task.error_detail,
+                "stale_running_task_cleaned": True,
+            },
+        )
+        expired += 1
+    if expired:
+        await db.flush()
+    return expired
+
+
 async def _expire_waiting_sms_task(
     db: AsyncSession,
     *,
@@ -7731,6 +8057,10 @@ async def _quote_snapshot_material_is_current(
     submitted = _snapshot_material_fingerprint(snapshot)
     if not submitted:
         return True
+    try:
+        await db.refresh(case)
+    except Exception:
+        pass
     current = await _current_case_material_fingerprint(db, case)
     return current == submitted
 
@@ -8079,9 +8409,78 @@ def _quote_money_text(value: Any, default: str = "0.00") -> str:
         return default
 
 
+def _quote_has_text(value: Any) -> bool:
+    return _to_str(value).strip() != ""
+
+
+def _quote_first_text(*values: Any) -> str:
+    for value in values:
+        text = _to_str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _quote_money_text_or_empty(value: Any) -> str:
+    return _quote_money_text(value) if _quote_has_text(value) else ""
+
+
+def _quote_decimal_if_present(value: Any) -> Optional[Decimal]:
+    if not _quote_has_text(value):
+        return None
+    return _quote_money_decimal(value)
+
+
+def _quote_sum_if_present(*values: Any) -> str:
+    total = Decimal("0")
+    seen = False
+    for value in values:
+        amount = _quote_decimal_if_present(value)
+        if amount is None:
+            continue
+        total += amount
+        seen = True
+    return _quote_money_text(total) if seen else ""
+
+
+def _picc_code_label(code: Any, labels: Mapping[str, str]) -> str:
+    text = _to_str(code).strip()
+    if not text:
+        return ""
+    label = labels.get(text)
+    return f"{text}-{label}" if label else text
+
+
+PICC_DISPLAY_CAR_KIND_LABELS = {
+    "A01": "客车",
+    "A02": "货车",
+    "A03": "客货两用车",
+    "A04": "挂车",
+    "A05": "特种车",
+}
+
+
+PICC_DISPLAY_USE_NATURE_LABELS = {
+    "21": "家庭自用汽车",
+    "211": "家庭自用汽车",
+    "212": "非营业企业客车",
+    "213": "非营业机关客车",
+    "220": "营业出租租赁",
+    "230": "营业城市公交",
+    "240": "营业公路客运",
+    "250": "营业货运",
+}
+
+
 def _quote_compact_money_text(value: Any, default: str = "0") -> str:
     text = _quote_money_text(value, default=f"{default}.00" if "." not in default else default)
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _quote_compact_money_text_or_empty(value: Any) -> str:
+    if not _quote_has_text(value):
+        return ""
+    return _quote_compact_money_text(value)
 
 
 def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, Any]:
@@ -8124,7 +8523,9 @@ def _picc_proposal_amount_text(name: Any, amount: Any, *, seat_count: Any = "") 
     if value <= 0:
         return "-"
     if "乘客" in text:
-        seats = max(1, _safe_int(seat_count, 5))
+        if not _quote_has_text(seat_count):
+            return f"{_quote_money_text(value)}元"
+        seats = max(1, _safe_int(seat_count, 0))
         quantity = max(1, seats - 1)
         per_seat = (value / Decimal(quantity)).quantize(Decimal("0.01")) if quantity else value
         return f"{_quote_compact_money_text(per_seat / Decimal('10000'))}万元/座*{quantity}"
@@ -8140,19 +8541,21 @@ def _picc_start_datetime_from_request(quote_form: Mapping[str, Any], vehicle: Ma
             or vehicle.get("startDateCI")
             or quote_form.get("startDateCI")
         ).strip()
-        hour_value = _to_str(quote_form.get("prpCmain.starthourci") or quote_form.get("starthourci") or "0").strip()
-        minute_value = _to_str(quote_form.get("prpCmain.startminuteci") or quote_form.get("startminuteci") or "0").strip()
+        hour_value = _to_str(quote_form.get("prpCmain.starthourci") or quote_form.get("starthourci")).strip()
+        minute_value = _to_str(quote_form.get("prpCmain.startminuteci") or quote_form.get("startminuteci")).strip()
     else:
         date_value = _to_str(
             quote_form.get("prpCmain.startDate")
             or vehicle.get("startDateBI")
             or quote_form.get("startDateBI")
         ).strip()
-        hour_value = _to_str(quote_form.get("prpCmain.starthourbi") or quote_form.get("starthourbi") or "0").strip()
-        minute_value = _to_str(quote_form.get("prpCmain.startminutebi") or quote_form.get("startminutebi") or "0").strip()
+        hour_value = _to_str(quote_form.get("prpCmain.starthourbi") or quote_form.get("starthourbi")).strip()
+        minute_value = _to_str(quote_form.get("prpCmain.startminutebi") or quote_form.get("startminutebi")).strip()
     if not date_value:
-        return "-"
+        return ""
     if re.search(r"\d{1,2}:\d{2}", date_value):
+        return date_value
+    if not hour_value and not minute_value:
         return date_value
     return f"{date_value} {_safe_int(hour_value, 0):02d}:{_safe_int(minute_value, 0):02d}"
 
@@ -8172,7 +8575,7 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
     owner = _json_obj(request_body.get("ownerForm"))
     quote_form = _json_obj(request_body.get("quoteForm"))
     coverage_items = _json_list(safe_card.get("proposal_coverage_items") or safe_card.get("coverage_items"))
-    seat_count = vehicle.get("seatCount") or quote_form.get("prpCitemCar.seatCount") or "5"
+    seat_count = _quote_first_text(vehicle.get("seatCount"), quote_form.get("prpCitemCar.seatCount"))
     proposal_coverage_items = []
     for item in coverage_items:
         row = _json_obj(item)
@@ -8184,32 +8587,51 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
                 "name": name,
                 "amount_text": _to_str(row.get("amount_text")).strip()
                 or _picc_proposal_amount_text(name, row.get("amount"), seat_count=seat_count),
-                "premium": _quote_money_text(row.get("premium")),
+                "premium": _quote_money_text_or_empty(row.get("premium")),
             }
         )
 
-    commercial = _quote_money_text(safe_card.get("commercial_premium") or _quote_result_price_amount(result, "商业"))
-    compulsory = _quote_money_text(safe_card.get("compulsory_premium") or _quote_result_price_amount(result, "交强"))
-    vehicle_tax = _quote_money_text(safe_card.get("vehicle_tax") or _quote_result_price_amount(result, "车船"))
-    joint_premium = _quote_money_text(safe_card.get("joint_sales_premium") or result.get("joint_sales_premium"))
-    joint_amount = _quote_money_text(safe_card.get("joint_sales_amount") or result.get("joint_sales_amount"))
-    total_without_tax = _quote_money_text(
-        safe_card.get("total_without_vehicle_tax")
-        or (_quote_money_decimal(commercial) + _quote_money_decimal(compulsory) + _quote_money_decimal(joint_premium))
+    commercial = _quote_money_text_or_empty(
+        _quote_first_text(safe_card.get("commercial_premium"), _quote_result_price_amount(result, "商业"))
     )
-    total_with_tax = _quote_money_text(
-        safe_card.get("total_with_vehicle_tax")
-        or safe_card.get("total_premium")
-        or result.get("premium_total")
-        or (_quote_money_decimal(total_without_tax) + _quote_money_decimal(vehicle_tax))
+    compulsory = _quote_money_text_or_empty(
+        _quote_first_text(safe_card.get("compulsory_premium"), _quote_result_price_amount(result, "交强"))
     )
+    vehicle_tax = _quote_money_text_or_empty(
+        _quote_first_text(safe_card.get("vehicle_tax"), _quote_result_price_amount(result, "车船"))
+    )
+    joint_premium = _quote_money_text_or_empty(_quote_first_text(safe_card.get("joint_sales_premium"), result.get("joint_sales_premium")))
+    joint_amount = _quote_money_text_or_empty(_quote_first_text(safe_card.get("joint_sales_amount"), result.get("joint_sales_amount")))
+    if _quote_money_decimal(joint_premium) <= 0:
+        joint_premium = ""
+        joint_amount = ""
+    total_without_tax = _quote_money_text_or_empty(safe_card.get("total_without_vehicle_tax"))
+    if not total_without_tax:
+        total_without_tax = _quote_sum_if_present(commercial, compulsory, joint_premium)
+    total_with_tax = _quote_money_text_or_empty(
+        _quote_first_text(safe_card.get("total_with_vehicle_tax"), safe_card.get("total_premium"), result.get("premium_total"))
+    )
+    if not total_with_tax and total_without_tax and vehicle_tax:
+        total_with_tax = _quote_sum_if_present(total_without_tax, vehicle_tax)
 
-    car_kind_code = _to_str(vehicle.get("carKindCode") or quote_form.get("prpCitemCar.carKindCode") or "A01").strip() or "A01"
-    use_nature_code = _to_str(vehicle.get("useNatureCode") or quote_form.get("prpCitemCar.useNatureCode") or "211").strip()
-    vehicle_type_label = "客车" if car_kind_code == "A01" else "车辆"
-    vehicle_usage_label = "家庭自用汽车" if use_nature_code in {"211", "21"} else "车辆使用"
-    claim_bi = _safe_int(safe_card.get("claim_business_count"), 0)
-    claim_ci = _safe_int(safe_card.get("claim_compulsory_count"), 0)
+    car_kind_code = _quote_first_text(vehicle.get("carKindCode"), quote_form.get("prpCitemCar.carKindCode"))
+    use_nature_code = _quote_first_text(vehicle.get("useNatureCode"), quote_form.get("prpCitemCar.useNatureCode"))
+    claim_bi = _quote_first_text(safe_card.get("claim_business_count"))
+    claim_ci = _quote_first_text(safe_card.get("claim_compulsory_count"))
+    claim_parts = []
+    if _quote_has_text(safe_card.get("claim_summary")):
+        claim_summary = _to_str(safe_card.get("claim_summary")).strip()
+    else:
+        if claim_bi:
+            claim_parts.append(f"连续承保期间出险次数{claim_bi}次")
+        if claim_ci:
+            claim_parts.append(f"交强险{claim_ci}次")
+        claim_summary = "，".join(claim_parts)
+    tax_detail = {
+        key: _quote_money_text_or_empty(value)
+        for key, value in _json_obj(safe_card.get("vehicle_tax_detail")).items()
+        if _quote_has_text(value)
+    }
 
     upgraded = {
         **safe_card,
@@ -8221,36 +8643,37 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         "commercial_premium": commercial,
         "compulsory_premium": compulsory,
         "vehicle_tax": vehicle_tax,
-        "vehicle_tax_detail": _json_obj(safe_card.get("vehicle_tax_detail"))
-        or {"current": vehicle_tax, "back": "0.00", "late_fee": "0.00"},
+        "vehicle_tax_detail": tax_detail,
         "joint_sales_label": "途家安顺",
         "joint_sales_display_label": "途顺家安组合保险",
         "joint_sales_premium": joint_premium,
         "joint_sales_amount": joint_amount,
-        "driver_accident_premium": _quote_money_text(safe_card.get("driver_accident_premium")),
+        "driver_accident_premium": _quote_money_text_or_empty(safe_card.get("driver_accident_premium")),
         "claim_business_count": claim_bi,
         "claim_compulsory_count": claim_ci,
         "risk_score": _to_str(result.get("risk_score") or safe_card.get("risk_score") or "-").strip() or "-",
         "proposal_info": {
-            "insured_name": _to_str(owner.get("ownerName") or result.get("owner_name") or safe_card.get("owner_name") or "-").strip(),
-            "plate_no": _to_str(result.get("plate_no") or vehicle.get("licenseNo") or safe_card.get("plate_no") or "-").strip(),
-            "engine_no": _to_str(vehicle.get("engineNo") or quote_form.get("prpCitemCar.engineNo") or safe_card.get("engine_no") or "-").strip(),
-            "vin": _to_str(vehicle.get("vin") or quote_form.get("prpCitemCar.vinNo") or safe_card.get("vin") or "-").strip(),
-            "vehicle_type": f"{car_kind_code}-{vehicle_type_label}",
-            "vehicle_usage": f"21-{vehicle_usage_label}" if use_nature_code in {"211", "21"} else f"{use_nature_code}-{vehicle_usage_label}",
-            "vehicle_model": _to_str(
-                result.get("vehicle_model")
-                or vehicle.get("selectedModelName")
-                or vehicle.get("modelName")
-                or quote_form.get("prpCitemCar.brandName")
-                or "-"
-            ).strip(),
-            "enroll_date": _to_str(vehicle.get("enrollDate") or quote_form.get("prpCitemCar.enrollDate") or "-").strip(),
-            "ton_count": f"{_quote_compact_money_text(vehicle.get('tonCount') or quote_form.get('prpCitemCar.tonCount') or '0')}千克",
-            "seat_count": f"{_safe_int(seat_count, 5)}人",
-            "purchase_price": f"{_quote_compact_money_text(vehicle.get('purchasePrice') or vehicle.get('actualValue') or result.get('vehicle_actual_value'))}元",
-            "claim_summary": _to_str(safe_card.get("claim_summary")).strip()
-            or f"商业险连续承保年数0年，连续承保期间出险次数{claim_bi}次，交强险{claim_ci}次",
+            "insured_name": _quote_first_text(owner.get("ownerName"), result.get("owner_name"), safe_card.get("owner_name")),
+            "plate_no": _quote_first_text(result.get("plate_no"), vehicle.get("licenseNo"), safe_card.get("plate_no")),
+            "engine_no": _quote_first_text(vehicle.get("engineNo"), quote_form.get("prpCitemCar.engineNo"), safe_card.get("engine_no")),
+            "vin": _quote_first_text(vehicle.get("vin"), quote_form.get("prpCitemCar.vinNo"), safe_card.get("vin")),
+            "vehicle_type": _picc_code_label(car_kind_code, PICC_DISPLAY_CAR_KIND_LABELS),
+            "vehicle_usage": _picc_code_label(use_nature_code, PICC_DISPLAY_USE_NATURE_LABELS),
+            "vehicle_model": _quote_first_text(
+                result.get("vehicle_model"),
+                vehicle.get("selectedModelName"),
+                vehicle.get("modelName"),
+                quote_form.get("prpCitemCar.brandName"),
+            ),
+            "enroll_date": _quote_first_text(vehicle.get("enrollDate"), quote_form.get("prpCitemCar.enrollDate")),
+            "ton_count": f"{_quote_compact_money_text_or_empty(_quote_first_text(vehicle.get('tonCount'), quote_form.get('prpCitemCar.tonCount')))}千克"
+            if _quote_first_text(vehicle.get("tonCount"), quote_form.get("prpCitemCar.tonCount"))
+            else "",
+            "seat_count": f"{_safe_int(seat_count, 0)}人" if seat_count else "",
+            "purchase_price": f"{_quote_compact_money_text_or_empty(_quote_first_text(vehicle.get('purchasePrice'), vehicle.get('actualValue'), result.get('vehicle_actual_value')))}元"
+            if _quote_first_text(vehicle.get("purchasePrice"), vehicle.get("actualValue"), result.get("vehicle_actual_value"))
+            else "",
+            "claim_summary": claim_summary,
             "bi_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="bi"),
             "ci_start_date": _picc_start_datetime_from_request(quote_form, vehicle, kind="ci"),
         },
@@ -8298,8 +8721,14 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
         return {}
     aliases = ("途家安顺保费", "途家安顺非车保费", "途顺家安保费", "途家安顺", "途顺家安", "非车")
     alias_group = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
-    number = r"(-?\d+(?:[,，]\d{3})*(?:\.\d+)?)"
-    pattern = rf"^(?:请)?(?:把|将)?(?:{alias_group})(?:保费|金额|保额)?(?:[:：=+＋]|改成|改为|调整为|调整到|调成|改到|设置为|设为|变成|调整|改|到|为)?{number}(万|元)?$"
+    remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "不需要")
+    remove_group = "|".join(re.escape(word) for word in remove_words)
+    remove_pattern = rf"^(?:请)?(?:(?:{remove_group})(?:{alias_group})(?:保费|金额|保额|险|保险)?|(?:{alias_group})(?:保费|金额|保额|险|保险)?(?:{remove_group}))$"
+    if re.fullmatch(remove_pattern, compact, flags=re.IGNORECASE):
+        return {"field_name": "途家安顺保费", "field_value": "0", "remove": True}
+    number = r"(\d+(?:[,，]\d{3})*(?:\.\d+)?)"
+    connector = r"(?:[:：=+＋]|改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置为|设为|变成|变为|变到|调整|改|变|到|为)?"
+    pattern = rf"^(?:请)?(?:把|将)?(?:{alias_group})(?:保费|金额|保额)?{connector}{number}(万|元)?$"
     match = re.fullmatch(pattern, compact, flags=re.IGNORECASE)
     if not match:
         return {}
@@ -8357,10 +8786,13 @@ def _update_joint_sales_price_items(result: Dict[str, Any], premium: Decimal) ->
         row = dict(_json_obj(item))
         name = _to_str(row.get("name")).strip()
         if name and any(keyword in name for keyword in ("途家", "途顺", "非车")):
-            row["amount"] = float(premium)
-            found = True
+            if premium > 0:
+                row["amount"] = float(premium)
+                items.append(row)
+                found = True
+            continue
         items.append(row)
-    if not found:
+    if premium > 0 and not found:
         items.append({"name": "途家安顺", "amount": float(premium)})
     result["price_items"] = items
 
@@ -8546,17 +8978,19 @@ def _apply_joint_sales_image_adjustment(
         or old_amount_source
     )
     original_amount_text = _quote_money_text(original_amount_source)
-    amount_text = "0.00" if premium == 0 else original_amount_text
+    enabled = premium > 0
+    amount_text = original_amount_text if enabled else ""
 
     card["joint_sales_label"] = "途家安顺"
     card["joint_sales_display_label"] = "途顺家安组合保险"
-    card["joint_sales_premium"] = premium_text
+    card["joint_sales_premium"] = premium_text if enabled else ""
     card["joint_sales_amount"] = amount_text
     card["joint_sales_original_amount"] = original_amount_text
-    adjusted["joint_sales_premium"] = premium_text
+    adjusted["joint_sales_premium"] = premium_text if enabled else ""
     adjusted["joint_sales_amount"] = amount_text
     adjusted["joint_sales_original_amount"] = original_amount_text
     if joint_sales:
+        joint_sales["enabled"] = enabled
         joint_sales["premium"] = premium_text
         joint_sales["amount"] = amount_text
         joint_sales["original_amount"] = original_amount_text
@@ -8603,14 +9037,16 @@ async def _handle_joint_sales_image_adjustment_message(
     session_id: Optional[str],
     text: str,
     adjustment: Dict[str, Any],
+    source_pair: Optional[Tuple[QuoteCase, QuoteTask]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    source_pair = await _latest_success_quote_task_for_session(
-        db,
-        owner_user_id=owner_user_id,
-        session_id=session_id,
-        ctx=ctx,
-        for_update=True,
-    )
+    if source_pair is None:
+        source_pair = await _latest_success_quote_task_for_session(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            ctx=ctx,
+            for_update=False,
+        )
     if not source_pair:
         return (
             "请先完成一次报价后，再发送“非车 金额”调整报价结果图。",
@@ -8632,6 +9068,88 @@ async def _handle_joint_sales_image_adjustment_message(
     case = await _lock_quote_case(db, case)
     trace_id = _new_trace_id()
     premium_value = adjustment.get("field_value")
+    premium_override = {"途家安顺保费": _quote_money_text(premium_value)}
+    await _cancel_active_quote_tasks_for_case(
+        db,
+        case=case,
+        reason=QUOTE_SUPERSEDED_MESSAGE,
+        now=_now(),
+    )
+    images_by_slot = await _active_images_by_slot(db, case.id)
+    draft_base = _json_obj(case.draft_order_data) or _json_obj(case.normalized_data)
+    merged_overrides = _merge_quote_config_overrides(
+        draft_base.get("quote_field_overrides"),
+        premium_override,
+    )
+    next_normalized = _normalize_quote_case_data(
+        base_data=_json_obj(case.normalized_data) or draft_base,
+        order_data={},
+        text_data={"quote_field_overrides": merged_overrides},
+        images_by_slot=images_by_slot,
+    )
+    case.draft_order_data = next_normalized
+    case.normalized_data = next_normalized
+
+    submitted_snapshot = deepcopy(_json_obj(source_task.submitted_snapshot))
+    submitted_normalized = _json_obj(submitted_snapshot.get("normalized_data"))
+    submitted_normalized["quote_field_overrides"] = _merge_quote_config_overrides(
+        submitted_normalized.get("quote_field_overrides"),
+        premium_override,
+    )
+    submitted_snapshot["normalized_data"] = submitted_normalized
+    submitted_defaults = _json_obj(submitted_snapshot.get("default_config_json"))
+    if submitted_defaults:
+        submitted_defaults["途家安顺保费"] = _quote_money_text(premium_value)
+        submitted_snapshot["default_config_json"] = submitted_defaults
+    submitted_snapshot["joint_sales_image_adjustment"] = {
+        "source_task_id": source_task.id,
+        "field_name": "途家安顺保费",
+        "field_value": _quote_money_text(premium_value),
+        "raw_text": text,
+    }
+    request_payload = {
+        "mode": "result_image_adjustment",
+        "source_task_id": source_task.id,
+        "owner_user_id": owner_user_id,
+        "platform_account": _json_obj(_json_obj(source_task.request_payload).get("platform_account")),
+        "joint_sales_image_adjustment": submitted_snapshot["joint_sales_image_adjustment"],
+    }
+    now = _now()
+    task = QuoteTask(
+        quote_case_id=case.id,
+        platform_code=source_task.platform_code or case.platform_code or "PICC",
+        platform_name=source_task.platform_name or case.platform_name or source_task.platform_code or case.platform_code,
+        status=TASK_STATUS_RUNNING,
+        login_state=source_task.login_state or "authenticated",
+        sms_phone_mask=source_task.sms_phone_mask,
+        trace_id=trace_id,
+        request_payload=request_payload,
+        response_payload={"source_task_id": source_task.id},
+        result_payload={},
+        submitted_snapshot=submitted_snapshot,
+        started_at=now,
+    )
+    db.add(task)
+    await db.flush()
+    case.current_task_id = task.id
+    case.updated_at = now
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_RUNNING,
+            "trace_id": trace_id,
+            "source_task_id": source_task.id,
+            "joint_sales_image_adjustment": submitted_snapshot["joint_sales_image_adjustment"],
+        },
+    )
+    await db.flush()
+    await db.commit()
+
     try:
         joint_sales_amount, joint_sales_amount_query, platform_account = await _query_joint_sales_amount_for_image_adjustment(
             db,
@@ -8642,6 +9160,36 @@ async def _handle_joint_sales_image_adjustment_message(
     except Exception as exc:
         detail = sanitize_quote_user_message(exc, "途家安顺保额查询失败")
         reply = f"途家安顺保额查询失败：{detail}，本次没有更新报价结果图。"
+        task = await _lock_quote_task(db, task)
+        if await _quote_task_was_cancelled(db, task=task):
+            return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
+        task.status = TASK_STATUS_FAILED
+        task.error_detail = reply
+        task.response_payload = {
+            **_json_obj(task.response_payload),
+            "joint_sales_amount_query_error": detail,
+        }
+        task.result_payload = {}
+        task.finished_at = _now()
+        task.updated_at = _now()
+        if case.current_task_id == task.id:
+            case.current_task_id = task.id
+        case.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": TASK_STATUS_FAILED,
+                "trace_id": trace_id,
+                "reason": detail,
+                "source_task_id": source_task.id,
+            },
+        )
+        await db.flush()
         return (
             reply,
             {
@@ -8667,6 +9215,9 @@ async def _handle_joint_sales_image_adjustment_message(
                 "actions": [],
             },
         )
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     adjusted_result = _apply_joint_sales_image_adjustment(
         _json_obj(source_task.result_payload),
         premium_value=premium_value,
@@ -8681,46 +9232,31 @@ async def _handle_joint_sales_image_adjustment_message(
         platform_account=platform_account,
         platform_name=platform_name,
     )
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
 
-    submitted_snapshot = deepcopy(_json_obj(source_task.submitted_snapshot))
-    submitted_snapshot["joint_sales_image_adjustment"] = {
-        "source_task_id": source_task.id,
-        "field_name": "途家安顺保费",
-        "field_value": _quote_money_text(premium_value),
-        "resolved_amount": _quote_money_text(joint_sales_amount),
-        "raw_text": text,
-    }
+    submitted_snapshot["joint_sales_image_adjustment"]["resolved_amount"] = _quote_money_text(joint_sales_amount)
     request_payload = {
-        "mode": "result_image_adjustment",
-        "source_task_id": source_task.id,
-        "owner_user_id": owner_user_id,
-        "platform_account": _json_obj(_json_obj(source_task.request_payload).get("platform_account")),
-        "joint_sales_image_adjustment": submitted_snapshot["joint_sales_image_adjustment"],
+        **_json_obj(task.request_payload),
         "resolved_joint_sales_amount": _quote_money_text(joint_sales_amount),
         "joint_sales_amount_query": joint_sales_amount_query,
     }
     now = _now()
-    task = QuoteTask(
-        quote_case_id=case.id,
-        platform_code=source_task.platform_code or case.platform_code or adjusted_result.get("platform_code") or "PICC",
-        platform_name=platform_name or source_task.platform_code or case.platform_code,
-        status=TASK_STATUS_SUCCESS,
-        login_state=source_task.login_state or "authenticated",
-        sms_phone_mask=source_task.sms_phone_mask,
-        trace_id=trace_id,
-        request_payload=request_payload,
-        response_payload={
-            "reused_quote_result": True,
-            "source_task_id": source_task.id,
-            "joint_sales_amount_query": joint_sales_amount_query,
-        },
-        result_payload=display_result,
-        submitted_snapshot=submitted_snapshot,
-        started_at=now,
-        finished_at=now,
-    )
-    db.add(task)
-    await db.flush()
+    task.status = TASK_STATUS_SUCCESS
+    task.login_state = source_task.login_state or "authenticated"
+    task.platform_name = platform_name or source_task.platform_name or case.platform_name or source_task.platform_code or case.platform_code
+    task.request_payload = request_payload
+    task.response_payload = {
+        **_json_obj(task.response_payload),
+        "reused_quote_result": True,
+        "source_task_id": source_task.id,
+        "joint_sales_amount_query": joint_sales_amount_query,
+    }
+    task.result_payload = display_result
+    task.submitted_snapshot = submitted_snapshot
+    task.finished_at = now
+    task.updated_at = now
 
     case.status = CASE_STATUS_QUOTED
     case.current_task_id = task.id
@@ -8838,6 +9374,7 @@ async def _cancel_waiting_tasks_for_case(
                 QuoteTask.quote_case_id == case.id,
                 QuoteTask.status.in_((TASK_STATUS_WAITING_SMS, TASK_STATUS_WAITING_DUPLICATE_CONFIRM)),
             )
+            .with_for_update()
         )
     ).scalars().all()
 
@@ -8863,6 +9400,123 @@ async def _cancel_waiting_tasks_for_case(
         case.current_task_id = None
         case.updated_at = ts
     return cancelled
+
+
+async def _cancel_active_quote_tasks_for_case(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    reason: str,
+    now: Optional[datetime] = None,
+    exclude_task_id: int = 0,
+) -> int:
+    ts = now or _now()
+    owner_user_id = _safe_int(getattr(case, "owner_user_id", 0), 0)
+    active_tasks = (
+        await db.execute(
+            select(QuoteTask).where(
+                QuoteTask.quote_case_id == case.id,
+                QuoteTask.status.in_(
+                    (
+                        "pending",
+                        TASK_STATUS_RUNNING,
+                        TASK_STATUS_WAITING_SMS,
+                        TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+                    )
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+
+    cancelled = 0
+    for task in active_tasks:
+        task_id = _safe_int(getattr(task, "id", 0), 0)
+        if exclude_task_id and task_id == exclude_task_id:
+            continue
+        was_sms_task = task.status == TASK_STATUS_WAITING_SMS or task.login_state == "sms_required"
+        task.status = TASK_STATUS_CANCELLED
+        task.login_state = "failed" if was_sms_task else "authenticated"
+        task.error_detail = reason
+        task.response_payload = {
+            **_json_obj(task.response_payload),
+            "cancelled_by_new_quote_state": True,
+            "cancel_reason": reason,
+        }
+        task.finished_at = ts
+        task.updated_at = ts
+        account_id = _quote_task_platform_account_id(task)
+        if was_sms_task and owner_user_id > 0 and account_id > 0:
+            account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+            if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
+                account.login_status = ACCOUNT_LOGIN_EXPIRED
+                account.last_error = reason
+                account.last_check_at = ts
+                account.updated_at = ts
+        cancelled += 1
+
+    if cancelled:
+        if not exclude_task_id or _safe_int(case.current_task_id, 0) != exclude_task_id:
+            case.current_task_id = None
+        case.updated_at = ts
+    return cancelled
+
+
+def _quote_superseded_silent_response(
+    *,
+    case: QuoteCase,
+    task: Optional[QuoteTask],
+    trace_id: str,
+    reason: str = QUOTE_SUPERSEDED_MESSAGE,
+) -> Tuple[str, Dict[str, Any]]:
+    payload = {
+        "quote_superseded": True,
+        "reason": reason,
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+            "current_task_id": case.current_task_id,
+        },
+        "quote_task": {
+            "id": task.id if task is not None else None,
+            "status": task.status if task is not None else TASK_STATUS_CANCELLED,
+            "trace_id": trace_id,
+        },
+    }
+    data = _mk_data(
+        result_status=RESULT_NOT_READY,
+        message="",
+        entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return "", {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "silent": True,
+        "ui_visible": False,
+        "data": data,
+        "actions": [],
+    }
+
+
+async def _quote_task_was_cancelled(
+    db: AsyncSession,
+    *,
+    task: Optional[QuoteTask],
+) -> bool:
+    if task is None:
+        return False
+    try:
+        await db.refresh(task)
+    except Exception:
+        pass
+    return _to_str(getattr(task, "status", "")).strip() == TASK_STATUS_CANCELLED
 
 
 async def has_waiting_sms_task(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
@@ -9708,6 +10362,8 @@ async def _continue_quote_with_platform_account(
             },
         )
 
+    await db.flush()
+    await db.commit()
     login_runtime_result = await quote_platform_runtime.login(_platform_account_context(platform_account), db=db)
     login_status = _runtime_status(login_runtime_result)
     if login_status in RUNTIME_SESSION_DEGRADED_STATUSES and bool(_json_obj(login_runtime_result.data).get("preserved_previous_session")):
@@ -10031,9 +10687,31 @@ async def _complete_waiting_task(
             platform_account=platform_account,
         )
 
+    perf_started = time.perf_counter()
+    perf: Dict[str, Any] = {"login_mode": "sms_verified"}
+    task.status = TASK_STATUS_RUNNING
+    task.login_state = "authenticated"
+    task.error_detail = None
+    task.response_payload = {"perf": perf}
+    task.updated_at = _now()
+    case.current_task_id = task.id
+    case.updated_at = _now()
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={"task_id": task.id, "status": TASK_STATUS_RUNNING, "trace_id": trace_id, "login_mode": "sms_verified"},
+    )
+    await db.flush()
+    await db.commit()
+
     challenge_started = time.perf_counter()
     challenge_result = await quote_platform_runtime.submit_challenge(platform_ctx, sms_code, db=db)
     perf["challenge_ms"] = _elapsed_ms(challenge_started)
+    if await _quote_task_was_cancelled(db, task=task):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     challenge_status = _runtime_status(challenge_result)
     challenge_preserved_session = bool(
         challenge_status in RUNTIME_SESSION_DEGRADED_STATUSES
@@ -10179,6 +10857,9 @@ async def _complete_waiting_task(
         quota_started = time.perf_counter()
         quota_reservation = await _reserve_account_quota_for_quote(db, account=platform_account)
         perf["quota_reserve_ms"] = _elapsed_ms(quota_started)
+        if await _quote_task_was_cancelled(db, task=task):
+            await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+            return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
         if not quota_reservation.get("available", True):
             task.status = TASK_STATUS_FAILED
             task.login_state = "authenticated"
@@ -10248,6 +10929,9 @@ async def _complete_waiting_task(
     platform_quote_started = time.perf_counter()
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
+    if await _quote_task_was_cancelled(db, task=task):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     quote_status = _runtime_status(quote_runtime_result)
     if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
@@ -10423,6 +11107,10 @@ async def _complete_waiting_task(
     perf["result_display_ms"] = _elapsed_ms(display_started)
     if result.get("result_image_ms") is not None:
         perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         perf["total_ms"] = _elapsed_ms(perf_started)
         return await _stop_quote_for_material_change(
@@ -10507,6 +11195,16 @@ async def _complete_waiting_task(
         },
         "quote_result": result,
     }
+    platform_dialog = _platform_dialog_from_source(
+        _json_obj(result.get("platform_dialog")) or _json_obj(_json_obj(getattr(quote_runtime_result, "data", None)).get("platform_dialog")),
+        trace_id=trace_id,
+        task_id=task.id,
+        case_id=case.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    if platform_dialog:
+        payload["platform_dialog"] = platform_dialog
     return reply, {
         "status": "success",
         "intent": "quote",
@@ -10549,47 +11247,61 @@ async def _complete_quote_without_sms(
     if current_account_id:
         attempted.add(current_account_id)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
-        return await _stop_quote_for_material_change(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            platform_name=platform_name,
-            trace_id=trace_id,
-            platform_account=platform_account,
-        )
+        return _quote_superseded_silent_response(case=case, task=None, trace_id=trace_id)
+
+    request_payload = {
+        "mode": "stub",
+        "login": login_mode,
+        "owner_user_id": owner_user_id,
+        "platform_account": _credential_public_payload(platform_account),
+        "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
+        "default_config_json": _json_obj(snapshot.get("default_config_json")),
+        "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
+        "request_body": _json_obj(snapshot.get("request_body")),
+    }
+    task = QuoteTask(
+        quote_case_id=case.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        status=TASK_STATUS_RUNNING,
+        login_state="authenticated",
+        sms_phone_mask=platform_account.login_phone_mask,
+        trace_id=trace_id,
+        request_payload=request_payload,
+        response_payload={"perf": perf},
+        result_payload={},
+        submitted_snapshot=snapshot,
+        started_at=_now(),
+    )
+    db.add(task)
+    await db.flush()
+    case.current_task_id = task.id
+    case.updated_at = _now()
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={"task_id": task.id, "status": TASK_STATUS_RUNNING, "trace_id": trace_id, "login_mode": login_mode},
+    )
+    await db.flush()
+    await db.commit()
+
     quota_started = time.perf_counter()
     quota_reservation = await _reserve_account_quota_for_quote(db, account=platform_account)
     perf["quota_reserve_ms"] = _elapsed_ms(quota_started)
+    if await _quote_task_was_cancelled(db, task=task):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     if not quota_reservation.get("available", True):
         error_detail = _quote_quota_exhausted_message(platform_name, platform_account)
         perf["total_ms"] = _elapsed_ms(perf_started)
-        task = QuoteTask(
-            quote_case_id=case.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-            status=TASK_STATUS_FAILED,
-            login_state="authenticated",
-            sms_phone_mask=platform_account.login_phone_mask,
-            trace_id=trace_id,
-            request_payload={
-                "mode": "stub",
-                "login": login_mode,
-                "owner_user_id": owner_user_id,
-                "platform_account": _credential_public_payload(platform_account),
-                "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
-                "default_config_json": _json_obj(snapshot.get("default_config_json")),
-                "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
-                "request_body": _json_obj(snapshot.get("request_body")),
-            },
-            response_payload={"perf": perf},
-            result_payload={},
-            submitted_snapshot=snapshot,
-            error_detail=error_detail,
-            started_at=_now(),
-            finished_at=_now(),
-        )
-        db.add(task)
-        await db.flush()
+        task.status = TASK_STATUS_FAILED
+        task.error_detail = error_detail
+        task.response_payload = {"perf": perf}
+        task.finished_at = _now()
+        task.updated_at = _now()
         case.status = CASE_STATUS_READY
         case.current_task_id = task.id
         case.updated_at = _now()
@@ -10657,41 +11369,18 @@ async def _complete_quote_without_sms(
     platform_quote_started = time.perf_counter()
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
+    if await _quote_task_was_cancelled(db, task=task):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         perf["total_ms"] = _elapsed_ms(perf_started)
-        task = QuoteTask(
-            quote_case_id=case.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-            status=TASK_STATUS_FAILED,
-            login_state="authenticated",
-            sms_phone_mask=platform_account.login_phone_mask,
-            trace_id=trace_id,
-            request_payload={
-                "mode": "stub",
-                "login": login_mode,
-                "owner_user_id": owner_user_id,
-                "platform_account": _credential_public_payload(platform_account),
-                "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
-                "default_config_json": _json_obj(snapshot.get("default_config_json")),
-                "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
-                "request_body": _json_obj(snapshot.get("request_body")),
-            },
-            response_payload={
-                "stub": True,
-                "login": login_mode,
-                "quote": _runtime_result_payload(quote_runtime_result),
-                "material_changed": True,
-                "perf": perf,
-            },
-            result_payload={},
-            submitted_snapshot=snapshot,
-            error_detail=QUOTE_MATERIAL_CHANGED_MESSAGE,
-            started_at=_now(),
-            finished_at=_now(),
-        )
-        db.add(task)
-        await db.flush()
+        task.response_payload = {
+            "stub": True,
+            "login": login_mode,
+            "quote": _runtime_result_payload(quote_runtime_result),
+            "material_changed": True,
+            "perf": perf,
+        }
         return await _stop_quote_for_material_change(
             db,
             case=case,
@@ -10732,37 +11421,18 @@ async def _complete_quote_without_sms(
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
         perf["total_ms"] = _elapsed_ms(perf_started)
-        task = QuoteTask(
-            quote_case_id=case.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-            status=TASK_STATUS_FAILED,
-            login_state="authenticated",
-            sms_phone_mask=platform_account.login_phone_mask,
-            trace_id=trace_id,
-            request_payload={
-                "mode": "stub",
-                "login": login_mode,
-                "owner_user_id": owner_user_id,
-                "platform_account": _credential_public_payload(platform_account),
-                "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
-                "default_config_json": _json_obj(snapshot.get("default_config_json")),
-                "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
-                "request_body": _json_obj(snapshot.get("request_body")),
-            },
-            response_payload={
-                "stub": True,
-                "login": login_mode,
-                "quote": _runtime_result_payload(quote_runtime_result),
-                "perf": perf,
-            },
-            result_payload={},
-            submitted_snapshot=snapshot,
-            error_detail=error_detail,
-            started_at=_now(),
-            finished_at=_now(),
-        )
-        db.add(task)
+        task.status = TASK_STATUS_FAILED
+        task.login_state = "authenticated"
+        task.error_detail = error_detail
+        task.response_payload = {
+            "stub": True,
+            "login": login_mode,
+            "quote": _runtime_result_payload(quote_runtime_result),
+            "perf": perf,
+        }
+        task.result_payload = {}
+        task.finished_at = _now()
+        task.updated_at = _now()
         await db.flush()
 
         case.status = CASE_STATUS_READY
@@ -10914,36 +11584,40 @@ async def _complete_quote_without_sms(
     if result.get("result_image_ms") is not None:
         perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
     perf["total_ms"] = _elapsed_ms(perf_started)
-    task = QuoteTask(
-        quote_case_id=case.id,
-        platform_code=platform_code,
-        platform_name=platform_name,
-        status=TASK_STATUS_SUCCESS,
-        login_state="authenticated",
-        sms_phone_mask=platform_account.login_phone_mask,
-        trace_id=trace_id,
-        request_payload={
-            "mode": "stub",
-            "login": login_mode,
-            "owner_user_id": owner_user_id,
-            "platform_account": _credential_public_payload(platform_account),
-            "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
-            "default_config_json": _json_obj(snapshot.get("default_config_json")),
-            "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
-            "request_body": _json_obj(snapshot.get("request_body")),
-        },
-        response_payload={
-            "stub": True,
-            "login": login_mode,
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
+    if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        task.response_payload = {
+            **_json_obj(task.response_payload),
             "quote": _runtime_result_payload(quote_runtime_result),
+            "material_changed_before_finish": True,
             "perf": perf,
-        },
-        result_payload=result,
-        submitted_snapshot=snapshot,
-        started_at=_now(),
-        finished_at=_now(),
-    )
-    db.add(task)
+        }
+        return await _stop_quote_for_material_change(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            task=task,
+            platform_account=platform_account,
+            quota_reservation=quota_reservation,
+            response_payload={"quote": _runtime_result_payload(quote_runtime_result)},
+        )
+    task.status = TASK_STATUS_SUCCESS
+    task.login_state = "authenticated"
+    task.response_payload = {
+        "stub": True,
+        "login": login_mode,
+        "quote": _runtime_result_payload(quote_runtime_result),
+        "perf": perf,
+    }
+    task.result_payload = result
+    task.finished_at = _now()
+    task.updated_at = _now()
     await db.flush()
 
     case.status = CASE_STATUS_QUOTED
@@ -11002,6 +11676,16 @@ async def _complete_quote_without_sms(
         "platform_account": _credential_public_payload(platform_account),
         "quote_result": result,
     }
+    platform_dialog = _platform_dialog_from_source(
+        _json_obj(result.get("platform_dialog")) or _json_obj(_json_obj(getattr(quote_runtime_result, "data", None)).get("platform_dialog")),
+        trace_id=trace_id,
+        task_id=task.id,
+        case_id=case.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    if platform_dialog:
+        payload["platform_dialog"] = platform_dialog
     return reply, {
         "status": "success",
         "intent": "quote",
@@ -11033,6 +11717,12 @@ async def handle_quote_images_message(
     _ensure_quote_flow_access(ctx)
 
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    await _expire_stale_running_quote_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     merged_entities = dict(entities or {})
     signal = detect_quote_signal(text)
     if isinstance(signal.get("entities"), dict):
@@ -11079,6 +11769,23 @@ async def handle_quote_images_message(
     )
     if order_id and order is None:
         return _quote_order_not_accessible_response(order_id=order_id, platform_name=platform_name)
+    exclude_case_ids: Set[int] = set()
+    duplicate_waiting_pair = await _find_waiting_duplicate_quote_confirm_task(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    if duplicate_waiting_pair:
+        waiting_case, waiting_task = duplicate_waiting_pair
+        exclude_case_ids.add(_safe_int(getattr(waiting_case, "id", 0), 0))
+        await _cancel_waiting_duplicate_quote_task(
+            db,
+            case=waiting_case,
+            task=waiting_task,
+            owner_user_id=owner_user_id,
+            reason="已上传新资料，自动中止上一笔重复投保确认",
+        )
     case = await _get_or_create_case(
         db,
         owner_user_id=owner_user_id,
@@ -11088,6 +11795,7 @@ async def handle_quote_images_message(
         platform_name=platform_name if explicit_platform_quote else "",
         ctx=ctx,
         reuse_quoted=bool(_is_explicit_requote(text) or quote_field_overrides),
+        exclude_case_ids=exclude_case_ids,
     )
     case = await _lock_quote_case(db, case)
     quote_check_requested = explicit_platform_quote or _quote_check_context_is_active(case)
@@ -11107,7 +11815,7 @@ async def handle_quote_images_message(
 
     cancelled_waiting_tasks = 0
     if attached_images:
-        cancelled_waiting_tasks = await _cancel_waiting_tasks_for_case(
+        cancelled_waiting_tasks = await _cancel_active_quote_tasks_for_case(
             db,
             case=case,
             reason="cancelled_by_material_change",
@@ -11243,16 +11951,25 @@ async def handle_quote_images_message(
         platform_account=None,
     )
     payload["quote_check_requested"] = quote_check_requested
+    if not quote_check_requested:
+        payload["silent"] = True
+        payload["ui_visible"] = False
+    response_data = _mk_data(
+        result_status=RESULT_NOT_READY if quote_check_requested and missing else RESULT_SUCCESS,
+        message="图片已进入报价材料",
+        entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    if not quote_check_requested:
+        response_data["silent"] = True
+        response_data["ui_visible"] = False
     return "\n".join(lines), {
         "status": "success",
         "intent": "quote" if quote_check_requested else "quote_image_collect",
         "trace_id": _new_trace_id(),
-        "data": _mk_data(
-            result_status=RESULT_NOT_READY if quote_check_requested and missing else RESULT_SUCCESS,
-            message="图片已进入报价材料",
-            entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-            payload=payload,
-        ),
+        "silent": not quote_check_requested,
+        "ui_visible": bool(quote_check_requested),
+        "data": response_data,
         "actions": [_mk_action(f"{auto_platform_name or platform_name or '平台'}报价")] if quote_check_requested else [],
     }
 
@@ -11305,7 +12022,7 @@ async def recall_quote_case_images(
     cancelled_tasks = 0
     for case in case_map.values():
         case_changed_images = [item for item in changed_images if item.get("quote_case_id") == case.id]
-        case_cancelled_tasks = await _cancel_waiting_tasks_for_case(
+        case_cancelled_tasks = await _cancel_active_quote_tasks_for_case(
             db,
             case=case,
             reason="cancelled_by_image_recall",
@@ -11379,8 +12096,29 @@ async def handle_quote_message(
     _ensure_quote_flow_access(ctx)
 
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    await _expire_stale_running_quote_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    quote_product_exclusions = _extract_quote_product_exclusions(text)
+    quote_command_mode = _to_str(merged_entities.get("quote_command_mode")).strip()
+    if quote_command_mode == "全保":
+        base_product_exclusions: List[str] = []
+    elif quote_command_mode == "交三":
+        base_product_exclusions = [QUOTE_LOSS_LABEL]
+    else:
+        base_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    if quote_product_exclusions:
+        merged_entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = _normalize_quote_product_exclusions(
+            [*base_product_exclusions, *quote_product_exclusions]
+        )
+        merged_entities["force_requote"] = True
+    elif quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+        merged_entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = _normalize_quote_product_exclusions(base_product_exclusions)
     transfer_vehicle_command = _extract_transfer_vehicle_command(text)
     if transfer_vehicle_command:
         for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_override"):
@@ -11421,12 +12159,24 @@ async def handle_quote_message(
             validate_positive=False,
         )
     joint_sales_image_adjustment = _extract_joint_sales_image_adjustment(text)
+    if joint_sales_image_adjustment:
+        quote_field_overrides = _merge_quote_config_overrides(
+            quote_field_overrides,
+            {joint_sales_image_adjustment.get("field_name") or "途家安顺保费": joint_sales_image_adjustment.get("field_value")},
+        )
     if quote_field_overrides:
         merged_entities = {
             **merged_entities,
             "quote_field_overrides": quote_field_overrides,
             "force_requote": True,
         }
+    quote_state_changed = bool(
+        quote_field_overrides
+        or quote_product_exclusions
+        or quote_command_mode in {"全保", "交三"}
+        or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities
+        or transfer_vehicle_command
+    )
     override_summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(quote_field_overrides)
     override_reply_prefix = f"已按本次调整重报：{override_summary}\n" if override_summary else ""
     sms_code = _extract_sms_code(text)
@@ -11523,7 +12273,17 @@ async def handle_quote_message(
             },
         )
 
-    if waiting_pair and quote_field_overrides:
+    if waiting_pair:
+        _, waiting_task = waiting_pair
+        waiting_product_state_changed = _quote_product_state_changes_current(
+            quote_command_mode=quote_command_mode,
+            quote_product_exclusions=quote_product_exclusions,
+            current_exclusions=_snapshot_quote_product_exclusions(waiting_task.submitted_snapshot),
+        )
+    else:
+        waiting_product_state_changed = False
+
+    if waiting_pair and (quote_field_overrides or transfer_vehicle_command or waiting_product_state_changed):
         case, task = waiting_pair
         await _expire_waiting_sms_task(
             db,
@@ -11604,15 +12364,34 @@ async def handle_quote_message(
             },
         )
     if joint_sales_image_adjustment:
-        return await _handle_joint_sales_image_adjustment_message(
+        source_pair = await _latest_success_quote_task_for_session(
             db,
-            ctx=ctx,
             owner_user_id=owner_user_id,
             session_id=session_id,
-            text=text,
-            adjustment=joint_sales_image_adjustment,
+            ctx=ctx,
+            for_update=False,
         )
-    if duplicate_confirm_pair and quote_field_overrides:
+        if source_pair:
+            return await _handle_joint_sales_image_adjustment_message(
+                db,
+                ctx=ctx,
+                owner_user_id=owner_user_id,
+                session_id=session_id,
+                text=text,
+                adjustment=joint_sales_image_adjustment,
+                source_pair=source_pair,
+            )
+    if duplicate_confirm_pair:
+        _, duplicate_task = duplicate_confirm_pair
+        duplicate_product_state_changed = _quote_product_state_changes_current(
+            quote_command_mode=quote_command_mode,
+            quote_product_exclusions=quote_product_exclusions,
+            current_exclusions=_snapshot_quote_product_exclusions(duplicate_task.submitted_snapshot),
+        )
+    else:
+        duplicate_product_state_changed = False
+
+    if duplicate_confirm_pair and (quote_field_overrides or transfer_vehicle_command or duplicate_product_state_changed):
         case, task = duplicate_confirm_pair
         if not merged_entities.get("platform_code") and (case.platform_code or task.platform_code):
             merged_entities["platform_code"] = case.platform_code or task.platform_code
@@ -11640,6 +12419,7 @@ async def handle_quote_message(
                     "duplicate_quote_confirm_cancelled": True,
                     "reason": QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE,
                     "quote_field_overrides": quote_field_overrides,
+                    QUOTE_PRODUCT_EXCLUSIONS_KEY: quote_product_exclusions,
                     "old_task_id": task.id,
                 },
             )
@@ -11752,14 +12532,19 @@ async def handle_quote_message(
     entity_order_id = _safe_int(merged_entities.get("order_id"), 0) or None
     explicit_order_id = ctx_order_id or entity_order_id
     short_quote_command = looks_like_short_quote_command(text)
+    quote_command_restarts_active_task = bool(signal.get("is_quote") or short_quote_command)
     transfer_vehicle_text_data = {
         key: merged_entities.get(key)
         for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_override")
         if merged_entities.get(key) not in (None, "")
     }
+    cancelled_active_quote_tasks = 0
     inherited_case: Optional[QuoteCase] = None
     inherited_order_id: Optional[int] = None
-    if (quote_field_overrides or short_quote_command or transfer_vehicle_text_data) and (not platform_code or not platform_name):
+    if (
+        quote_state_changed
+        or short_quote_command
+    ) and (not platform_code or not platform_name):
         inherited_case = await _latest_reusable_session_case(
             db,
             owner_user_id=owner_user_id,
@@ -11778,7 +12563,7 @@ async def handle_quote_message(
                 inherited_order_id = _safe_int(inherited_case.order_id, 0) or None
                 merged_entities["order_id"] = inherited_order_id
 
-    if not platform_name and (quote_field_overrides or transfer_vehicle_text_data):
+    if not platform_name and quote_state_changed:
         case = inherited_case or await _get_or_create_case(
             db,
             owner_user_id=owner_user_id,
@@ -11789,6 +12574,11 @@ async def handle_quote_message(
             ctx=ctx,
         )
         case = await _lock_quote_case(db, case)
+        cancelled_active_quote_tasks = await _cancel_active_quote_tasks_for_case(
+            db,
+            case=case,
+            reason=QUOTE_SUPERSEDED_MESSAGE,
+        )
         old_draft = _json_obj(case.draft_order_data)
         merged_overrides = _merge_quote_config_overrides(
             old_draft.get("quote_field_overrides"),
@@ -11797,6 +12587,20 @@ async def handle_quote_message(
         text_patch: Dict[str, Any] = dict(transfer_vehicle_text_data)
         if merged_overrides:
             text_patch["quote_field_overrides"] = merged_overrides
+        old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+        incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+        if quote_command_mode == "全保":
+            merged_product_exclusions: List[str] = _normalize_quote_product_exclusions(quote_product_exclusions)
+        elif quote_command_mode == "交三":
+            merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
+        elif quote_product_exclusions:
+            merged_product_exclusions = _normalize_quote_product_exclusions([*old_product_exclusions, *incoming_product_exclusions])
+        elif QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+            merged_product_exclusions = incoming_product_exclusions
+        else:
+            merged_product_exclusions = []
+        if quote_product_exclusions or quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+            text_patch[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
         images_by_slot = await _active_images_by_slot(db, case.id)
         next_normalized = _normalize_quote_case_data(
             base_data=_json_obj(case.normalized_data) or old_draft,
@@ -11816,37 +12620,51 @@ async def handle_quote_message(
             content=text,
             payload={
                 "quote_field_overrides": merged_overrides,
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
                 "transfer_vehicle": transfer_vehicle_text_data,
                 "deferred_quote": True,
+                "cancelled_active_quote_tasks": cancelled_active_quote_tasks,
             },
         )
         await db.flush()
+        if cancelled_active_quote_tasks:
+            await db.commit()
         summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(merged_overrides)
+        if not summary:
+            summary = _quote_product_exclusion_summary(text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
         if not summary and transfer_vehicle_text_data:
             summary = "已按过户车处理" if bool(transfer_vehicle_text_data.get("is_transfer_vehicle")) else "已按非过户车处理"
+        response_data = _mk_data(
+            result_status=RESULT_SUCCESS,
+            message="已记录报价调整",
+            entities={"quote_case_id": case.id, "order_id": case.order_id},
+            payload={
+                "quote_field_overrides": merged_overrides,
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
+                "transfer_vehicle": {
+                    key: next_normalized.get(key)
+                    for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_source", "transfer_vehicle_override")
+                    if next_normalized.get(key) not in (None, "")
+                },
+                "repair_code": {
+                    "matched": repair_code_resolution.get("matched"),
+                    "query": repair_code_resolution.get("query"),
+                } if repair_code_resolution else {},
+                "silent": True,
+                "ui_visible": False,
+            },
+        )
+        response_data["silent"] = True
+        response_data["ui_visible"] = False
         return (
             f"已记录：{summary}。",
             {
                 "status": "success",
                 "intent": "quote_config_override",
                 "trace_id": _new_trace_id(),
-                "data": _mk_data(
-                    result_status=RESULT_SUCCESS,
-                    message="已记录报价调整",
-                    entities={"quote_case_id": case.id, "order_id": case.order_id},
-                    payload={
-                        "quote_field_overrides": merged_overrides,
-                        "transfer_vehicle": {
-                            key: next_normalized.get(key)
-                            for key in ("is_transfer_vehicle", "transfer_date", "transfer_vehicle_source", "transfer_vehicle_override")
-                            if next_normalized.get(key) not in (None, "")
-                        },
-                        "repair_code": {
-                            "matched": repair_code_resolution.get("matched"),
-                            "query": repair_code_resolution.get("query"),
-                        } if repair_code_resolution else {},
-                    },
-                ),
+                "silent": True,
+                "ui_visible": False,
+                "data": response_data,
                 "actions": [],
             },
         )
@@ -11919,6 +12737,13 @@ async def handle_quote_message(
     )
     case = await _lock_quote_case(db, case)
     await _add_event(db, case=case, owner_user_id=owner_user_id, event_type="chat", role="user", content=text, payload={})
+    cancelled_active_quote_tasks = 0
+    if quote_state_changed or quote_command_restarts_active_task:
+        cancelled_active_quote_tasks = await _cancel_active_quote_tasks_for_case(
+            db,
+            case=case,
+            reason=QUOTE_SUPERSEDED_MESSAGE,
+        )
 
     order_data = _order_data(order)
     old_draft = _json_obj(case.draft_order_data)
@@ -11928,6 +12753,20 @@ async def handle_quote_message(
     )
     if merged_quote_field_overrides:
         text_data["quote_field_overrides"] = merged_quote_field_overrides
+    old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    if quote_command_mode == "全保":
+        merged_product_exclusions = _normalize_quote_product_exclusions(quote_product_exclusions)
+    elif quote_command_mode == "交三":
+        merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
+    elif quote_product_exclusions:
+        merged_product_exclusions = _normalize_quote_product_exclusions([*old_product_exclusions, *incoming_product_exclusions])
+    elif QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+        merged_product_exclusions = incoming_product_exclusions
+    else:
+        merged_product_exclusions = []
+    if quote_product_exclusions or quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+        text_data[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
 
     await _sync_order_images_to_case(db, case=case, owner_user_id=owner_user_id, order=order)
     attached_images = await _attach_uploaded_images(
@@ -11946,6 +12785,9 @@ async def handle_quote_message(
     )
     case.draft_order_data = normalized_data
     case.normalized_data = normalized_data
+    if quote_state_changed or quote_command_restarts_active_task or cancelled_active_quote_tasks:
+        await db.flush()
+        await db.commit()
     vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
     auto_account_type_name = _normalize_account_type_name(vehicle_type_detect.get("config_type_name"))
     selected_account_type_name = account_type_name or auto_account_type_name
@@ -12250,6 +13092,12 @@ async def handle_quote_material_status(
     _ensure_quote_flow_access(ctx)
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
     await _expire_stale_waiting_sms_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    await _expire_stale_running_quote_tasks_for_owner_session(
         db,
         owner_user_id=owner_user_id,
         session_id=session_id,
