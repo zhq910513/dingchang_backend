@@ -724,6 +724,31 @@ def _platform_status_code(data: Any) -> int:
         return 0
 
 
+def _quote_response_has_display_result(data: Any) -> bool:
+    payload = _json_obj(_json_obj(data).get("data"))
+    if not payload or not _has_text(payload.get("piccScore")):
+        return False
+    premium_keys = (
+        "sumPremium",
+        "totalPremium",
+        "premiumTotal",
+        "biPremium",
+        "ciPremium",
+        "sumPayTax",
+        "thisPayTax",
+        "quotationNo",
+        "quotationId",
+    )
+    if any(_has_text(payload.get(key)) for key in premium_keys):
+        return True
+    item_rows = _json_obj(data).get("itemKindTempList")
+    if not isinstance(item_rows, list):
+        item_rows = payload.get("itemKindTempList")
+    if not isinstance(item_rows, list):
+        return False
+    return any(_has_text(_json_obj(row).get("premium")) for row in item_rows)
+
+
 def _platform_message(data: Any, default: str = "平台返回业务校验失败") -> str:
     payload = _json_obj(data)
 
@@ -2241,7 +2266,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     if not corrected:
                         raise
                     request_body = corrected_body
-                quote_response = self._submit_used_fuel_quote(client, request_body)
+                    quote_response = self._submit_used_fuel_quote(client, request_body)
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
@@ -3314,6 +3339,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 raise PiccDuplicateQuoteError(message or "平台提示该车辆已报价过")
             if _contains_quota_full(data):
                 raise PiccQuotaFullError(message or "查询额度已用完")
+            if _quote_response_has_display_result(data):
+                return _json_obj(data)
             raise PiccBusinessRequestError(
                 f"报价提交失败：{message}",
                 action="报价提交",

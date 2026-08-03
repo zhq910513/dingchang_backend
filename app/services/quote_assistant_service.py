@@ -11530,6 +11530,7 @@ async def _complete_quote_without_sms(
             platform_account=platform_account,
             runtime_result=quote_runtime_result,
             login_mode=login_mode,
+            existing_task=task,
         )
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
@@ -11543,6 +11544,7 @@ async def _complete_quote_without_sms(
                 platform_account=platform_account,
                 runtime_result=quote_runtime_result,
                 login_mode=login_mode,
+                existing_task=task,
             )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")

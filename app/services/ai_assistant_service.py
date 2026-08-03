@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -61,6 +62,7 @@ from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
 storage = StorageService()
+logger = logging.getLogger(__name__)
 HISTORY_BEFORE_CURSOR_PREFIX = "__before__:"
 
 # =============================
@@ -3022,6 +3024,20 @@ def _dispatch_error_reply(
     )
 
 
+def _log_dispatch_exception(error: Exception, *, intent: str, ctx: Optional[Dict[str, Any]] = None) -> None:
+    safe_ctx = ctx or {}
+    try:
+        logger.exception(
+            "ai assistant dispatch failed: intent=%s user_id=%s session_id=%s error_type=%s",
+            intent,
+            safe_ctx.get("current_user_id"),
+            safe_ctx.get("session_id"),
+            error.__class__.__name__,
+        )
+    except Exception:
+        pass
+
+
 async def _dispatch_rule_with_db(
         text: str,
         ctx: Dict[str, Any],
@@ -3141,9 +3157,21 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
 
     if db is not None:
         try:
-            # Keep quote-state writes in the same API transaction as chat
-            # messages, while allowing a failed dispatch to roll back only the
-            # quote attempt and preserve the user's message.
+            # Quote flows create/update long-running task state and may commit
+            # before calling the platform. Wrapping them in begin_nested() can
+            # close the transaction mid-context, so let the quote service own
+            # its transaction boundary.
+            if intent in {"quote", "quote_credential"}:
+                return await _dispatch_rule_with_db(
+                    text,
+                    ctx,
+                    db=db,
+                    intent=intent,
+                    confidence=confidence,
+                    entities=entities,
+                )
+            # Keep normal assistant writes in the same API transaction while
+            # allowing a failed dispatch to preserve the user's message.
             async with db.begin_nested():
                 return await _dispatch_rule_with_db(
                     text,
@@ -3154,6 +3182,7 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
                     entities=entities,
                 )
         except Exception as e:
+            _log_dispatch_exception(e, intent=intent, ctx=ctx)
             return _dispatch_error_reply(e, entities, ctx=ctx)
 
     async for db in get_db():
@@ -3174,6 +3203,7 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
                 await db.rollback()
             except Exception:
                 pass
+            _log_dispatch_exception(e, intent=intent, ctx=ctx)
             return _dispatch_error_reply(e, entities, ctx=ctx)
 
     return _fallback_reply()
