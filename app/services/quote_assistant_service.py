@@ -11327,16 +11327,22 @@ async def _complete_waiting_task(
     )
     if platform_dialog:
         payload["platform_dialog"] = platform_dialog
+    response_data = _mk_data(
+        result_status=RESULT_SUCCESS,
+        message="报价流程已完成",
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    response_data["quote_case"] = payload["quote_case"]
+    response_data["quote_task"] = payload["quote_task"]
+    response_data["quote_result"] = result
+    if platform_dialog:
+        response_data["platform_dialog"] = platform_dialog
     return reply, {
         "status": "success",
         "intent": "quote",
         "trace_id": trace_id,
-        "data": _mk_data(
-            result_status=RESULT_SUCCESS,
-            message="报价流程已完成",
-            entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-            payload=payload,
-        ),
+        "data": response_data,
         "actions": [],
     }
 
