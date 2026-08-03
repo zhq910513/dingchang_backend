@@ -388,6 +388,23 @@ def _message_preview_text(role: Any, content: Any, metadata: Any) -> str:
     return ""
 
 
+def _session_preview_needs_recompute(value: Any) -> bool:
+    text = _safe_chat_text_for_display(value).strip()
+    if not text:
+        return True
+    hidden_markers = (
+        "已完成识别归位",
+        "默认参数已更新",
+        "我没完全看懂这条指令",
+        "重复投保提示",
+        "等待重复投保确认",
+        "平台提示可能重复投保",
+    )
+    if any(marker in text for marker in hidden_markers):
+        return True
+    return bool(re.match(r"^已收到\s*\d+\s*张图片", text))
+
+
 def _looks_like_image_dict(value: Dict[str, Any]) -> bool:
     if not isinstance(value, dict):
         return False
@@ -924,22 +941,23 @@ async def _db_session_last_visible_preview(
         session_id: str,
         fallback: str = "",
 ) -> str:
+    fallback_preview = _safe_chat_text_for_display(fallback).strip()[:120]
+    if fallback_preview and not _session_preview_needs_recompute(fallback_preview):
+        return fallback_preview
     try:
-        page = await db_list_messages(db, owner_user_id=owner_user_id, session_id=session_id, limit=1)
+        page = await db_list_messages(db, owner_user_id=owner_user_id, session_id=session_id, limit=8)
     except Exception:
-        return _safe_chat_text_for_display(fallback)[:120]
+        return fallback_preview
     items = page.get("items") if isinstance(page, dict) else []
     if not items:
-        return _safe_chat_text_for_display(fallback)[:120]
-    item = items[-1]
-    if not isinstance(item, dict):
-        return _safe_chat_text_for_display(fallback)[:120]
-    preview = _safe_chat_text_for_display(item.get("content", "")).strip()
-    if preview:
-        return preview[:120]
-    if _context_has_history_images(item.get("metadata") or {}):
-        return "图片"
-    return _safe_chat_text_for_display(fallback)[:120]
+        return "" if _session_preview_needs_recompute(fallback_preview) else fallback_preview
+    for item in reversed(items):
+        if not isinstance(item, dict):
+            continue
+        preview = _message_preview_text(item.get("role"), item.get("content", ""), item.get("metadata") or {})
+        if preview:
+            return preview[:120]
+    return "" if _session_preview_needs_recompute(fallback_preview) else fallback_preview
 
 
 async def db_list_sessions(

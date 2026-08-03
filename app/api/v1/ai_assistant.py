@@ -73,7 +73,6 @@ from app.services.quote_assistant_service import (
     update_platform_account_profile as _update_platform_account_profile,
 )
 from app.services.image_slot_classifier import SLOT_KEYS
-from app.services.quote_result_image import save_quote_result_card_image
 from app.services.storage import StorageService
 
 router = APIRouter(prefix="/ai-assistant", tags=["报价助手"])
@@ -262,23 +261,6 @@ def _filter_metadata_for_quote_permission(metadata: Any, *, can_quote_use: bool)
     }
 
 
-def _regenerate_quote_result_image_from_result(result: Any, *, legacy_url: str = "") -> Dict[str, Any]:
-    if not isinstance(result, dict):
-        return {}
-    card = result.get("result_card") or result.get("resultCard") or {}
-    if not isinstance(card, dict) or not card:
-        return {}
-    trace_id = str(result.get("trace_id") or result.get("traceId") or "").strip()
-    try:
-        regenerated = save_quote_result_card_image(card, trace_id=trace_id) or {}
-        if regenerated and legacy_url:
-            regenerated["legacy_url"] = legacy_url
-        return regenerated
-    except Exception:
-        logger.exception("legacy quote result image regenerate failed")
-        return {}
-
-
 def _is_legacy_quote_result_url(url: str) -> bool:
     normalized = str(url or "").replace("\\", "/").lower()
     return "/quote_results/" in normalized or normalized.startswith("quote_results/")
@@ -289,31 +271,30 @@ def _normalize_quote_result_image_ref(image: Any, *, result: Any = None) -> Any:
         url = image.strip()
         if not url:
             return image
-        if _is_legacy_quote_result_url(url):
-            regenerated = _regenerate_quote_result_image_from_result(result, legacy_url=url)
-            if regenerated:
-                return regenerated
-        return {
+        wrapped = {
             "kind": "quote_result",
             "slot_key": "related",
             "url": url,
             "image_url": url,
             "preview_url": url,
         }
+        if _is_legacy_quote_result_url(url):
+            wrapped["provider"] = "legacy_local"
+            wrapped["legacy_url"] = url
+        return wrapped
     if isinstance(image, dict):
         url = str(image.get("preview_url") or image.get("url") or image.get("image_url") or "").strip()
         if not url:
             return image
-        if _is_legacy_quote_result_url(url):
-            regenerated = _regenerate_quote_result_image_from_result(result, legacy_url=url)
-            if regenerated:
-                return regenerated
         normalized = deepcopy(image)
         normalized.setdefault("kind", "quote_result")
         normalized.setdefault("slot_key", "related")
         normalized["url"] = str(normalized.get("url") or url)
         normalized["image_url"] = str(normalized.get("image_url") or url)
         normalized["preview_url"] = str(normalized.get("preview_url") or url)
+        if _is_legacy_quote_result_url(url):
+            normalized.setdefault("provider", "legacy_local")
+            normalized.setdefault("legacy_url", url)
         return normalized
     return image
 
@@ -333,10 +314,6 @@ def _normalize_quote_result_payload(payload: Any) -> Any:
             result_copy["result_image"] = wrapped
             if "resultImage" in result_copy:
                 result_copy["resultImage"] = wrapped
-        else:
-            generated = _regenerate_quote_result_image_from_result(result_copy)
-            if generated:
-                result_copy["result_image"] = generated
         normalized[key] = result_copy
     return normalized
 

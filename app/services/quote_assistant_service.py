@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -70,6 +71,7 @@ from app.core.config import settings
 
 TZ_BJ = timezone(timedelta(hours=8))
 storage = StorageService()
+logger = logging.getLogger(__name__)
 
 
 def _elapsed_ms(start: float) -> int:
@@ -77,6 +79,31 @@ def _elapsed_ms(start: float) -> int:
         return max(0, int(round((time.perf_counter() - start) * 1000)))
     except Exception:
         return 0
+
+
+def _log_quote_perf(
+    *,
+    stage: str,
+    trace_id: str,
+    case_id: Any = None,
+    task_id: Any = None,
+    platform_code: Any = "",
+    account_id: Any = None,
+    perf: Optional[Mapping[str, Any]] = None,
+) -> None:
+    try:
+        logger.info(
+            "[quote_perf] stage=%s trace_id=%s case_id=%s task_id=%s platform=%s account_id=%s perf=%s",
+            _to_str(stage).strip() or "-",
+            _to_str(trace_id).strip() or "-",
+            _to_str(case_id).strip() or "-",
+            _to_str(task_id).strip() or "-",
+            _to_str(platform_code).strip().upper() or "-",
+            _to_str(account_id).strip() or "-",
+            json.dumps(dict(perf or {}), ensure_ascii=False, sort_keys=True),
+        )
+    except Exception:
+        logger.debug("quote perf log failed", exc_info=True)
 
 RESULT_SUCCESS = "success"
 RESULT_NEED_MORE = "need_more_info"
@@ -11418,6 +11445,15 @@ async def _complete_waiting_task(
         perf["total_ms"] = _elapsed_ms(perf_started)
         task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
 
+    _log_quote_perf(
+        stage="success",
+        trace_id=trace_id,
+        case_id=case.id,
+        task_id=task.id,
+        platform_code=platform_code,
+        account_id=account_id,
+        perf=perf,
+    )
     await _add_event(
         db,
         case=case,
@@ -11916,6 +11952,15 @@ async def _complete_quote_without_sms(
     perf["quota_update_ms"] = _elapsed_ms(quota_update_started)
     perf["total_ms"] = _elapsed_ms(perf_started)
     task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
+    _log_quote_perf(
+        stage="success",
+        trace_id=trace_id,
+        case_id=case.id,
+        task_id=task.id,
+        platform_code=platform_code,
+        account_id=platform_account.id,
+        perf=perf,
+    )
     await _add_event(
         db,
         case=case,
@@ -13295,9 +13340,14 @@ async def handle_quote_message(
         payload["platform_default_config"] = platform_default_config
         payload["default_config_json"] = _json_obj(snapshot.get("default_config_json"))
         type_hint = f"（类型：{selected_account_type_name}）"
+        config_action_text = _quote_account_action_text(
+            operator_role_name,
+            "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
+            "请联系管理员在“默认参数配置”中新增并启用该账号类型配置后，再重新发起报价。",
+        )
         return (
             f"{override_reply_prefix}{platform_name}{type_hint}还没有启用的默认参数配置，暂不提交报价。\n"
-            "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
+            f"{config_action_text}",
             {
                 "status": "success",
                 "intent": "quote",
@@ -13309,13 +13359,19 @@ async def handle_quote_message(
                     payload=payload,
                 ),
                 "actions": [
-                    _mk_action(
-                        "默认参数配置",
-                        "open_default_config_manager",
-                        "quote_platform_default_configs",
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                        account_type_name=selected_account_type_name,
+                    *(
+                        []
+                        if _quote_account_needs_admin_contact(operator_role_name)
+                        else [
+                            _mk_action(
+                                "默认参数配置",
+                                "open_default_config_manager",
+                                "quote_platform_default_configs",
+                                platform_code=platform_code,
+                                platform_name=platform_name,
+                                account_type_name=selected_account_type_name,
+                            ),
+                        ]
                     ),
                     _mk_action(f"{platform_name}报价"),
                 ],
