@@ -1012,6 +1012,7 @@ async def ai_chat(
             max_tokens=None,
             stream=bool(body.stream),
             context=_chat_context(ctx, body),
+            client_msg_id=(body.client_msg_id or "").strip() or None,
             db=db,
         )
         await db.commit()

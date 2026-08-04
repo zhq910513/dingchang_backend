@@ -852,6 +852,28 @@ def _platform_datetime_text(value: Any) -> str:
         return text
 
 
+def _loose_platform_date_text(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value).strip())
+    if not text:
+        return ""
+    for pattern in (
+        r"(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})",
+        r"(\d{4})(\d{2})(\d{2})",
+    ):
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            return datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
 def _platform_current_day_from_response(data: Any) -> str:
     payload = _json_obj(_json_obj(data).get("data"))
     raw = _to_str(payload.get("currentTime") or payload.get("current_time") or payload.get("time")).strip()
@@ -1017,6 +1039,45 @@ def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
     return kinds
 
 
+def _reinsure_notice_suggested_start_date(message: Any) -> str:
+    text = _platform_notice_text(message)
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    date_pattern = r"(\d{4}(?:[-/年月.]?\d{1,2}){2})"
+    for pattern in (
+        rf"(?:系统建议|平台建议|建议).{{0,40}}(?:起保日期|保险期间|起期).{{0,24}}(?:调整为|调整至|改为|改至|变更为|同步至|为){date_pattern}",
+        rf"(?:起保日期|保险期间|起期).{{0,24}}(?:调整为|调整至|改为|改至|变更为|同步至|为){date_pattern}",
+        rf"(?:调整为|调整至|改为|改至|变更为|同步至){date_pattern}",
+    ):
+        match = re.search(pattern, compact)
+        if not match:
+            continue
+        day = _loose_platform_date_text(match.group(1))
+        if day:
+            return day
+    return ""
+
+
+def _reinsure_notice_adjustment_kinds(message: Any) -> List[str]:
+    text = _platform_notice_text(message)
+    compact = re.sub(r"\s+", "", text)
+    if not compact or "保单重复投保" not in compact:
+        return []
+    kinds: List[str] = []
+    if (
+        re.search(r"(?:商业险?|商业).{0,24}(?:保险期间|起保|起期|重复投保)", compact)
+        or re.search(r"(?:机动车|车损|三者|车上人员|医保外).{0,40}(?:险|责任|损失|服务)", compact)
+    ):
+        kinds.append("bi")
+    if (
+        re.search(r"(?:交强险?|交强).{0,24}(?:保险期间|起保|起期|重复投保)", compact)
+        or "机动车交通事故责任强制保险" in compact
+    ):
+        kinds.append("ci")
+    return kinds or ["bi"]
+
+
 def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     payload = _json_obj(_json_obj(data).get("data"))
     if not payload:
@@ -1041,12 +1102,14 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         return {}
     first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
     advise_start = _first_text(first_reinsure.get("adviseStartDate"), first_reinsure.get("effectiveDate"))
+    if not advise_start:
+        advise_start = _reinsure_notice_suggested_start_date(message)
     adjusted_start = _platform_effective_quote_date(advise_start)
-    adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure) if first_reinsure else []
+    adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure) if first_reinsure else _reinsure_notice_adjustment_kinds(message)
     confirm_command = _platform_quote_date_command(advise_start, kinds=adjustment_kinds)
     return {
         "type": "confirm" if confirm_command else "notice",
-        "subtype": "insurance_date_adjust" if confirm_command else "quote_platform_notice",
+        "subtype": "insurance_date_adjust" if (confirm_command or adjustment_kinds) else "quote_platform_notice",
         "title": "报价提示",
         "severity": "warning",
         "message": message,
@@ -3795,6 +3858,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             kinds = _insurance_date_error_adjustment_kinds(detect_text)
             if kinds:
                 message = platform_text or detect_text
+            else:
+                repeat_kinds = _reinsure_notice_adjustment_kinds(detect_text)
+                if repeat_kinds:
+                    kinds = repeat_kinds
+                    message = platform_text or detect_text
+                    candidate_date = _reinsure_notice_suggested_start_date(detect_text)
 
         if not kinds:
             return {}
@@ -3958,6 +4027,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 )
                 adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
                 if not changed:
+                    if adjustment and adjustment.get("message") and not notices:
+                        ready_notice = _insurance_date_notice_from_adjustment(adjustment)
+                        ready_notice["already_effective"] = True
+                        remember_notice(adjustment, ready_notice)
                     exc.platform_auto_notices = [
                         *getattr(exc, "platform_auto_notices", []),
                         *notices,
