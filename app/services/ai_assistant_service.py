@@ -3395,7 +3395,33 @@ async def send_message(
     reply_text, reply_meta = await _dispatch_rule(final_text, final_context, db=db)
 
     assistant_content = redact_quote_sensitive_text(reply_text)
-    if db is not None:
+    reply_meta = reply_meta if isinstance(reply_meta, dict) else {}
+    reply_data = reply_meta.get("data") if isinstance(reply_meta.get("data"), dict) else {}
+    reply_payload = reply_data.get("payload") if isinstance(reply_data.get("payload"), dict) else {}
+    hidden_assistant_response = (
+        reply_meta.get("silent") is True
+        or _to_str(reply_meta.get("silent")).strip().lower() == "true"
+        or reply_meta.get("ui_visible") is False
+        or _to_str(reply_meta.get("ui_visible")).strip().lower() == "false"
+        or reply_data.get("silent") is True
+        or _to_str(reply_data.get("silent")).strip().lower() == "true"
+        or reply_data.get("ui_visible") is False
+        or _to_str(reply_data.get("ui_visible")).strip().lower() == "false"
+        or reply_payload.get("silent") is True
+        or _to_str(reply_payload.get("silent")).strip().lower() == "true"
+        or reply_payload.get("ui_visible") is False
+        or _to_str(reply_payload.get("ui_visible")).strip().lower() == "false"
+        or _to_str(reply_meta.get("intent") or reply_data.get("intent")).strip().lower() == "quote_image_collect"
+    )
+    if hidden_assistant_response:
+        assistant_msg = {
+            "id": None,
+            "role": "assistant",
+            "content": "",
+            "metadata": reply_meta,
+            "hidden": True,
+        }
+    elif db is not None:
         assistant_msg = await db_append_message(
             db,
             owner_user_id=owner_user_id,

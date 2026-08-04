@@ -3934,59 +3934,57 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
     ) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
         notices: List[Dict[str, Any]] = []
         body = dict(_json_obj(request_body))
-        try:
-            body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, body)
-        except PiccBusinessRequestError as exc:
-            adjustment = self._insurance_date_adjustment_from_platform_response(
-                client,
-                getattr(exc, "platform_response", None),
-                error_message=str(exc),
-            )
-            adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
-            if not changed:
-                raise
+
+        def remember_notice(adjustment: Mapping[str, Any], notice: Mapping[str, Any]) -> None:
+            item = dict(_json_obj(notice))
             emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
             if emitted:
-                notice["emitted_to_chat"] = True
-            notices.append(notice)
-            try:
-                body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, adjusted_body)
-            except PiccBusinessRequestError as retry_exc:
-                retry_exc.platform_auto_notices = [
-                    *getattr(retry_exc, "platform_auto_notices", []),
-                    *notices,
-                ]
-                raise
+                item["emitted_to_chat"] = True
+            notices.append(item)
 
-        # HAR confirms the page may show "修改保险期间" after a quote response:
-        # it fills a platform-current valid start date, recalculates actual value,
-        # then submits quote.do again. Keep this bounded to avoid loops.
-        for _ in range(2):
+        # HAR confirms the page may report commercial and compulsory date issues
+        # one after another. Treat both exception responses and successful quote
+        # responses as state-machine transitions, and keep the loop bounded.
+        last_error: Optional[PiccBusinessRequestError] = None
+        for _ in range(6):
+            try:
+                body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, body)
+            except PiccBusinessRequestError as exc:
+                last_error = exc
+                adjustment = self._insurance_date_adjustment_from_platform_response(
+                    client,
+                    getattr(exc, "platform_response", None),
+                    error_message=str(exc),
+                )
+                adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
+                if not changed:
+                    exc.platform_auto_notices = [
+                        *getattr(exc, "platform_auto_notices", []),
+                        *notices,
+                    ]
+                    raise
+                remember_notice(adjustment, notice)
+                body = adjusted_body
+                continue
+
             adjustment = self._insurance_date_adjustment_from_platform_response(client, quote_response)
             adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
             if not changed:
                 if adjustment and adjustment.get("message") and not notices:
                     ready_notice = _insurance_date_notice_from_adjustment(adjustment)
                     ready_notice["already_effective"] = True
-                    emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
-                    if emitted:
-                        ready_notice["emitted_to_chat"] = True
-                    notices.append(ready_notice)
-                break
-            emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
-            if emitted:
-                notice["emitted_to_chat"] = True
-            notices.append(notice)
-            try:
-                body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, adjusted_body)
-            except PiccBusinessRequestError as retry_exc:
-                retry_exc.platform_auto_notices = [
-                    *getattr(retry_exc, "platform_auto_notices", []),
-                    *notices,
-                ]
-                raise
+                    remember_notice(adjustment, ready_notice)
+                return body, quote_response, notices
+            remember_notice(adjustment, notice)
+            body = adjusted_body
 
-        return body, quote_response, notices
+        if last_error is not None:
+            last_error.platform_auto_notices = [
+                *getattr(last_error, "platform_auto_notices", []),
+                *notices,
+            ]
+            raise last_error
+        raise PiccRequestError("平台连续提示修改保险期间，已达到自动调整上限，请人工核对起保日期后重试")
 
     def _used_fuel_products(
         self,
