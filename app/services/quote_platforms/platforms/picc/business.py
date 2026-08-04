@@ -257,6 +257,24 @@ PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
     "车主生日": "1990-01-01",
 }
 
+PICC_ENERGY_TYPE_PLAT_LABELS: Dict[str, str] = {
+    "0": "燃油",
+    "1": "纯电动",
+    "2": "燃料电池",
+    "3": "插电式混合动力",
+    "4": "增程式混合动力",
+}
+PICC_VEHICLE_FUEL_TYPE_TO_ENERGY_TYPE_PLAT: Dict[str, str] = {
+    "D6": "1",
+    "D12": "3",
+}
+PICC_PM_FUEL_TYPE_TO_ENERGY_TYPE_PLAT: Dict[str, str] = {
+    "1": "1",
+    "2": "2",
+    "3": "3",
+    "4": "4",
+}
+
 
 def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
     """Return editable PICC product defaults for the configured account type."""
@@ -1441,10 +1459,11 @@ def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any])
         score += 20
     if name_hint and name_hint in haystack:
         score += 15
-    energy_expected = bool(re.search(r"(纯电|电动|新能源|BEV|PHEV|EV)", _compact_vehicle_compare_text(vehicle.get("energyModelSuffix"))))
+    energy_expected = bool(re.search(r"(纯电|电动|新能源|插电|混合动力|BEV|PHEV|EV|增程)", _compact_vehicle_compare_text(vehicle.get("energyModelSuffix"))))
     if energy_expected and (
-        re.search(r"(纯电|电动|新能源|BEV|PHEV|EV)", haystack)
-        or _to_str(row.get("energyTypePlat")).strip() == "1"
+        re.search(r"(纯电|电动|新能源|插电|混合动力|BEV|PHEV|EV|增程)", haystack)
+        or _to_str(row.get("energyTypePlat")).strip() in {"1", "2", "3", "4"}
+        or _to_str(row.get("vehicleFuelType")).strip().upper() in PICC_VEHICLE_FUEL_TYPE_TO_ENERGY_TYPE_PLAT
         or _to_str(row.get("isEnergyCar")).strip() in {"1", "true", "True"}
     ):
         score += 10
@@ -1806,6 +1825,137 @@ def _vehicle_platform_purchase_price(selected: Mapping[str, Any], precise_vehicl
     )
 
 
+def _energy_type_plat_from_vehicle_text(*values: Any) -> str:
+    text = _compact_vehicle_compare_text(" ".join(_to_str(value) for value in values if _to_str(value).strip()))
+    if not text:
+        return ""
+    if re.search(r"(插电|PHEV|PLUG.?IN)", text, flags=re.I):
+        return "3"
+    if re.search(r"(增程|EREV|REEV)", text, flags=re.I):
+        return "4"
+    if re.search(r"(燃料电池|氢能源|氢燃料)", text, flags=re.I):
+        return "2"
+    if re.search(r"(纯电|纯电动|BEV|ELECTRIC)", text, flags=re.I):
+        return "1"
+    if re.search(r"(汽油|柴油|燃油|GASOLINE|DIESEL)", text, flags=re.I):
+        return "0"
+    return ""
+
+
+def _normalize_energy_type_plat(value: Any) -> str:
+    text = _to_str(value).strip()
+    return text if text in PICC_ENERGY_TYPE_PLAT_LABELS else ""
+
+
+def _energy_type_plat_label(code: Any, *name_values: Any) -> str:
+    code_text = _normalize_energy_type_plat(code)
+    for value in name_values:
+        text = _to_str(value).strip()
+        if not text:
+            continue
+        inferred = _energy_type_plat_from_vehicle_text(text)
+        if code_text and inferred == code_text:
+            return PICC_ENERGY_TYPE_PLAT_LABELS.get(code_text, text)
+        if not code_text and inferred:
+            return PICC_ENERGY_TYPE_PLAT_LABELS.get(inferred, text)
+        if code_text and code_text in PICC_ENERGY_TYPE_PLAT_LABELS:
+            return PICC_ENERGY_TYPE_PLAT_LABELS[code_text]
+        return text
+    return PICC_ENERGY_TYPE_PLAT_LABELS.get(code_text, "")
+
+
+def _vehicle_energy_model_suffix(data: Mapping[str, Any], profile: Mapping[str, Any]) -> str:
+    text_values = (
+        data.get("vehicle_energy_type"),
+        data.get("energy_type"),
+        data.get("fuel_type"),
+        data.get("fuel_kind"),
+        data.get("vehicle_model"),
+        data.get("vehicle_brand_name"),
+        data.get("vehicle_name"),
+        data.get("vehicle_certificate_text"),
+        data.get("generic_ocr_text"),
+        data.get("ocr_text"),
+        data.get("raw_text"),
+    )
+    inferred = _energy_type_plat_from_vehicle_text(*text_values)
+    if inferred == "3":
+        return "插电式混合动力"
+    if inferred == "4":
+        return "增程式混合动力"
+    if inferred == "2":
+        return "燃料电池"
+    if inferred == "1" or _profile_text(profile, "is_energy_car") == "1":
+        return "纯电动轿车"
+    return ""
+
+
+def _resolve_vehicle_energy_fields(
+    defaults: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    precise_vehicle: Mapping[str, Any],
+    *,
+    vehicle: Optional[Mapping[str, Any]] = None,
+    profile: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    prof = _json_obj(profile)
+    vehicle_obj = _json_obj(vehicle)
+    selected_obj = _json_obj(selected)
+    precise_obj = _json_obj(precise_vehicle)
+    vehicle_fuel_type = _first_text(
+        precise_obj.get("vehicleFuelType"),
+        selected_obj.get("vehicleFuelType"),
+        _field_value(defaults, "车辆燃料类型", "vehicleFuelType", fallback=_profile_text(prof, "vehicle_fuel_type", "D1")),
+    )
+    vehicle_code = _first_text(precise_obj.get("energyTypePlat"), selected_obj.get("energyTypePlat"))
+    inferred_code = _first_text(
+        PICC_VEHICLE_FUEL_TYPE_TO_ENERGY_TYPE_PLAT.get(_to_str(vehicle_fuel_type).strip().upper(), ""),
+        PICC_PM_FUEL_TYPE_TO_ENERGY_TYPE_PLAT.get(_to_str(_first_text(precise_obj.get("pmFuelType"), selected_obj.get("pmFuelType"))).strip(), ""),
+        _energy_type_plat_from_vehicle_text(
+            precise_obj.get("fuel_type"),
+            selected_obj.get("fuel_type"),
+            precise_obj.get("vehicleName"),
+            selected_obj.get("vehicleName"),
+            precise_obj.get("carName"),
+            selected_obj.get("carName"),
+            vehicle_obj.get("selectedModelName"),
+            vehicle_obj.get("modelName"),
+            vehicle_obj.get("rawModelName"),
+            vehicle_obj.get("energyModelSuffix"),
+        ),
+    )
+    if _normalize_energy_type_plat(vehicle_code) == "0" and _normalize_energy_type_plat(inferred_code) not in {"", "0"}:
+        code = inferred_code
+    else:
+        code = _first_text(
+            vehicle_code,
+            inferred_code,
+            _field_value(defaults, "能源类型代码", "energyTypePlat"),
+            _profile_text(prof, "energy_type_plat", "0"),
+        )
+    code = _normalize_energy_type_plat(code) or _profile_text(prof, "energy_type_plat", "0")
+    name = _energy_type_plat_label(
+        code,
+        precise_obj.get("energyTypePlatTemp"),
+        selected_obj.get("energyTypePlatTemp"),
+        precise_obj.get("fuel_type"),
+        selected_obj.get("fuel_type"),
+        _field_value(defaults, "能源类型名称", "energyTypePlatTemp"),
+        _profile_text(prof, "energy_type_name", ""),
+    )
+    is_energy_car = "1" if code != "0" or _checked(_first_text(precise_obj.get("isEnergyCar"), selected_obj.get("isEnergyCar")), default=False) else "0"
+    energy_flag = "1" if is_energy_car == "1" else "0"
+    return {
+        "energy_type_plat": code,
+        "energy_type_name": name or PICC_ENERGY_TYPE_PLAT_LABELS.get(code, ""),
+        "vehicle_energy_type": code,
+        "is_energy_car": is_energy_car,
+        "energy_flag": energy_flag,
+        "fuel_type": _to_str(_field_value(defaults, "燃料种类", "fuelType", fallback=_profile_text(prof, "fuel_type", "A"))),
+        "vehicle_fuel_type": vehicle_fuel_type,
+    }
+
+
 def _vehicle_platform_brand_id(selected: Mapping[str, Any], precise_vehicle: Mapping[str, Any]) -> str:
     return _first_text(selected.get("brandId"), precise_vehicle.get("brandId"))
 
@@ -1922,6 +2072,8 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     )
     selected_model_name = _first_text(precise_vehicle.get("vehicleName"), vehicle.get("selectedModelName"), selected.get("vehicleName"), vehicle.get("modelName"))
     profile = _motor_quote_profile(body.get("accountTypeName"))
+    defaults = _json_obj(body.get("defaultFields"))
+    energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=profile)
     is_new_car = bool(_profile_text(profile, "new_car_flag")) or _to_str(form.get("newCarFlag")).strip().lower() == "on"
     actual_value = _first_text(purchase_price if is_new_car else "", form.get("prpCitemCar.actualValue"), vehicle.get("actualValue"), purchase_price)
 
@@ -1940,11 +2092,16 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     set_form("prpCitemCar.vehicleMaker", _first_text(selected.get("vehicleMaker"), precise_vehicle.get("vehicleMakerid"), precise_vehicle.get("vehicleMaker")))
     set_form("prpCitemCar.carLotEquQuality", _first_text(precise_vehicle.get("vehicleWeight"), selected.get("vehicleWeight")))
     set_form("prpCitemCar.enginePower", _first_text(precise_vehicle.get("enginePower"), selected.get("enginePower")))
-    set_form("prpCitemCar.vehicleFuelType", _first_text(precise_vehicle.get("vehicleFuelType"), selected.get("vehicleFuelType")))
+    set_form("energyTypePlat", energy_fields["energy_type_plat"])
+    set_form("energyTypePlatTemp", energy_fields["energy_type_name"])
+    set_form("prpCitemCar.energyType", energy_fields["vehicle_energy_type"])
+    set_form("prpCitemCar.isEnergyCar", energy_fields["is_energy_car"])
+    set_form("energyFlag", energy_fields["energy_flag"])
+    set_form("prpCitemCar.fuelType", energy_fields["fuel_type"])
+    set_form("prpCitemCar.vehicleFuelType", energy_fields["vehicle_fuel_type"])
     set_form("prpCmain.vehicleStyleUniqueId", _first_text(selected.get("vehicleStyleUniqueId"), vehicle.get("vehicleStyleUniqueId")))
     set_form("prpCmain.presaleCarFlag", _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")))
 
-    defaults = _json_obj(body.get("defaultFields"))
     if not _product_excluded(defaults, PRODUCT_LOSS) and not _to_str(_default_value(defaults, PRODUCT_LOSS)).strip():
         set_form("prpCitemKindVos[1].amount", _money_text(actual_value))
 
@@ -1966,6 +2123,9 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
         "vehicleId": model_code,
         "vehicleModelCode": vehicle_model_code,
         "purchasePrice": purchase_price,
+        "energyTypePlat": energy_fields["energy_type_plat"],
+        "energyTypePlatTemp": energy_fields["energy_type_name"],
+        "vehicleFuelType": energy_fields["vehicle_fuel_type"],
     }
     body["quoteForm"] = form
     body["vehicleForm"] = vehicle
@@ -2429,6 +2589,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "vehicleId": quote_form.get("prpCitemCar.modelCode"),
                     "vehicleModelCode": quote_form.get("prpCmain.vehicleModelCode"),
                     "purchasePrice": quote_form.get("prpCitemCar.purchasePrice"),
+                    "energyTypePlat": quote_form.get("energyTypePlat"),
+                    "energyTypePlatTemp": quote_form.get("energyTypePlatTemp"),
+                    "vehicleFuelType": quote_form.get("prpCitemCar.vehicleFuelType"),
                     "selectedBy": _vehicle_selection_rule(explicit_loss_amount),
                     "requestedLossAmount": _clean_money_text(explicit_loss_amount) if explicit_loss_amount > 0 else "",
                     "lossThresholdPurchasePrice": _clean_money_text(_vehicle_loss_threshold(explicit_loss_amount)) if explicit_loss_amount > 0 else "",
@@ -3026,6 +3189,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     ),
                 },
                 "preciseVehicle": precise_vehicle,
+                "energyResolve": {
+                    "energyTypePlat": quote_form.get("energyTypePlat"),
+                    "energyTypePlatTemp": quote_form.get("energyTypePlatTemp"),
+                    "vehicleEnergyType": quote_form.get("prpCitemCar.energyType"),
+                    "isEnergyCar": quote_form.get("prpCitemCar.isEnergyCar"),
+                    "vehicleFuelType": quote_form.get("prpCitemCar.vehicleFuelType"),
+                },
                 "actualValue": {"offline": True, "value": _money_text(actual_value)},
                 "selectedVehicle": selected,
                 "quoteFormError": quote_form_error,
@@ -3149,6 +3319,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
                 "selectedVehicle": selected,
                 "preciseVehicle": precise_vehicle,
+                "energyResolve": {
+                    "energyTypePlat": quote_form.get("energyTypePlat"),
+                    "energyTypePlatTemp": quote_form.get("energyTypePlatTemp"),
+                    "vehicleEnergyType": quote_form.get("prpCitemCar.energyType"),
+                    "isEnergyCar": quote_form.get("prpCitemCar.isEnergyCar"),
+                    "vehicleFuelType": quote_form.get("prpCitemCar.vehicleFuelType"),
+                },
                 "actualValue": actual_value_result,
                 "taxabate": taxabate_result,
                 "carChecker": checker_info,
@@ -3374,6 +3551,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         ton_count = _first_text(precise_vehicle.get("tonCount"), selected.get("tonCount"), selected.get("vehicleTonnage"))
         if _money(ton_count) == 0:
             ton_count = ""
+        energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=prof)
 
         compulsory_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"), "20")
         loss_amount = _money_text(_first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value))
@@ -3424,8 +3602,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCmain.carOwnerChooseUsedName": "0",
             "businesNature": _to_str(_field_value(defaults, "业务性质代码", "businesNature", fallback="2")),
             "businesNatureName": _to_str(_field_value(defaults, "业务性质名称", "businesNatureName", fallback="专业代理业务")),
-            "energyTypePlat": _to_str(_field_value(defaults, "能源类型代码", "energyTypePlat", fallback=_profile_text(prof, "energy_type_plat", "0"))),
-            "energyTypePlatTemp": _to_str(_field_value(defaults, "能源类型名称", "energyTypePlatTemp", fallback=_profile_text(prof, "energy_type_name", "燃油"))),
+            "energyTypePlat": energy_fields["energy_type_plat"],
+            "energyTypePlatTemp": energy_fields["energy_type_name"],
             "eadinfo.isEAD": "0",
             "transfer": "0",
             "transferDate": _date_text(vehicle.get("transferDate")),
@@ -3471,7 +3649,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.carLotEquQuality": _first_text(precise_vehicle.get("vehicleWeight"), selected.get("vehicleWeight")),
             "prpCitemCar.enginePower": _first_text(selected.get("enginePower"), precise_vehicle.get("enginePower")),
             "prpCitemCar.runAreaCode": _to_str(_field_value(defaults, "行驶区域代码", "runAreaCode", fallback="11")),
-            "prpCitemCar.energyType": _to_str(_field_value(defaults, "车辆能源类型", "energyType", fallback=_profile_text(prof, "vehicle_energy_type", "0"))),
+            "prpCitemCar.energyType": energy_fields["vehicle_energy_type"],
             "prpCitemCar.referenceActualValue": actual_value,
             "prpCitemCar.queryArea": query_area,
             "prpCitemCar.carInsuredRelation": _to_str(_field_value(defaults, "车主与被保险人关系", "carInsuredRelation", fallback="所有")),
@@ -3479,12 +3657,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.clauseType": _to_str(_field_value(defaults, "条款类型", "clauseType", fallback="F42")),
             "prpCitemCar.licenseColorCode": _to_str(_field_value(defaults, "车牌颜色代码", "licenseColorCode", fallback="01")),
             "prpCitemCar.netWeifaFlag": "0",
-            "prpCitemCar.isEnergyCar": _profile_text(prof, "is_energy_car", "0"),
+            "prpCitemCar.isEnergyCar": energy_fields["is_energy_car"],
             "prpCitemCar.isDangerousCar": "0",
             "prpCitemCar.IsCriterion": "1",
             "prpCitemCar.taxPayerType": _to_str(_field_value(defaults, "纳税人类型", "taxPayerType", fallback="01")),
-            "prpCitemCar.fuelType": _to_str(_field_value(defaults, "燃料种类", "fuelType", fallback=_profile_text(prof, "fuel_type", "A"))),
-            "prpCitemCar.vehicleFuelType": _first_text(selected.get("vehicleFuelType"), _field_value(defaults, "车辆燃料类型", "vehicleFuelType", fallback=_profile_text(prof, "vehicle_fuel_type", "D1"))),
+            "prpCitemCar.fuelType": energy_fields["fuel_type"],
+            "prpCitemCar.vehicleFuelType": energy_fields["vehicle_fuel_type"],
             "prpCitemCar.vehicleFgwCode": vehicle_fgw_code,
             "prpCitemCar.colorCode": _to_str(_field_value(defaults, "车辆颜色代码", "colorCode", fallback="999")),
             "prpCitemCar.nonlocalFlag": "0",
@@ -3539,7 +3717,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCmain.presaleCarFlag": _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")),
             "firstQuote": "0",
             "notBindingFlag": "0",
-            "energyFlag": _profile_text(prof, "energy_flag", "0"),
+            "energyFlag": energy_fields["energy_flag"],
             "quoteCacheFlagVal": "on",
             "opconf_makecomCode": opconf_com_code,
         }
@@ -3654,10 +3832,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if not enroll_date and _profile_text(prof, "enroll_date_fallback") == "today":
             enroll_date = _today_text()
+        energy_model_suffix = _vehicle_energy_model_suffix(data, prof)
         model_terms = _used_fuel_model_query_terms(
             raw_model_name,
             vehicle_type,
-            "纯电动轿车" if _profile_text(prof, "is_energy_car") == "1" else "",
+            energy_model_suffix,
             brand_name=vehicle_brand_name,
             vehicle_name=vehicle_name_hint,
         )
@@ -3677,7 +3856,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "brandNameHint": vehicle_brand_name,
             "vehicleNameHint": vehicle_name_hint,
             "vehicleType": vehicle_type,
-            "energyModelSuffix": "纯电动轿车" if _profile_text(prof, "is_energy_car") == "1" else "",
+            "energyModelSuffix": energy_model_suffix,
             "seatCount": _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"), "5"),
         }
 
@@ -3740,6 +3919,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile: Optional[Mapping[str, Any]] = None,
     ) -> Any:
         prof = _json_obj(profile)
+        energy_fields = _resolve_vehicle_energy_fields(defaults, selected, {}, vehicle=vehicle, profile=prof)
         purchase_price = _first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT"))
         params = {
             "vin": vehicle.get("vin") or "",
@@ -3760,7 +3940,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "seatCount": _first_text(selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
             "carLotEquQuality": _first_text(selected.get("vehicleWeight"), selected.get("carLotEquQuality"), "0"),
             "clauseFlag": _field_value(defaults, "条款标识", fallback="1"),
-            "energyTypePlat": _first_text(selected.get("energyTypePlat"), _profile_text(prof, "precise_energy_type_plat")),
+            "energyTypePlat": energy_fields["energy_type_plat"],
             "rows": 10,
         }
         data = client.request_json(
@@ -3784,14 +3964,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile: Optional[Mapping[str, Any]] = None,
     ) -> Any:
         prof = _json_obj(profile)
+        energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=prof)
         params = {
-            "energyTypePlat": _first_text(
-                precise_vehicle.get("energyTypePlat"),
-                selected.get("energyTypePlat"),
-                _field_value(defaults, "能源类型代码", "energyTypePlat"),
-                _profile_text(prof, "energy_type_plat", "0"),
-            ),
-            "energyFlag": _field_value(defaults, "能源标识", "energyFlag", fallback=_profile_text(prof, "energy_flag", "0")),
+            "energyTypePlat": energy_fields["energy_type_plat"],
+            "energyFlag": energy_fields["energy_flag"],
             "clauseType": _field_value(defaults, "条款类型", fallback="F42"),
             "carKindCode": vehicle.get("carKindCode") or "A01",
             "seatCount": _first_text(precise_vehicle.get("vehicleSeat"), selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
