@@ -6,7 +6,7 @@ import html
 import json
 import re
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -57,9 +57,11 @@ MONOPOLY_QUERY_PATH = "/khyx/newFront/qth/myinfo/monopoly/query.do"
 QUERY_QUALITY_FLAG_PATH = "/khyx/newFront/qth/price/queryQualityFlag.do"
 GET_CLUB_GIFT_DISPLAY_INFO_PATH = "/khyx/newFront/qth/price/getClubGiftDisplayInfo.do"
 QUERY_CAR_CHECKER_PATH = "/khyx/newFront/common/queryCarchecker.do"
+GET_CURRENT_TIME_PATH = "/khyx/newFront/price/getCurrentTime.do"
 QUOTE_PATH = "/khyx/newFront/qth/price/quote.do"
 QUERY_QUOTE_TIMES_PATH = "/khyx/newFront/qth/price/queryQuoteTimes.do"
 CLEAR_JS_QUOTATION_NO_PATH = "/khyx/newFront/qth/price/clearJSQuotationNo.do"
+TZ_BJ = timezone(timedelta(hours=8))
 
 JOINT_SALES_QUOTATION_FIELDS = {
     "EAD": "quotationNoEAD",
@@ -446,11 +448,13 @@ class PiccBusinessRequestError(PiccRequestError):
         action: str = "",
         platform_response: Any = None,
         request_body: Optional[Mapping[str, Any]] = None,
+        platform_auto_notices: Optional[List[Mapping[str, Any]]] = None,
     ) -> None:
         super().__init__(message)
         self.action = action
         self.platform_response = platform_response
         self.request_body = dict(request_body or {})
+        self.platform_auto_notices = [dict(item or {}) for item in (platform_auto_notices or []) if isinstance(item, Mapping)]
 
 
 def _json_obj(value: Any) -> Dict[str, Any]:
@@ -812,6 +816,26 @@ def _platform_notice_text(value: Any) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _join_unique_platform_notice_parts(*values: Any) -> str:
+    parts: List[str] = []
+    compact_parts: List[str] = []
+    for value in values:
+        text = _platform_notice_text(value)
+        compact = re.sub(r"\s+", "", text)
+        if not compact:
+            continue
+        if any(compact in existing for existing in compact_parts):
+            continue
+        replacement_index = next((idx for idx, existing in enumerate(compact_parts) if existing in compact), None)
+        if replacement_index is not None:
+            parts[replacement_index] = text
+            compact_parts[replacement_index] = compact
+            continue
+        parts.append(text)
+        compact_parts.append(compact)
+    return "\n".join(parts).strip()
+
+
 def _platform_datetime_text(value: Any) -> str:
     text = _to_str(value).strip()
     if not text:
@@ -828,7 +852,47 @@ def _platform_datetime_text(value: Any) -> str:
         return text
 
 
-def _platform_effective_quote_date(value: Any) -> str:
+def _platform_current_day_from_response(data: Any) -> str:
+    payload = _json_obj(_json_obj(data).get("data"))
+    raw = _to_str(payload.get("currentTime") or payload.get("current_time") or payload.get("time")).strip()
+    if raw:
+        head = raw.split(",", 1)[0].strip()
+        if re.fullmatch(r"\d{12,}", head):
+            try:
+                return datetime.fromtimestamp(int(head) / 1000, TZ_BJ).date().strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        day = _date_text(head)
+        if day:
+            return day
+    for key in ("date", "currentDate", "current_date", "today"):
+        day = _date_text(payload.get(key))
+        if day:
+            return day
+    return ""
+
+
+def _platform_next_quote_start_date_from_day(day: Any) -> str:
+    text = _date_text(day)
+    if not text:
+        return _next_day_text()
+    try:
+        return (datetime.strptime(text, "%Y-%m-%d").date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return _next_day_text()
+
+
+def _date_obj(value: Any) -> Optional[date]:
+    text = _date_text(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _platform_effective_quote_date(value: Any, *, min_day: Any = None) -> str:
     day = _date_text(value)
     if not day:
         return ""
@@ -837,17 +901,51 @@ def _platform_effective_quote_date(value: Any) -> str:
     except ValueError:
         return day
     # 人保 0 点起保不能早于当前时间；历史建议日按次日 0 点重报更稳。
-    min_day = date.today() + timedelta(days=1)
-    if parsed < min_day:
-        parsed = min_day
+    minimum = _date_obj(min_day) or (date.today() + timedelta(days=1))
+    if parsed < minimum:
+        parsed = minimum
     return parsed.strftime("%Y-%m-%d")
 
 
-def _platform_quote_date_command(value: Any) -> str:
+def _platform_quote_date_command(value: Any, *, kinds: Optional[List[str]] = None) -> str:
     day = _platform_effective_quote_date(value)
     if not day:
         return ""
-    return f"商业起保日期：{day}\n交强起保日期：{day}\n人保报价"
+    safe_kinds = {item for item in (kinds or ["bi", "ci"]) if item in {"bi", "ci"}}
+    lines = []
+    if "bi" in safe_kinds:
+        lines.append(f"商业起保日期：{day}")
+    if "ci" in safe_kinds:
+        lines.append(f"交强起保日期：{day}")
+    lines.append("人保报价")
+    return "\n".join(lines)
+
+
+def _insurance_date_notice_from_adjustment(adjustment: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "insurance_date_adjust",
+        "message": _to_str(adjustment.get("message")).strip(),
+        "commercial_start_date": _date_text(adjustment.get("commercial_start_date")),
+        "compulsory_start_date": _date_text(adjustment.get("compulsory_start_date")),
+        "adjustment_kinds": [
+            item
+            for item in (adjustment.get("adjustment_kinds") if isinstance(adjustment.get("adjustment_kinds"), list) else [])
+            if item in {"bi", "ci"}
+        ],
+        "source": adjustment.get("source") or "platform_prompt",
+    }
+
+
+def _emit_insurance_date_adjust_notice(callback: Any, adjustment: Mapping[str, Any]) -> bool:
+    if not callable(callback):
+        return False
+    notice = _insurance_date_notice_from_adjustment(adjustment)
+    if not _to_str(notice.get("message")).strip():
+        return False
+    try:
+        return bool(callback(dict(notice)))
+    except Exception:
+        return False
 
 
 def _format_reinsure_items_prompt(items: Any) -> str:
@@ -871,13 +969,13 @@ def _format_reinsure_items_prompt(items: Any) -> str:
             lines.append("该车辆与现存有效保单存在重复投保，请核实保单概要信息：")
         if len(items) > 1:
             lines.append(f"重复投保记录{index}：")
-        lines.append(f"重复投保单号： {_first_text(item.get('policyNo'), item.get('proposalNo'))}")
-        lines.append(f"保险公司名称： {_first_text(item.get('insurerCode'), item.get('insurerName'))}")
+        lines.append(f"重复投保单号：{_first_text(item.get('policyNo'), item.get('proposalNo'))}")
+        lines.append(f"保险公司名称：{_first_text(item.get('insurerName'), item.get('insurerCode'))}")
         coverage_list = item.get("itemList") if isinstance(item.get("itemList"), list) else []
         if coverage_list:
             lines.append("险种信息： 同步起保日期与险种")
             for coverage_index, coverage in enumerate(coverage_list[:12], start=1):
-                coverage_name = _first_text(_json_obj(coverage).get("coverageCode"), _json_obj(coverage).get("coverageName"))
+                coverage_name = _first_text(_json_obj(coverage).get("coverageName"), _json_obj(coverage).get("coverageCode"))
                 if coverage_name:
                     lines.append(f"{coverage_index} {coverage_name}")
         lines.append(f"号牌号码： {_first_text(item.get('licensePlateNo'), item.get('licenseNo'))}")
@@ -893,12 +991,40 @@ def _format_reinsure_items_prompt(items: Any) -> str:
     return "\n".join(line for line in lines if line is not None).strip()
 
 
+def _reinsure_adjustment_kinds(item: Mapping[str, Any]) -> List[str]:
+    coverage_list = item.get("itemList") if isinstance(item.get("itemList"), list) else []
+    kinds: List[str] = []
+    for coverage_any in coverage_list:
+        coverage = _json_obj(coverage_any)
+        code = _to_str(_first_text(coverage.get("coverageRealCode"), coverage.get("coverageCode"))).strip()
+        name = _to_str(_first_text(coverage.get("coverageName"), coverage.get("coverageCode"))).strip()
+        if code == "051074" or "交强" in name:
+            if "ci" not in kinds:
+                kinds.append("ci")
+        elif code.startswith("051") or "商业" in name or "机动车" in name or "三者" in name or "车上人员" in name:
+            if "bi" not in kinds:
+                kinds.append("bi")
+    return kinds or ["bi"]
+
+
+def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
+    text = _platform_notice_text(message)
+    kinds: List[str] = []
+    if re.search(r"(?:商业险?|商业).{0,8}起保.{0,80}(?:当前时间|之前|不能)", text):
+        kinds.append("bi")
+    if re.search(r"(?:交强险?|交强).{0,8}起保.{0,80}(?:当前时间|之前|不能)", text):
+        kinds.append("ci")
+    return kinds
+
+
 def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     payload = _json_obj(_json_obj(data).get("data"))
     if not payload:
         return {}
     notice = _platform_notice_text(
         _first_text(
+            payload.get("normalizeErrorMsg"),
+            payload.get("errorMsg"),
             payload.get("errorMessage"),
             payload.get("businessControlMsg"),
             payload.get("businessMsg"),
@@ -916,7 +1042,8 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
     advise_start = _first_text(first_reinsure.get("adviseStartDate"), first_reinsure.get("effectiveDate"))
     adjusted_start = _platform_effective_quote_date(advise_start)
-    confirm_command = _platform_quote_date_command(advise_start)
+    adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure) if first_reinsure else []
+    confirm_command = _platform_quote_date_command(advise_start, kinds=adjustment_kinds)
     return {
         "type": "confirm" if confirm_command else "notice",
         "subtype": "insurance_date_adjust" if confirm_command else "quote_platform_notice",
@@ -928,8 +1055,9 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         "cancel_text": "关闭" if confirm_command else "",
         "close_text": "关闭",
         "confirm_action": {"command": confirm_command} if confirm_command else {},
-        "suggested_commercial_start_date": adjusted_start or _date_text(advise_start),
-        "suggested_compulsory_start_date": adjusted_start or _date_text(advise_start),
+        "suggested_commercial_start_date": (adjusted_start or _date_text(advise_start)) if "bi" in adjustment_kinds else "",
+        "suggested_compulsory_start_date": (adjusted_start or _date_text(advise_start)) if "ci" in adjustment_kinds else "",
+        "adjustment_kinds": adjustment_kinds,
         "reinsure_items": reinsure_items[:3] if reinsure_items else [],
     }
 
@@ -2330,24 +2458,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         data=success_data(client, extra=duplicate_confirm_payload),
                     )
                 runtime_stage = "submit_quote"
-                try:
-                    quote_response = self._submit_used_fuel_quote(client, request_body)
-                except PiccBusinessRequestError as exc:
-                    platform_text = json.dumps(getattr(exc, "platform_response", None), ensure_ascii=False, default=str)
-                    if not (_vehicle_platform_mismatch_message(str(exc)) or _vehicle_platform_mismatch_message(platform_text)):
-                        raise
-                    platform_codes = _vehicle_platform_mismatch_codes(str(exc)) + _vehicle_platform_mismatch_codes(platform_text)
-                    corrected_body, corrected = self._rebuild_quote_for_platform_vehicle_code(client, request_body, platform_codes)
-                    if not corrected:
-                        corrected_body, corrected = _accept_platform_returned_vehicle_body(request_body)
-                    if not corrected:
-                        raise
-                    request_body = corrected_body
-                    quote_response = self._submit_used_fuel_quote(client, request_body)
+                request_body, quote_response, auto_period_notices = self._submit_used_fuel_quote_with_period_auto_adjust(
+                    client,
+                    request_body,
+                    auto_notice_callback=_json_obj(ctx.payload).get("auto_notice_callback"),
+                )
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
+                if auto_period_notices:
+                    quote_result["platform_auto_notices"] = auto_period_notices
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
-                if platform_dialog:
+                if platform_dialog and not (
+                    auto_period_notices
+                    and _to_str(platform_dialog.get("subtype")).strip().lower() == "insurance_date_adjust"
+                ):
                     quote_result["platform_dialog"] = platform_dialog
                 runtime_stage = "postchecks"
                 post_quote = self._run_used_fuel_quote_postchecks(client, request_body, quote_response)
@@ -2436,6 +2560,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if isinstance(exc, PiccBusinessRequestError):
                 data_payload["platform_response"] = _platform_debug_payload(getattr(exc, "platform_response", None))
                 data_payload["platform_dialog"] = _platform_business_error_dialog(getattr(exc, "platform_response", None))
+                auto_notices = getattr(exc, "platform_auto_notices", None)
+                if auto_notices:
+                    data_payload["platform_auto_notices"] = [dict(item or {}) for item in auto_notices if isinstance(item, Mapping)]
                 data_payload["request_body_envelope"] = data_payload["request_body"]
                 data_payload["request_form_body"] = getattr(exc, "request_body", None) or {}
                 data_payload["request_body"] = data_payload["request_form_body"] or data_payload["request_body"]
@@ -3620,6 +3747,246 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         _ensure_platform_success(data, action="车辆实际价值计算")
         return data
+
+    def _platform_next_quote_start_date(self, client: PiccProtocolClient) -> str:
+        try:
+            data = client.request_json(
+                "GET",
+                GET_CURRENT_TIME_PATH,
+                purpose="business",
+                params={"timeFormat": "yyyy-MM-dd"},
+                headers={"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"},
+            )
+            current_day = _platform_current_day_from_response(data)
+            if current_day:
+                return _platform_next_quote_start_date_from_day(current_day)
+        except Exception:
+            pass
+        return _next_day_text()
+
+    def _insurance_date_adjustment_from_platform_response(
+        self,
+        client: PiccProtocolClient,
+        platform_response: Any,
+        *,
+        error_message: Any = "",
+    ) -> Dict[str, Any]:
+        dialog = _used_fuel_quote_platform_dialog(platform_response)
+        message = _to_str(dialog.get("message")).strip()
+        kinds = [item for item in (dialog.get("adjustment_kinds") if isinstance(dialog.get("adjustment_kinds"), list) else []) if item in {"bi", "ci"}]
+        reinsure_items = dialog.get("reinsure_items") if isinstance(dialog.get("reinsure_items"), list) else []
+        first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
+        candidate_date = _first_text(
+            first_reinsure.get("adviseStartDate"),
+            first_reinsure.get("effectiveDate"),
+            dialog.get("suggested_commercial_start_date"),
+            dialog.get("suggested_compulsory_start_date"),
+        )
+
+        if not kinds:
+            platform_body = _json_obj(_json_obj(platform_response).get("data"))
+            platform_text = _join_unique_platform_notice_parts(
+                platform_body.get("normalizeErrorMsg"),
+                platform_body.get("errorMsg"),
+                platform_body.get("errorMessage"),
+                _platform_message(platform_response, ""),
+            )
+            detect_text = _join_unique_platform_notice_parts(platform_text, error_message)
+            kinds = _insurance_date_error_adjustment_kinds(detect_text)
+            if kinds:
+                message = platform_text or detect_text
+
+        if not kinds:
+            return {}
+
+        platform_next_day = self._platform_next_quote_start_date(client)
+        start_day = _platform_effective_quote_date(candidate_date or platform_next_day, min_day=platform_next_day)
+        if not start_day:
+            start_day = platform_next_day
+        return {
+            "message": message or "平台提示需要修改保险期间，已按平台当前时间自动调整。",
+            "start_date": start_day,
+            "commercial_start_date": start_day if "bi" in kinds else "",
+            "compulsory_start_date": start_day if "ci" in kinds else "",
+            "adjustment_kinds": kinds,
+            "source": "platform_current_time_and_quote_prompt",
+        }
+
+    def _apply_insurance_date_adjustment_to_request_body(
+        self,
+        client: PiccProtocolClient,
+        request_body: Mapping[str, Any],
+        adjustment: Mapping[str, Any],
+    ) -> tuple[Dict[str, Any], bool, Dict[str, Any]]:
+        body = dict(_json_obj(request_body))
+        form = dict(_json_obj(body.get("quoteForm")))
+        vehicle = dict(_json_obj(body.get("vehicleForm")))
+        owner = dict(_json_obj(body.get("ownerForm")))
+        defaults = dict(_json_obj(body.get("defaultFields")))
+        preflight = dict(_json_obj(body.get("preflight")))
+        selected = _json_obj(preflight.get("selectedVehicle"))
+        precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
+        profile = _motor_quote_profile(body.get("accountTypeName")) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
+        if not form or not vehicle:
+            return body, False, {}
+
+        kinds = [item for item in (adjustment.get("adjustment_kinds") if isinstance(adjustment.get("adjustment_kinds"), list) else []) if item in {"bi", "ci"}]
+        bi_day = _date_text(adjustment.get("commercial_start_date"))
+        ci_day = _date_text(adjustment.get("compulsory_start_date"))
+        changed = False
+
+        if "bi" in kinds and bi_day:
+            if _to_str(form.get("prpCmain.startDate")).strip() != bi_day:
+                form["prpCmain.startDate"] = bi_day
+                changed = True
+            if _to_str(vehicle.get("startDateBI")).strip() != bi_day:
+                vehicle["startDateBI"] = bi_day
+                changed = True
+        if "ci" in kinds and ci_day:
+            if _to_str(form.get("prpCmain.startDateCI")).strip() != ci_day:
+                form["prpCmain.startDateCI"] = ci_day
+                changed = True
+            if _to_str(vehicle.get("startDateCI")).strip() != ci_day:
+                vehicle["startDateCI"] = ci_day
+                changed = True
+            form["prpCmain.endDateCI"] = _end_date_text(ci_day)
+
+        recalculated_actual_value = ""
+        if changed and "bi" in kinds and selected:
+            try:
+                actual_value_result = self._query_actual_value(client, vehicle, defaults, selected, precise_vehicle, profile=profile)
+                platform_purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
+                actual_value = _actual_value_from_response(actual_value_result, platform_purchase_price or selected.get("actualValue"))
+                if _profile_text(profile, "new_car_flag") and platform_purchase_price:
+                    actual_value = platform_purchase_price
+                recalculated_actual_value = _money_text(actual_value)
+                if recalculated_actual_value:
+                    vehicle["actualValue"] = recalculated_actual_value
+                    form["prpCitemCar.actualValue"] = recalculated_actual_value
+                    form["prpCitemCar.referenceActualValue"] = recalculated_actual_value
+
+                    vehicle_search = _json_obj(preflight.get("vehicleSearch"))
+                    has_explicit_loss = (
+                        _money(vehicle_search.get("requestedLossAmount")) > 0
+                        or _has_text(_default_value(defaults, PRODUCT_LOSS))
+                        or _product_excluded(defaults, PRODUCT_LOSS)
+                    )
+                    if not has_explicit_loss:
+                        loss_index = _quote_form_kind_index(form, "051050")
+                        if loss_index is not None:
+                            form[f"prpCitemKindVos[{loss_index}].amount"] = recalculated_actual_value
+                        product_form = dict(_json_obj(body.get("productForm")))
+                        products = product_form.get("products") if isinstance(product_form.get("products"), list) else []
+                        for row in products:
+                            if isinstance(row, dict) and _canonical_product_name(row.get("name")) == _canonical_product_name(PRODUCT_LOSS):
+                                row["insuredAmount"] = recalculated_actual_value
+                        if product_form:
+                            body["productForm"] = product_form
+            except Exception as exc:
+                preflight["insuranceDateAutoAdjustActualValueError"] = str(exc)[:300] or exc.__class__.__name__
+
+        if not changed:
+            return body, False, {}
+
+        notice = {
+            "type": "insurance_date_adjust",
+            "message": _to_str(adjustment.get("message")).strip(),
+            "commercial_start_date": bi_day,
+            "compulsory_start_date": ci_day,
+            "adjustment_kinds": kinds,
+            "actual_value": recalculated_actual_value,
+            "source": adjustment.get("source") or "platform_prompt",
+        }
+        preflight["insuranceDateAutoAdjusted"] = notice
+        body["quoteForm"] = form
+        body["vehicleForm"] = vehicle
+        body["ownerForm"] = owner
+        body["defaultFields"] = defaults
+        body["preflight"] = preflight
+        return body, True, notice
+
+    def _submit_used_fuel_quote_with_vehicle_retry(
+        self,
+        client: PiccProtocolClient,
+        request_body: Mapping[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        body = dict(_json_obj(request_body))
+        try:
+            return body, self._submit_used_fuel_quote(client, body)
+        except PiccBusinessRequestError as exc:
+            platform_text = json.dumps(getattr(exc, "platform_response", None), ensure_ascii=False, default=str)
+            if not (_vehicle_platform_mismatch_message(str(exc)) or _vehicle_platform_mismatch_message(platform_text)):
+                raise
+            platform_codes = _vehicle_platform_mismatch_codes(str(exc)) + _vehicle_platform_mismatch_codes(platform_text)
+            corrected_body, corrected = self._rebuild_quote_for_platform_vehicle_code(client, body, platform_codes)
+            if not corrected:
+                corrected_body, corrected = _accept_platform_returned_vehicle_body(body)
+            if not corrected:
+                raise
+            return corrected_body, self._submit_used_fuel_quote(client, corrected_body)
+
+    def _submit_used_fuel_quote_with_period_auto_adjust(
+        self,
+        client: PiccProtocolClient,
+        request_body: Mapping[str, Any],
+        *,
+        auto_notice_callback: Any = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+        notices: List[Dict[str, Any]] = []
+        body = dict(_json_obj(request_body))
+        try:
+            body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, body)
+        except PiccBusinessRequestError as exc:
+            adjustment = self._insurance_date_adjustment_from_platform_response(
+                client,
+                getattr(exc, "platform_response", None),
+                error_message=str(exc),
+            )
+            adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
+            if not changed:
+                raise
+            emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
+            if emitted:
+                notice["emitted_to_chat"] = True
+            notices.append(notice)
+            try:
+                body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, adjusted_body)
+            except PiccBusinessRequestError as retry_exc:
+                retry_exc.platform_auto_notices = [
+                    *getattr(retry_exc, "platform_auto_notices", []),
+                    *notices,
+                ]
+                raise
+
+        # HAR confirms the page may show "修改保险期间" after a quote response:
+        # it fills a platform-current valid start date, recalculates actual value,
+        # then submits quote.do again. Keep this bounded to avoid loops.
+        for _ in range(2):
+            adjustment = self._insurance_date_adjustment_from_platform_response(client, quote_response)
+            adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
+            if not changed:
+                if adjustment and adjustment.get("message") and not notices:
+                    ready_notice = _insurance_date_notice_from_adjustment(adjustment)
+                    ready_notice["already_effective"] = True
+                    emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
+                    if emitted:
+                        ready_notice["emitted_to_chat"] = True
+                    notices.append(ready_notice)
+                break
+            emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
+            if emitted:
+                notice["emitted_to_chat"] = True
+            notices.append(notice)
+            try:
+                body, quote_response = self._submit_used_fuel_quote_with_vehicle_retry(client, adjusted_body)
+            except PiccBusinessRequestError as retry_exc:
+                retry_exc.platform_auto_notices = [
+                    *getattr(retry_exc, "platform_auto_notices", []),
+                    *notices,
+                ]
+                raise
+
+        return body, quote_response, notices
 
     def _used_fuel_products(
         self,

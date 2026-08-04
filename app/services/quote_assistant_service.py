@@ -4754,6 +4754,7 @@ def _quote_platform_dialog_response(
         platform_code=platform_code,
         platform_name=platform_name,
     )
+    visible_to_chat = not bool(dialog.get("confirm_required"))
     payload = {
         "quote_case": {
             "id": case.id,
@@ -4772,7 +4773,7 @@ def _quote_platform_dialog_response(
         "platform_account": _credential_public_payload(platform_account),
         "platform_dialog": dialog,
         "quote_runtime": _runtime_result_payload(runtime_result),
-        "ui_visible": False,
+        "ui_visible": visible_to_chat,
     }
     payload.update(_json_obj(extra_payload))
     data = _mk_data(
@@ -4781,16 +4782,16 @@ def _quote_platform_dialog_response(
         entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
         payload=payload,
     )
-    data["silent"] = True
-    data["ui_visible"] = False
+    data["silent"] = not visible_to_chat
+    data["ui_visible"] = visible_to_chat
     return (
-        "",
+        message if visible_to_chat else "",
         {
             "status": response_status,
             "intent": "quote",
             "trace_id": trace_id,
-            "silent": True,
-            "ui_visible": False,
+            "silent": not visible_to_chat,
+            "ui_visible": visible_to_chat,
             "data": data,
             "actions": actions or [],
         },
@@ -5211,7 +5212,7 @@ async def _select_quote_platform_account(
             owner_rank = 0 if _safe_int(_loaded_value(row, "owner_user_id"), 0) == int(owner_user_id) else 1
             auto_rank = 0 if bool(_loaded_value(row, "auto_login")) else 1
             last_used = _to_str(_loaded_value(row, "last_used_at")).strip()
-            return (login_rank, type_rank, owner_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
+            return (type_rank, login_rank, owner_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
 
         rows.sort(key=account_rank)
     account_ids = [int(row.id) for row in rows if getattr(row, "id", None)]
@@ -8463,6 +8464,236 @@ def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, acco
     return f"{display_name}风险水平：{risk_score or '-'} 分"
 
 
+async def _persist_unemitted_quote_auto_notices(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    result: Mapping[str, Any],
+    trace_id: str,
+    task_id: Any,
+    platform_code: str,
+    platform_name: str,
+) -> int:
+    emitted = 0
+    seen: Set[str] = set()
+    from app.services.ai_assistant_service import db_append_message
+
+    for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
+        notice = _json_obj(notice_any)
+        if _to_str(notice.get("type")).strip() != "insurance_date_adjust":
+            continue
+        if notice.get("emitted_to_chat") is True:
+            continue
+        message = sanitize_quote_user_message(notice.get("message"), "")
+        if not message:
+            continue
+        dedupe_key = re.sub(r"\s+", "", message)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        payload = {
+            "quote_case": {"id": case.id, "status": CASE_STATUS_READY},
+            "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
+            "platform_code": _to_str(platform_code).strip().upper(),
+            "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
+            "platform_auto_notice": {
+                "type": "insurance_date_adjust",
+                "message": message,
+                "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
+                "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
+                "adjustment_kinds": [
+                    item
+                    for item in _json_list(notice.get("adjustment_kinds"))
+                    if _to_str(item).strip() in {"bi", "ci"}
+                ],
+                "source": _to_str(notice.get("source")).strip() or "platform_prompt",
+                "fallback_persisted": True,
+            },
+            "ui_visible": True,
+        }
+        metadata = {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "data": _mk_data(
+                result_status=RESULT_NOT_READY,
+                message=message,
+                entities={"quote_case_id": case.id, "quote_task_id": _safe_int(task_id, 0), "order_id": case.order_id},
+                payload=payload,
+            ),
+            "actions": [],
+        }
+        await db_append_message(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=case.session_id,
+            role="assistant",
+            content=message,
+            metadata=metadata,
+        )
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="platform_notice",
+            role="assistant",
+            content=redact_quote_sensitive_text(message),
+            payload=payload,
+        )
+        notice["emitted_to_chat"] = True
+        emitted += 1
+    return emitted
+
+
+def _attach_quote_auto_notice_callback(
+    platform_ctx: PlatformAccountContext,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    case_id: Any,
+    task_id: Any,
+    trace_id: str,
+    platform_code: str,
+    platform_name: str,
+) -> PlatformAccountContext:
+    """Let synchronous platform code publish a user-visible notice before auto retrying."""
+
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip()
+    if owner <= 0 or not sid:
+        return platform_ctx
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return platform_ctx
+
+    emitted_keys: Set[str] = set()
+
+    async def persist_notice(notice_any: Any) -> bool:
+        notice = _json_obj(notice_any)
+        if _to_str(notice.get("type")).strip() != "insurance_date_adjust":
+            return False
+        message = sanitize_quote_user_message(notice.get("message"), "")
+        if not message:
+            return False
+        from app.core.db import async_session_factory
+        from app.services.ai_assistant_service import db_append_message
+
+        payload = {
+            "quote_case": {"id": _safe_int(case_id, 0), "status": CASE_STATUS_READY},
+            "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
+            "platform_code": _to_str(platform_code).strip().upper(),
+            "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
+            "platform_auto_notice": {
+                "type": "insurance_date_adjust",
+                "message": message,
+                "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
+                "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
+                "adjustment_kinds": [
+                    item
+                    for item in (_json_list(notice.get("adjustment_kinds")))
+                    if _to_str(item).strip() in {"bi", "ci"}
+                ],
+                "source": _to_str(notice.get("source")).strip() or "platform_prompt",
+            },
+            "ui_visible": True,
+        }
+        metadata = {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "data": _mk_data(
+                result_status=RESULT_NOT_READY,
+                message=message,
+                entities={"quote_case_id": _safe_int(case_id, 0), "quote_task_id": _safe_int(task_id, 0)},
+                payload=payload,
+            ),
+            "actions": [],
+        }
+        async with async_session_factory() as notice_db:
+            try:
+                await db_append_message(
+                    notice_db,
+                    owner_user_id=owner,
+                    session_id=sid,
+                    role="assistant",
+                    content=message,
+                    metadata=metadata,
+                )
+                if _safe_int(case_id, 0) > 0:
+                    notice_db.add(
+                        QuoteCaseEvent(
+                            quote_case_id=_safe_int(case_id, 0),
+                            owner_user_id=owner,
+                            session_id=sid,
+                            event_type="platform_notice",
+                            role="assistant",
+                            content=redact_quote_sensitive_text(message),
+                            payload=payload,
+                        )
+                    )
+                await notice_db.commit()
+                return True
+            except Exception:
+                await notice_db.rollback()
+                raise
+
+    def auto_notice_callback(notice_any: Any) -> bool:
+        notice = _json_obj(notice_any)
+        message = sanitize_quote_user_message(notice.get("message"), "")
+        if not message:
+            return False
+        key = hashlib.sha1(
+            "|".join(
+                [
+                    _to_str(case_id),
+                    _to_str(task_id),
+                    _to_str(notice.get("type")).strip(),
+                    re.sub(r"\s+", "", message),
+                ]
+            ).encode("utf-8", errors="ignore")
+        ).hexdigest()
+        if key in emitted_keys:
+            return True
+        try:
+            try:
+                if asyncio.get_running_loop() is loop:
+                    return False
+            except RuntimeError:
+                pass
+            future = asyncio.run_coroutine_threadsafe(persist_notice(notice), loop)
+            ok = bool(future.result(timeout=8))
+            if ok:
+                emitted_keys.add(key)
+            return ok
+        except Exception as exc:
+            logger.warning(
+                "quote auto notice emit failed: trace_id=%s case_id=%s task_id=%s error=%s",
+                trace_id,
+                case_id,
+                task_id,
+                str(exc) or exc.__class__.__name__,
+            )
+            return False
+
+    payload = dict(_json_obj(platform_ctx.payload))
+    payload["auto_notice_callback"] = auto_notice_callback
+    return PlatformAccountContext(
+        platform_code=platform_ctx.platform_code,
+        platform_name=platform_ctx.platform_name,
+        account_id=platform_ctx.account_id,
+        account_username=platform_ctx.account_username,
+        owner_user_id=platform_ctx.owner_user_id,
+        account_password=platform_ctx.account_password,
+        account_type_name=platform_ctx.account_type_name,
+        browser_env_key=platform_ctx.browser_env_key,
+        profile_dir=platform_ctx.profile_dir,
+        payload=payload,
+    )
+
+
 def _quote_card_time_text(value: Optional[datetime] = None) -> str:
     ts = value or _now()
     try:
@@ -11197,6 +11428,16 @@ async def _complete_waiting_task(
                 },
             )
     platform_quote_started = time.perf_counter()
+    platform_ctx = _attach_quote_auto_notice_callback(
+        platform_ctx,
+        owner_user_id=owner_user_id,
+        session_id=case.session_id,
+        case_id=case.id,
+        task_id=task.id,
+        trace_id=trace_id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     if await _quote_task_was_cancelled(db, task=task):
@@ -11463,6 +11704,17 @@ async def _complete_waiting_task(
         payload={"task_id": task.id, "status": "success", "trace_id": trace_id, "result": result},
     )
     await db.flush()
+    await _persist_unemitted_quote_auto_notices(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        result=result,
+        trace_id=trace_id,
+        task_id=task.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    await db.flush()
 
     reply = _quote_result_reply_text(result, platform_name=platform_name)
     payload = {
@@ -11663,6 +11915,16 @@ async def _complete_quote_without_sms(
             },
         )
     platform_quote_started = time.perf_counter()
+    platform_ctx = _attach_quote_auto_notice_callback(
+        platform_ctx,
+        owner_user_id=owner_user_id,
+        session_id=case.session_id,
+        case_id=case.id,
+        task_id=task.id,
+        trace_id=trace_id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     if await _quote_task_was_cancelled(db, task=task):
@@ -11968,6 +12230,17 @@ async def _complete_quote_without_sms(
         event_type="task",
         role="system",
         payload={"task_id": task.id, "status": TASK_STATUS_SUCCESS, "trace_id": trace_id, "result": result, "login_mode": login_mode},
+    )
+    await db.flush()
+    await _persist_unemitted_quote_auto_notices(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        result=result,
+        trace_id=trace_id,
+        task_id=task.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
     )
     await db.flush()
 

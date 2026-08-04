@@ -890,6 +890,7 @@ async def _db_get_session_row(
             QuoteAssistantSession.session_id == sid,
             QuoteAssistantSession.deleted.is_(False),
         )
+        .execution_options(populate_existing=True)
         .limit(1)
     )
     return (await db.execute(stmt)).scalars().first()
@@ -3018,8 +3019,8 @@ def _dispatch_error_reply(
 ) -> Tuple[str, Dict[str, Any]]:
     detail = _humanize_exception(error)
     role_name = _ctx_role_name(ctx or {})
-    can_use_quote = role_name in {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES}
-    actions = [_mk_action("查看当前材料状态"), _mk_action("太平洋报价")] if can_use_quote else [_mk_action("查订单")]
+    can_use_quote = role_name in {ROLE_SUPER_ADMIN, ROLE_MANAGER, ROLE_SALES, ROLE_FINANCE, ROLE_MARKET}
+    actions = [_mk_action("查看当前材料状态"), _mk_action("人保报价")] if can_use_quote else [_mk_action("查订单")]
     fallback_hint = "查看当前材料状态" if can_use_quote else "查订单 车牌号或车主姓名"
     first_line = "这次处理没成功。"
     if detail and detail != "处理失败，请稍后重试":
