@@ -249,6 +249,12 @@ QUOTE_ACCOUNT_TYPE_OPTIONS: Tuple[str, ...] = ("油车-新", "油车-旧", "新�
 QUOTE_ACCOUNT_TYPE_ALIASES: Dict[str, str] = {
     "新油车": "油车-新",
     "旧油车": "油车-旧",
+    "油车新": "油车-新",
+    "油车旧": "油车-旧",
+    "燃油车新": "油车-新",
+    "燃油车旧": "油车-旧",
+    "新燃油": "油车-新",
+    "旧燃油": "油车-旧",
     "新车": "油车-新",
     "旧车": "油车-旧",
     "二手车": "油车-旧",
@@ -267,6 +273,12 @@ QUOTE_ACCOUNT_TYPE_ALIASES: Dict[str, str] = {
     "旧新能源车": "新能源车-旧",
     "新能源旧车": "新能源车-旧",
     "新能源车旧": "新能源车-旧",
+    "新能源新": "新能源车-新",
+    "新能源旧": "新能源车-旧",
+    "纯电新车": "新能源车-新",
+    "纯电旧车": "新能源车-旧",
+    "电车新车": "新能源车-新",
+    "电车旧车": "新能源车-旧",
     "二手新能源车": "新能源车-旧",
 }
 QUOTE_ACCOUNT_TYPE_SET = set(QUOTE_ACCOUNT_TYPE_OPTIONS)
@@ -953,28 +965,28 @@ REQUIRED_FIELDS: Tuple[Tuple[str, str], ...] = (
 CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE: Dict[str, Tuple[Tuple[str, str], ...]] = {
     "油车-新": (
         ("engine_no", "发动机号"),
-        ("vin", "VIN/车架号"),
+        ("vin", "车架号"),
         ("vehicle_model", "车型名称"),
         ("owner_name", "车主姓名"),
     ),
     "油车-旧": (
         ("plate_no", "号牌号码"),
         ("engine_no", "发动机号"),
-        ("vin", "VIN/车架号"),
+        ("vin", "车架号"),
         ("first_register_date", "初登日期"),
         ("vehicle_model", "车型名称"),
         ("owner_name", "车主姓名"),
     ),
     "新能源车-新": (
         ("engine_no", "发动机号"),
-        ("vin", "VIN/车架号"),
+        ("vin", "车架号"),
         ("vehicle_model", "车型名称"),
         ("owner_name", "车主姓名"),
     ),
     "新能源车-旧": (
         ("plate_no", "号牌号码"),
         ("engine_no", "发动机号"),
-        ("vin", "VIN/车架号"),
+        ("vin", "车架号"),
         ("first_register_date", "初登日期"),
         ("vehicle_model", "车型名称"),
         ("owner_name", "车主姓名"),
@@ -1086,6 +1098,27 @@ QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
     "专管名称",
     "monopolyCode",
     "monopolyName",
+}
+
+QUOTE_DATA_OVERRIDES_KEY = "quote_data_overrides"
+
+QUOTE_DATA_OVERRIDE_ALIASES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("owner_name", "车主姓名", ("车主姓名", "车主名称", "客户姓名", "客户名称", "行驶证所有人", "所有人", "被保险人姓名", "被保险人", "投保人姓名", "投保人", "联系人姓名", "车主", "姓名")),
+    ("id_name", "身份证姓名", ("身份证姓名", "证件姓名", "身份证名字", "证件名字")),
+    ("owner_phone", "车主手机号", ("车主手机号", "车主手机", "车主电话", "客户手机号", "客户手机", "被保险人手机号", "被保人手机号", "投保人手机号", "联系电话", "手机号", "手机号码", "手机", "电话")),
+    ("id_number", "身份证号", ("身份证号", "身份证号码", "证件号", "证件号码", "身份证")),
+    ("plate_no", "车牌号", ("号牌号码", "车牌号码", "车牌号", "号牌", "车牌")),
+    ("vin", "车架号", ("车辆识别代号", "VIN码", "VIN", "车架号", "车架")),
+    ("engine_no", "发动机号", ("发动机号码", "发动机号", "发动机")),
+    ("vehicle_model", "车型名称", ("车辆品牌/车辆名称", "车辆品牌/车辆型号", "品牌型号", "车型名称", "车辆型号", "车型")),
+    ("first_register_date", "初登日期", ("初登日期", "初登", "初次登记日期", "注册日期", "登记日期")),
+    ("issue_date", "行驶证发证日期", ("行驶证发证日期", "发证日期", "发证时间")),
+    ("commercial_start_date", "商业起保日期", ("商业起保日期", "商业险起保日期", "商业起保", "商业险起期")),
+    ("compulsory_start_date", "交强起保日期", ("交强起保日期", "交强险起保日期", "交强起保", "交强险起期")),
+)
+
+QUOTE_DATA_OVERRIDE_LABELS: Dict[str, str] = {
+    key: label for key, label, _ in QUOTE_DATA_OVERRIDE_ALIASES
 }
 
 QUOTE_IMAGE_FIELDS_BY_SLOT: Dict[str, Tuple[str, ...]] = {
@@ -1477,10 +1510,15 @@ def _normalize_quote_case_data(
     images_by_slot: Dict[str, List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
     base = _clean_quote_dynamic_data(_merge_data(_json_obj(base_data), _json_obj(order_data)))
+    base_overrides = _json_obj(base.get(QUOTE_DATA_OVERRIDES_KEY))
     base = _drop_uploaded_image_managed_fields(base, images_by_slot)
     image_data = _active_image_extracted_data(images_by_slot)
     text_clean = _clean_quote_dynamic_data(_json_obj(text_data))
-    merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean))
+    text_overrides = _json_obj(text_clean.get(QUOTE_DATA_OVERRIDES_KEY))
+    merged_overrides = _merge_quote_data_overrides(base_overrides, text_overrides)
+    merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean, merged_overrides))
+    if merged_overrides:
+        merged[QUOTE_DATA_OVERRIDES_KEY] = merged_overrides
     return _apply_transfer_vehicle_state(merged)
 
 
@@ -1495,11 +1533,17 @@ def _quote_material_issues(
     images_by_slot: Dict[str, List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
     data = _clean_quote_dynamic_data(_json_obj(normalized_data))
+    manual_overrides = _json_obj(data.get(QUOTE_DATA_OVERRIDES_KEY))
     issues: List[Dict[str, Any]] = []
 
     owner_name = _to_str(data.get("owner_name")).strip()
     id_name = _to_str(data.get("id_name")).strip()
-    if owner_name and id_name and not _same_material_text(owner_name, id_name):
+    if (
+        owner_name
+        and id_name
+        and not _same_material_text(owner_name, id_name)
+        and not ({"owner_name", "id_name"} & set(manual_overrides))
+    ):
         issues.append(
             {
                 "type": "data_conflict",
@@ -1512,7 +1556,7 @@ def _quote_material_issues(
     slot_data = _slot_extracted_data_map(images_by_slot)
     cert_vin = _to_str(slot_data.get("vehicle_cert", {}).get("vin")).strip()
     license_vin = _to_str(slot_data.get("driving_license_main", {}).get("vin")).strip()
-    if cert_vin and license_vin and cert_vin != license_vin:
+    if cert_vin and license_vin and cert_vin != license_vin and "vin" not in manual_overrides:
         issues.append(
             {
                 "type": "data_conflict",
@@ -1524,7 +1568,7 @@ def _quote_material_issues(
 
     cert_engine = _to_str(slot_data.get("vehicle_cert", {}).get("engine_no")).strip()
     license_engine = _to_str(slot_data.get("driving_license_main", {}).get("engine_no")).strip()
-    if cert_engine and license_engine and cert_engine != license_engine:
+    if cert_engine and license_engine and cert_engine != license_engine and "engine_no" not in manual_overrides:
         issues.append(
             {
                 "type": "data_conflict",
@@ -1625,6 +1669,8 @@ def _required_slots_for_quote(
     if _to_str(platform_code).strip().upper() == "PICC" and not config_type:
         return ()
     if config_type in CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE:
+        if _quote_text_only_material_mode(normalized_data, images_by_slot):
+            return ()
         required_fields = CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE.get(config_type, ())
         if required_fields and all(_to_str(_json_obj(normalized_data).get(key)).strip() for key, _ in required_fields):
             return ()
@@ -1688,12 +1734,119 @@ def _extract_labeled_value(text: str, labels: Tuple[str, ...], *, max_len: int =
     label_expr = "|".join(re.escape(x) for x in sorted(labels, key=len, reverse=True) if x)
     if not label_expr:
         return None
-    pattern = rf"(?:{label_expr})\s*[:：=]?\s*([^\s,，,;；。]+)"
+    pattern = rf"(?:{label_expr})\s*(?:[:：=]|是|为)?\s*([^\s,，,;；。]+)"
     match = re.search(pattern, text, flags=re.IGNORECASE)
     if not match:
         return None
     value = _clean_secret_value(match.group(1), max_len=max_len)
     return value or None
+
+
+_QUOTE_TEXT_VALUE_BOUNDARY_LABELS = (
+    "车主手机号",
+    "车主手机",
+    "车主电话",
+    "客户手机号",
+    "客户手机",
+    "手机号",
+    "手机号码",
+    "手机",
+    "电话",
+    "被保险人手机号",
+    "被保人手机号",
+    "投保人手机号",
+    "联系电话",
+    "身份证号",
+    "身份证号码",
+    "身份证",
+    "证件号",
+    "证件号码",
+    "车牌号码",
+    "车牌号",
+    "车牌",
+    "号牌号码",
+    "号牌",
+    "VIN码",
+    "VIN",
+    "车架号",
+    "车辆识别代号",
+    "发动机号",
+    "发动机号码",
+    "发动机",
+    "车辆品牌/车辆名称",
+    "车辆品牌/车辆型号",
+    "车型名称",
+    "车型",
+    "品牌型号",
+    "车辆型号",
+    "初登",
+    "初登日期",
+    "初次登记日期",
+    "注册日期",
+    "登记日期",
+    "发证日期",
+    "行驶证发证日期",
+    "商业起保日期",
+    "商业险起保日期",
+    "交强起保日期",
+    "交强险起保日期",
+)
+
+
+_QUOTE_OWNER_NAME_FORBIDDEN_PREFIXES = (
+    "车主手机号",
+    "车主手机",
+    "车主电话",
+    "客户手机号",
+    "客户手机",
+    "手机号",
+    "手机号码",
+    "手机",
+    "电话",
+    "身份证号",
+    "身份证号码",
+    "身份证",
+    "证件号",
+    "证件号码",
+    "车牌号码",
+    "车牌号",
+    "车牌",
+    "号牌号码",
+    "号牌",
+    "VIN码",
+    "VIN",
+    "车架号",
+    "车辆识别代号",
+    "发动机号",
+    "发动机号码",
+    "发动机",
+    "车型名称",
+    "车型",
+    "品牌型号",
+)
+
+
+def _trim_quote_text_value_at_next_label(value: Any) -> str:
+    text = _to_str(value).strip()
+    if not text:
+        return ""
+    cut_at: Optional[int] = None
+    for label in _QUOTE_TEXT_VALUE_BOUNDARY_LABELS:
+        label_text = _to_str(label).strip()
+        if not label_text:
+            continue
+        pos = text.find(label_text)
+        if pos > 0 and (cut_at is None or pos < cut_at):
+            cut_at = pos
+    return (text[:cut_at] if cut_at is not None else text).strip()
+
+
+def _quote_owner_name_value_blocked(value: Any) -> bool:
+    text = _to_str(value).strip()
+    if not text:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    return any(compact.startswith(prefix) for prefix in _QUOTE_OWNER_NAME_FORBIDDEN_PREFIXES)
 
 
 _LOGIN_PHONE_HINTS = (
@@ -1721,6 +1874,10 @@ _OWNER_PHONE_HINTS = (
     "车主电话",
     "客户手机号",
     "客户手机",
+    "手机号",
+    "手机号码",
+    "手机",
+    "电话",
     "被保险人手机号",
     "被保人手机号",
     "投保人手机号",
@@ -1729,10 +1886,13 @@ _OWNER_PHONE_HINTS = (
 
 _OWNER_NAME_HINTS = (
     "被保险人姓名",
+    "被保人姓名",
     "投保人姓名",
     "联系人姓名",
     "车主姓名",
     "车主名称",
+    "车主",
+    "所有人",
     "姓名",
 )
 
@@ -2193,6 +2353,198 @@ def _quote_override_summary(overrides: Any) -> str:
         if label and text:
             pairs.append(f"{label}={text}")
     return "、".join(pairs[:8])
+
+
+def _quote_data_override_alias_items() -> Tuple[Tuple[str, str, str], ...]:
+    items: List[Tuple[str, str, str]] = []
+    for key, label, aliases in QUOTE_DATA_OVERRIDE_ALIASES:
+        for alias in aliases:
+            alias_text = _to_str(alias).strip()
+            if alias_text:
+                items.append((key, label, alias_text))
+    return tuple(sorted(items, key=lambda item: len(item[2]), reverse=True))
+
+
+def _quote_data_override_value_pattern(field_key: str) -> str:
+    if field_key == "owner_phone":
+        return r"(1\d{10})"
+    if field_key == "id_number":
+        return r"(\d{17}[\dXx])"
+    if field_key == "plate_no":
+        return r"([\u4e00-\u9fff][A-Za-z][A-Za-z0-9]{4,7})"
+    if field_key == "vin":
+        return r"([A-HJ-NPR-Za-hj-npr-z0-9]{11,20})"
+    if field_key == "engine_no":
+        return r"([A-Za-z0-9\-]{4,32})"
+    if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
+        return r"(\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2})"
+    if field_key in {"owner_name", "id_name"}:
+        return r"([\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,40})"
+    if field_key == "vehicle_model":
+        return r"([^\s,，,;；。]{2,80})"
+    return r"([^\s,，,;；。]{1,128})"
+
+
+def _trim_quote_data_override_value(field_key: str, value: str) -> str:
+    text = _to_str(value).strip()
+    if field_key not in {"owner_name", "id_name", "vehicle_model"} or not text:
+        return text
+    current_aliases = {
+        alias
+        for key, _label, aliases in QUOTE_DATA_OVERRIDE_ALIASES
+        if key == field_key
+        for alias in aliases
+    }
+    cut_at: Optional[int] = None
+    for key, _label, aliases in QUOTE_DATA_OVERRIDE_ALIASES:
+        if key == field_key:
+            continue
+        for alias in aliases:
+            alias_text = _to_str(alias).strip()
+            if not alias_text or alias_text in current_aliases:
+                continue
+            pos = text.find(alias_text)
+            if pos == 0:
+                return ""
+            if pos > 0 and (cut_at is None or pos < cut_at):
+                cut_at = pos
+    return text[:cut_at].strip() if cut_at is not None else text
+
+
+def _clean_quote_data_override_value(field_key: str, value: Any) -> Any:
+    raw = _trim_quote_data_override_value(field_key, _to_str(value)).strip().strip("，,。.;；")
+    if not raw:
+        return None
+    if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
+        return _normalize_quote_date_text(raw) or None
+    if field_key in {"vin", "engine_no", "plate_no", "id_number"}:
+        raw = re.sub(r"\s+", "", raw).upper()
+    if field_key == "owner_phone":
+        return _normalize_owner_phone(raw)
+    cleaned = _clean_quote_dynamic_data({field_key: raw}, derive_owner_name=False)
+    value = cleaned.get(field_key)
+    if value in (None, ""):
+        return None
+    return value
+
+
+def _merge_quote_data_overrides(*items: Any) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    allowed = set(QUOTE_DATA_OVERRIDE_LABELS)
+    for item in items:
+        for key, value in _json_obj(item).items():
+            field_key = _to_str(key).strip()
+            if field_key not in allowed:
+                continue
+            cleaned = _clean_quote_data_override_value(field_key, value)
+            if cleaned in (None, ""):
+                continue
+            merged[field_key] = cleaned
+    # 身份姓名在报价请求里最终按车主姓名使用。人工只修正其中一个时，
+    # 两侧同步，避免旧 OCR 姓名继续参与报价或材料冲突判断。
+    if _to_str(merged.get("owner_name")).strip() and not _to_str(merged.get("id_name")).strip():
+        merged["id_name"] = merged["owner_name"]
+    if _to_str(merged.get("id_name")).strip() and not _to_str(merged.get("owner_name")).strip():
+        merged["owner_name"] = merged["id_name"]
+    return merged
+
+
+def extract_quote_data_overrides(text: Any) -> Dict[str, Any]:
+    raw_text = _norm_text(text)
+    if not raw_text:
+        return {}
+    compact_query_guard = re.sub(r"\s+", "", raw_text)
+    if re.match(r"^(查找|查询|查一下|查|搜索|搜|找)", compact_query_guard) and not re.search(
+        r"(改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置成|设置为|设成|设为|变成|变为|变到|修改成|修改为|修改到|更正成|更正为|更正到|修正成|修正为|修正到|纠正成|纠正为|纠正到|改|变)",
+        compact_query_guard,
+    ):
+        return {}
+    connector = r"(?:改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置成|设置为|设成|设为|变成|变为|变到|修改成|修改为|修改到|更正成|更正为|更正到|修正成|修正为|修正到|纠正成|纠正为|纠正到|改|变)"
+    separator = r"(?:[:：=+＋])?"
+    scan_texts = [raw_text]
+    compact = re.sub(r"\s+", "", raw_text)
+    if compact and compact != raw_text:
+        scan_texts.append(compact)
+
+    overrides: Dict[str, Any] = {}
+    consumed_by_text: Dict[str, List[Tuple[int, int]]] = {}
+    for scan_text in scan_texts:
+        consumed = consumed_by_text.setdefault(scan_text, [])
+        for field_key, _label, alias in _quote_data_override_alias_items():
+            value_pattern = _quote_data_override_value_pattern(field_key)
+            pattern = rf"{re.escape(alias)}\s*{separator}\s*{connector}\s*{separator}\s*{value_pattern}"
+            for match in re.finditer(pattern, scan_text, flags=re.IGNORECASE):
+                overlaps = any(not (match.end() <= start or match.start() >= end) for start, end in consumed)
+                if overlaps and field_key in overrides:
+                    continue
+                if overlaps and field_key not in {"owner_name", "id_name", "vehicle_model"}:
+                    continue
+                cleaned = _clean_quote_data_override_value(field_key, match.group(1))
+                if cleaned in (None, ""):
+                    continue
+                overrides[field_key] = cleaned
+                consumed.append(match.span())
+                break
+    compact_only = re.sub(r"\s+", "", raw_text).upper()
+    if "vin" not in overrides and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", compact_only):
+        cleaned = _clean_quote_data_override_value("vin", compact_only)
+        if cleaned:
+            overrides["vin"] = cleaned
+    if "id_number" not in overrides and re.fullmatch(r"\d{17}[\dX]", compact_only):
+        cleaned = _clean_quote_data_override_value("id_number", compact_only)
+        if cleaned:
+            overrides["id_number"] = cleaned
+    if "plate_no" not in overrides and re.fullmatch(r"[\u4e00-\u9fff][A-Z][A-Z0-9]{4,7}", compact_only):
+        cleaned = _clean_quote_data_override_value("plate_no", compact_only)
+        if cleaned:
+            overrides["plate_no"] = cleaned
+    return _merge_quote_data_overrides(overrides)
+
+
+def _quote_text_has_explicit_data_override_operator(text: Any) -> bool:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return False
+    return bool(
+        re.search(
+            r"改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置为|设为|变成|变为|变到|更正为|修正为|纠正为|调整|修改|更正|修正|纠正|改|变",
+            compact,
+        )
+    )
+
+
+def detect_quote_data_override_signal(text: Any) -> Dict[str, Any]:
+    if not _quote_text_has_explicit_data_override_operator(text):
+        return {"is_override": False, "entities": {}, "overrides": {}}
+    overrides = extract_quote_data_overrides(text)
+    return {
+        "is_override": bool(overrides),
+        "entities": {QUOTE_DATA_OVERRIDES_KEY: overrides, "force_requote": True} if overrides else {},
+        "overrides": overrides,
+    }
+
+
+def _quote_data_override_summary(overrides: Any) -> str:
+    pairs: List[str] = []
+    for key, value in _json_obj(overrides).items():
+        label = QUOTE_DATA_OVERRIDE_LABELS.get(_to_str(key).strip(), _to_str(key).strip())
+        text = _to_str(value).strip()
+        if label and text:
+            pairs.append(f"{label}：{text}")
+    return "、".join(pairs[:8])
+
+
+def _quote_lookup_value(overrides: Any, extracted: Any, entities: Any, key: str) -> str:
+    """Use manually confirmed quote data first when finding/reusing an order."""
+
+    field_key = _to_str(key).strip()
+    if not field_key:
+        return ""
+    for source in (_json_obj(overrides), _json_obj(extracted), _json_obj(entities)):
+        value = _to_str(source.get(field_key)).strip()
+        if value:
+            return value
+    return ""
 
 
 def _quote_product_exclusion_summary(exclusions: Any) -> str:
@@ -5713,6 +6065,154 @@ def _extract_account_type_from_quote_text(text: Any, platform_name: str, platfor
     return normalized if normalized in QUOTE_ACCOUNT_TYPE_SET else None
 
 
+def _quote_account_type_from_material_text(text: Any, extracted: Optional[Mapping[str, Any]] = None) -> str:
+    raw = _norm_text(text)
+    compact = re.sub(r"[\s,，。.;；:：=+\-_/\\]+", "", raw)
+    if not compact:
+        return ""
+
+    data = _json_obj(extracted)
+    has_plate = bool(_to_str(data.get("plate_no")).strip()) or bool(
+        re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)[:：=]?[\u4e00-\u9fff][A-Z][A-Z0-9]{4,7}", compact, flags=re.IGNORECASE)
+    )
+    has_register_date = bool(_to_str(data.get("first_register_date")).strip())
+    old_hint = bool(re.search(r"旧车|二手车|过户车|转移登记|行驶证|初登|初次登记|注册日期|登记日期", compact, flags=re.IGNORECASE))
+    new_hint = bool(re.search(r"新车|新购|未上牌|车辆合格证|合格证|国产新车|进口新车", compact, flags=re.IGNORECASE))
+    new_energy_hint = bool(
+        _quote_new_energy_plate_no_present(data.get("plate_no"))
+        or re.search(r"新能源|纯电|插电|混动|电动|油电|增程|新能源车辆|纯电动轿车|EV|BEV|PHEV", compact, flags=re.IGNORECASE)
+    )
+    fuel_hint = bool(re.search(r"油车|燃油|汽油|柴油|非新能源|不是新能源", compact, flags=re.IGNORECASE))
+
+    generic_usage_aliases = {"新车", "旧车", "二手车", "过户车"}
+
+    candidates = sorted(
+        (*QUOTE_ACCOUNT_TYPE_OPTIONS, *QUOTE_ACCOUNT_TYPE_ALIASES.keys()),
+        key=lambda item: len(re.sub(r"[\s,，。.;；:：=+\-_/\\]+", "", _to_str(item))),
+        reverse=True,
+    )
+    for candidate in candidates:
+        normalized = _normalize_account_type_name(candidate)
+        compact_candidate = re.sub(r"[\s,，。.;；:：=+\-_/\\]+", "", candidate)
+        if normalized not in QUOTE_ACCOUNT_TYPE_SET or compact_candidate not in compact:
+            continue
+        # “新车/旧车”只是使用性质，不能抢在“纯电/新能源”等能源特征前面定成油车。
+        if compact_candidate in generic_usage_aliases and new_energy_hint and not fuel_hint:
+            break
+        else:
+            return normalized
+
+    usage = ""
+    if has_plate or has_register_date or old_hint:
+        usage = "旧"
+    elif new_hint:
+        usage = "新"
+
+    energy = ""
+    if new_energy_hint and not re.search(r"非新能源|不是新能源", compact, flags=re.IGNORECASE):
+        energy = "新能源"
+    elif fuel_hint:
+        energy = "油"
+
+    if usage and not energy:
+        # 没有新能源特征时按燃油车处理；新能源车通常能从绿牌或文本命中。
+        energy = "油"
+    if energy == "新能源" and not usage:
+        usage = "新"
+    if energy == "油" and not usage:
+        usage = "旧" if has_plate else "新"
+
+    if energy == "新能源" and usage == "旧":
+        return "新能源车-旧"
+    if energy == "新能源":
+        return "新能源车-新"
+    if energy == "油" and usage == "旧":
+        return "油车-旧"
+    if energy == "油" and usage == "新":
+        return "油车-新"
+    return ""
+
+
+def _quote_vehicle_type_text_data(text: Any, extracted: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    type_name = _quote_account_type_from_material_text(text, extracted)
+    if not type_name:
+        return {}
+    usage = "used_car" if type_name.endswith("-旧") else "new_car"
+    energy = "new_energy" if type_name.startswith("新能源") else "fuel"
+    return {
+        "account_type_name": type_name,
+        "quote_vehicle_type": "旧车" if usage == "used_car" else "新车",
+        "vehicle_usage_type": usage,
+        "vehicle_energy_type": energy,
+        "energy_type": energy,
+    }
+
+
+def _quote_text_material_field_count(data: Mapping[str, Any]) -> int:
+    keys = {
+        "owner_name",
+        "owner_phone",
+        "id_number",
+        "plate_no",
+        "vin",
+        "engine_no",
+        "vehicle_model",
+        "first_register_date",
+    }
+    return sum(1 for key in keys if _to_str(_json_obj(data).get(key)).strip())
+
+
+def _quote_text_only_material_mode(
+    normalized_data: Mapping[str, Any],
+    images_by_slot: Optional[Mapping[str, List[Dict[str, Any]]]] = None,
+) -> bool:
+    if any(rows for rows in (images_by_slot or {}).values()):
+        return False
+    data = _json_obj(normalized_data)
+    if _to_str(data.get("raw_text")).strip():
+        return True
+    return _quote_text_material_field_count(data) > 0
+
+
+def _looks_like_quote_text_material(text: Any, extracted: Optional[Mapping[str, Any]] = None) -> bool:
+    raw = _norm_text(text)
+    if not raw or looks_like_sms_code(raw):
+        return False
+    if re.match(r"^(查找|查询|查一下|查|搜索|搜|找)", re.sub(r"\s+", "", raw)):
+        return False
+    data = _json_obj(extracted)
+    field_count = _quote_text_material_field_count(data)
+    if field_count >= 2:
+        return True
+    type_name = _quote_account_type_from_material_text(raw, data)
+    if type_name and field_count >= 1:
+        return True
+    material_terms = (
+        "车主",
+        "被保险人",
+        "投保人",
+        "手机号",
+        "手机",
+        "电话",
+        "身份证",
+        "车牌",
+        "号牌",
+        "车架",
+        "车辆识别代号",
+        "VIN",
+        "发动机",
+        "车型",
+        "品牌型号",
+        "初登",
+        "合格证",
+        "行驶证",
+        "新能源",
+        "新车",
+        "旧车",
+    )
+    return bool(field_count and any(term.lower() in raw.lower() for term in material_terms))
+
+
 def detect_quote_signal(text: Any) -> Dict[str, Any]:
     t = _norm_text(text)
     low = t.lower()
@@ -5733,6 +6233,7 @@ def detect_quote_signal(text: Any) -> Dict[str, Any]:
 
     extracted = extract_quote_fields(t)
     entities.update({k: v for k, v in extracted.items() if v})
+    entities.update({k: v for k, v in _quote_vehicle_type_text_data(t, extracted).items() if v})
 
     is_quote = bool(professional.get("is_quote") or re.search(r"报价|重报|\bquote\b", low) or looks_like_short_quote_command(t))
     return {"is_quote": bool(is_quote), "entities": entities}
@@ -5848,6 +6349,21 @@ def _quote_check_context_is_active(case: QuoteCase) -> bool:
     return bool(_json_list(case.missing_requirements))
 
 
+def _quote_case_has_pending_quote_check(case: Optional[QuoteCase]) -> bool:
+    if not case or not _to_str(getattr(case, "platform_code", "")).strip():
+        return False
+    if _json_list(getattr(case, "missing_requirements", None)):
+        return True
+    if _safe_int(getattr(case, "current_task_id", 0), 0) > 0:
+        return True
+    return _to_str(getattr(case, "status", "")).strip() in {
+        CASE_STATUS_READY,
+        CASE_STATUS_WAITING_SMS,
+        CASE_STATUS_WAITING_DUPLICATE_CONFIRM,
+        CASE_STATUS_FAILED,
+    }
+
+
 def looks_like_sms_code(text: Any) -> bool:
     t = _norm_text(text)
     if re.fullmatch(r"\d{4,8}", t):
@@ -5897,7 +6413,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
 
     owner_phone = _extract_labeled_value(t, _OWNER_PHONE_HINTS, max_len=32)
     if owner_phone:
-        digits = re.sub(r"\D+", "", owner_phone)
+        digits = re.sub(r"\D+", "", _trim_quote_text_value_at_next_label(owner_phone))
         if len(digits) == 11:
             out["owner_phone"] = digits
     elif not _has_login_phone_hint(t):
@@ -5905,64 +6421,101 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
         if phone:
             out["owner_phone"] = phone.group(1)
 
-    id_no = re.search(r"\b(\d{17}[\dXx])\b", t)
+    id_no = re.search(
+        r"(?:身份证号|身份证号码|身份证|证件号|证件号码)\s*(?:[:：=]|是|为)?\s*(\d{17}[\dXx])",
+        t,
+    )
+    if not id_no:
+        id_no = re.search(r"(?<!\d)(\d{17}[\dXx])(?!\d)", t)
     if id_no:
         out["id_number"] = id_no.group(1).upper()
 
-    plate = re.search(r"([\u4e00-\u9fa5][A-Z][A-Z0-9]{4,7})", up)
+    plate = re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)\s*(?:[:：=]|是|为)?\s*([\u4e00-\u9fa5][A-Z][A-Z0-9]{4,7})", up)
+    if not plate:
+        plate = re.search(r"(?<![\u4e00-\u9fffA-Z0-9])([\u4e00-\u9fa5][A-Z][A-Z0-9]{4,7})(?![A-Z0-9])", up)
     if plate:
         out["plate_no"] = plate.group(1)
 
-    vin = re.search(r"(?:VIN|车架号|车辆识别代号)\s*[:：]?\s*([A-HJ-NPR-Z0-9]{11,20})", up, flags=re.IGNORECASE)
+    vin = re.search(r"(?:VIN|车架号|车架|车辆识别代号|车辆识别代码|车辆识别码)\s*(?:[:：=]|是|为)?\s*([A-HJ-NPR-Z0-9]{11,20})", up, flags=re.IGNORECASE)
     if not vin:
         vin = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", up)
     if vin:
         out["vin"] = vin.group(1).upper()
 
-    engine = re.search(r"(?:发动机号|发动机号码|发动机)\s*[:：]?\s*([A-Z0-9\-]{4,32})", up, flags=re.IGNORECASE)
+    engine = re.search(r"(?:发动机号|发动机号码|发动机)\s*(?:[:：=]|是|为)?\s*([A-Z0-9\-]{4,32})", up, flags=re.IGNORECASE)
     if engine:
         out["engine_no"] = engine.group(1).upper()
 
     owner_name = _extract_labeled_value(t, _OWNER_NAME_HINTS, max_len=64)
+    if owner_name and _quote_owner_name_value_blocked(owner_name):
+        owner_name = None
     if not owner_name:
-        name = re.search(r"(?:车主|姓名|被保人|被保险人|投保人|联系人)\s*[:：]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})", t)
+        owner_label_block = (
+            r"(?!手机号|手机号码|手机|电话|身份证号|身份证号码|身份证|证件号|证件号码|"
+            r"车牌号码|车牌号|车牌|号牌号码|号牌|VIN|车架号|车架|车辆识别代号|"
+            r"发动机号|发动机号码|发动机|车型名称|车型|品牌型号)"
+        )
+        name = re.search(
+            rf"(?:车主|姓名|被保人|被保险人|投保人|联系人){owner_label_block}\s*[:：]\s*([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{{2,40}})",
+            t,
+            flags=re.IGNORECASE,
+        )
         if not name:
-            name = re.search(r"(?:车主|姓名)\s+([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40})(?=\s|$)", t)
+            name = re.search(
+                rf"(?:车主|姓名){owner_label_block}\s+([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{{2,40}})(?=\s|$)",
+                t,
+                flags=re.IGNORECASE,
+            )
+        if not name:
+            name = re.search(
+                rf"(?:车主|被保人|被保险人|投保人|联系人){owner_label_block}([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{{2,40}})",
+                t,
+                flags=re.IGNORECASE,
+            )
         owner_name = name.group(1).strip() if name else None
+    if owner_name:
+        owner_name = _trim_quote_text_value_at_next_label(owner_name)
+        owner_name = re.sub(
+            r"^(?:改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置成|设置为|设成|设为|变成|变为|变到|修改成|修改为|修改到|更正成|更正为|更正到|修正成|修正为|修正到|纠正成|纠正为|纠正到|改|变|是|为)",
+            "",
+            owner_name,
+        ).strip()
+        if _quote_owner_name_value_blocked(owner_name):
+            owner_name = ""
     if owner_name and owner_name not in {"姓名", "车主", "手机号", "电话", "车牌号", "身份证号"}:
         out["owner_name"] = owner_name.strip()
 
-    model = re.search(r"(?:车型|品牌型号|车辆型号)\s*[:：]?\s*([^\s,，,;；。]{2,60})", t)
+    model = re.search(r"(?:车辆品牌/车辆名称|车辆品牌/车辆型号|车型名称|品牌型号|车辆型号|车型)\s*(?:[:：=]|是|为)?\s*([^，,;；。\n\r]{2,90})", t)
     if model:
-        out["vehicle_model"] = model.group(1).strip()
+        out["vehicle_model"] = _trim_quote_text_value_at_next_label(model.group(1)).strip()
 
     quote_date_pattern = r"(\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2})"
 
-    exp_date = re.search(r"(?:保险到期|到期日|保险止期)\s*[:：]?\s*" + quote_date_pattern, t)
+    exp_date = re.search(r"(?:保险到期|到期日|保险止期)\s*(?:[:：=]|是|为)?\s*" + quote_date_pattern, t)
     if exp_date:
         value = _normalize_quote_date_text(exp_date.group(1))
         if value:
             out["insurance_expire_date"] = value
 
-    first_register = re.search(r"(?:初登日期|初次登记日期|注册日期|登记日期)\s*[:：]?\s*" + quote_date_pattern, t)
+    first_register = re.search(r"(?:初登日期|初登|初次登记日期|注册日期|登记日期)\s*(?:[:：=]|是|为)?\s*" + quote_date_pattern, t)
     if first_register:
         value = _normalize_quote_date_text(first_register.group(1))
         if value:
             out["first_register_date"] = value
 
-    issue_date = re.search(r"(?:行驶证发证日期|发证日期|发证时间)\s*[:：]?\s*" + quote_date_pattern, t)
+    issue_date = re.search(r"(?:行驶证发证日期|发证日期|发证时间)\s*(?:[:：=]|是|为)?\s*" + quote_date_pattern, t)
     if issue_date:
         value = _normalize_quote_date_text(issue_date.group(1))
         if value:
             out["issue_date"] = value
 
-    commercial_start = re.search(r"(?:商业起保日期|商业险起保日期|商业起保|商业险起期)\s*[:：]?\s*" + quote_date_pattern, t)
+    commercial_start = re.search(r"(?:商业起保日期|商业险起保日期|商业起保|商业险起期)\s*(?:[:：=]|是|为)?\s*" + quote_date_pattern, t)
     if commercial_start:
         value = _normalize_quote_date_text(commercial_start.group(1))
         if value:
             out["commercial_start_date"] = value
 
-    compulsory_start = re.search(r"(?:交强起保日期|交强险起保日期|交强起保|交强险起期)\s*[:：]?\s*" + quote_date_pattern, t)
+    compulsory_start = re.search(r"(?:交强起保日期|交强险起保日期|交强起保|交强险起期)\s*(?:[:：=]|是|为)?\s*" + quote_date_pattern, t)
     if compulsory_start:
         value = _normalize_quote_date_text(compulsory_start.group(1))
         if value:
@@ -6022,6 +6575,8 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
         out["is_transfer_vehicle"] = transfer_command.get("is_transfer_vehicle")
         if _to_str(transfer_command.get("transfer_date")).strip():
             out["transfer_date"] = transfer_command.get("transfer_date")
+
+    out.update({k: v for k, v in _quote_vehicle_type_text_data(t, out).items() if v})
 
     return out
 
@@ -7431,10 +7986,15 @@ QUOTE_ENTITY_FIELD_KEYS = tuple(
             "insurance_expire_date",
             "quote_vehicle_type",
             "vehicle_usage_type",
+            "vehicle_energy_type",
+            "energy_type",
+            "fuel_type",
             "vehicle_kind",
+            "raw_text",
             "is_transfer_vehicle",
             "transfer_date",
             "transfer_vehicle_override",
+            QUOTE_DATA_OVERRIDES_KEY,
             QUOTE_PRODUCT_EXCLUSIONS_KEY,
             "quote_command_mode",
         }
@@ -8481,7 +9041,8 @@ async def _persist_unemitted_quote_auto_notices(
 
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
         notice = _json_obj(notice_any)
-        if _to_str(notice.get("type")).strip() != "insurance_date_adjust":
+        notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             continue
         if notice.get("emitted_to_chat") is True:
             continue
@@ -8493,24 +9054,33 @@ async def _persist_unemitted_quote_auto_notices(
             continue
         seen.add(dedupe_key)
 
+        auto_notice_payload = {
+            "type": notice_type,
+            "message": message,
+            "source": _to_str(notice.get("source")).strip() or "platform_prompt",
+            "fallback_persisted": True,
+        }
+        if notice_type == "insurance_date_adjust":
+            auto_notice_payload.update(
+                {
+                    "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
+                    "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
+                    "adjustment_kinds": [
+                        item
+                        for item in _json_list(notice.get("adjustment_kinds"))
+                        if _to_str(item).strip() in {"bi", "ci"}
+                    ],
+                }
+            )
+        elif notice_type == "duplicate_quote_notice":
+            auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
+
         payload = {
             "quote_case": {"id": case.id, "status": CASE_STATUS_READY},
             "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
             "platform_code": _to_str(platform_code).strip().upper(),
             "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
-            "platform_auto_notice": {
-                "type": "insurance_date_adjust",
-                "message": message,
-                "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
-                "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
-                "adjustment_kinds": [
-                    item
-                    for item in _json_list(notice.get("adjustment_kinds"))
-                    if _to_str(item).strip() in {"bi", "ci"}
-                ],
-                "source": _to_str(notice.get("source")).strip() or "platform_prompt",
-                "fallback_persisted": True,
-            },
+            "platform_auto_notice": auto_notice_payload,
             "ui_visible": True,
         }
         metadata = {
@@ -8573,7 +9143,8 @@ def _attach_quote_auto_notice_callback(
 
     async def persist_notice(notice_any: Any) -> bool:
         notice = _json_obj(notice_any)
-        if _to_str(notice.get("type")).strip() != "insurance_date_adjust":
+        notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             return False
         message = sanitize_quote_user_message(notice.get("message"), "")
         if not message:
@@ -8581,23 +9152,32 @@ def _attach_quote_auto_notice_callback(
         from app.core.db import async_session_factory
         from app.services.ai_assistant_service import db_append_message
 
+        auto_notice_payload = {
+            "type": notice_type,
+            "message": message,
+            "source": _to_str(notice.get("source")).strip() or "platform_prompt",
+        }
+        if notice_type == "insurance_date_adjust":
+            auto_notice_payload.update(
+                {
+                    "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
+                    "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
+                    "adjustment_kinds": [
+                        item
+                        for item in (_json_list(notice.get("adjustment_kinds")))
+                        if _to_str(item).strip() in {"bi", "ci"}
+                    ],
+                }
+            )
+        elif notice_type == "duplicate_quote_notice":
+            auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
+
         payload = {
             "quote_case": {"id": _safe_int(case_id, 0), "status": CASE_STATUS_READY},
             "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
             "platform_code": _to_str(platform_code).strip().upper(),
             "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
-            "platform_auto_notice": {
-                "type": "insurance_date_adjust",
-                "message": message,
-                "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
-                "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
-                "adjustment_kinds": [
-                    item
-                    for item in (_json_list(notice.get("adjustment_kinds")))
-                    if _to_str(item).strip() in {"bi", "ci"}
-                ],
-                "source": _to_str(notice.get("source")).strip() or "platform_prompt",
-            },
+            "platform_auto_notice": auto_notice_payload,
             "ui_visible": True,
         }
         metadata = {
@@ -10706,9 +11286,14 @@ async def _continue_quote_with_platform_account(
         )
         payload["platform_default_config"] = platform_default_config
         payload["default_config_json"] = _json_obj(account_snapshot.get("default_config_json"))
+        config_action_text = _quote_account_action_text(
+            operator_role_name,
+            "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
+            "请联系管理员在“默认参数配置”中新增并启用该账号类型配置后，再重新发起报价。",
+        )
         return (
             f"{reply_prefix}{platform_name}（类型：{selected_type_name}）还没有启用的默认参数配置，暂不提交报价。\n"
-            "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
+            f"{config_action_text}",
             {
                 "status": "success",
                 "intent": "quote",
@@ -10720,13 +11305,19 @@ async def _continue_quote_with_platform_account(
                     payload=payload,
                 ),
                 "actions": [
-                    _mk_action(
-                        "默认参数配置",
-                        "open_default_config_manager",
-                        "quote_platform_default_configs",
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                        account_type_name=selected_type_name,
+                    *(
+                        []
+                        if _quote_account_needs_admin_contact(operator_role_name)
+                        else [
+                            _mk_action(
+                                "默认参数配置",
+                                "open_default_config_manager",
+                                "quote_platform_default_configs",
+                                platform_code=platform_code,
+                                platform_name=platform_name,
+                                account_type_name=selected_type_name,
+                            ),
+                        ]
                     ),
                     _mk_action(f"{platform_name}报价"),
                 ],
@@ -10746,7 +11337,7 @@ async def _continue_quote_with_platform_account(
             account_type_name=config_type_name,
             operator_role_name=operator_role_name,
         )
-        return f"{reply_prefix}{reply}", meta
+        return reply, meta
 
     if not bool(platform_account.auto_login):
         retry = await _retry_quote_with_next_platform_account(
@@ -10831,7 +11422,7 @@ async def _continue_quote_with_platform_account(
             account_type_name=config_type_name,
             operator_role_name=operator_role_name,
         )
-        return f"{reply_prefix}{platform_name}新登录失败，但已保留原有可用会话，继续尝试报价。\n{reply}", meta
+        return reply, meta
     if not _is_runtime_login_success(login_status) and not _is_runtime_challenge(login_status):
         platform_account.login_status = ACCOUNT_LOGIN_FAILED
         platform_account.last_error = _runtime_detail(login_runtime_result, "平台登录失败")
@@ -10890,7 +11481,7 @@ async def _continue_quote_with_platform_account(
             account_type_name=config_type_name,
             operator_role_name=operator_role_name,
         )
-        return f"{reply_prefix}{reply}", meta
+        return reply, meta
 
     challenge_prompt = await _mark_quote_account_challenge_attention(
         db,
@@ -10989,7 +11580,7 @@ async def _continue_quote_with_platform_account(
         f"- 已复用平台登录资料：{account_payload.get('login_phone_mask') or task.sms_phone_mask or '业务员手机号'}\n"
         "请在聊天框直接输入收到的 4-8 位短信验证码。"
     )
-    return f"{reply_prefix}{reply}", {
+    return reply, {
         "status": "success",
         "intent": "quote",
         "trace_id": trace_id,
@@ -11444,33 +12035,8 @@ async def _complete_waiting_task(
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     quote_status = _runtime_status(quote_runtime_result)
-    if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
-        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        return await _start_duplicate_quote_confirm_task(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=snapshot,
-            trace_id=trace_id,
-            platform_account=platform_account,
-            runtime_result=quote_runtime_result,
-            login_mode="sms_verified",
-            existing_task=task,
-        )
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        if _is_runtime_duplicate_quote_result(quote_runtime_result) and not _snapshot_has_duplicate_quote_confirmation(snapshot):
-            return await _start_duplicate_quote_confirm_task(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                platform_account=platform_account,
-                runtime_result=quote_runtime_result,
-                login_mode="sms_verified",
-                existing_task=task,
-            )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         task.status = TASK_STATUS_FAILED
         task.login_state = "authenticated"
@@ -11951,33 +12517,8 @@ async def _complete_quote_without_sms(
             response_payload={"quote": _runtime_result_payload(quote_runtime_result)},
         )
     quote_status = _runtime_status(quote_runtime_result)
-    if _is_runtime_duplicate_quote_confirm_required_result(quote_runtime_result):
-        await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        return await _start_duplicate_quote_confirm_task(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=snapshot,
-            trace_id=trace_id,
-            platform_account=platform_account,
-            runtime_result=quote_runtime_result,
-            login_mode=login_mode,
-            existing_task=task,
-        )
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        if _is_runtime_duplicate_quote_result(quote_runtime_result) and not _snapshot_has_duplicate_quote_confirmation(snapshot):
-            return await _start_duplicate_quote_confirm_task(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                platform_account=platform_account,
-                runtime_result=quote_runtime_result,
-                login_mode=login_mode,
-                existing_task=task,
-            )
         _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
         error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
         perf["total_ms"] = _elapsed_ms(perf_started)
@@ -12322,6 +12863,14 @@ async def handle_quote_images_message(
             "quote_field_overrides": quote_field_overrides,
             "force_requote": True,
         }
+    data_override_signal = detect_quote_data_override_signal(text)
+    quote_data_overrides = _json_obj(data_override_signal.get("overrides"))
+    if quote_data_overrides:
+        merged_entities = {
+            **merged_entities,
+            QUOTE_DATA_OVERRIDES_KEY: quote_data_overrides,
+            "force_requote": True,
+        }
 
     platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
     platform_name = _to_str(merged_entities.get("platform_name")).strip()
@@ -12350,9 +12899,9 @@ async def handle_quote_images_message(
         db,
         ctx=ctx,
         order_id=order_id,
-        plate_no=_to_str(extracted.get("plate_no") or merged_entities.get("plate_no")).strip() or None,
-        owner_phone=_to_str(extracted.get("owner_phone") or merged_entities.get("owner_phone")).strip() or None,
-        owner_name=_to_str(extracted.get("owner_name") or merged_entities.get("owner_name")).strip() or None,
+        plate_no=_quote_lookup_value(quote_data_overrides, extracted, merged_entities, "plate_no") or None,
+        owner_phone=_quote_lookup_value(quote_data_overrides, extracted, merged_entities, "owner_phone") or None,
+        owner_name=_quote_lookup_value(quote_data_overrides, extracted, merged_entities, "owner_name") or None,
     )
     if order_id and order is None:
         return _quote_order_not_accessible_response(order_id=order_id, platform_name=platform_name)
@@ -12381,7 +12930,10 @@ async def handle_quote_images_message(
         platform_code=platform_code if explicit_platform_quote else "",
         platform_name=platform_name if explicit_platform_quote else "",
         ctx=ctx,
-        reuse_quoted=bool(_is_explicit_requote(text) or quote_field_overrides),
+        # A new image after a completed quote usually means a new order. Even
+        # if the caption carries field values, do not drag the previous quoted
+        # case forward unless the user explicitly asks to requote.
+        reuse_quoted=bool(_is_explicit_requote(text)),
         exclude_case_ids=exclude_case_ids,
     )
     case = await _lock_quote_case(db, case)
@@ -12516,18 +13068,16 @@ async def handle_quote_images_message(
 
     await db.flush()
 
-    lines = [f"已收到 {len(attached_images)} 张图片，已完成识别归位。"]
-    if quote_check_requested and cancelled_waiting_tasks:
-        lines.append("材料已更新，上一条等待中的验证码已作废；请重新输入平台名+报价触发新流程。")
-    if quote_check_requested and missing:
+    visible_image_quote_check = bool(explicit_platform_quote and missing)
+    lines: List[str] = []
+    if visible_image_quote_check:
+        lines.append(f"{auto_platform_name or platform_name or '平台'}报价资料还不完整，已中断本次报价。")
         conflict_labels = [_missing_item_text(item) for item in missing if item.get("type") == "data_conflict"]
         ordinary_labels = [_missing_item_text(item) for item in missing if item.get("type") != "data_conflict"]
         if ordinary_labels:
-            lines.append("仍缺少：" + "、".join(ordinary_labels[:8]))
+            lines.append("缺少字段：" + "、".join(ordinary_labels[:8]))
         if conflict_labels:
             lines.append("资料冲突：" + "、".join(conflict_labels[:8]))
-    if quote_check_requested and missing:
-        lines.append("请先补齐缺少资料，或撤回/更换冲突图片后再报价。")
 
     payload = _case_payload(
         case=case,
@@ -12538,26 +13088,27 @@ async def handle_quote_images_message(
         platform_account=None,
     )
     payload["quote_check_requested"] = quote_check_requested
-    if not quote_check_requested:
+    if not visible_image_quote_check:
         payload["silent"] = True
         payload["ui_visible"] = False
     response_data = _mk_data(
-        result_status=RESULT_NOT_READY if quote_check_requested and missing else RESULT_SUCCESS,
-        message="图片已进入报价材料",
+        result_status=RESULT_NEED_MORE if visible_image_quote_check else RESULT_SUCCESS,
+        message="报价资料不足，已中断本次报价" if visible_image_quote_check else "图片已进入报价材料",
         entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
         payload=payload,
     )
-    if not quote_check_requested:
+    if not visible_image_quote_check:
         response_data["silent"] = True
         response_data["ui_visible"] = False
-    return "\n".join(lines), {
+    reply_text = "\n".join(lines)
+    return reply_text, {
         "status": "success",
-        "intent": "quote" if quote_check_requested else "quote_image_collect",
+        "intent": "quote" if visible_image_quote_check else "quote_image_collect",
         "trace_id": _new_trace_id(),
-        "silent": not quote_check_requested,
-        "ui_visible": bool(quote_check_requested),
+        "silent": not visible_image_quote_check,
+        "ui_visible": bool(visible_image_quote_check),
         "data": response_data,
-        "actions": [_mk_action(f"{auto_platform_name or platform_name or '平台'}报价")] if quote_check_requested else [],
+        "actions": [],
     }
 
 
@@ -12670,6 +13221,289 @@ async def recall_quote_case_images(
     }
 
 
+async def handle_quote_text_material_message(
+    db: AsyncSession,
+    *,
+    ctx: Dict[str, Any],
+    entities: Dict[str, Any],
+    text: str,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    owner_user_id = _ctx_current_user_id(ctx)
+    if owner_user_id <= 0:
+        return None
+    extracted = extract_quote_fields(text)
+    session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    looks_like_material = _looks_like_quote_text_material(text, extracted)
+    active_case_for_followup: Optional[QuoteCase] = None
+    if not looks_like_material and _quote_text_material_field_count(extracted) >= 1 and session_id:
+        active_case_for_followup = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
+        looks_like_material = _quote_case_has_pending_quote_check(active_case_for_followup)
+    if not looks_like_material:
+        return None
+    _ensure_quote_flow_access(ctx)
+
+    signal = detect_quote_signal(text)
+    merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    text_data = _quote_text_data_from_entities(extracted, merged_entities)
+    type_data = _quote_vehicle_type_text_data(text, text_data)
+    if type_data:
+        text_data = _merge_data(text_data, type_data)
+        merged_entities = {**merged_entities, **type_data}
+
+    platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
+    platform_name = _to_str(merged_entities.get("platform_name")).strip()
+    if not platform_code and platform_name:
+        platform_code = _platform_code_from_display_name(platform_name) or ""
+    if not platform_name and platform_code:
+        platform_name = _platform_display_name(platform_code) or platform_code
+    if platform_code and platform_name and not _is_quote_platform_developed(platform_code):
+        platform_code = ""
+        platform_name = ""
+
+    order_id = (
+        _safe_int((ctx or {}).get("order_id"), 0)
+        or _safe_int(merged_entities.get("order_id"), 0)
+        or None
+    )
+    order = await _find_order(
+        db,
+        ctx=ctx,
+        order_id=order_id,
+        plate_no=_to_str(text_data.get("plate_no")).strip() or None,
+        owner_phone=_to_str(text_data.get("owner_phone")).strip() or None,
+        owner_name=_to_str(text_data.get("owner_name")).strip() or None,
+    )
+    if order_id and order is None:
+        order = None
+
+    exclude_case_ids: Set[int] = set()
+    duplicate_waiting_pair = await _find_waiting_duplicate_quote_confirm_task(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    if duplicate_waiting_pair:
+        waiting_case, waiting_task = duplicate_waiting_pair
+        exclude_case_ids.add(_safe_int(getattr(waiting_case, "id", 0), 0))
+        await _cancel_waiting_duplicate_quote_task(
+            db,
+            case=waiting_case,
+            task=waiting_task,
+            owner_user_id=owner_user_id,
+            reason="已提交新文本资料，自动中止上一笔重复投保确认",
+        )
+
+    case = await _get_or_create_case(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        order=order,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        ctx=ctx,
+        reuse_quoted=bool(_is_explicit_requote(text)),
+        exclude_case_ids=exclude_case_ids,
+    )
+    case = await _lock_quote_case(db, case)
+    pending_quote_check = _quote_case_has_pending_quote_check(case)
+    cancelled_active_quote_tasks = await _cancel_active_quote_tasks_for_case(
+        db,
+        case=case,
+        reason=QUOTE_MATERIAL_CHANGED_MESSAGE,
+    )
+
+    images_by_slot = await _active_images_by_slot(db, case.id)
+    base_data = _json_obj(case.normalized_data) or _json_obj(case.draft_order_data)
+    material_text = _norm_text(text)
+    if material_text:
+        previous_raw_text = _to_str(base_data.get("raw_text")).strip()
+        if previous_raw_text and material_text not in previous_raw_text:
+            text_data["raw_text"] = (previous_raw_text + "\n" + material_text)[-6000:]
+        else:
+            text_data["raw_text"] = previous_raw_text or material_text
+    normalized_data = _normalize_quote_case_data(
+        base_data=base_data,
+        order_data=_order_data(order),
+        text_data=text_data,
+        images_by_slot=images_by_slot,
+    )
+    platform_code = _to_str(case.platform_code or platform_code).strip().upper()
+    platform_name = _to_str(case.platform_name or platform_name).strip()
+    if platform_code and not platform_name:
+        platform_name = _platform_display_name(platform_code) or platform_code
+    vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
+    selected_account_type_name = _normalize_account_type_name(
+        merged_entities.get("account_type_name")
+        or normalized_data.get("account_type_name")
+        or vehicle_type_detect.get("config_type_name")
+    )
+    missing = (
+        _missing_requirements(
+            normalized_data,
+            images_by_slot,
+            platform_code=platform_code,
+            account_type_name=selected_account_type_name,
+        )
+        if pending_quote_check
+        else []
+    )
+
+    case.draft_order_data = normalized_data
+    case.normalized_data = normalized_data
+    case.missing_requirements = missing
+    case.status = CASE_STATUS_READY if pending_quote_check and platform_code and selected_account_type_name and not missing else CASE_STATUS_COLLECTING
+    case.updated_at = _now()
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="chat",
+        role="user",
+        content=text,
+        payload={
+            "text_material": True,
+            "extracted_fields": extracted,
+            "vehicle_type_detect": vehicle_type_detect,
+            "cancelled_active_quote_tasks": cancelled_active_quote_tasks,
+        },
+    )
+
+    if pending_quote_check and platform_code and platform_name and selected_account_type_name and not missing:
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="status",
+            role="assistant",
+            payload={
+                "status": case.status,
+                "text_material": True,
+                "auto_continue_after_text_material": True,
+                "cancelled_active_quote_tasks": cancelled_active_quote_tasks,
+            },
+        )
+        await db.flush()
+        quote_ctx = dict(ctx or {})
+        quote_ctx["images"] = []
+        quote_ctx["uploaded_images"] = []
+        quote_ctx["quote_images"] = []
+        page_ctx = dict(quote_ctx.get("page_context") or {})
+        page_ctx.pop("uploaded_images", None)
+        quote_ctx["page_context"] = page_ctx
+        quote_reply, quote_meta = await handle_quote_message(
+            db,
+            ctx=quote_ctx,
+            entities={
+                **merged_entities,
+                "platform_code": platform_code,
+                "platform_name": platform_name,
+                "account_type_name": selected_account_type_name,
+            },
+            text=f"{platform_name}报价",
+        )
+        data = quote_meta.get("data")
+        if isinstance(data, dict):
+            payload = data.setdefault("payload", {})
+            if isinstance(payload, dict):
+                payload["auto_started_after_text_collect"] = True
+                payload["text_collect"] = {
+                    "field_count": _quote_text_material_field_count(text_data),
+                    "cancelled_active_quote_tasks": cancelled_active_quote_tasks,
+                }
+        return quote_reply, quote_meta
+
+    if pending_quote_check and platform_code and platform_name and missing:
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="status",
+            role="assistant",
+            payload={"status": "collecting", "text_material": True, "missing": missing},
+        )
+        await db.flush()
+        payload = _case_payload(
+            case=case,
+            normalized_data=normalized_data,
+            images_by_slot=images_by_slot,
+            missing=missing,
+            attached_images=[],
+            platform_account=None,
+        )
+        payload.update(
+            {
+                "text_material": True,
+                "vehicle_type_detect": vehicle_type_detect,
+                "pending_quote_check": True,
+            }
+        )
+        missing_fields = [_missing_item_text(item) for item in missing if item.get("type") == "field"]
+        missing_images = [_missing_item_text(item) for item in missing if item.get("type") == "image"]
+        missing_conflicts = [_missing_item_text(item) for item in missing if item.get("type") == "data_conflict"]
+        lines = [f"{platform_name}报价资料还不完整，已中断本次报价。"]
+        if missing_fields:
+            lines.append("缺少字段：" + "、".join(missing_fields))
+        if missing_images:
+            lines.append("缺少图片：" + "、".join(missing_images))
+        if missing_conflicts:
+            lines.append("资料冲突：" + "、".join(missing_conflicts))
+        return (
+            "\n".join(lines),
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message="报价资料不完整",
+                    entities={"quote_case_id": case.id, "order_id": case.order_id},
+                    payload=payload,
+                ),
+                "actions": [_mk_action(f"{platform_name}报价")],
+            },
+        )
+
+    await db.flush()
+
+    payload = _case_payload(
+        case=case,
+        normalized_data=normalized_data,
+        images_by_slot=images_by_slot,
+        missing=missing,
+        attached_images=[],
+        platform_account=None,
+    )
+    payload.update(
+        {
+            "text_material": True,
+            "vehicle_type_detect": vehicle_type_detect,
+            "silent": True,
+            "ui_visible": False,
+        }
+    )
+    data = _mk_data(
+        result_status=RESULT_SUCCESS,
+        message="已记录文本报价资料",
+        entities={"quote_case_id": case.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return (
+        "",
+        {
+            "status": "success",
+            "intent": "quote_text_material",
+            "trace_id": _new_trace_id(),
+            "silent": True,
+            "ui_visible": False,
+            "data": data,
+            "actions": [],
+        },
+    )
+
+
 async def handle_quote_message(
     db: AsyncSession,
     *,
@@ -12717,6 +13551,14 @@ async def handle_quote_message(
     repair_code_command = _extract_quote_repair_code_command(text)
     repair_code_resolution: Dict[str, Any] = {}
     extracted = extract_quote_fields(text)
+    data_override_signal = detect_quote_data_override_signal(text)
+    quote_data_overrides = _json_obj(data_override_signal.get("overrides"))
+    if quote_data_overrides:
+        merged_entities = {
+            **merged_entities,
+            QUOTE_DATA_OVERRIDES_KEY: quote_data_overrides,
+            "force_requote": True,
+        }
     quote_date_overrides = {
         key: extracted.get(key)
         for key in ("commercial_start_date", "compulsory_start_date")
@@ -12766,13 +13608,21 @@ async def handle_quote_message(
         }
     quote_state_changed = bool(
         quote_field_overrides
+        or quote_data_overrides
         or quote_product_exclusions
         or quote_command_mode in {"全保", "交三"}
         or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities
         or transfer_vehicle_command
         or quote_date_overrides
     )
-    override_summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(quote_field_overrides)
+    override_summary = "、".join(
+        item
+        for item in (
+            _quote_data_override_summary(quote_data_overrides),
+            _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(quote_field_overrides),
+        )
+        if item
+    )
     override_reply_prefix = f"已按本次调整重报：{override_summary}\n" if override_summary else ""
     sms_code = _extract_sms_code(text)
 
@@ -12885,7 +13735,7 @@ async def handle_quote_message(
     else:
         waiting_product_state_changed = False
 
-    if waiting_pair and (quote_field_overrides or transfer_vehicle_command or quote_date_overrides or waiting_product_state_changed):
+    if waiting_pair and (quote_field_overrides or quote_data_overrides or transfer_vehicle_command or quote_date_overrides or waiting_product_state_changed):
         case, task = waiting_pair
         await _expire_waiting_sms_task(
             db,
@@ -12993,7 +13843,7 @@ async def handle_quote_message(
     else:
         duplicate_product_state_changed = False
 
-    if duplicate_confirm_pair and (quote_field_overrides or transfer_vehicle_command or quote_date_overrides or duplicate_product_state_changed):
+    if duplicate_confirm_pair and (quote_field_overrides or quote_data_overrides or transfer_vehicle_command or quote_date_overrides or duplicate_product_state_changed):
         case, task = duplicate_confirm_pair
         if not merged_entities.get("platform_code") and (case.platform_code or task.platform_code):
             merged_entities["platform_code"] = case.platform_code or task.platform_code
@@ -13021,6 +13871,7 @@ async def handle_quote_message(
                     "duplicate_quote_confirm_cancelled": True,
                     "reason": QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE,
                     "quote_field_overrides": quote_field_overrides,
+                    QUOTE_DATA_OVERRIDES_KEY: quote_data_overrides,
                     "quote_date_overrides": quote_date_overrides,
                     QUOTE_PRODUCT_EXCLUSIONS_KEY: quote_product_exclusions,
                     "old_task_id": task.id,
@@ -13188,9 +14039,16 @@ async def handle_quote_message(
             old_draft.get("quote_field_overrides"),
             quote_field_overrides,
         )
+        merged_data_overrides = _merge_quote_data_overrides(
+            old_draft.get(QUOTE_DATA_OVERRIDES_KEY),
+            quote_data_overrides,
+        )
         text_patch: Dict[str, Any] = {**quote_date_overrides, **transfer_vehicle_text_data}
         if merged_overrides:
             text_patch["quote_field_overrides"] = merged_overrides
+        if merged_data_overrides:
+            text_patch.update(merged_data_overrides)
+            text_patch[QUOTE_DATA_OVERRIDES_KEY] = merged_data_overrides
         old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
         incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
         if quote_command_mode == "全保":
@@ -13224,6 +14082,7 @@ async def handle_quote_message(
             content=text,
             payload={
                 "quote_field_overrides": merged_overrides,
+                QUOTE_DATA_OVERRIDES_KEY: merged_data_overrides,
                 QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
                 "quote_date_overrides": quote_date_overrides,
                 "transfer_vehicle": transfer_vehicle_text_data,
@@ -13234,7 +14093,14 @@ async def handle_quote_message(
         await db.flush()
         if cancelled_active_quote_tasks:
             await db.commit()
-        summary = _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(merged_overrides)
+        summary = "、".join(
+            item
+            for item in (
+                _quote_data_override_summary(merged_data_overrides),
+                _to_str(repair_code_resolution.get("summary")).strip() or _quote_override_summary(merged_overrides),
+            )
+            if item
+        )
         if not summary:
             summary = _quote_product_exclusion_summary(text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
         if not summary and transfer_vehicle_text_data:
@@ -13245,6 +14111,7 @@ async def handle_quote_message(
             entities={"quote_case_id": case.id, "order_id": case.order_id},
             payload={
                 "quote_field_overrides": merged_overrides,
+                QUOTE_DATA_OVERRIDES_KEY: merged_data_overrides,
                 QUOTE_PRODUCT_EXCLUSIONS_KEY: text_patch.get(QUOTE_PRODUCT_EXCLUSIONS_KEY),
                 "quote_date_overrides": quote_date_overrides,
                 "transfer_vehicle": {
@@ -13313,9 +14180,9 @@ async def handle_quote_message(
 
     order_id = explicit_order_id or inherited_order_id or None
     text_data = _quote_text_data_from_entities(extracted, merged_entities)
-    plate_no = _to_str(extracted.get("plate_no") or merged_entities.get("plate_no")).strip() or None
-    owner_phone = _to_str(extracted.get("owner_phone") or merged_entities.get("owner_phone")).strip() or None
-    owner_name = _to_str(extracted.get("owner_name") or merged_entities.get("owner_name")).strip() or None
+    plate_no = _quote_lookup_value(quote_data_overrides, extracted, merged_entities, "plate_no") or None
+    owner_phone = _quote_lookup_value(quote_data_overrides, extracted, merged_entities, "owner_phone") or None
+    owner_name = _quote_lookup_value(quote_data_overrides, extracted, merged_entities, "owner_name") or None
     order = await _find_order(
         db,
         ctx=ctx,
@@ -13358,6 +14225,13 @@ async def handle_quote_message(
     )
     if merged_quote_field_overrides:
         text_data["quote_field_overrides"] = merged_quote_field_overrides
+    merged_quote_data_overrides = _merge_quote_data_overrides(
+        old_draft.get(QUOTE_DATA_OVERRIDES_KEY),
+        merged_entities.get(QUOTE_DATA_OVERRIDES_KEY),
+    )
+    if merged_quote_data_overrides:
+        text_data.update(merged_quote_data_overrides)
+        text_data[QUOTE_DATA_OVERRIDES_KEY] = merged_quote_data_overrides
     old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
     incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
     if quote_command_mode == "全保":
@@ -13686,8 +14560,23 @@ async def handle_platform_credential_message(
     if not platform_name and platform_code:
         platform_name = _platform_display_name(platform_code)
     platform_text = f"{platform_name}平台" if platform_name else "对应平台"
+    operator_role_name = _ctx_role_name(ctx)
+    if _quote_account_needs_admin_contact(operator_role_name):
+        reply_text = f"{platform_text}账号资料请联系管理员在“平台账号管理”中维护；聊天框不再保存账号、密码或手机号。"
+        actions: List[Dict[str, Any]] = []
+    else:
+        reply_text = f"为了避免账号资料和报价会话混在一起，{platform_text}账号请统一在右上角“平台账号管理”中新增或编辑；聊天框不再保存账号、密码或手机号。"
+        actions = [
+            _mk_action(
+                "平台账号管理",
+                "open_account_manager",
+                "quote_platform_accounts",
+                platform_code=platform_code,
+                platform_name=platform_name,
+            )
+        ]
     return (
-        f"为了避免账号资料和报价会话混在一起，{platform_text}账号请统一在右上角“平台账号管理”中新增或编辑；聊天框不再保存账号、密码或手机号。",
+        reply_text,
         {
             "status": "success",
             "intent": "quote_credential",
@@ -13698,15 +14587,7 @@ async def handle_platform_credential_message(
                 entities=merged_entities,
                 payload={},
             ),
-            "actions": [
-                _mk_action(
-                    "平台账号管理",
-                    "open_account_manager",
-                    "quote_platform_accounts",
-                    platform_code=platform_code,
-                    platform_name=platform_name,
-                )
-            ],
+            "actions": actions,
         },
     )
 

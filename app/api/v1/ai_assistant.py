@@ -12,9 +12,11 @@ from __future__ import annotations
 - /sessions/{id}/history 作为调试辅助，不强制 schema（返回 dict）
 """
 
+import asyncio
 import hashlib
 import logging
 import os
+import time
 from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
@@ -99,6 +101,34 @@ QUOTE_IMAGE_EXT_CONTENT_TYPES = {
     ".heic": "image/heic",
     ".heif": "image/heif",
 }
+_CHAT_SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
+_CHAT_SESSION_LOCK_TOUCHED: Dict[str, float] = {}
+_CHAT_SESSION_LOCK_GUARD = asyncio.Lock()
+_CHAT_SESSION_LOCK_TTL_SECONDS = 15 * 60
+
+
+async def _get_chat_session_lock(owner_user_id: int, session_id: Any) -> asyncio.Lock | None:
+    sid = str(session_id or "").strip()
+    if owner_user_id <= 0 or not sid:
+        return None
+    key = f"{owner_user_id}:{sid}"
+    now = time.monotonic()
+    async with _CHAT_SESSION_LOCK_GUARD:
+        if len(_CHAT_SESSION_LOCKS) > 500:
+            stale_keys = [
+                k for k, touched in _CHAT_SESSION_LOCK_TOUCHED.items()
+                if now - float(touched or 0) > _CHAT_SESSION_LOCK_TTL_SECONDS
+                and not _CHAT_SESSION_LOCKS.get(k, asyncio.Lock()).locked()
+            ]
+            for stale_key in stale_keys[:200]:
+                _CHAT_SESSION_LOCKS.pop(stale_key, None)
+                _CHAT_SESSION_LOCK_TOUCHED.pop(stale_key, None)
+        lock = _CHAT_SESSION_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CHAT_SESSION_LOCKS[key] = lock
+        _CHAT_SESSION_LOCK_TOUCHED[key] = now
+        return lock
 
 
 def _quote_api_error_detail(error: Exception) -> str:
@@ -175,6 +205,22 @@ def _can_quote_use(ctx: CurrentUserContext) -> bool:
         return False
 
 
+def _can_platform_account_manage(ctx: CurrentUserContext) -> bool:
+    try:
+        require_quote_platform_account_manage_access(role_name=ctx.primary_role)
+        return True
+    except HTTPException:
+        return False
+
+
+def _can_default_config_manage(ctx: CurrentUserContext) -> bool:
+    try:
+        require_quote_default_config_manage_access(role_name=ctx.primary_role)
+        return True
+    except HTTPException:
+        return False
+
+
 def _action_requires_quote_use(action: Any) -> bool:
     if not isinstance(action, dict):
         return False
@@ -187,13 +233,27 @@ def _action_requires_quote_use(action: Any) -> bool:
     return any(keyword in text for keyword in QUOTE_ACTION_KEYWORDS)
 
 
-def _filter_actions_for_quote_permission(actions: Any, *, can_quote_use: bool) -> List[Dict[str, Any]]:
+def _filter_actions_for_quote_permission(
+        actions: Any,
+        *,
+        can_quote_use: bool,
+        can_platform_account_manage: bool = False,
+        can_default_config_manage: bool = False,
+) -> List[Dict[str, Any]]:
     if not isinstance(actions, list):
         return []
     items = [item for item in actions if isinstance(item, dict)]
-    if can_quote_use:
-        return items
-    return [item for item in items if not _action_requires_quote_use(item)]
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        action_type = str(item.get("type") or "").strip()
+        if action_type == "open_account_manager" and not can_platform_account_manage:
+            continue
+        if action_type == "open_default_config_manager" and not can_default_config_manage:
+            continue
+        if not can_quote_use and _action_requires_quote_use(item):
+            continue
+        out.append(item)
+    return out
 
 
 def _metadata_is_quote_material(metadata: Any) -> bool:
@@ -229,6 +289,7 @@ def _metadata_is_quote_material(metadata: Any) -> bool:
                 "images_by_slot",
                 "normalized_data",
                 "quote_field_overrides",
+                "quote_data_overrides",
                 "platform_dialog",
             }
             if quote_keys.intersection(payload.keys()):
@@ -236,17 +297,28 @@ def _metadata_is_quote_material(metadata: Any) -> bool:
     return False
 
 
-def _filter_metadata_for_quote_permission(metadata: Any, *, can_quote_use: bool) -> Dict[str, Any]:
+def _filter_metadata_for_quote_permission(
+        metadata: Any,
+        *,
+        can_quote_use: bool,
+        can_platform_account_manage: bool = False,
+        can_default_config_manage: bool = False,
+) -> Dict[str, Any]:
     if not isinstance(metadata, dict):
         return {}
     safe = deepcopy(metadata)
+    filtered_actions = _filter_actions_for_quote_permission(
+        safe.get("actions"),
+        can_quote_use=can_quote_use,
+        can_platform_account_manage=can_platform_account_manage,
+        can_default_config_manage=can_default_config_manage,
+    )
     if can_quote_use:
-        if isinstance(safe.get("actions"), list):
-            safe["actions"] = _filter_actions_for_quote_permission(safe.get("actions"), can_quote_use=True)
+        safe["actions"] = filtered_actions
         return safe
 
     quote_material = _metadata_is_quote_material(safe)
-    safe["actions"] = _filter_actions_for_quote_permission(safe.get("actions"), can_quote_use=False)
+    safe["actions"] = filtered_actions
     if not quote_material:
         return safe
 
@@ -535,6 +607,8 @@ async def get_ai_history(
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
     can_quote_use = _can_quote_use(ctx)
+    can_account_manage = _can_platform_account_manage(ctx)
+    can_default_config_manage = _can_default_config_manage(ctx)
 
     try:
         page = await _get_session_messages(
@@ -552,7 +626,12 @@ async def get_ai_history(
     for m in rows:
         raw_metadata = _pick(m, "metadata", default={}) or {}
         filtered_metadata = _normalize_quote_result_metadata(
-            _filter_metadata_for_quote_permission(raw_metadata, can_quote_use=can_quote_use)
+            _filter_metadata_for_quote_permission(
+                raw_metadata,
+                can_quote_use=can_quote_use,
+                can_platform_account_manage=can_account_manage,
+                can_default_config_manage=can_default_config_manage,
+            )
         )
         raw_content = sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", "")
         if not can_quote_use and _metadata_is_quote_material(raw_metadata):
@@ -999,23 +1078,40 @@ async def ai_chat(
 ):
     owner_user_id = _owner_user_id_or_401(ctx)
     can_quote_use = _can_quote_use(ctx)
+    can_account_manage = _can_platform_account_manage(ctx)
+    can_default_config_manage = _can_default_config_manage(ctx)
+    chat_context = _chat_context(ctx, body)
 
     try:
-        result = await _send_message(
-            owner_user_id=owner_user_id,
-            session_id=body.session_id,
-            message=body.message,
-            history=body.history,
-            system_prompt=None,
-            model=None,
-            temperature=None,
-            max_tokens=None,
-            stream=bool(body.stream),
-            context=_chat_context(ctx, body),
-            client_msg_id=(body.client_msg_id or "").strip() or None,
-            db=db,
-        )
-        await db.commit()
+        chat_lock = await _get_chat_session_lock(owner_user_id, body.session_id)
+
+        async def _run_chat_once() -> Dict[str, Any]:
+            # Auth dependencies may have opened a MySQL repeatable-read snapshot
+            # before a previous in-flight message committed. Start the actual
+            # chat handling from a fresh transaction after the per-session lock.
+            await db.rollback()
+            result_inner = await _send_message(
+                owner_user_id=owner_user_id,
+                session_id=body.session_id,
+                message=body.message,
+                history=body.history,
+                system_prompt=None,
+                model=None,
+                temperature=None,
+                max_tokens=None,
+                stream=bool(body.stream),
+                context=chat_context,
+                client_msg_id=(body.client_msg_id or "").strip() or None,
+                db=db,
+            )
+            await db.commit()
+            return result_inner
+
+        if chat_lock is not None:
+            async with chat_lock:
+                result = await _run_chat_once()
+        else:
+            result = await _run_chat_once()
     except ValueError as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "消息处理失败"))
@@ -1031,6 +1127,8 @@ async def ai_chat(
         _filter_metadata_for_quote_permission(
             raw_response_metadata,
             can_quote_use=can_quote_use,
+            can_platform_account_manage=can_account_manage,
+            can_default_config_manage=can_default_config_manage,
         )
     )
     reply = sanitize_quote_user_message(_pick(result, "reply", "content", "text", default="") or "", "")

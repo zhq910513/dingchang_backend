@@ -38,13 +38,17 @@ from app.services.quote_assistant_service import (
     _extract_quote_repair_code_command,
     _extract_transfer_vehicle_command,
     _is_explicit_platform_quote_command,
+    _looks_like_quote_text_material,
     detect_platform_credential_signal,
     detect_quote_config_override_signal,
+    detect_quote_data_override_signal,
     detect_quote_signal,
+    extract_quote_fields,
     handle_quote_images_message,
     handle_platform_credential_message,
     handle_quote_material_status,
     handle_quote_message,
+    handle_quote_text_material_message,
     has_expired_waiting_sms_task,
     has_quote_case_waiting_for_login_phone,
     has_recent_invalid_sms_task,
@@ -130,6 +134,36 @@ def _to_str(v: Any, default: str = "") -> str:
         return str(v)
     except Exception:
         return default
+
+
+def _merge_quote_entities(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge intent entities without dropping complementary quote field overrides."""
+    if not isinstance(incoming, dict):
+        return base
+
+    prev_overrides = base.get("quote_field_overrides")
+    next_overrides = incoming.get("quote_field_overrides")
+    prev_map = dict(prev_overrides) if isinstance(prev_overrides, dict) else {}
+    next_map = dict(next_overrides) if isinstance(next_overrides, dict) else {}
+
+    base.update(incoming)
+    if prev_map or next_map:
+        base["quote_field_overrides"] = {**prev_map, **next_map}
+    return base
+
+
+def _looks_like_quote_data_override_command(text: Any) -> bool:
+    """A field value is not always a correction; initial text materials use the same labels."""
+
+    compact = re.sub(r"\s+", "", _to_str(text))
+    if not compact:
+        return False
+    return bool(
+        re.search(
+            r"改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置为|设为|变成|变为|变到|更正为|修正为|纠正为|调整|修改|更正|修正|纠正|改|变",
+            compact,
+        )
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -3102,8 +3136,18 @@ async def _dispatch_rule_with_db(
     if intent not in {"quote", "quote_credential"} or should_collect_images:
         image_result = await handle_quote_images_message(db, ctx=ctx, entities=entities, text=text)
 
+    text_material_result = None
+    if (
+        not image_result
+        and intent not in {"quote", "quote_credential", "query_material_status"}
+        and not has_context_images
+    ):
+        text_material_result = await handle_quote_text_material_message(db, ctx=ctx, entities=entities, text=text)
+
     if image_result:
         reply, meta = image_result
+    elif text_material_result:
+        reply, meta = text_material_result
     elif intent == "help":
         reply, meta = _help_reply()
     elif intent == "query_material_status":
@@ -3140,7 +3184,7 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
     quote_signal = detect_quote_signal(text)
     signal_entities = quote_signal.get("entities")
     if isinstance(signal_entities, dict):
-        entities.update(signal_entities)
+        _merge_quote_entities(entities, signal_entities)
     quote_platform_code = _to_str(entities.get("platform_code")).strip().upper()
     quote_platform_name = _to_str(entities.get("platform_name")).strip()
     if quote_signal.get("is_quote") and (
@@ -3155,7 +3199,18 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
         confidence = max(float(confidence or 0.0), 0.93)
         override_entities = quote_override_signal.get("entities")
         if isinstance(override_entities, dict):
-            entities.update(override_entities)
+            _merge_quote_entities(entities, override_entities)
+    quote_data_override_signal = detect_quote_data_override_signal(text)
+    if (
+        intent != "quote_credential"
+        and quote_data_override_signal.get("is_override")
+        and _looks_like_quote_data_override_command(text)
+    ):
+        intent = "quote"
+        confidence = max(float(confidence or 0.0), 0.93)
+        data_override_entities = quote_data_override_signal.get("entities")
+        if isinstance(data_override_entities, dict):
+            _merge_quote_entities(entities, data_override_entities)
     transfer_vehicle_command = _extract_transfer_vehicle_command(text)
     if transfer_vehicle_command:
         intent = "quote"
@@ -3180,7 +3235,11 @@ async def _dispatch_rule(text: str, ctx: Dict[str, Any], db: Optional[AsyncSessi
             # before calling the platform. Wrapping them in begin_nested() can
             # close the transaction mid-context, so let the quote service own
             # its transaction boundary.
-            if intent in {"quote", "quote_credential"}:
+            quote_material_candidate = bool(_collect_context_images(ctx)) or _looks_like_quote_text_material(
+                text,
+                extract_quote_fields(text),
+            )
+            if intent in {"quote", "quote_credential"} or quote_material_candidate:
                 return await _dispatch_rule_with_db(
                     text,
                     ctx,

@@ -977,9 +977,13 @@ def _insurance_date_notice_from_adjustment(adjustment: Mapping[str, Any]) -> Dic
 
 
 def _emit_insurance_date_adjust_notice(callback: Any, adjustment: Mapping[str, Any]) -> bool:
+    return _emit_platform_auto_notice(callback, _insurance_date_notice_from_adjustment(adjustment))
+
+
+def _emit_platform_auto_notice(callback: Any, notice_any: Mapping[str, Any]) -> bool:
     if not callable(callback):
         return False
-    notice = _insurance_date_notice_from_adjustment(adjustment)
+    notice = dict(_json_obj(notice_any))
     if not _to_str(notice.get("message")).strip():
         return False
     try:
@@ -1391,6 +1395,20 @@ def _duplicate_quote_confirmation_payload(request_body: Mapping[str, Any]) -> Di
         "request_body": request_body,
         "request_body_draft": request_body,
         "offline_request_body": True,
+    }
+
+
+def _duplicate_quote_auto_notice_from_confirmation_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    data = _json_obj(payload)
+    duplicate = _json_obj(data.get("duplicateVin"))
+    warning = _to_str(data.get("duplicate_quote_warning") or duplicate.get("warning") or duplicate.get("message")).strip()
+    if not warning:
+        return {}
+    return {
+        "type": "duplicate_quote_notice",
+        "message": warning,
+        "source": "duplicate_vin_precheck",
+        "duplicateVin": duplicate,
     }
 
 
@@ -2675,24 +2693,28 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             quote_result: Dict[str, Any] = {}
             if is_real_quote:
                 runtime_stage = "prepare_quote"
+                auto_notice_callback = _json_obj(ctx.payload).get("auto_notice_callback")
+                prequote_auto_notices: List[Dict[str, Any]] = []
                 request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
                 duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
                 if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
-                    return PlatformRuntimeResult(
-                        status="duplicate_quote_confirm_required",
-                        message=_to_str(duplicate_confirm_payload.get("duplicate_quote_warning")),
-                        data=success_data(client, extra=duplicate_confirm_payload),
-                    )
+                    duplicate_notice = _duplicate_quote_auto_notice_from_confirmation_payload(duplicate_confirm_payload)
+                    if duplicate_notice:
+                        emitted = _emit_platform_auto_notice(auto_notice_callback, duplicate_notice)
+                        if emitted:
+                            duplicate_notice["emitted_to_chat"] = True
+                        prequote_auto_notices.append(duplicate_notice)
                 runtime_stage = "submit_quote"
                 request_body, quote_response, auto_period_notices = self._submit_used_fuel_quote_with_period_auto_adjust(
                     client,
                     request_body,
-                    auto_notice_callback=_json_obj(ctx.payload).get("auto_notice_callback"),
+                    auto_notice_callback=auto_notice_callback,
                 )
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
-                if auto_period_notices:
-                    quote_result["platform_auto_notices"] = auto_period_notices
+                platform_auto_notices = [*prequote_auto_notices, *auto_period_notices]
+                if platform_auto_notices:
+                    quote_result["platform_auto_notices"] = platform_auto_notices
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
                 if platform_dialog and not (
                     auto_period_notices
@@ -3780,12 +3802,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         status_code = _platform_status_code(data)
         if status_code != 0:
             message = _platform_message(data, "平台返回业务校验失败")
+            if _quote_response_has_display_result(data):
+                return _json_obj(data)
             if _contains_duplicate_quote(data):
                 raise PiccDuplicateQuoteError(message or "平台提示该车辆已报价过")
             if _contains_quota_full(data):
                 raise PiccQuotaFullError(message or "查询额度已用完")
-            if _quote_response_has_display_result(data):
-                return _json_obj(data)
             raise PiccBusinessRequestError(
                 f"报价提交失败：{message}",
                 action="报价提交",
