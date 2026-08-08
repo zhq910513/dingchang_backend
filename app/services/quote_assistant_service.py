@@ -50,7 +50,7 @@ from app.services.image_slot_classifier import (
     slot_label,
 )
 from app.services.baidu_ocr import OcrCallError, OcrNotConfigured, call_ocr
-from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
+from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
 from app.services.ocr_worker import _cache_put, _extract_by_type
 from app.services.quote_platforms import runtime as quote_platform_runtime
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
@@ -794,6 +794,67 @@ def _runtime_platform_dialog_message(
     )
 
 
+def _renewal_lookup_failure_text(value: Any) -> str:
+    text = _to_str(value).strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return ""
+    if re.search(
+        r"(没有此车辆信息或不是可续保车辆|没有此车辆信息|此车辆信息不存在|车辆信息不存在|"
+        r"不是可续保车辆|不是续保车辆|不是续保车|不可续保车辆|非可续保车辆|"
+        r"续保车辆不存在|无续保车辆|未查询到续保|没有续保信息|无续保信息|"
+        r"不满足续保|无法续保)",
+        compact,
+    ):
+        return text
+    return ""
+
+
+def _extract_renewal_lookup_failure_text(result: Optional[PlatformRuntimeResult]) -> str:
+    data = _json_obj(getattr(result, "data", None) if result is not None else None)
+    platform_response = _json_obj(data.get("platform_response"))
+    platform_dialog = _json_obj(data.get("platform_dialog"))
+    platform_response_body = _json_obj(platform_response.get("response"))
+    candidates: List[Any] = [
+        platform_dialog.get("message"),
+        platform_dialog.get("content"),
+        platform_response.get("raw_message"),
+        platform_response_body.get("normalizeErrorMsg"),
+        platform_response_body.get("errorMsg"),
+        platform_response_body.get("errorMessage"),
+        platform_response_body.get("businessControlMsg"),
+        platform_response_body.get("businessMsg"),
+        platform_response.get("message"),
+        platform_response.get("statusText"),
+        platform_response.get("errorMessage"),
+        platform_response_body.get("statusText"),
+        data.get("platform_status_text"),
+        data.get("error_message"),
+        data.get("message"),
+        getattr(result, "message", "") if result is not None else "",
+    ]
+    candidates.extend(_platform_dialog_candidate_texts(data))
+    candidates.extend(_platform_dialog_candidate_texts(platform_response))
+    seen: Set[str] = set()
+    for raw in candidates:
+        text = _renewal_lookup_failure_text(raw)
+        compact = re.sub(r"\s+", "", text)
+        if text and compact not in seen:
+            seen.add(compact)
+            return text
+    blob = json.dumps(data, ensure_ascii=False, default=str)
+    match = re.search(
+        r"(没有此车辆信息或不是可续保车辆|没有此车辆信息|此车辆信息不存在|车辆信息不存在|"
+        r"不是可续保车辆|不是续保车辆|不是续保车|不可续保车辆|非可续保车辆|"
+        r"续保车辆不存在|无续保车辆|未查询到续保|没有续保信息|无续保信息|"
+        r"不满足续保|无法续保)",
+        blob,
+    )
+    return match.group(1) if match else ""
+
+
 def _platform_dialog_id(
     *,
     subtype: str,
@@ -991,6 +1052,26 @@ CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE: Dict[str, Tuple[Tuple[str, str], ...]] = {
         ("vehicle_model", "车型名称"),
         ("owner_name", "车主姓名"),
     ),
+}
+
+QUOTE_MANUAL_MATERIAL_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
+    ("account_type_name", "报价类型", "select"),
+    ("owner_name", "车主姓名", "text"),
+    ("owner_phone", "车主手机号", "text"),
+    ("id_number", "身份证号", "text"),
+    ("plate_no", "号牌号码", "text"),
+    ("engine_no", "发动机号", "text"),
+    ("vin", "VIN/车架号", "text"),
+    ("first_register_date", "初登日期", "date"),
+    ("issue_date", "行驶证发证日期", "date"),
+    ("commercial_start_date", "商业起保日期", "date"),
+    ("compulsory_start_date", "交强起保日期", "date"),
+    ("vehicle_model", "车型名称", "text"),
+)
+
+QUOTE_MATERIAL_FORM_REQUIRED_BY_TYPE: Dict[str, Tuple[str, ...]] = {
+    type_name: tuple(key for key, _ in fields)
+    for type_name, fields in CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE.items()
 }
 
 CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE: Dict[str, Tuple[str, ...]] = {
@@ -2369,11 +2450,11 @@ def _quote_data_override_value_pattern(field_key: str) -> str:
     if field_key == "owner_phone":
         return r"(1\d{10})"
     if field_key == "id_number":
-        return r"(\d{17}[\dXx])"
+        return r"([0-9A-Za-z\u00d7Xx]{18})"
     if field_key == "plate_no":
         return r"([\u4e00-\u9fff][A-Za-z][A-Za-z0-9]{4,7})"
     if field_key == "vin":
-        return r"([A-HJ-NPR-Za-hj-npr-z0-9]{11,20})"
+        return r"([A-Za-z0-9]{11,20})"
     if field_key == "engine_no":
         return r"([A-Za-z0-9\-]{4,32})"
     if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
@@ -2381,7 +2462,7 @@ def _quote_data_override_value_pattern(field_key: str) -> str:
     if field_key in {"owner_name", "id_name"}:
         return r"([\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,40})"
     if field_key == "vehicle_model":
-        return r"([^\s,，,;；。]{2,80})"
+        return r"([^,，;；。\n\r]{2,90})"
     return r"([^\s,，,;；。]{1,128})"
 
 
@@ -2485,12 +2566,43 @@ def extract_quote_data_overrides(text: Any) -> Dict[str, Any]:
                 overrides[field_key] = cleaned
                 consumed.append(match.span())
                 break
+    fallback_connectors = (
+        "\u4fee\u6539",
+        "\u66f4\u6b63",
+        "\u4fee\u6b63",
+        "\u7ea0\u6b63",
+        "\u8c03\u6574",
+        "\u8bbe\u7f6e",
+        "\u53d8",
+        "\u6539",
+        "\u8c03",
+        "\u8bbe",
+    )
+    fallback_connector = "|".join(re.escape(item) for item in fallback_connectors)
+    fallback_separator = r"(?::|\uff1a|=|\+|\uff0c|,)?"
+    fallback_suffix = r"(?:\u4e3a|\u6210|\u5230|\u81f3)?"
+    for scan_text in scan_texts:
+        consumed = consumed_by_text.setdefault(scan_text, [])
+        for field_key, _label, alias in _quote_data_override_alias_items():
+            if field_key in overrides:
+                continue
+            value_pattern = _quote_data_override_value_pattern(field_key)
+            pattern = rf"{re.escape(alias)}\s*{fallback_separator}\s*(?:{fallback_connector}){fallback_suffix}\s*{fallback_separator}\s*{value_pattern}"
+            for match in re.finditer(pattern, scan_text, flags=re.IGNORECASE):
+                if any(not (match.end() <= start or match.start() >= end) for start, end in consumed):
+                    continue
+                cleaned = _clean_quote_data_override_value(field_key, match.group(1))
+                if cleaned in (None, ""):
+                    continue
+                overrides[field_key] = cleaned
+                consumed.append(match.span())
+                break
     compact_only = re.sub(r"\s+", "", raw_text).upper()
-    if "vin" not in overrides and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", compact_only):
+    if "vin" not in overrides and re.fullmatch(r"[A-Z0-9]{17}", compact_only):
         cleaned = _clean_quote_data_override_value("vin", compact_only)
         if cleaned:
             overrides["vin"] = cleaned
-    if "id_number" not in overrides and re.fullmatch(r"\d{17}[\dX]", compact_only):
+    if "id_number" not in overrides and re.fullmatch(r"[0-9A-Z\u00d7X]{18}", compact_only):
         cleaned = _clean_quote_data_override_value("id_number", compact_only)
         if cleaned:
             overrides["id_number"] = cleaned
@@ -5083,6 +5195,11 @@ def _quote_platform_dialog_response(
         platform_code=platform_code,
         platform_name=platform_name,
     )
+    renewal_lookup_failure_text = _extract_renewal_lookup_failure_text(runtime_result)
+    if renewal_lookup_failure_text:
+        error_detail = renewal_lookup_failure_text
+        message = renewal_lookup_failure_text
+        source_confirm_required = False
     if _quote_account_needs_admin_contact(operator_role_name) and subtype in {"session_expired", "quota_full"}:
         if subtype == "session_expired":
             message = f"{platform_name or '平台'}账号登录已过期，请联系管理员处理。"
@@ -6422,11 +6539,11 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
             out["owner_phone"] = phone.group(1)
 
     id_no = re.search(
-        r"(?:身份证号|身份证号码|身份证|证件号|证件号码)\s*(?:[:：=]|是|为)?\s*(\d{17}[\dXx])",
+        r"(?:身份证号|身份证号码|身份证|证件号|证件号码)\s*(?:[:：=]|是|为)?\s*([0-9A-Za-z\u00d7Xx]{18})",
         t,
     )
     if not id_no:
-        id_no = re.search(r"(?<!\d)(\d{17}[\dXx])(?!\d)", t)
+        id_no = re.search(r"(?<![0-9A-Za-z])([0-9A-Za-z\u00d7Xx]{18})(?![0-9A-Za-z])", t)
     if id_no:
         out["id_number"] = id_no.group(1).upper()
 
@@ -6436,9 +6553,9 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
     if plate:
         out["plate_no"] = plate.group(1)
 
-    vin = re.search(r"(?:VIN|车架号|车架|车辆识别代号|车辆识别代码|车辆识别码)\s*(?:[:：=]|是|为)?\s*([A-HJ-NPR-Z0-9]{11,20})", up, flags=re.IGNORECASE)
+    vin = re.search(r"(?:VIN|车架号|车架|车辆识别代号|车辆识别代码|车辆识别码)\s*(?:[:：=]|是|为)?\s*([A-Z0-9]{11,20})", up, flags=re.IGNORECASE)
     if not vin:
-        vin = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", up)
+        vin = re.search(r"\b([A-Z0-9]{17})\b", up)
     if vin:
         out["vin"] = vin.group(1).upper()
 
@@ -6578,7 +6695,7 @@ def extract_quote_fields(text: Any) -> Dict[str, Any]:
 
     out.update({k: v for k, v in _quote_vehicle_type_text_data(t, out).items() if v})
 
-    return out
+    return _clean_quote_dynamic_data(out, derive_owner_name=False)
 
 
 def _ctx_role_name(ctx: Dict[str, Any]) -> str:
@@ -8096,6 +8213,364 @@ def _missing_item_text(item: Dict[str, Any]) -> str:
     return f"{label}（{detail}）" if detail else label
 
 
+def _quote_material_form_command_mode(text: Any) -> str:
+    compact = re.sub(r"[\s,，。.;；:：]+", "", _norm_text(text))
+    if not compact:
+        return ""
+    manual_commands = {
+        "手工",
+        "手工录入",
+        "手工填写",
+        "手动",
+        "手动录入",
+        "手动填写",
+        "人工",
+        "人工录入",
+        "人工填写",
+    }
+    supplement_commands = {
+        "补资料",
+        "补充资料",
+        "补全资料",
+        "补材料",
+        "补充材料",
+        "补全材料",
+        "缺什么",
+        "缺少什么",
+    }
+    if compact in manual_commands:
+        return "manual"
+    if compact in supplement_commands:
+        return "supplement"
+    return ""
+
+
+def looks_like_quote_material_form_command(text: Any) -> bool:
+    return bool(_quote_material_form_command_mode(text))
+
+
+def _quote_material_form_required_types_for_key(key: str) -> List[str]:
+    out: List[str] = []
+    for type_name in QUOTE_ACCOUNT_TYPE_OPTIONS:
+        required_keys = set(QUOTE_MATERIAL_FORM_REQUIRED_BY_TYPE.get(type_name) or ())
+        if key in required_keys:
+            out.append(type_name)
+    return out
+
+
+def _quote_material_form_value(data: Mapping[str, Any], key: str, *, account_type_name: str = "") -> str:
+    if key == "account_type_name":
+        return _normalize_account_type_name(account_type_name or _json_obj(data).get(key)) or ""
+    value = _to_str(_json_obj(data).get(key)).strip()
+    if key.endswith("_date"):
+        return _normalize_quote_date_text(value) or value
+    return value
+
+
+def _quote_material_form_field(
+    key: str,
+    label: str,
+    field_type: str,
+    *,
+    data: Mapping[str, Any],
+    account_type_name: str,
+    required: bool = False,
+) -> Dict[str, Any]:
+    field: Dict[str, Any] = {
+        "key": key,
+        "label": label,
+        "type": field_type,
+        "required": bool(required),
+        "value": _quote_material_form_value(data, key, account_type_name=account_type_name),
+    }
+    required_for = _quote_material_form_required_types_for_key(key)
+    if required_for:
+        field["required_for_account_types"] = required_for
+    if key == "account_type_name":
+        field["required"] = True
+        field["options"] = [{"label": item, "value": item} for item in QUOTE_ACCOUNT_TYPE_OPTIONS]
+        field["placeholder"] = "请选择报价类型"
+    elif field_type == "date":
+        field["placeholder"] = "请选择或输入日期"
+    else:
+        field["placeholder"] = f"请输入{label}"
+    return field
+
+
+def _quote_material_conflict_edit_keys(item: Mapping[str, Any]) -> Tuple[str, ...]:
+    key = _to_str(_json_obj(item).get("key")).strip()
+    if key == "owner_name_id_name_conflict":
+        return ("owner_name", "id_number")
+    if key == "vehicle_cert_license_vin_conflict":
+        return ("vin",)
+    if key == "vehicle_cert_license_engine_conflict":
+        return ("engine_no",)
+    return ()
+
+
+def _quote_material_form_payload(
+    *,
+    mode: str,
+    normalized_data: Dict[str, Any],
+    missing: List[Dict[str, Any]],
+    platform_code: str,
+    platform_name: str,
+    account_type_name: str,
+    session_id: Optional[str] = None,
+    quote_case_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    data = _json_obj(normalized_data)
+    selected_type = _normalize_account_type_name(account_type_name or data.get("account_type_name")) or ""
+    order_map = {key: (label, field_type) for key, label, field_type in QUOTE_MANUAL_MATERIAL_FIELD_ORDER}
+    missing_field_keys: List[str] = []
+    conflict_field_keys: List[str] = []
+    for item in missing or []:
+        item_type = _to_str(item.get("type")).strip()
+        item_key = _to_str(item.get("key")).strip()
+        if item_type == "field" and item_key:
+            missing_field_keys.append(item_key)
+        elif item_type == "data_conflict":
+            conflict_field_keys.extend(_quote_material_conflict_edit_keys(item))
+
+    core_field_union: List[str] = []
+    for type_name in QUOTE_ACCOUNT_TYPE_OPTIONS:
+        for key in QUOTE_MATERIAL_FORM_REQUIRED_BY_TYPE.get(type_name, ()):
+            if key not in core_field_union:
+                core_field_union.append(key)
+
+    if mode == "manual":
+        field_keys = [key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER]
+    elif not selected_type or "account_type_name" in missing_field_keys:
+        field_keys = [key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER]
+    else:
+        field_keys = ["account_type_name"]
+        for key in [*core_field_union, *conflict_field_keys]:
+            if key not in field_keys:
+                field_keys.append(key)
+
+    fields: List[Dict[str, Any]] = []
+    missing_set = set(missing_field_keys)
+    for key in field_keys:
+        label, field_type = order_map.get(key, (key, "text"))
+        required = key == "account_type_name" or key in missing_set
+        fields.append(
+            _quote_material_form_field(
+                key,
+                label,
+                field_type,
+                data=data,
+                account_type_name=selected_type,
+                required=required,
+            )
+        )
+
+    missing_texts = [_missing_item_text(item) for item in missing or []]
+    title = "手工填写报价资料" if mode == "manual" else "补充报价资料"
+    if mode == "supplement" and missing_texts:
+        description = "请补齐下列表单字段；提交后会继续沿用当前资料。"
+    elif mode == "supplement":
+        description = "当前核心字段已基本齐全，如需纠正可直接修改后提交。"
+    else:
+        description = "请填写客户提供的资料；提交后先保存资料，发起报价时再校验最低必填字段。"
+    return {
+        "mode": mode,
+        "title": title,
+        "description": description,
+        "platform_code": platform_code or "PICC",
+        "platform_name": platform_name or "人保",
+        "account_type_name": selected_type,
+        "session_id": _to_str(session_id).strip(),
+        "quote_case_id": _safe_int(quote_case_id, 0) or None,
+        "fields": fields,
+        "missing": missing or [],
+        "missing_texts": missing_texts,
+        "submit_prefix": "手工资料" if mode == "manual" else "补充资料",
+    }
+
+
+def _quote_material_form_values_from_context(ctx: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(ctx, Mapping) or not ctx.get("quote_material_form_submit"):
+        return {}
+    values = _json_obj(ctx.get("quote_material_form_values"))
+    if not values:
+        values = _json_obj(ctx.get("quoteMaterialFormValues"))
+    if not values:
+        return {}
+    allowed = {key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER}
+    return {
+        key: value
+        for key, value in values.items()
+        if key in allowed and _to_str(value).strip()
+    }
+
+
+def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dict[str, Any]:
+    raw = {
+        key: value
+        for key, value in _json_obj(values).items()
+        if key != "account_type_name" and _to_str(value).strip()
+    }
+    return _clean_quote_dynamic_data(raw, derive_owner_name=False) if raw else {}
+
+
+async def _quote_case_by_id_for_form(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    quote_case_id: int,
+) -> Optional[QuoteCase]:
+    if owner_user_id <= 0 or quote_case_id <= 0:
+        return None
+    stmt = select(QuoteCase).where(
+        QuoteCase.id == int(quote_case_id),
+        QuoteCase.owner_user_id == int(owner_user_id),
+        QuoteCase.status.in_(ACTIVE_CASE_STATUSES),
+    )
+    if session_id:
+        stmt = stmt.where(QuoteCase.session_id == session_id)
+    return (await db.execute(stmt.limit(1))).scalars().first()
+
+
+async def handle_quote_material_form_message(
+    db: AsyncSession,
+    *,
+    ctx: Dict[str, Any],
+    entities: Dict[str, Any],
+    text: str,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    mode = _quote_material_form_command_mode(text)
+    if not mode:
+        return None
+    owner_user_id = _ctx_current_user_id(ctx)
+    if owner_user_id <= 0:
+        return None
+    _ensure_quote_flow_access(ctx)
+
+    session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    signal = detect_quote_signal(text)
+    merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
+    platform_name = _to_str(merged_entities.get("platform_name")).strip()
+
+    case = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
+    if case:
+        case = await _lock_quote_case(db, case)
+        if not platform_code:
+            platform_code = _to_str(case.platform_code).strip().upper()
+        if not platform_name:
+            platform_name = _to_str(case.platform_name).strip()
+    if not platform_code:
+        platform_code = "PICC"
+    if not platform_name:
+        platform_name = _platform_display_name(platform_code) or "人保"
+
+    if not case:
+        case = await _get_or_create_case(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            order=None,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            ctx=ctx,
+        )
+        case = await _lock_quote_case(db, case)
+    else:
+        changed = False
+        if platform_code and _to_str(case.platform_code).strip().upper() != platform_code:
+            case.platform_code = platform_code
+            changed = True
+        if platform_name and _to_str(case.platform_name).strip() != platform_name:
+            case.platform_name = platform_name
+            changed = True
+        if changed:
+            case.updated_at = _now()
+
+    images_by_slot = await _active_images_by_slot(db, int(case.id))
+    normalized_data = _normalize_quote_case_data(
+        base_data=_json_obj(case.normalized_data) or _json_obj(case.draft_order_data),
+        order_data={},
+        text_data={},
+        images_by_slot=images_by_slot,
+    )
+    vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
+    selected_account_type_name = _normalize_account_type_name(
+        merged_entities.get("account_type_name")
+        or normalized_data.get("account_type_name")
+        or vehicle_type_detect.get("config_type_name")
+    )
+    missing = _missing_requirements(
+        normalized_data,
+        images_by_slot,
+        platform_code=platform_code,
+        account_type_name=selected_account_type_name,
+    )
+    case.normalized_data = normalized_data
+    case.draft_order_data = normalized_data
+    case.missing_requirements = missing
+    if case.status not in {CASE_STATUS_QUOTED, CASE_STATUS_WAITING_SMS, CASE_STATUS_WAITING_DUPLICATE_CONFIRM}:
+        case.status = CASE_STATUS_READY if not missing else CASE_STATUS_COLLECTING
+    case.updated_at = _now()
+
+    form_payload = _quote_material_form_payload(
+        mode=mode,
+        normalized_data=normalized_data,
+        missing=missing,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        account_type_name=selected_account_type_name,
+        session_id=session_id,
+        quote_case_id=_safe_int(case.id, 0),
+    )
+    payload = _case_payload(
+        case=case,
+        normalized_data=normalized_data,
+        images_by_slot=images_by_slot,
+        missing=missing,
+        attached_images=[],
+        platform_account=None,
+    )
+    payload.update(
+        {
+            "quote_material_form": form_payload,
+            "ui_visible": False,
+            "silent": True,
+        }
+    )
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="chat",
+        role="user",
+        content=text,
+        payload={"quote_material_form_requested": True, "mode": mode, "missing": missing},
+    )
+    await db.flush()
+
+    data = _mk_data(
+        result_status=RESULT_NEED_MORE if form_payload.get("missing") else RESULT_NOT_READY,
+        message="请填写报价资料表单",
+        entities={"quote_case_id": case.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return (
+        "",
+        {
+            "status": "success",
+            "intent": "quote_material_form",
+            "trace_id": _new_trace_id(),
+            "silent": True,
+            "ui_visible": False,
+            "data": data,
+            "actions": [],
+        },
+    )
+
+
 _MATERIAL_DETAIL_LABELS = {
     "owner_name": "行驶证所有人",
     "id_name": "身份证姓名",
@@ -9472,6 +9947,11 @@ def _quote_first_positive_money_text(*values: Any) -> str:
     return ""
 
 
+def _quote_cert_display_text(field_name: str, *values: Any) -> str:
+    raw = _quote_first_text(*values)
+    return correct_vehicle_cert_field(field_name, raw) or raw
+
+
 def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
     safe_card = dict(_json_obj(card))
     request_body = _json_obj(result.get("request_body"))
@@ -9526,6 +10006,25 @@ def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], ca
         proposal_info["bi_start_date"] = bi_start
     if ci_start:
         proposal_info["ci_start_date"] = ci_start
+    if proposal_info:
+        proposal_info["plate_no"] = _quote_cert_display_text(
+            "plate_no",
+            proposal_info.get("plate_no"),
+            vehicle.get("licenseNo"),
+            quote_form.get("prpCitemCar.licenseNo"),
+        )
+        proposal_info["engine_no"] = _quote_cert_display_text(
+            "engine_no",
+            proposal_info.get("engine_no"),
+            vehicle.get("engineNo"),
+            quote_form.get("prpCitemCar.engineNo"),
+        )
+        proposal_info["vin"] = _quote_cert_display_text(
+            "vin",
+            proposal_info.get("vin"),
+            vehicle.get("vin"),
+            quote_form.get("prpCitemCar.vinNo"),
+        )
     if proposal_info:
         safe_card["proposal_info"] = proposal_info
     return safe_card
@@ -9630,9 +10129,9 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         "risk_score": _to_str(result.get("risk_score") or safe_card.get("risk_score") or "-").strip() or "-",
         "proposal_info": {
             "insured_name": _quote_first_text(owner.get("ownerName"), result.get("owner_name"), safe_card.get("owner_name")),
-            "plate_no": _quote_first_text(result.get("plate_no"), vehicle.get("licenseNo"), safe_card.get("plate_no")),
-            "engine_no": _quote_first_text(vehicle.get("engineNo"), quote_form.get("prpCitemCar.engineNo"), safe_card.get("engine_no")),
-            "vin": _quote_first_text(vehicle.get("vin"), quote_form.get("prpCitemCar.vinNo"), safe_card.get("vin")),
+            "plate_no": _quote_cert_display_text("plate_no", result.get("plate_no"), vehicle.get("licenseNo"), safe_card.get("plate_no")),
+            "engine_no": _quote_cert_display_text("engine_no", vehicle.get("engineNo"), quote_form.get("prpCitemCar.engineNo"), safe_card.get("engine_no")),
+            "vin": _quote_cert_display_text("vin", vehicle.get("vin"), quote_form.get("prpCitemCar.vinNo"), safe_card.get("vin")),
             "vehicle_type": _picc_code_label(car_kind_code, PICC_DISPLAY_CAR_KIND_LABELS),
             "vehicle_usage": _picc_code_label(use_nature_code, PICC_DISPLAY_USE_NATURE_LABELS),
             "vehicle_model": _quote_first_text(
@@ -13233,7 +13732,28 @@ async def handle_quote_text_material_message(
         return None
     extracted = extract_quote_fields(text)
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    form_values = _quote_material_form_values_from_context(ctx or {})
+    form_session_id = _to_str((ctx or {}).get("quote_material_form_session_id")).strip()
+    form_case_id = _safe_int((ctx or {}).get("quote_material_form_case_id"), 0)
+    if form_values and form_session_id and session_id and form_session_id != session_id:
+        return (
+            "这份资料表单属于另一个会话，我没有写入当前会话。请在当前会话重新输入“手工”或“补资料”后再提交。",
+            {
+                "status": "success",
+                "intent": "quote_material_form",
+                "trace_id": _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message="资料表单会话不一致",
+                    entities={"quote_case_id": form_case_id or None},
+                    payload={"quote_material_form_stale": True},
+                ),
+                "actions": [],
+            },
+        )
     looks_like_material = _looks_like_quote_text_material(text, extracted)
+    if form_values:
+        looks_like_material = True
     active_case_for_followup: Optional[QuoteCase] = None
     if not looks_like_material and _quote_text_material_field_count(extracted) >= 1 and session_id:
         active_case_for_followup = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
@@ -13244,6 +13764,14 @@ async def handle_quote_text_material_message(
 
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    form_overrides = _quote_material_form_overrides_from_values(form_values)
+    if form_values.get("account_type_name"):
+        merged_entities["account_type_name"] = form_values.get("account_type_name")
+    if form_overrides:
+        merged_entities[QUOTE_DATA_OVERRIDES_KEY] = _merge_quote_data_overrides(
+            merged_entities.get(QUOTE_DATA_OVERRIDES_KEY),
+            form_overrides,
+        )
     text_data = _quote_text_data_from_entities(extracted, merged_entities)
     type_data = _quote_vehicle_type_text_data(text, text_data)
     if type_data:
@@ -13294,17 +13822,51 @@ async def handle_quote_text_material_message(
             reason="已提交新文本资料，自动中止上一笔重复投保确认",
         )
 
-    case = await _get_or_create_case(
-        db,
-        owner_user_id=owner_user_id,
-        session_id=session_id,
-        order=order,
-        platform_code=platform_code,
-        platform_name=platform_name,
-        ctx=ctx,
-        reuse_quoted=bool(_is_explicit_requote(text)),
-        exclude_case_ids=exclude_case_ids,
-    )
+    case = None
+    if form_case_id:
+        case = await _quote_case_by_id_for_form(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            quote_case_id=form_case_id,
+        )
+        if case is None:
+            return (
+                "这份资料表单对应的会话材料已变化或不可用，我没有写入当前会话。请重新输入“手工”或“补资料”打开最新表单。",
+                {
+                    "status": "success",
+                    "intent": "quote_material_form",
+                    "trace_id": _new_trace_id(),
+                    "data": _mk_data(
+                        result_status=RESULT_NEED_MORE,
+                        message="资料表单对应 case 不可用",
+                        entities={"quote_case_id": form_case_id},
+                        payload={"quote_material_form_stale": True},
+                    ),
+                    "actions": [],
+                },
+            )
+        changed = False
+        if platform_code and _to_str(case.platform_code).strip().upper() != platform_code:
+            case.platform_code = platform_code
+            changed = True
+        if platform_name and _to_str(case.platform_name).strip() != platform_name:
+            case.platform_name = platform_name
+            changed = True
+        if changed:
+            case.updated_at = _now()
+    if case is None:
+        case = await _get_or_create_case(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            order=order,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            ctx=ctx,
+            reuse_quoted=bool(_is_explicit_requote(text)),
+            exclude_case_ids=exclude_case_ids,
+        )
     case = await _lock_quote_case(db, case)
     pending_quote_check = _quote_case_has_pending_quote_check(case)
     cancelled_active_quote_tasks = await _cancel_active_quote_tasks_for_case(

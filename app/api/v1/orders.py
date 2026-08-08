@@ -54,7 +54,7 @@ from app.schemas.order import (
     OrderStatusUpdate,
     OrderInfoIn,
 )
-from app.services.ocr_cleaner import clean_dynamic_data_for_ocr
+from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
 from app.services.order_owner_name import (
     append_owner_name_fuzzy_clause as _append_owner_name_fuzzy_clause,
 )
@@ -1351,6 +1351,11 @@ async def _build_order_list_clauses(
                 detail="first_register_date_* must be YYYY-MM-DD and end>=start",
             )
         clauses.append(and_(OrderFact.first_register_date >= d_start, OrderFact.first_register_date <= d_end))
+
+    id_number = correct_vehicle_cert_field("id_number", id_number) or id_number
+    plate_no = correct_vehicle_cert_field("plate_no", plate_no) or plate_no
+    engine_no = correct_vehicle_cert_field("engine_no", engine_no) or engine_no
+    vin = correct_vehicle_cert_field("vin", vin) or vin
 
     fact_clauses = (
         _build_fact_match_clause(OrderFact.owner_name, owner_name),

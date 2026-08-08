@@ -15,8 +15,35 @@ _8DIGITS_RE = re.compile(r"^\d{8}$")
 _6DIGITS_RE = re.compile(r"^\d{6}$")
 _VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")
 _PLATE_RE = re.compile(r"[\u4e00-\u9fff][A-Z][A-Z0-9]{4,6}")
-_RESIDENT_ID_RE = re.compile(r"\d{17}[\dXx]")
 _SOCIAL_CREDIT_RE = re.compile(r"[0-9A-Z]{18}")
+_SOCIAL_CREDIT_CHARS = "0123456789ABCDEFGHJKLMNPQRTUWXY"
+_SOCIAL_CREDIT_WEIGHTS = (1, 3, 9, 27, 19, 26, 16, 17, 20, 29, 25, 13, 8, 24, 10, 30, 28)
+_VEHICLE_CODE_CHAR_MAP = str.maketrans({
+    "O": "0",
+    "I": "1",
+    "Q": "0",
+})
+_PLATE_SERIAL_CHAR_MAP = str.maketrans({
+    "O": "0",
+    "I": "1",
+})
+_RESIDENT_ID_DIGIT_CHAR_MAP = str.maketrans({
+    "O": "0",
+    "Q": "0",
+    "D": "0",
+    "I": "1",
+    "L": "1",
+    "Z": "2",
+    "S": "5",
+    "G": "6",
+    "B": "8",
+})
+_SOCIAL_CREDIT_OCR_CHAR_MAP = str.maketrans({
+    "O": "0",
+    "I": "1",
+    "Z": "2",
+    "S": "5",
+})
 
 _EMPTY_MARKERS = {
     "",
@@ -93,6 +120,46 @@ _LABEL_PREFIXES: Dict[str, tuple[str, ...]] = {
 }
 
 _ALIASES: Dict[str, str] = {
+    "plateNo": "plate_no",
+    "plateNumber": "plate_no",
+    "plate_number": "plate_no",
+    "licenseNo": "plate_no",
+    "license_no": "plate_no",
+    "licensePlateNo": "plate_no",
+    "licensePlateNumber": "plate_no",
+    "license_plate_no": "plate_no",
+    "license_plate_number": "plate_no",
+    "vinNo": "vin",
+    "vehicleVin": "vin",
+    "vehicle_vin": "vin",
+    "carVin": "vin",
+    "car_vin": "vin",
+    "chassisNo": "vin",
+    "chassis_no": "vin",
+    "frameNo": "vin",
+    "frame_no": "vin",
+    "vin_no": "vin",
+    "engineNo": "engine_no",
+    "engineNumber": "engine_no",
+    "engine_number": "engine_no",
+    "motorNo": "engine_no",
+    "motor_no": "engine_no",
+    "idNo": "id_number",
+    "id_no": "id_number",
+    "ownerIdNo": "id_number",
+    "owner_id_no": "id_number",
+    "ownerCertNo": "id_number",
+    "owner_cert_no": "id_number",
+    "insuredIdNo": "id_number",
+    "insured_id_no": "id_number",
+    "applicantIdNo": "id_number",
+    "applicant_id_no": "id_number",
+    "identifyNumber": "id_number",
+    "identify_number": "id_number",
+    "certNo": "cert_no",
+    "certificateNo": "certificate_no",
+    "vehicleCertificateNo": "vehicle_certificate_no",
+    "chassisCertNo": "chassis_cert_no",
     "id_birth": "id_birth_date",
     "id_nation": "id_ethnicity",
     "id_valid_period": "id_validity",
@@ -102,6 +169,7 @@ _ALIASES: Dict[str, str] = {
     "dla_approved_passengers": "approved_passenger_count",
     "dla_passenger_count": "approved_passenger_count",
 }
+_ALIASES_LOWER: Dict[str, str] = {key.lower(): value for key, value in _ALIASES.items()}
 
 _TEXT_FIELDS = (
     "owner_name",
@@ -236,6 +304,134 @@ def _alnum_only(text: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", text or "")
 
 
+def _vehicle_cert_base_clean(value: Any) -> str:
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value)).strip().upper()
+    text = text.replace("\u00d7", "X")
+    return re.sub(r"[\s\-_:\uff1a]", "", text)
+
+
+def _calc_resident_id_check_code(first17: str) -> str:
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    check_codes = "10X98765432"
+    total = sum(int(num) * weight for num, weight in zip(first17, weights))
+    return check_codes[total % 11]
+
+
+def _correct_driver_license_no(value: str) -> str:
+    chars = list(value)
+    for index in range(min(17, len(chars))):
+        chars[index] = chars[index].translate(_RESIDENT_ID_DIGIT_CHAR_MAP)
+    if len(chars) >= 18:
+        chars[17] = "X" if chars[17] in {"\u00d7", "X"} else chars[17].translate(_RESIDENT_ID_DIGIT_CHAR_MAP)
+    corrected = "".join(chars)
+    if len(corrected) == 18 and corrected[:17].isdigit() and corrected[17] not in "0123456789X":
+        corrected = corrected[:17] + _calc_resident_id_check_code(corrected[:17])
+    return corrected
+
+
+def _correct_social_credit_code(value: str) -> str:
+    corrected = value.translate(_SOCIAL_CREDIT_OCR_CHAR_MAP)
+    return corrected if _looks_like_social_credit_code(corrected) else value
+
+
+def _correct_vehicle_code_no(value: str) -> str:
+    return value.translate(_VEHICLE_CODE_CHAR_MAP)
+
+
+def _correct_plate_no(value: str) -> str:
+    """Keep the plate authority letter intact; only fix OCR chars in the serial part."""
+    text = value.upper()
+    match = re.match(r"^([\u4e00-\u9fff][A-Z])([A-Z0-9]{4,7})$", text)
+    if not match:
+        return text
+    return match.group(1) + match.group(2).translate(_PLATE_SERIAL_CHAR_MAP)
+
+
+def correct_vehicle_cert_no(value: Any) -> str:
+    """Safely correct OCR mistakes in vehicle/driver certificate numbers."""
+    text = _vehicle_cert_base_clean(value)
+    if not text:
+        return ""
+    if len(text) == 18:
+        corrected_id = _correct_driver_license_no(text)
+        if _looks_like_resident_id(corrected_id):
+            return corrected_id
+        corrected_credit = _correct_social_credit_code(text)
+        if corrected_credit != text:
+            return corrected_credit
+        return text
+    if len(text) in {15, 17}:
+        return _correct_vehicle_code_no(text)
+    return text
+
+
+def correct_vehicle_cert_field(field_name: str, value: Any) -> str:
+    """Field-aware certificate-number cleanup used before OCR/chat/request persistence."""
+    text = _vehicle_cert_base_clean(value)
+    if not text:
+        return ""
+    key = str(field_name or "").strip()
+    key_lower = key.lower()
+    if key in {"prpCitemCar.vinNo", "prpCitemCar.frameNo", "jyVehicleRequest.vinno"} or key_lower in {
+        "vin",
+        "vin_no",
+        "vinno",
+        "vehicle_vin",
+        "vehiclevin",
+        "car_vin",
+        "carvin",
+        "frame_no",
+        "frameno",
+        "chassis_no",
+        "chassisno",
+    }:
+        return _correct_vehicle_code_no(text)
+    if key in {"prpCitemCar.engineNo"} or key_lower in {
+        "engine_no",
+        "engineno",
+        "engine_number",
+        "enginenumber",
+        "engine",
+        "motor_no",
+        "motorno",
+    }:
+        return _correct_vehicle_code_no(text)
+    if key_lower in {"certificate_no", "certificateno", "cert_no", "certno", "vehicle_certificate_no", "chassis_cert_no"}:
+        return _correct_vehicle_code_no(text) if len(text) == 15 else text.translate(_VEHICLE_CODE_CHAR_MAP)
+    if key in {"prpCitemCar.licenseNo"} or key_lower in {
+        "plate_no",
+        "plateno",
+        "plate_number",
+        "platenumber",
+        "licenseno",
+        "license_no",
+        "licenseplateno",
+        "license_plate_no",
+        "licenseplatenumber",
+        "license_plate_number",
+    }:
+        return _correct_plate_no(text)
+    if key in {"quoteCarOwner.identifyNumber"} or key_lower in {
+        "id_number",
+        "idno",
+        "owneridno",
+        "owner_id_no",
+        "ownercertno",
+        "owner_cert_no",
+        "insuredidno",
+        "insured_id_no",
+        "applicantidno",
+        "applicant_id_no",
+        "identify_number",
+        "identifynumber",
+        "holdidentifynumber",
+    }:
+        return correct_vehicle_cert_no(text)
+    return correct_vehicle_cert_no(text)
+
+
 def _strip_label_prefix(value: Any, field_name: str) -> str:
     text = _s(value)
     if not text:
@@ -333,25 +529,38 @@ def _looks_like_resident_id(candidate: str) -> bool:
     return _valid_ymd(candidate[6:10], candidate[10:12], candidate[12:14]) is not None
 
 
+def _looks_like_social_credit_code(candidate: str) -> bool:
+    code = _alnum_only(candidate).upper()
+    if not re.fullmatch(r"[159Y][1239][0-9A-Z]{6}[0-9A-Z]{9}[0-9A-Z]", code):
+        return False
+    if any(ch not in _SOCIAL_CREDIT_CHARS for ch in code):
+        return False
+    total = sum(_SOCIAL_CREDIT_CHARS.index(ch) * weight for ch, weight in zip(code[:17], _SOCIAL_CREDIT_WEIGHTS))
+    check_index = (31 - total % 31) % 31
+    return code[-1] == _SOCIAL_CREDIT_CHARS[check_index]
+
+
 def norm_id_number(value: Any) -> Optional[str]:
     if _is_empty(value):
         return None
     text = _strip_label_prefix(value, "id_number").upper()
-    compact = _alnum_only(text).upper()
+    compact = _alnum_only(_vehicle_cert_base_clean(text)).upper()
     if not compact:
         return None
 
-    resident_match = _RESIDENT_ID_RE.search(compact)
-    if resident_match:
-        candidate = resident_match.group(0).upper()
+    for i in range(0, max(1, len(compact) - 17)):
+        candidate = correct_vehicle_cert_field("id_number", compact[i : i + 18])
         if _looks_like_resident_id(candidate):
             return candidate
 
     credit_match = _SOCIAL_CREDIT_RE.search(compact)
     if credit_match:
         candidate = credit_match.group(0).upper()
-        if any(ch.isalpha() for ch in candidate):
+        if _looks_like_social_credit_code(candidate):
             return candidate
+        corrected = _correct_social_credit_code(candidate)
+        if _looks_like_social_credit_code(corrected):
+            return corrected
 
     return None
 
@@ -366,10 +575,9 @@ def norm_vin(value: Any) -> Optional[str]:
     if _is_empty(value, field_name="vin"):
         return None
     text = _strip_label_prefix(value, "vin").upper()
-    compact = _alnum_only(text).upper()
+    compact = _alnum_only(correct_vehicle_cert_field("vin", text)).upper()
     if not compact:
         return None
-    compact = compact.replace("O", "0").replace("I", "1").replace("Q", "0")
 
     for i in range(0, max(1, len(compact) - 16)):
         candidate = compact[i : i + 17]
@@ -384,7 +592,7 @@ def norm_engine_no(value: Any) -> Optional[str]:
     if _is_empty(value):
         return None
     text = _strip_label_prefix(value, "engine_no").upper()
-    compact = _alnum_only(text).upper()
+    compact = _alnum_only(correct_vehicle_cert_field("engine_no", text)).upper()
     if 3 <= len(compact) <= 32:
         return compact
     return None
@@ -397,6 +605,7 @@ def norm_plate_no(value: Any) -> Optional[str]:
     if _is_empty(text, field_name="plate_no"):
         return None
     text = re.sub(r"\s+", "", text)
+    text = correct_vehicle_cert_field("plate_no", text)
     text = re.sub(r"[^\u4e00-\u9fffA-Z0-9]", "", text)
     match = _PLATE_RE.search(text)
     if match:
@@ -464,8 +673,10 @@ def norm_vehicle_brand_name(value: Any) -> Optional[str]:
 
 
 def _merge_aliases(data: Dict[str, Any]) -> None:
-    for alias, canonical in _ALIASES.items():
-        if alias not in data:
+    for alias in list(data.keys()):
+        alias_text = str(alias)
+        canonical = _ALIASES.get(alias_text) or _ALIASES_LOWER.get(alias_text.lower())
+        if not canonical or alias_text == canonical:
             continue
         if canonical not in data or _is_empty(data.get(canonical)):
             data[canonical] = data.get(alias)
@@ -536,6 +747,10 @@ def clean_dynamic_data_for_ocr(dynamic_data: Dict[str, Any]) -> Dict[str, Any]:
     _apply_normalizer(data, "plate_no", norm_plate_no)
     _apply_normalizer(data, "vin", norm_vin)
     _apply_normalizer(data, "engine_no", norm_engine_no)
+    _apply_normalizer(data, "cert_no", lambda value: correct_vehicle_cert_field("cert_no", value) or None)
+    _apply_normalizer(data, "certificate_no", lambda value: correct_vehicle_cert_field("certificate_no", value) or None)
+    _apply_normalizer(data, "vehicle_certificate_no", lambda value: correct_vehicle_cert_field("vehicle_certificate_no", value) or None)
+    _apply_normalizer(data, "chassis_cert_no", lambda value: correct_vehicle_cert_field("chassis_cert_no", value) or None)
     _apply_normalizer(data, "id_number", norm_id_number)
     _apply_normalizer(data, "first_register_date", norm_fuzzy_date_text)
     _apply_normalizer(data, "issue_date", norm_ymd)

@@ -21,6 +21,7 @@ from app.services.quote_platforms.platforms.picc.base import (
     snapshot_from_context,
     success_data,
 )
+from app.services.ocr_cleaner import correct_vehicle_cert_field
 
 NEW_FUEL_ACCOUNT_TYPE = "油车-新"
 USED_FUEL_ACCOUNT_TYPE = "油车-旧"
@@ -297,6 +298,130 @@ def _picc_business_defaults(default_values: Any) -> Dict[str, Any]:
     defaults = dict(PICC_COMMON_PLATFORM_DEFAULTS)
     defaults.update(_json_obj(default_values))
     return defaults
+
+
+PICC_VEHICLE_CERT_FIELD_MAP: Dict[str, str] = {
+    "plateNo": "plate_no",
+    "plate_no": "plate_no",
+    "plateNumber": "plate_no",
+    "plate_number": "plate_no",
+    "licenseNo": "plate_no",
+    "license_no": "plate_no",
+    "licensePlateNo": "plate_no",
+    "license_plate_no": "plate_no",
+    "licensePlateNumber": "plate_no",
+    "license_plate_number": "plate_no",
+    "prpCitemCar.licenseNo": "plate_no",
+    "vin": "vin",
+    "vinNo": "vin",
+    "vin_no": "vin",
+    "vinno": "vin",
+    "vehicleVin": "vin",
+    "vehicle_vin": "vin",
+    "carVin": "vin",
+    "car_vin": "vin",
+    "frameNo": "vin",
+    "frame_no": "vin",
+    "chassisNo": "vin",
+    "chassis_no": "vin",
+    "jyVehicleRequest.vinno": "vin",
+    "prpCitemCar.vinNo": "vin",
+    "prpCitemCar.frameNo": "vin",
+    "engine": "engine_no",
+    "engineNo": "engine_no",
+    "engine_no": "engine_no",
+    "engineNumber": "engine_no",
+    "engine_number": "engine_no",
+    "motorNo": "engine_no",
+    "motor_no": "engine_no",
+    "prpCitemCar.engineNo": "engine_no",
+    "idNo": "id_number",
+    "id_no": "id_number",
+    "id_number": "id_number",
+    "ownerIdNo": "id_number",
+    "owner_id_no": "id_number",
+    "ownerCertNo": "id_number",
+    "owner_cert_no": "id_number",
+    "insuredIdNo": "id_number",
+    "insured_id_no": "id_number",
+    "applicantIdNo": "id_number",
+    "applicant_id_no": "id_number",
+    "identifyNumber": "id_number",
+    "identify_number": "id_number",
+    "quoteCarOwner.identifyNumber": "id_number",
+    "carQuoteInsuredRealList[0].holdIdentifyNumber": "id_number",
+    "carQuoteInsuredRealList[1].holdIdentifyNumber": "id_number",
+    "carQuoteInsuredRealList[2].holdIdentifyNumber": "id_number",
+    "certNo": "cert_no",
+    "certificateNo": "certificate_no",
+    "certificate_no": "certificate_no",
+    "cert_no": "cert_no",
+    "vehicle_certificate_no": "vehicle_certificate_no",
+    "chassis_cert_no": "chassis_cert_no",
+}
+PICC_VEHICLE_CERT_FIELD_MAP_LOWER: Dict[str, str] = {
+    str(key).lower(): value for key, value in PICC_VEHICLE_CERT_FIELD_MAP.items()
+}
+
+
+def _clean_vehicle_cert_value(field_name: str, value: Any) -> Any:
+    text = _to_str(value).strip()
+    if not text:
+        return value
+    cleaned = correct_vehicle_cert_field(field_name, text)
+    return cleaned or value
+
+
+def _clean_vehicle_cert_fields(data: Mapping[str, Any]) -> Dict[str, Any]:
+    out = dict(_json_obj(data))
+    for key in list(out.keys()):
+        key_text = _to_str(key).strip()
+        key_lower = key_text.lower()
+        field_name = PICC_VEHICLE_CERT_FIELD_MAP.get(key_text) or PICC_VEHICLE_CERT_FIELD_MAP_LOWER.get(key_lower)
+        if not field_name:
+            if key_lower.endswith(".holdidentifynumber") or key_lower.endswith("holdidentifynumber"):
+                field_name = "id_number"
+            elif key_lower.endswith(".identifynumber") or key_lower.endswith("identifynumber"):
+                field_name = "id_number"
+            elif key_lower.endswith(".owneridno") or key_lower.endswith("owneridno") or key_lower.endswith("owner_id_no"):
+                field_name = "id_number"
+            elif key_lower.endswith(".ownercertno") or key_lower.endswith("ownercertno") or key_lower.endswith("owner_cert_no"):
+                field_name = "id_number"
+            elif key_lower.endswith(".insuredidno") or key_lower.endswith("insuredidno") or key_lower.endswith("insured_id_no"):
+                field_name = "id_number"
+            elif key_lower.endswith(".applicantidno") or key_lower.endswith("applicantidno") or key_lower.endswith("applicant_id_no"):
+                field_name = "id_number"
+            elif key_lower.endswith(".idno") or key_lower.endswith("idno") or key_lower.endswith("id_number"):
+                field_name = "id_number"
+            elif key_lower.endswith(".vinno") or key_lower.endswith("vinno") or key_lower.endswith("vin_no"):
+                field_name = "vin"
+            elif key_lower.endswith(".frameno") or key_lower.endswith("frameno") or key_lower.endswith("frame_no"):
+                field_name = "vin"
+            elif key_lower.endswith(".chassisno") or key_lower.endswith("chassisno") or key_lower.endswith("chassis_no"):
+                field_name = "vin"
+            elif key_lower.endswith(".vehiclevin") or key_lower.endswith("vehiclevin") or key_lower.endswith("vehicle_vin"):
+                field_name = "vin"
+            elif key_lower.endswith(".engineno") or key_lower.endswith("engineno") or key_lower.endswith("engine_no"):
+                field_name = "engine_no"
+            elif key_lower.endswith(".enginenumber") or key_lower.endswith("enginenumber") or key_lower.endswith("engine_number"):
+                field_name = "engine_no"
+            elif key_lower.endswith(".licenseno") or key_lower.endswith("licenseno") or key_lower.endswith("license_plate_no"):
+                field_name = "plate_no"
+            elif key_lower.endswith(".licenseplatenumber") or key_lower.endswith("licenseplatenumber") or key_lower.endswith("license_plate_number"):
+                field_name = "plate_no"
+        if field_name:
+            out[key] = _clean_vehicle_cert_value(field_name, out.get(key))
+    return out
+
+
+def _clean_used_fuel_request_body(request_body: Mapping[str, Any]) -> Dict[str, Any]:
+    """Clean vehicle certificate numbers in every known PICC request-body section."""
+    body = dict(_json_obj(request_body))
+    for section in ("vehicleForm", "ownerForm", "quoteForm", "vehicle", "applicant"):
+        section_data = body.get(section)
+        if isinstance(section_data, Mapping):
+            body[section] = _clean_vehicle_cert_fields(section_data)
+    return body
 
 USED_FUEL_QUOTE_EMPTY_FORM_FIELDS: tuple[str, ...] = (
     "activityID",
@@ -1283,7 +1408,7 @@ def _duplicate_insured_vin_warning(vin_no: Any, payload: Mapping[str, Any]) -> s
     rows = payload.get("list")
     if not isinstance(rows, list) or not rows:
         return ""
-    vin = _first_text(vin_no, *(_json_obj(row).get("vinNo") for row in rows))
+    vin = _clean_vehicle_cert_value("vin", _first_text(vin_no, *(_json_obj(row).get("vinNo") for row in rows)))
     ci_period = ""
     bi_period = ""
     kind_names: List[str] = []
@@ -2042,7 +2167,7 @@ def _vehicle_row_codes(row: Mapping[str, Any]) -> List[str]:
 
 
 def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> tuple[Dict[str, Any], bool]:
-    body = dict(_json_obj(request_body))
+    body = _clean_used_fuel_request_body(request_body)
     form = dict(_json_obj(body.get("quoteForm")))
     preflight = dict(_json_obj(body.get("preflight")))
     vehicle = dict(_json_obj(body.get("vehicleForm")))
@@ -2145,10 +2270,10 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
         "energyTypePlatTemp": energy_fields["energy_type_name"],
         "vehicleFuelType": energy_fields["vehicle_fuel_type"],
     }
-    body["quoteForm"] = form
-    body["vehicleForm"] = vehicle
+    body["quoteForm"] = _clean_vehicle_cert_fields(form)
+    body["vehicleForm"] = _clean_vehicle_cert_fields(vehicle)
     body["preflight"] = preflight
-    return body, changed
+    return _clean_used_fuel_request_body(body), changed
 
 
 def _vehicle_model_suffix_from_type(value: Any) -> str:
@@ -2522,12 +2647,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body: Mapping[str, Any],
         codes: List[str],
     ) -> tuple[Dict[str, Any], bool]:
-        body = dict(_json_obj(request_body))
+        body = _clean_used_fuel_request_body(request_body)
         if not codes:
             return body, False
         defaults = _json_obj(body.get("defaultFields"))
-        vehicle = dict(_json_obj(body.get("vehicleForm")))
-        owner = dict(_json_obj(body.get("ownerForm")))
+        vehicle = _clean_vehicle_cert_fields(_json_obj(body.get("vehicleForm")))
+        owner = _clean_vehicle_cert_fields(_json_obj(body.get("ownerForm")))
         if not defaults or not vehicle or not owner:
             return body, False
 
@@ -2616,14 +2741,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
             }
         )
-        body["vehicleForm"] = vehicle
+        body["vehicleForm"] = _clean_vehicle_cert_fields(vehicle)
         body["productForm"] = {
             "products": products,
             "sharedMainLimit": _checked(_default_value(defaults, PRODUCT_SHARED_LIMIT, True), default=True),
         }
-        body["quoteForm"] = quote_form
+        body["quoteForm"] = _clean_vehicle_cert_fields(quote_form)
         body["preflight"] = preflight
-        return body, True
+        return _clean_used_fuel_request_body(body), True
 
     def _quote_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         client: Optional[PiccProtocolClient] = None
@@ -2943,7 +3068,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
     ) -> Dict[str, Any]:
         data = _json_obj(_json_obj(quote_response).get("data"))
         form = _json_obj(_json_obj(request_body).get("quoteForm"))
-        vin_no = _first_text(data.get("vinNo"), data.get("frameNo"), form.get("prpCitemCar.vinNo"))
+        vin_no = _clean_vehicle_cert_value("vin", _first_text(data.get("vinNo"), data.get("frameNo"), form.get("prpCitemCar.vinNo")))
         quotation_id = _first_text(data.get("quotationId"), form.get("quotationId"))
         if not vin_no or not quotation_id:
             return {"attempted": False, "reason": "平台未返回车架号或报价流水号，跳过质量标记查询"}
@@ -3068,6 +3193,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "vehicleModel": normalized_data.get("vehicle_model"),
             },
         )
+        body["vehicle"] = _clean_vehicle_cert_fields(_json_obj(body.get("vehicle")))
         body["applicant"] = _deep_merge(
             _json_obj(body.get("applicant")),
             {
@@ -3076,6 +3202,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "idNo": normalized_data.get("id_number"),
             },
         )
+        body["applicant"] = _clean_vehicle_cert_fields(_json_obj(body.get("applicant")))
         return body
 
     def _real_quote_account_type(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> str:
@@ -3098,11 +3225,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         return self._real_quote_account_type(ctx, quote_payload) == USED_FUEL_ACCOUNT_TYPE
 
     def _used_fuel_owner(self, defaults: Mapping[str, Any], normalized_data: Mapping[str, Any]) -> Dict[str, Any]:
-        return {
+        owner = {
             "ownerName": _first_text(normalized_data.get("owner_name"), normalized_data.get("id_name"), _field_value(defaults, "车主")),
             "ownerIdNo": _first_text(normalized_data.get("id_number"), _field_value(defaults, "车主证件号码")),
             "ownerPhone": _first_text(normalized_data.get("owner_phone"), _field_value(defaults, "车主手机号")),
         }
+        return _clean_vehicle_cert_fields(owner)
 
     def _assemble_used_fuel_offline_request_body(
         self,
@@ -3125,10 +3253,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile),
             _json_obj(incoming_body.get("vehicleForm")),
         )
+        vehicle = _clean_vehicle_cert_fields(vehicle)
         owner = _deep_merge(
             self._used_fuel_owner(defaults, normalized_data),
             _json_obj(incoming_body.get("ownerForm")),
         )
+        owner = _clean_vehicle_cert_fields(owner)
         selected = _json_obj(
             incoming_body.get("selectedVehicle")
             or incoming_preflight.get("selectedVehicle")
@@ -3178,7 +3308,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if not _to_str(_field_value(defaults, *aliases)).strip():
                 missing_config.append(label)
 
-        return {
+        return _clean_used_fuel_request_body({
             "requestId": f"{_profile_text(profile, 'request_id_prefix', 'picc-motor')}-draft-{uuid.uuid4().hex}",
             "platform": "PICC",
             "accountTypeName": resolved_account_type,
@@ -3229,7 +3359,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     },
                 },
             },
-        }
+        })
 
     def _prepare_used_fuel_quote(
         self,
@@ -3306,6 +3436,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 ),
             }
         )
+        vehicle = _clean_vehicle_cert_fields(vehicle)
         checker_info = self._query_car_checker(client, defaults)
         if checker_info:
             vehicle["carchecker"] = _first_text(checker_info.get("userName"), vehicle.get("carchecker"))
@@ -3315,7 +3446,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         prechecks = self._run_used_fuel_quote_prechecks(client, defaults, quote_form)
         joint_sale = self._query_tujia_anshun_plan_best_effort(client, defaults, quote_form)
 
-        return {
+        return _clean_used_fuel_request_body({
             "requestId": f"{_profile_text(profile, 'request_id_prefix', 'picc-motor')}-{uuid.uuid4().hex}",
             "platform": "PICC",
             "accountTypeName": resolved_account_type,
@@ -3356,7 +3487,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "tujiaAnshun": joint_sale,
                 },
             },
-        }
+        })
 
     def _query_tujia_anshun_plan_best_effort(
         self,
@@ -3474,6 +3605,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         quote_form: Mapping[str, Any],
     ) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
+        quote_form = _clean_vehicle_cert_fields(quote_form)
         selected_operate_config_id = _to_str(
             quote_form.get("selectedOperateConfigId") or _field_value(defaults, "操作配置ID", "车型配置ID", "selectedOperateConfigId")
         ).strip()
@@ -3494,7 +3626,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             _ensure_platform_success(verify_data, action="代理配置校验")
             out["agentControl"] = _json_obj(verify_data).get("data") or {}
 
-        vin = _to_str(quote_form.get("prpCitemCar.vinNo")).strip()
+        vin = _to_str(_clean_vehicle_cert_value("vin", quote_form.get("prpCitemCar.vinNo"))).strip()
         if vin:
             duplicate_data = client.request_json(
                 "GET",
@@ -3782,10 +3914,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         for key, value in extra_form.items():
             if _to_str(key).strip():
                 form[_to_str(key).strip()] = value
+        form = _clean_vehicle_cert_fields(form)
         return {key: value for key, value in form.items() if value is not None}
 
     def _submit_used_fuel_quote(self, client: PiccProtocolClient, request_body: Mapping[str, Any]) -> Dict[str, Any]:
-        form_body = _json_obj(request_body.get("quoteForm"))
+        form_body = _clean_vehicle_cert_fields(_json_obj(request_body.get("quoteForm")))
         if not form_body:
             raise PiccRequestError("人保报价请求体为空，无法提交报价")
         data = client.request_json(
@@ -3842,6 +3975,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         engine_no = _first_text(data.get("engine_no"), _field_value(defaults, "发动机号"))
         vin = _first_text(data.get("vin"), _field_value(defaults, "VIN/车架号", "车架号"))
         license_no = _first_text(data.get("plate_no"), _field_value(defaults, "号牌号码"))
+        engine_no = _clean_vehicle_cert_value("engine_no", engine_no)
+        vin = _clean_vehicle_cert_value("vin", vin)
+        license_no = _clean_vehicle_cert_value("plate_no", license_no)
         if not license_no and _profile_text(prof, "license_no_strategy") == "new_car_placeholder":
             license_no = _new_car_placeholder_license(engine_no, vin)
         transfer_date = ""
@@ -3862,7 +3998,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             brand_name=vehicle_brand_name,
             vehicle_name=vehicle_name_hint,
         )
-        return {
+        vehicle = {
             "licenseNo": license_no,
             "licenseType": _first_text(_field_value(defaults, "号牌种类"), "02"),
             "engineNo": engine_no,
@@ -3881,8 +4017,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "energyModelSuffix": energy_model_suffix,
             "seatCount": _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"), "5"),
         }
+        return _clean_vehicle_cert_fields(vehicle)
 
     def _query_vehicle_candidates(self, client: PiccProtocolClient, vehicle: Mapping[str, Any]) -> Any:
+        cleaned_vehicle = _clean_vehicle_cert_fields(vehicle)
+        if isinstance(vehicle, dict):
+            vehicle.update(cleaned_vehicle)
+        else:
+            vehicle = cleaned_vehicle
         model_name = _to_str(vehicle.get("rawModelName") or vehicle.get("modelName")).strip()
         if not model_name:
             raise PiccRequestError("人保报价缺少车型名称，无法查询车型配置")
@@ -3940,6 +4082,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         *,
         profile: Optional[Mapping[str, Any]] = None,
     ) -> Any:
+        vehicle = _clean_vehicle_cert_fields(vehicle)
         prof = _json_obj(profile)
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, {}, vehicle=vehicle, profile=prof)
         purchase_price = _first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT"))
@@ -3985,6 +4128,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         *,
         profile: Optional[Mapping[str, Any]] = None,
     ) -> Any:
+        vehicle = _clean_vehicle_cert_fields(vehicle)
         prof = _json_obj(profile)
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=prof)
         params = {
@@ -4085,10 +4229,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body: Mapping[str, Any],
         adjustment: Mapping[str, Any],
     ) -> tuple[Dict[str, Any], bool, Dict[str, Any]]:
-        body = dict(_json_obj(request_body))
-        form = dict(_json_obj(body.get("quoteForm")))
-        vehicle = dict(_json_obj(body.get("vehicleForm")))
-        owner = dict(_json_obj(body.get("ownerForm")))
+        body = _clean_used_fuel_request_body(request_body)
+        form = _clean_vehicle_cert_fields(_json_obj(body.get("quoteForm")))
+        vehicle = _clean_vehicle_cert_fields(_json_obj(body.get("vehicleForm")))
+        owner = _clean_vehicle_cert_fields(_json_obj(body.get("ownerForm")))
         defaults = dict(_json_obj(body.get("defaultFields")))
         preflight = dict(_json_obj(body.get("preflight")))
         selected = _json_obj(preflight.get("selectedVehicle"))
@@ -4165,19 +4309,19 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "source": adjustment.get("source") or "platform_prompt",
         }
         preflight["insuranceDateAutoAdjusted"] = notice
-        body["quoteForm"] = form
-        body["vehicleForm"] = vehicle
-        body["ownerForm"] = owner
+        body["quoteForm"] = _clean_vehicle_cert_fields(form)
+        body["vehicleForm"] = _clean_vehicle_cert_fields(vehicle)
+        body["ownerForm"] = _clean_vehicle_cert_fields(owner)
         body["defaultFields"] = defaults
         body["preflight"] = preflight
-        return body, True, notice
+        return _clean_used_fuel_request_body(body), True, notice
 
     def _submit_used_fuel_quote_with_vehicle_retry(
         self,
         client: PiccProtocolClient,
         request_body: Mapping[str, Any],
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        body = dict(_json_obj(request_body))
+        body = _clean_used_fuel_request_body(request_body)
         try:
             return body, self._submit_used_fuel_quote(client, body)
         except PiccBusinessRequestError as exc:
@@ -4200,7 +4344,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         auto_notice_callback: Any = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
         notices: List[Dict[str, Any]] = []
-        body = dict(_json_obj(request_body))
+        body = _clean_used_fuel_request_body(request_body)
 
         def remember_notice(adjustment: Mapping[str, Any], notice: Mapping[str, Any]) -> None:
             item = dict(_json_obj(notice))
@@ -4321,10 +4465,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             or USED_FUEL_ACCOUNT_TYPE
         )
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
-        data = _json_obj(_json_obj(quote_response).get("data"))
-        vehicle = _json_obj(request_body.get("vehicleForm"))
-        owner = _json_obj(request_body.get("ownerForm"))
-        form = _json_obj(request_body.get("quoteForm"))
+        data = _clean_vehicle_cert_fields(_json_obj(_json_obj(quote_response).get("data")))
+        vehicle = _clean_vehicle_cert_fields(_json_obj(request_body.get("vehicleForm")))
+        owner = _clean_vehicle_cert_fields(_json_obj(request_body.get("ownerForm")))
+        form = _clean_vehicle_cert_fields(_json_obj(request_body.get("quoteForm")))
         shared_main_limit = _quote_form_shared_main_limit(form)
         preflight = _json_obj(request_body.get("preflight"))
         selected_vehicle = _json_obj(preflight.get("selectedVehicle"))

@@ -192,7 +192,14 @@ def _ensure_platform_account_manage(ctx: CurrentUserContext) -> None:
     require_quote_platform_account_manage_access(role_name=ctx.primary_role)
 
 
-QUOTE_USE_INTENTS = {"quote", "quote_image_collect", "quote_material_status", "quote_credential", "quote_config_override"}
+QUOTE_USE_INTENTS = {
+    "quote",
+    "quote_image_collect",
+    "quote_material_form",
+    "quote_material_status",
+    "quote_credential",
+    "quote_config_override",
+}
 QUOTE_ACTION_KEYWORDS = ("报价", "材料状态", "平台账号", "短信验证码", "验证码")
 QUOTE_HIDDEN_MESSAGE = "当前账号无权查看历史报价材料内容"
 

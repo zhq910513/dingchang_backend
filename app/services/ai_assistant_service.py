@@ -31,6 +31,7 @@ from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
 from app.services.image_slot_classifier import slot_label
+from app.services.ocr_cleaner import correct_vehicle_cert_field, norm_id_number
 from app.services.quote_assistant_service import (
     _collect_context_images,
     _extract_joint_sales_image_adjustment,
@@ -45,6 +46,7 @@ from app.services.quote_assistant_service import (
     detect_quote_signal,
     extract_quote_fields,
     handle_quote_images_message,
+    handle_quote_material_form_message,
     handle_platform_credential_message,
     handle_quote_material_status,
     handle_quote_message,
@@ -54,6 +56,7 @@ from app.services.quote_assistant_service import (
     has_recent_invalid_sms_task,
     has_waiting_duplicate_quote_confirm_task,
     has_waiting_sms_task,
+    looks_like_quote_material_form_command,
     looks_like_duplicate_quote_cancel,
     looks_like_duplicate_quote_confirmation,
     looks_like_short_quote_command,
@@ -1394,7 +1397,7 @@ def _extract_task_id(text: str) -> Optional[int]:
 
 def _extract_plate_no(text: str) -> Optional[str]:
     m = re.search(r"([京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Z][A-Z0-9]{4,6})", text.upper())
-    return m.group(1).upper() if m else None
+    return correct_vehicle_cert_field("plate_no", m.group(1)).upper() if m else None
 
 
 def _extract_owner_name(text: str) -> Optional[str]:
@@ -1443,22 +1446,31 @@ def _extract_owner_phone(text: str) -> Optional[str]:
 
 
 def _extract_id_number(text: str) -> Optional[str]:
-    m = re.search(r"\b(\d{17}[\dXx])\b", text)
-    return m.group(1).upper() if m else None
+    m = re.search(r"\b([0-9A-Za-z\u00d7Xx]{18})\b", text)
+    if not m:
+        return None
+    value = norm_id_number(m.group(1))
+    return value.upper() if value else None
 
 
 def _extract_vin(text: str) -> Optional[str]:
     up = text.upper()
-    m = re.search(r"(?:VIN|车架号|车辆识别代号)\s*[:：]?\s*([A-HJ-NPR-Z0-9]{11,20})", up)
+    m = re.search(r"(?:VIN|车架号|车辆识别代号)\s*[:：]?\s*([A-Z0-9]{11,20})", up)
     if not m:
-        m = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", up)
-    return m.group(1).upper() if m else None
+        m = re.search(r"\b([A-Z0-9]{17})\b", up)
+    if not m:
+        return None
+    value = correct_vehicle_cert_field("vin", m.group(1))
+    return value.upper() if value else None
 
 
 def _extract_engine_no(text: str) -> Optional[str]:
     up = text.upper()
     m = re.search(r"(?:发动机号|发动机号码|发动机)\s*[:：]?\s*([A-Z0-9\-]{4,32})", up)
-    return m.group(1).upper() if m else None
+    if not m:
+        return None
+    value = correct_vehicle_cert_field("engine_no", m.group(1))
+    return value.upper() if value else None
 
 
 def _extract_order_query_fields(text: str) -> List[str]:
@@ -3126,6 +3138,17 @@ async def _dispatch_rule_with_db(
     if intent not in {"quote", "query_material_status", "quote_credential"} and waiting_sms_active:
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.9)
+
+    if intent != "quote_credential" and looks_like_quote_material_form_command(text):
+        form_result = await handle_quote_material_form_message(db, ctx=ctx, entities=entities, text=text)
+        if form_result:
+            reply, meta = form_result
+            meta["intent"] = _to_str(meta.get("intent"), "quote_material_form") or "quote_material_form"
+            meta["confidence"] = max(float(confidence or 0.0), 0.96)
+            data = meta.get("data")
+            if isinstance(data, dict):
+                data.setdefault("entities", entities)
+            return reply, meta
 
     image_result = None
     has_context_images = bool(_collect_context_images(ctx))
