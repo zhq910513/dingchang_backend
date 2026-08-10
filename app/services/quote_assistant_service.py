@@ -1088,7 +1088,7 @@ QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者", "三责")),
     ("车上人员责任险（司机）", ("车上人员责任险（司机）", "车上人员责任险(司机)", "司机责任险", "司机险", "司机")),
     ("车上人员责任险（乘客）", ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客责任险", "乘客险", "乘客")),
-    ("交强", ("交强险", "交强")),
+    ("交强", ("交强险", "交强", "交强主险")),
     ("共享主险限额", ("共享主险限额", "主险限额共享")),
 )
 
@@ -1098,29 +1098,56 @@ QUOTE_SHARED_LIMIT_LABEL = "共享主险限额"
 QUOTE_LOSS_LABEL = "机动车损失保险"
 QUOTE_DRIVER_LABEL = "车上人员责任险（司机）"
 QUOTE_PASSENGER_LABEL = "车上人员责任险（乘客）"
+QUOTE_COMPULSORY_LABEL = "交强"
 QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
 PICC_FULL_COVER_COMMANDS = {
     "全保",
     "人保全保",
+    "中国人保全保",
+    "PICC全保",
     "人保报价",
     "中国人保报价",
     "PICC报价",
     "全保报价",
     "人保全保报价",
+    "中国人保全保报价",
+    "PICC全保报价",
     "人保重报",
     "中国人保重报",
     "PICC重报",
     "全保重报",
     "人保全保重报",
+    "中国人保全保重报",
+    "PICC全保重报",
 }
 PICC_JIAOSAN_COMMANDS = {
     "交三",
     "人保交三",
+    "中国人保交三",
+    "PICC交三",
     "交三报价",
     "人保交三报价",
+    "中国人保交三报价",
+    "PICC交三报价",
     "交三重报",
     "人保交三重报",
+    "中国人保交三重报",
+    "PICC交三重报",
+}
+PICC_DANSHANG_COMMANDS = {
+    "单商",
+    "人保单商",
+    "中国人保单商",
+    "PICC单商",
+    "单商报价",
+    "人保单商报价",
+    "中国人保单商报价",
+    "PICC单商报价",
+    "单商重报",
+    "人保单商重报",
+    "中国人保单商重报",
+    "PICC单商重报",
 }
 
 
@@ -1128,10 +1155,22 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
     text = re.sub(r"\s+", "", _to_str(compact))
     if not text:
         return ""
+    if text in PICC_DANSHANG_COMMANDS:
+        return "单商"
     if text in PICC_JIAOSAN_COMMANDS:
         return "交三"
     if text in PICC_FULL_COVER_COMMANDS:
         return "全保"
+    if (
+        "单商" in text
+        and (
+            text.startswith("单商")
+            or "人保单商" in text
+            or "中国人保单商" in text
+            or "PICC单商" in text.upper()
+        )
+    ):
+        return "单商"
     if (
         "交三" in text
         and (
@@ -2273,6 +2312,7 @@ def _normalize_quote_product_exclusions(value: Any) -> List[str]:
 
     exclusions: List[str] = []
     removable = {
+        QUOTE_COMPULSORY_LABEL,
         QUOTE_LOSS_LABEL,
         QUOTE_THIRD_PARTY_LABEL,
         QUOTE_DRIVER_LABEL,
@@ -2295,6 +2335,7 @@ def _extract_quote_product_exclusions(text: Any) -> List[str]:
     remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "非")
     remove_group = "|".join(re.escape(word) for word in remove_words)
     removable = {
+        QUOTE_COMPULSORY_LABEL,
         QUOTE_LOSS_LABEL,
         QUOTE_THIRD_PARTY_LABEL,
         QUOTE_DRIVER_LABEL,
@@ -2340,6 +2381,16 @@ def _detect_professional_quote_command(text: Any) -> Dict[str, Any]:
                 "platform_name": "人保",
                 QUOTE_PRODUCT_EXCLUSIONS_KEY: [QUOTE_LOSS_LABEL],
                 "quote_command_mode": "交三",
+            },
+        }
+    if mode == "单商":
+        return {
+            "is_quote": True,
+            "entities": {
+                "platform_code": "PICC",
+                "platform_name": "人保",
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: [QUOTE_COMPULSORY_LABEL],
+                "quote_command_mode": "单商",
             },
         }
     if mode == "全保":
@@ -2691,6 +2742,8 @@ def _quote_product_state_changes_current(
     mode = _to_str(quote_command_mode).strip()
     if mode == "全保":
         desired = incoming
+    elif mode == "单商":
+        desired = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *incoming])
     elif mode == "交三":
         desired = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *incoming])
     elif incoming:
@@ -5223,7 +5276,10 @@ def _quote_platform_dialog_response(
         platform_code=platform_code,
         platform_name=platform_name,
     )
+    dialog_subtype = _to_str(dialog.get("subtype")).strip().lower()
     visible_to_chat = not bool(dialog.get("confirm_required"))
+    if dialog_subtype == "insurance_date_adjust":
+        visible_to_chat = True
     payload = {
         "quote_case": {
             "id": case.id,
@@ -6380,6 +6436,10 @@ def looks_like_short_quote_command(text: Any) -> bool:
         "人保交三",
         "交三报价",
         "人保交三报价",
+        "单商",
+        "人保单商",
+        "单商报价",
+        "人保单商报价",
     }
 
 
@@ -9517,7 +9577,7 @@ async def _persist_unemitted_quote_auto_notices(
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
+        if notice_type != "insurance_date_adjust":
             continue
         if notice.get("emitted_to_chat") is True:
             continue
@@ -9547,9 +9607,6 @@ async def _persist_unemitted_quote_auto_notices(
                     ],
                 }
             )
-        elif notice_type == "duplicate_quote_notice":
-            auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
-
         payload = {
             "quote_case": {"id": case.id, "status": CASE_STATUS_READY},
             "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
@@ -9619,7 +9676,7 @@ def _attach_quote_auto_notice_callback(
     async def persist_notice(notice_any: Any) -> bool:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
+        if notice_type != "insurance_date_adjust":
             return False
         message = sanitize_quote_user_message(notice.get("message"), "")
         if not message:
@@ -9644,9 +9701,6 @@ def _attach_quote_auto_notice_callback(
                     ],
                 }
             )
-        elif notice_type == "duplicate_quote_notice":
-            auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
-
         payload = {
             "quote_case": {"id": _safe_int(case_id, 0), "status": CASE_STATUS_READY},
             "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
@@ -12568,6 +12622,19 @@ async def _complete_waiting_task(
             payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": task.error_detail},
         )
         await db.flush()
+        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+            await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+            return await _start_duplicate_quote_confirm_task(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                snapshot=snapshot,
+                trace_id=trace_id,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                login_mode="sms_verified",
+                existing_task=task,
+            )
         if _is_runtime_session_expired_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
                 db,
@@ -13052,6 +13119,19 @@ async def _complete_quote_without_sms(
             payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": error_detail, "login_mode": login_mode},
         )
         await db.flush()
+        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+            await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
+            return await _start_duplicate_quote_confirm_task(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                snapshot=snapshot,
+                trace_id=trace_id,
+                platform_account=platform_account,
+                runtime_result=quote_runtime_result,
+                login_mode=login_mode,
+                existing_task=task,
+            )
         if _is_runtime_session_expired_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
                 db,
@@ -14092,6 +14172,8 @@ async def handle_quote_message(
     quote_command_mode = _to_str(merged_entities.get("quote_command_mode")).strip()
     if quote_command_mode == "全保":
         base_product_exclusions: List[str] = []
+    elif quote_command_mode == "单商":
+        base_product_exclusions = [QUOTE_COMPULSORY_LABEL]
     elif quote_command_mode == "交三":
         base_product_exclusions = [QUOTE_LOSS_LABEL]
     else:
@@ -14101,7 +14183,7 @@ async def handle_quote_message(
             [*base_product_exclusions, *quote_product_exclusions]
         )
         merged_entities["force_requote"] = True
-    elif quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+    elif quote_command_mode in {"全保", "交三", "单商"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
         merged_entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = _normalize_quote_product_exclusions(base_product_exclusions)
     transfer_vehicle_command = _extract_transfer_vehicle_command(text)
     if transfer_vehicle_command:
@@ -14172,7 +14254,7 @@ async def handle_quote_message(
         quote_field_overrides
         or quote_data_overrides
         or quote_product_exclusions
-        or quote_command_mode in {"全保", "交三"}
+        or quote_command_mode in {"全保", "交三", "单商"}
         or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities
         or transfer_vehicle_command
         or quote_date_overrides
@@ -14615,6 +14697,8 @@ async def handle_quote_message(
         incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
         if quote_command_mode == "全保":
             merged_product_exclusions: List[str] = _normalize_quote_product_exclusions(quote_product_exclusions)
+        elif quote_command_mode == "单商":
+            merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *quote_product_exclusions])
         elif quote_command_mode == "交三":
             merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
         elif quote_product_exclusions:
@@ -14623,7 +14707,7 @@ async def handle_quote_message(
             merged_product_exclusions = incoming_product_exclusions
         else:
             merged_product_exclusions = []
-        if quote_product_exclusions or quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+        if quote_product_exclusions or quote_command_mode in {"全保", "交三", "单商"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
             text_patch[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
         images_by_slot = await _active_images_by_slot(db, case.id)
         next_normalized = _normalize_quote_case_data(
@@ -14798,6 +14882,8 @@ async def handle_quote_message(
     incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
     if quote_command_mode == "全保":
         merged_product_exclusions = _normalize_quote_product_exclusions(quote_product_exclusions)
+    elif quote_command_mode == "单商":
+        merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *quote_product_exclusions])
     elif quote_command_mode == "交三":
         merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
     elif quote_product_exclusions:
@@ -14806,7 +14892,7 @@ async def handle_quote_message(
         merged_product_exclusions = incoming_product_exclusions
     else:
         merged_product_exclusions = []
-    if quote_product_exclusions or quote_command_mode in {"全保", "交三"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+    if quote_product_exclusions or quote_command_mode in {"全保", "交三", "单商"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
         text_data[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
 
     await _sync_order_images_to_case(db, case=case, owner_user_id=owner_user_id, order=order)

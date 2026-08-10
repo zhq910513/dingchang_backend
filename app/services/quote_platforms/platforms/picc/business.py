@@ -2246,7 +2246,9 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     set_form("prpCmain.presaleCarFlag", _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")))
 
     if not _product_excluded(defaults, PRODUCT_LOSS) and not _to_str(_default_value(defaults, PRODUCT_LOSS)).strip():
-        set_form("prpCitemKindVos[1].amount", _money_text(actual_value))
+        loss_index = _quote_form_kind_index(form, "051050")
+        if loss_index is not None:
+            set_form(f"prpCitemKindVos[{loss_index}].amount", _money_text(actual_value))
 
     set_vehicle("purchasePrice", purchase_price)
     set_vehicle("actualValue", _money_text(actual_value))
@@ -2823,12 +2825,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
                 duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
                 if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
-                    duplicate_notice = _duplicate_quote_auto_notice_from_confirmation_payload(duplicate_confirm_payload)
-                    if duplicate_notice:
-                        emitted = _emit_platform_auto_notice(auto_notice_callback, duplicate_notice)
-                        if emitted:
-                            duplicate_notice["emitted_to_chat"] = True
-                        prequote_auto_notices.append(duplicate_notice)
+                    return PlatformRuntimeResult(
+                        status="duplicate_quote_confirm_required",
+                        message=_to_str(duplicate_confirm_payload.get("duplicate_quote_warning")).strip()
+                        or "平台提示该车辆可能重复投保，请核实后再继续报价。",
+                        data=success_data(client, extra=duplicate_confirm_payload),
+                    )
                 runtime_stage = "submit_quote"
                 request_body, quote_response, auto_period_notices = self._submit_used_fuel_quote_with_period_auto_adjust(
                     client,
