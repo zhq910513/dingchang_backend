@@ -127,8 +127,12 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "vehicle_energy_type": "0",
         "is_energy_car": "0",
         "energy_flag": "0",
-        "tax_calculate_mode": "C1",
         "vehicle_fuel_type": "D1",
+        "license_type": "02",
+        "license_color_code": "01",
+        "tax_type": "1",
+        "tax_calculate_mode": "C1",
+        "tax_abate_type": "1",
         "fuel_type": "A",
         "new_car_flag": "on",
         "include_pay_last_year": False,
@@ -154,8 +158,12 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "vehicle_energy_type": "0",
         "is_energy_car": "0",
         "energy_flag": "0",
-        "tax_calculate_mode": "C1",
         "vehicle_fuel_type": "D1",
+        "license_type": "02",
+        "license_color_code": "01",
+        "tax_type": "1",
+        "tax_calculate_mode": "C1",
+        "tax_abate_type": "1",
         "fuel_type": "A",
         "new_car_flag": "",
         "include_pay_last_year": True,
@@ -181,8 +189,12 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "vehicle_energy_type": "1",
         "is_energy_car": "1",
         "energy_flag": "1",
-        "tax_calculate_mode": "C2",
         "vehicle_fuel_type": "D6",
+        "license_type": "52",
+        "license_color_code": "52",
+        "tax_type": "2",
+        "tax_calculate_mode": "C1",
+        "tax_abate_type": "1",
         "fuel_type": "A",
         "new_car_flag": "on",
         "include_pay_last_year": False,
@@ -208,8 +220,12 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "vehicle_energy_type": "1",
         "is_energy_car": "1",
         "energy_flag": "1",
-        "tax_calculate_mode": "C2",
         "vehicle_fuel_type": "D6",
+        "license_type": "52",
+        "license_color_code": "52",
+        "tax_type": "2",
+        "tax_calculate_mode": "C1",
+        "tax_abate_type": "1",
         "fuel_type": "A",
         "new_car_flag": "",
         "include_pay_last_year": True,
@@ -247,12 +263,10 @@ PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
     "是否代收车船税": "1",
     "行驶区域代码": "11",
     "条款类型": "F42",
-    "车牌颜色代码": "01",
     "国产进口标识": "01",
     "纳税人类型": "01",
     "车辆颜色代码": "999",
     "车主与被保险人关系": "所有",
-    "车船税减免类型": "1",
     "车主类型": "1",
     "车主性别": "1",
     "车主生日": "1990-01-01",
@@ -1072,18 +1086,79 @@ def _platform_effective_quote_date(value: Any, *, min_day: Any = None) -> str:
     return parsed.strftime("%Y-%m-%d")
 
 
-def _platform_quote_date_command(value: Any, *, kinds: Optional[List[str]] = None) -> str:
-    day = _platform_effective_quote_date(value)
-    if not day:
+def _insurance_date_adjustment_target_day(
+    form: Mapping[str, Any],
+    vehicle: Mapping[str, Any],
+    *,
+    kind: str,
+    target_day: Any,
+) -> str:
+    """Choose one safe date for every field belonging to the same insurance."""
+    if kind not in {"bi", "ci"}:
         return ""
-    safe_kinds = {item for item in (kinds or ["bi", "ci"]) if item in {"bi", "ci"}}
-    lines = []
-    if "bi" in safe_kinds:
-        lines.append(f"商业起保日期：{day}")
-    if "ci" in safe_kinds:
-        lines.append(f"交强起保日期：{day}")
-    lines.append("人保报价")
-    return "\n".join(lines)
+
+    if kind == "bi":
+        current_values = (
+            form.get("prpCmain.startDate"),
+            vehicle.get("startDateBI"),
+        )
+    else:
+        current_values = (
+            form.get("prpCmain.startDateCI"),
+            vehicle.get("startDateCI"),
+        )
+
+    candidates = [
+        parsed
+        for parsed in (
+            _date_obj(target_day),
+            *(_date_obj(value) for value in current_values),
+        )
+        if parsed is not None
+    ]
+    if not candidates:
+        return ""
+    # Old platform notices must never make a newer date go backwards. If the
+    # two request sections disagree, use the latest valid value and synchronize
+    # both sections before the retry.
+    return max(candidates).strftime("%Y-%m-%d")
+
+
+def _insurance_date_adjustment_needed(
+    form: Mapping[str, Any],
+    vehicle: Mapping[str, Any],
+    *,
+    kind: str,
+    target_day: Any,
+) -> bool:
+    """Return whether the final request still needs its insurance dates synchronized."""
+    target = _insurance_date_adjustment_target_day(
+        form,
+        vehicle,
+        kind=kind,
+        target_day=target_day,
+    )
+    if not target:
+        return False
+
+    if kind == "bi":
+        current_values = (
+            form.get("prpCmain.startDate"),
+            vehicle.get("startDateBI"),
+        )
+    elif kind == "ci":
+        current_values = (
+            form.get("prpCmain.startDateCI"),
+            vehicle.get("startDateCI"),
+        )
+    else:
+        return False
+
+    if any(_date_text(value) != target for value in current_values):
+        return True
+    if kind == "ci":
+        return _date_text(form.get("prpCmain.endDateCI")) != _end_date_text(target)
+    return False
 
 
 def _insurance_date_notice_from_adjustment(adjustment: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1125,11 +1200,18 @@ def _format_reinsure_items_prompt(items: Any) -> str:
         item = _json_obj(raw)
         if not item:
             continue
-        advise_start = _first_text(item.get("adviseStartDate"), item.get("effectiveDate"))
+        advise_start = _first_text(item.get("adviseStartDate"))
         if advise_start:
+            adjustment_kinds = _reinsure_adjustment_kinds(item)
+            if adjustment_kinds == ["ci"]:
+                coverage_label = "交强险"
+            elif "bi" in adjustment_kinds and "ci" in adjustment_kinds:
+                coverage_label = "商业险、交强险"
+            else:
+                coverage_label = "商业险"
             lines.extend(
                 [
-                    "该车辆商业险保险期间与现存有效保单重复投保，",
+                    f"该车辆{coverage_label}保险期间与现存有效保单重复投保，",
                     f"系统建议将起保日期调整为{_platform_datetime_text(advise_start)}",
                     "请确认是否调整？与其重复投保的有效保单概要信息如下：",
                 ]
@@ -1176,12 +1258,34 @@ def _reinsure_adjustment_kinds(item: Mapping[str, Any]) -> List[str]:
     return kinds or ["bi"]
 
 
+def _reinsure_suggested_start_dates(items: Any) -> Dict[str, str]:
+    """Collect the latest platform suggestion separately for commercial and compulsory cover."""
+    dates: Dict[str, str] = {}
+    if not isinstance(items, list):
+        return dates
+    for raw in items:
+        item = _json_obj(raw)
+        # `effectiveDate` is historical policy context. Only the explicit
+        # `adviseStartDate` field means the platform is asking to change dates.
+        suggested_day = _date_text(item.get("adviseStartDate"))
+        if not suggested_day:
+            continue
+        for kind in _reinsure_adjustment_kinds(item):
+            current_day = _date_text(dates.get(kind))
+            if not current_day or suggested_day > current_day:
+                dates[kind] = suggested_day
+    return dates
+
+
 def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
     text = _platform_notice_text(message)
+    compact = re.sub(r"\s+", "", text)
     kinds: List[str] = []
-    if re.search(r"(?:商业险?|商业).{0,8}起保.{0,80}(?:当前时间|之前|不能)", text):
+    period_words = r"(?:起保|起期|保险期间|保险期限|保险起期)"
+    action_words = r"(?:当前时间|之前|不能|不可|不允许|请核对|请修改|修改保险|调整为|调整至|改为|改至|变更为|同步至|建议)"
+    if re.search(rf"(?:商业险?|商业).{{0,24}}{period_words}.{{0,120}}{action_words}", compact):
         kinds.append("bi")
-    if re.search(r"(?:交强险?|交强).{0,8}起保.{0,80}(?:当前时间|之前|不能)", text):
+    if re.search(rf"(?:交强险?|交强).{{0,24}}{period_words}.{{0,120}}{action_words}", compact):
         kinds.append("ci")
     return kinds
 
@@ -1209,7 +1313,9 @@ def _reinsure_notice_suggested_start_date(message: Any) -> str:
 def _reinsure_notice_adjustment_kinds(message: Any) -> List[str]:
     text = _platform_notice_text(message)
     compact = re.sub(r"\s+", "", text)
-    if not compact or "保单重复投保" not in compact:
+    if not compact or "重复投保" not in compact:
+        return []
+    if not _reinsure_notice_suggested_start_date(compact):
         return []
     kinds: List[str] = []
     if (
@@ -1248,28 +1354,54 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     if not message:
         return {}
     first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
-    advise_start = _first_text(first_reinsure.get("adviseStartDate"), first_reinsure.get("effectiveDate"))
-    if not advise_start:
-        advise_start = _reinsure_notice_suggested_start_date(message)
-    adjusted_start = _platform_effective_quote_date(advise_start)
-    adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure) if first_reinsure else _reinsure_notice_adjustment_kinds(message)
-    confirm_command = _platform_quote_date_command(advise_start, kinds=adjustment_kinds)
+    suggested_dates = _reinsure_suggested_start_dates(reinsure_items)
+    # Parse only the original platform notice. `_format_reinsure_items_prompt`
+    # may include historical effective dates for display and must not turn them
+    # into a synthetic date-adjustment instruction.
+    notice_suggested_date = _reinsure_notice_suggested_start_date(notice)
+    adjustment_kinds = list(suggested_dates.keys())
+    if not adjustment_kinds and notice_suggested_date:
+        adjustment_kinds = _reinsure_notice_adjustment_kinds(message)
+        for kind in adjustment_kinds:
+            suggested_dates[kind] = notice_suggested_date
+    if not adjustment_kinds and first_reinsure:
+        adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure)
+    # A reinsure row without any usable suggested/effective date is historical
+    # context only, not an instruction to change today's quote dates.
+    if not suggested_dates:
+        adjustment_kinds = []
+    # This parser only preserves what PICC returned. The actual date used for
+    # the automatic retry is resolved later with PICC's current-time endpoint,
+    # so a local machine clock can never alter the submitted request.
     return {
-        "type": "confirm" if confirm_command else "notice",
-        "subtype": "insurance_date_adjust" if (confirm_command or adjustment_kinds) else "quote_platform_notice",
+        "type": "notice",
+        "subtype": "insurance_date_adjust" if adjustment_kinds else "quote_platform_notice",
         "title": "报价提示",
         "severity": "warning",
         "message": message,
-        "confirm_required": bool(confirm_command),
-        "confirm_text": "修改保险时间" if confirm_command else "确定",
-        "cancel_text": "关闭" if confirm_command else "",
+        "confirm_required": False,
+        "confirm_text": "确定",
+        "cancel_text": "",
         "close_text": "关闭",
-        "confirm_action": {"command": confirm_command} if confirm_command else {},
-        "suggested_commercial_start_date": (adjusted_start or _date_text(advise_start)) if "bi" in adjustment_kinds else "",
-        "suggested_compulsory_start_date": (adjusted_start or _date_text(advise_start)) if "ci" in adjustment_kinds else "",
+        "confirm_action": {},
+        "raw_suggested_commercial_start_date": _date_text(suggested_dates.get("bi")) if "bi" in adjustment_kinds else "",
+        "raw_suggested_compulsory_start_date": _date_text(suggested_dates.get("ci")) if "ci" in adjustment_kinds else "",
+        # Kept for compatibility with archived runtime payloads. These remain
+        # raw platform values and are not local-date-adjusted.
+        "suggested_commercial_start_date": _date_text(suggested_dates.get("bi")) if "bi" in adjustment_kinds else "",
+        "suggested_compulsory_start_date": _date_text(suggested_dates.get("ci")) if "ci" in adjustment_kinds else "",
         "adjustment_kinds": adjustment_kinds,
         "reinsure_items": reinsure_items[:3] if reinsure_items else [],
     }
+
+
+def _platform_response_requires_insurance_date_adjustment(data: Any) -> bool:
+    """Whether a quote response must enter the period-adjustment retry path."""
+    dialog = _used_fuel_quote_platform_dialog(data)
+    if _to_str(dialog.get("subtype")).strip().lower() != "insurance_date_adjust":
+        return False
+    kinds = dialog.get("adjustment_kinds")
+    return any(_to_str(kind).strip() in {"bi", "ci"} for kind in (kinds if isinstance(kinds, list) else []))
 
 
 def _platform_business_error_dialog(data: Any) -> Dict[str, Any]:
@@ -1451,7 +1583,10 @@ def _duplicate_insured_vin_warning(vin_no: Any, payload: Mapping[str, Any]) -> s
 
 def _contains_duplicate_quote(data: Any) -> bool:
     raw = _to_str(data)
-    return bool(re.search(r"(重复|已报价|重复报价|已经报价|不能重复)", raw))
+    compact = re.sub(r"\s+", "", raw)
+    return bool(
+        re.search(r"(重复投保|重复报价|已报价|已经报价|不能重复(?:报价|投保)|已在我司承保|近期已承保)", compact)
+    )
 
 
 def _contains_quota_full(data: Any) -> bool:
@@ -1513,8 +1648,8 @@ def _duplicate_quote_confirmation_payload(request_body: Mapping[str, Any]) -> Di
     if not warning:
         warning = "平台提示该车辆近期已承保，请核实后再继续报价。"
     return {
-        "business_status": "duplicate_quote_confirm_required",
-        "error_code": "duplicate_quote_confirm_required",
+        "business_status": "duplicate_quote_auto_continued",
+        "error_code": "duplicate_quote_auto_continued",
         "duplicate_quote_warning": warning,
         "duplicateVin": duplicate,
         "request_body": request_body,
@@ -1534,6 +1669,25 @@ def _duplicate_quote_auto_notice_from_confirmation_payload(payload: Mapping[str,
         "message": warning,
         "source": "duplicate_vin_precheck",
         "duplicateVin": duplicate,
+    }
+
+
+def _duplicate_quote_notice_from_success_dialog(
+    dialog: Mapping[str, Any],
+    *,
+    has_period_auto_notice: bool,
+    has_duplicate_precheck_notice: bool = False,
+) -> Dict[str, Any]:
+    """Keep duplicate-insurance text visible when a successful quote needs no further date change."""
+    if has_period_auto_notice or has_duplicate_precheck_notice:
+        return {}
+    message = _platform_notice_text(_json_obj(dialog).get("message"))
+    if "重复投保" not in re.sub(r"\s+", "", message):
+        return {}
+    return {
+        "type": "duplicate_quote_notice",
+        "message": message,
+        "source": "quote_response_duplicate_insurance",
     }
 
 
@@ -2099,6 +2253,103 @@ def _resolve_vehicle_energy_fields(
     }
 
 
+def _profile_license_type(profile: Mapping[str, Any], energy_fields: Mapping[str, Any]) -> str:
+    if _to_str(energy_fields.get("is_energy_car")).strip() == "1":
+        return "52"
+    return _profile_text(profile, "license_type", "02") or "02"
+
+
+def _profile_license_color_code(profile: Mapping[str, Any], energy_fields: Mapping[str, Any]) -> str:
+    if _to_str(energy_fields.get("is_energy_car")).strip() == "1":
+        return "52"
+    return _profile_text(profile, "license_color_code", "01") or "01"
+
+
+def _profile_tax_defaults(
+    profile: Mapping[str, Any],
+    energy_fields: Mapping[str, Any],
+    start_date: Any,
+) -> Dict[str, str]:
+    is_energy_car = _to_str(energy_fields.get("is_energy_car")).strip() == "1"
+    if is_energy_car:
+        start_day = _date_text(start_date)
+        year = start_day[:4] if start_day else _today_text()[:4]
+        return {
+            "tax_type": _profile_text(profile, "tax_type", "2") or "2",
+            "calculate_mode": _profile_text(profile, "tax_calculate_mode", "C1") or "C1",
+            "tax_abate_type": _profile_text(profile, "tax_abate_type", "1") or "1",
+            "tax_abate_reason": _profile_text(profile, "tax_abate_reason", "06") or "06",
+            "duty_paid_proof_no": _profile_text(profile, "duty_paid_proof_no", "0012061001") or "0012061001",
+            "pay_start_date": f"{year}-01-01",
+            "pay_end_date": f"{year}-12-31",
+        }
+    return {
+        "tax_type": _profile_text(profile, "tax_type", "1") or "1",
+        "calculate_mode": _profile_text(profile, "tax_calculate_mode", "C1") or "C1",
+        "tax_abate_type": _profile_text(profile, "tax_abate_type", "1") or "1",
+        "tax_abate_reason": "",
+        "duty_paid_proof_no": "",
+        "pay_start_date": "",
+        "pay_end_date": "",
+    }
+
+
+def _profile_license_fields(
+    profile: Mapping[str, Any],
+    energy_fields: Mapping[str, Any],
+    defaults: Mapping[str, Any],
+) -> Dict[str, str]:
+    return {
+        "license_type": _first_text(
+            _field_value(defaults, "号牌种类", "licenseType"),
+            _profile_license_type(profile, energy_fields),
+        ),
+        "license_color_code": _first_text(
+            _field_value(defaults, "车牌颜色代码", "licenseColorCode"),
+            _profile_license_color_code(profile, energy_fields),
+        ),
+    }
+
+
+def _profile_tax_field_values(
+    profile: Mapping[str, Any],
+    energy_fields: Mapping[str, Any],
+    defaults: Mapping[str, Any],
+    start_date: Any,
+) -> Dict[str, str]:
+    tax_defaults = _profile_tax_defaults(profile, energy_fields, start_date)
+    return {
+        "tax_type": _first_text(
+            _field_value(defaults, "车船税类型", "taxType"),
+            tax_defaults["tax_type"],
+        ),
+        "calculate_mode": _first_text(
+            _field_value(defaults, "车船税计算方式", "calculateMode"),
+            tax_defaults["calculate_mode"],
+        ),
+        "tax_abate_type": _first_text(
+            _field_value(defaults, "车船税减免类型", "taxAbateType"),
+            tax_defaults["tax_abate_type"],
+        ),
+        "tax_abate_reason": _first_text(
+            _field_value(defaults, "车船税减免原因", "taxAbateReason"),
+            tax_defaults["tax_abate_reason"],
+        ),
+        "duty_paid_proof_no": _first_text(
+            _field_value(defaults, "完税证明号", "dutyPaidProofNo"),
+            tax_defaults["duty_paid_proof_no"],
+        ),
+        "pay_start_date": _first_text(
+            _date_text(_field_value(defaults, "车船税起始日期", "payStartDate")),
+            tax_defaults["pay_start_date"],
+        ),
+        "pay_end_date": _first_text(
+            _date_text(_field_value(defaults, "车船税终止日期", "payEndDate")),
+            tax_defaults["pay_end_date"],
+        ),
+    }
+
+
 def _vehicle_platform_brand_id(selected: Mapping[str, Any], precise_vehicle: Mapping[str, Any]) -> str:
     return _first_text(selected.get("brandId"), precise_vehicle.get("brandId"))
 
@@ -2217,6 +2468,13 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     profile = _motor_quote_profile(body.get("accountTypeName"))
     defaults = _json_obj(body.get("defaultFields"))
     energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=profile)
+    license_fields = _profile_license_fields(profile, energy_fields, defaults)
+    tax_fields = _profile_tax_field_values(
+        profile,
+        energy_fields,
+        defaults,
+        _first_text(form.get("prpCmain.startDateCI"), form.get("prpCmain.startDate"), vehicle.get("startDateCI"), vehicle.get("startDateBI")),
+    )
     is_new_car = bool(_profile_text(profile, "new_car_flag")) or _to_str(form.get("newCarFlag")).strip().lower() == "on"
     actual_value = _first_text(purchase_price if is_new_car else "", form.get("prpCitemCar.actualValue"), vehicle.get("actualValue"), purchase_price)
 
@@ -2242,6 +2500,15 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     set_form("energyFlag", energy_fields["energy_flag"])
     set_form("prpCitemCar.fuelType", energy_fields["fuel_type"])
     set_form("prpCitemCar.vehicleFuelType", energy_fields["vehicle_fuel_type"])
+    set_form("prpCitemCar.licenseType", license_fields["license_type"])
+    set_form("prpCitemCar.licenseColorCode", license_fields["license_color_code"])
+    set_form("prpCcarShipTax.taxType", tax_fields["tax_type"])
+    set_form("prpCcarShipTax.calculateMode", tax_fields["calculate_mode"])
+    set_form("prpCcarShipTax.taxAbateType", tax_fields["tax_abate_type"])
+    set_form("prpCcarShipTax.taxAbateReason", tax_fields["tax_abate_reason"])
+    set_form("prpCcarShipTax.dutyPaidProofNo", tax_fields["duty_paid_proof_no"])
+    set_form("prpCcarShipTax.payStartDate", tax_fields["pay_start_date"])
+    set_form("prpCcarShipTax.payEndDate", tax_fields["pay_end_date"])
     set_form("prpCmain.vehicleStyleUniqueId", _first_text(selected.get("vehicleStyleUniqueId"), vehicle.get("vehicleStyleUniqueId")))
     set_form("prpCmain.presaleCarFlag", _first_text(precise_vehicle.get("presaleCarFlag"), selected.get("presaleCarFlag")))
 
@@ -2259,6 +2526,15 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     set_vehicle("vehicleFgwCode", _model_search_code(vehicle_fgw_code))
     set_vehicle("platformBrandId", brand_id)
     set_vehicle("platformBrandIDNew", brand_id_new)
+    set_vehicle("licenseType", license_fields["license_type"])
+    set_vehicle("licenseColorCode", license_fields["license_color_code"])
+    set_vehicle("taxType", tax_fields["tax_type"])
+    set_vehicle("calculateMode", tax_fields["calculate_mode"])
+    set_vehicle("taxAbateType", tax_fields["tax_abate_type"])
+    set_vehicle("taxAbateReason", tax_fields["tax_abate_reason"])
+    set_vehicle("dutyPaidProofNo", tax_fields["duty_paid_proof_no"])
+    set_vehicle("payStartDate", tax_fields["pay_start_date"])
+    set_vehicle("payEndDate", tax_fields["pay_end_date"])
 
     preflight["vehicleModelAutoAccepted"] = {
         "accepted": True,
@@ -2271,6 +2547,12 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
         "energyTypePlat": energy_fields["energy_type_plat"],
         "energyTypePlatTemp": energy_fields["energy_type_name"],
         "vehicleFuelType": energy_fields["vehicle_fuel_type"],
+        "licenseType": license_fields["license_type"],
+        "licenseColorCode": license_fields["license_color_code"],
+        "taxType": tax_fields["tax_type"],
+        "calculateMode": tax_fields["calculate_mode"],
+        "taxAbateType": tax_fields["tax_abate_type"],
+        "taxAbateReason": tax_fields["tax_abate_reason"],
     }
     body["quoteForm"] = _clean_vehicle_cert_fields(form)
     body["vehicleForm"] = _clean_vehicle_cert_fields(vehicle)
@@ -2759,6 +3041,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body_draft: Dict[str, Any] = {}
         draft_error = ""
         request_body: Dict[str, Any] = {}
+        prequote_auto_notices: List[Dict[str, Any]] = []
         runtime_stage = "init"
         try:
             request_body_draft = (
@@ -2821,16 +3104,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if is_real_quote:
                 runtime_stage = "prepare_quote"
                 auto_notice_callback = _json_obj(ctx.payload).get("auto_notice_callback")
-                prequote_auto_notices: List[Dict[str, Any]] = []
                 request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
                 duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
                 if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
-                    return PlatformRuntimeResult(
-                        status="duplicate_quote_confirm_required",
-                        message=_to_str(duplicate_confirm_payload.get("duplicate_quote_warning")).strip()
-                        or "平台提示该车辆可能重复投保，请核实后再继续报价。",
-                        data=success_data(client, extra=duplicate_confirm_payload),
-                    )
+                    preflight = dict(_json_obj(request_body.get("preflight")))
+                    preflight["confirmDuplicateQuote"] = True
+                    preflight["duplicateQuoteConfirmed"] = True
+                    preflight["allowDuplicateQuote"] = True
+                    request_body = {**request_body, "preflight": preflight}
+                    notice = _duplicate_quote_auto_notice_from_confirmation_payload(duplicate_confirm_payload)
+                    if notice:
+                        emitted = _emit_platform_auto_notice(auto_notice_callback, notice)
+                        if emitted:
+                            notice["emitted_to_chat"] = True
+                        prequote_auto_notices.append(notice)
                 runtime_stage = "submit_quote"
                 request_body, quote_response, auto_period_notices = self._submit_used_fuel_quote_with_period_auto_adjust(
                     client,
@@ -2840,13 +3127,26 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 platform_auto_notices = [*prequote_auto_notices, *auto_period_notices]
+                platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
+                duplicate_notice = _duplicate_quote_notice_from_success_dialog(
+                    platform_dialog,
+                    has_period_auto_notice=bool(auto_period_notices),
+                    has_duplicate_precheck_notice=any(
+                        _to_str(item.get("type")).strip() == "duplicate_quote_notice"
+                        for item in prequote_auto_notices
+                    ),
+                )
+                if duplicate_notice:
+                    emitted = _emit_platform_auto_notice(auto_notice_callback, duplicate_notice)
+                    if emitted:
+                        duplicate_notice["emitted_to_chat"] = True
+                    platform_auto_notices.append(duplicate_notice)
                 if platform_auto_notices:
                     quote_result["platform_auto_notices"] = platform_auto_notices
-                platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
-                if platform_dialog and not (
-                    auto_period_notices
-                    and _to_str(platform_dialog.get("subtype")).strip().lower() == "insurance_date_adjust"
-                ):
+                # Insurance-period prompts are handled in the retry loop above:
+                # emit raw chat text only when a request is actually adjusted,
+                # never leave a stale dialog in an otherwise successful result.
+                if platform_dialog and _to_str(platform_dialog.get("subtype")).strip().lower() != "insurance_date_adjust":
                     quote_result["platform_dialog"] = platform_dialog
                 runtime_stage = "postchecks"
                 post_quote = self._run_used_fuel_quote_postchecks(client, request_body, quote_response)
@@ -2881,6 +3181,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
         except PiccDuplicateQuoteError as exc:
             data_payload = {"business_status": "duplicate_quote", "error_code": "duplicate_quote"}
+            if prequote_auto_notices:
+                data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
             if client is not None:
                 data_payload = success_data(client, extra=data_payload)
             return PlatformRuntimeResult(
@@ -2890,6 +3192,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
         except PiccQuotaFullError as exc:
             data_payload = {"business_status": "quota_full", "error_code": "quota_full"}
+            if prequote_auto_notices:
+                data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
             if client is not None:
                 data_payload = success_data(client, extra=data_payload)
             return PlatformRuntimeResult(
@@ -2898,30 +3202,36 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 data=data_payload,
             )
         except PiccSessionExpiredError as exc:
+            data_payload: Dict[str, Any] = {
+                "business_status": "16",
+                "error_code": exc.__class__.__name__,
+                "request_body": request_body or request_body_draft,
+                "request_body_draft": request_body_draft,
+                "offline_request_body": True,
+                "request_body_error": draft_error,
+            }
+            if prequote_auto_notices:
+                data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
             return PlatformRuntimeResult(
                 status="expired",
                 message=str(exc) or "PICC 登录已过期，请重新登录",
-                data={
-                    "business_status": "16",
-                    "error_code": exc.__class__.__name__,
-                    "request_body": request_body or request_body_draft,
-                    "request_body_draft": request_body_draft,
-                    "offline_request_body": True,
-                    "request_body_error": draft_error,
-                },
+                data=data_payload,
             )
         except PiccTransientGatewayError as exc:
+            data_payload = {
+                "error_code": exc.__class__.__name__,
+                "transient": True,
+                "request_body": request_body or request_body_draft,
+                "request_body_draft": request_body_draft,
+                "offline_request_body": True,
+                "request_body_error": draft_error,
+            }
+            if prequote_auto_notices:
+                data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
             return PlatformRuntimeResult(
                 status="network_error",
                 message=str(exc) or "PICC 平台网关临时异常，请稍后重试",
-                data={
-                    "error_code": exc.__class__.__name__,
-                    "transient": True,
-                    "request_body": request_body or request_body_draft,
-                    "request_body_draft": request_body_draft,
-                    "offline_request_body": True,
-                    "request_body_error": draft_error,
-                },
+                data=data_payload,
             )
         except PiccRequestError as exc:
             data_payload: Dict[str, Any] = {
@@ -2935,9 +3245,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if isinstance(exc, PiccBusinessRequestError):
                 data_payload["platform_response"] = _platform_debug_payload(getattr(exc, "platform_response", None))
                 data_payload["platform_dialog"] = _platform_business_error_dialog(getattr(exc, "platform_response", None))
-                auto_notices = getattr(exc, "platform_auto_notices", None)
-                if auto_notices:
-                    data_payload["platform_auto_notices"] = [dict(item or {}) for item in auto_notices if isinstance(item, Mapping)]
+            auto_notices = [
+                *prequote_auto_notices,
+                *[
+                    dict(item or {})
+                    for item in getattr(exc, "platform_auto_notices", None) or []
+                    if isinstance(item, Mapping)
+                ],
+            ]
+            if auto_notices:
+                data_payload["platform_auto_notices"] = auto_notices
+            if isinstance(exc, PiccBusinessRequestError):
                 data_payload["request_body_envelope"] = data_payload["request_body"]
                 data_payload["request_form_body"] = getattr(exc, "request_body", None) or {}
                 data_payload["request_body"] = data_payload["request_form_body"] or data_payload["request_body"]
@@ -2949,17 +3267,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 data=data_payload,
             )
         except Exception as exc:
+            data_payload = {
+                "error_code": exc.__class__.__name__,
+                "error_stage": runtime_stage,
+                "request_body": request_body or request_body_draft,
+                "request_body_draft": request_body_draft,
+                "offline_request_body": True,
+                "request_body_error": draft_error,
+            }
+            if prequote_auto_notices:
+                data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
             return PlatformRuntimeResult(
                 status="failed",
                 message=str(exc) or exc.__class__.__name__,
-                data={
-                    "error_code": exc.__class__.__name__,
-                    "error_stage": runtime_stage,
-                    "request_body": request_body or request_body_draft,
-                    "request_body_draft": request_body_draft,
-                    "offline_request_body": True,
-                    "request_body_error": draft_error,
-                },
+                data=data_payload,
             )
 
     def _query_quote_times_best_effort(
@@ -3708,6 +4029,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if _money(ton_count) == 0:
             ton_count = ""
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=prof)
+        license_fields = _profile_license_fields(prof, energy_fields, defaults)
+        tax_fields = _profile_tax_field_values(prof, energy_fields, defaults, start_date_ci)
+        resolved_license_type = _to_str(
+            _field_value(defaults, "号牌种类", "licenseType", fallback=license_fields["license_type"])
+        )
+        resolved_license_color_code = _to_str(
+            _field_value(defaults, "车牌颜色代码", "licenseColorCode", fallback=license_fields["license_color_code"])
+        )
 
         compulsory_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"), "20")
         loss_amount = _money_text(_first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value))
@@ -3776,7 +4105,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.Nodamageyears": main_com_code,
             "prpCitemCar.carchecker": carchecker_name,
             "prpCitemCar.licenseNo": _to_str(vehicle.get("licenseNo")),
-            "prpCitemCar.licenseType": _to_str(vehicle.get("licenseType") or "02"),
+            "prpCitemCar.licenseType": resolved_license_type,
             "prpCitemCar.engineNo": _to_str(vehicle.get("engineNo")),
             "prpCitemCar.vinNo": _to_str(vehicle.get("vin")),
             "prpCitemCar.frameNo": _to_str(vehicle.get("vin")),
@@ -3811,7 +4140,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.carInsuredRelation": _to_str(_field_value(defaults, "车主与被保险人关系", "carInsuredRelation", fallback="所有")),
             "prpCitemCar.loanVehicleFlag": "0",
             "prpCitemCar.clauseType": _to_str(_field_value(defaults, "条款类型", "clauseType", fallback="F42")),
-            "prpCitemCar.licenseColorCode": _to_str(_field_value(defaults, "车牌颜色代码", "licenseColorCode", fallback="01")),
+            "prpCitemCar.licenseColorCode": resolved_license_color_code,
             "prpCitemCar.netWeifaFlag": "0",
             "prpCitemCar.isEnergyCar": energy_fields["is_energy_car"],
             "prpCitemCar.isDangerousCar": "0",
@@ -3843,11 +4172,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemKindsTemp[1].deductible": "0",
             "riskCodeType": "DZA",
             "quantity": str(passenger_quantity),
-            "prpCcarShipTax.taxType": _to_str(_field_value(defaults, "车船税类型", "taxType", fallback="1")),
-            "prpCcarShipTax.calculateMode": _to_str(_field_value(defaults, "车船税计算方式", "calculateMode", fallback=_profile_text(prof, "tax_calculate_mode", "C1"))),
+            "prpCcarShipTax.taxType": _to_str(_field_value(defaults, "车船税类型", "taxType", fallback=tax_fields["tax_type"])),
+            "prpCcarShipTax.calculateMode": _to_str(_field_value(defaults, "车船税计算方式", "calculateMode", fallback=tax_fields["calculate_mode"])),
             "prpCcarShipTax.taxcomcode": _to_str(_field_value(defaults, "税务机关代码", "taxcomcode")),
             "prpCcarShipTax.taxcomname": _to_str(_field_value(defaults, "税务机关名称", "taxcomname")),
-            "prpCcarShipTax.taxAbateType": _to_str(_field_value(defaults, "车船税减免类型", "taxAbateType", fallback="1")),
+            "prpCcarShipTax.taxAbateType": _to_str(_field_value(defaults, "车船税减免类型", "taxAbateType", fallback=tax_fields["tax_abate_type"])),
+            "prpCcarShipTax.taxAbateReason": _to_str(_field_value(defaults, "车船税减免原因", "taxAbateReason", fallback=tax_fields["tax_abate_reason"])),
+            "prpCcarShipTax.dutyPaidProofNo": _to_str(_field_value(defaults, "完税证明号", "dutyPaidProofNo", fallback=tax_fields["duty_paid_proof_no"])),
+            "prpCcarShipTax.payStartDate": _to_str(_field_value(defaults, "车船税起始日期", "payStartDate", fallback=tax_fields["pay_start_date"])),
+            "prpCcarShipTax.payEndDate": _to_str(_field_value(defaults, "车船税终止日期", "payEndDate", fallback=tax_fields["pay_end_date"])),
             "prpCcarShipTax.payLastYear": _period_last_year(start_date_ci),
             "prpCcarShipTax.taxregistrynumber": _to_str(_field_value(defaults, "车船税纳税人识别号", "taxregistrynumber")),
             "prpCcarShipTax.remark1": owner_name,
@@ -3939,6 +4272,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             message = _platform_message(data, "平台返回业务校验失败")
             if _quote_response_has_display_result(data):
                 return _json_obj(data)
+            # PICC can label a period-adjustment response as "duplicate
+            # insurance". It is not a duplicate-quote stop: preserve the raw
+            # response so the bounded retry loop can change the correct dates.
+            if _platform_response_requires_insurance_date_adjustment(data):
+                raise PiccBusinessRequestError(
+                    f"报价提交失败：{message}",
+                    action="报价提交",
+                    platform_response=data,
+                    request_body=form_body,
+                )
             if _contains_duplicate_quote(data):
                 raise PiccDuplicateQuoteError(message or "平台提示该车辆已报价过")
             if _contains_quota_full(data):
@@ -3950,6 +4293,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 request_body=form_body,
             )
         payload = _json_obj(_json_obj(data).get("data"))
+        if _platform_response_requires_insurance_date_adjustment(data):
+            raise PiccBusinessRequestError(
+                f"报价提交失败：{_platform_message(data, '平台提示需要修改保险期间')}",
+                action="报价提交",
+                platform_response=data,
+                request_body=form_body,
+            )
         if _contains_duplicate_quote(payload) and not _to_str(payload.get("quotationNo")).strip():
             raise PiccDuplicateQuoteError(_platform_message(data, "平台提示该车辆已报价过"))
         return _json_obj(data)
@@ -3993,6 +4343,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if not enroll_date and _profile_text(prof, "enroll_date_fallback") == "today":
             enroll_date = _today_text()
         energy_model_suffix = _vehicle_energy_model_suffix(data, prof)
+        initial_energy_fields = _resolve_vehicle_energy_fields(
+            defaults,
+            {},
+            {},
+            vehicle={
+                "rawModelName": raw_model_name,
+                "vehicleType": vehicle_type,
+                "brandNameHint": vehicle_brand_name,
+                "vehicleNameHint": vehicle_name_hint,
+                "energyModelSuffix": energy_model_suffix,
+            },
+            profile=prof,
+        )
+        license_fields = _profile_license_fields(prof, initial_energy_fields, defaults)
         model_terms = _used_fuel_model_query_terms(
             raw_model_name,
             vehicle_type,
@@ -4002,7 +4366,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         vehicle = {
             "licenseNo": license_no,
-            "licenseType": _first_text(_field_value(defaults, "号牌种类"), "02"),
+            "licenseType": license_fields["license_type"],
+            "licenseColorCode": license_fields["license_color_code"],
             "engineNo": engine_no,
             "vin": vin,
             "transferDate": transfer_date,
@@ -4087,6 +4452,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle = _clean_vehicle_cert_fields(vehicle)
         prof = _json_obj(profile)
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, {}, vehicle=vehicle, profile=prof)
+        license_fields = _profile_license_fields(prof, energy_fields, defaults)
         purchase_price = _first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT"))
         params = {
             "vin": vehicle.get("vin") or "",
@@ -4094,7 +4460,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "startHour": 0,
             "startMinute": 0,
             "licenseNo": vehicle.get("licenseNo") or "",
-            "licenseType": vehicle.get("licenseType") or "02",
+            "licenseType": vehicle.get("licenseType") or license_fields["license_type"],
             "carKindCode": vehicle.get("carKindCode") or _first_text(selected.get("vehicleClassPicc"), "A01"),
             "engineNo": vehicle.get("engineNo") or "",
             "enrollDate": vehicle.get("enrollDate") or "",
@@ -4177,18 +4543,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         platform_response: Any,
         *,
         error_message: Any = "",
+        request_body: Any = None,
     ) -> Dict[str, Any]:
         dialog = _used_fuel_quote_platform_dialog(platform_response)
         message = _to_str(dialog.get("message")).strip()
         kinds = [item for item in (dialog.get("adjustment_kinds") if isinstance(dialog.get("adjustment_kinds"), list) else []) if item in {"bi", "ci"}]
         reinsure_items = dialog.get("reinsure_items") if isinstance(dialog.get("reinsure_items"), list) else []
-        first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
-        candidate_date = _first_text(
-            first_reinsure.get("adviseStartDate"),
-            first_reinsure.get("effectiveDate"),
-            dialog.get("suggested_commercial_start_date"),
-            dialog.get("suggested_compulsory_start_date"),
-        )
+        raw_commercial_candidate = _date_text(dialog.get("raw_suggested_commercial_start_date"))
+        raw_compulsory_candidate = _date_text(dialog.get("raw_suggested_compulsory_start_date"))
+        # Prefer the untouched value parsed from the platform response. The
+        # legacy `suggested_*` fields are only a compatibility fallback.
+        commercial_candidate = raw_commercial_candidate or _date_text(dialog.get("suggested_commercial_start_date"))
+        compulsory_candidate = raw_compulsory_candidate or _date_text(dialog.get("suggested_compulsory_start_date"))
+        if not raw_commercial_candidate:
+            raw_commercial_candidate = commercial_candidate
+        if not raw_compulsory_candidate:
+            raw_compulsory_candidate = compulsory_candidate
 
         if not kinds:
             platform_body = _json_obj(_json_obj(platform_response).get("data"))
@@ -4207,20 +4577,73 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if repeat_kinds:
                     kinds = repeat_kinds
                     message = platform_text or detect_text
-                    candidate_date = _reinsure_notice_suggested_start_date(detect_text)
+                    candidate_day = _reinsure_notice_suggested_start_date(detect_text)
+                    if "bi" in kinds:
+                        commercial_candidate = candidate_day
+                        raw_commercial_candidate = candidate_day
+                    if "ci" in kinds:
+                        compulsory_candidate = candidate_day
+                        raw_compulsory_candidate = candidate_day
 
         if not kinds:
             return {}
 
+        # A structured reinsure row tells us which coverage was duplicated. An
+        # explicit platform error can additionally name a different coverage
+        # whose date is invalid. Treat the text as an additive signal so the
+        # retry can update commercial and compulsory dates independently.
+        explicit_error_kinds = _insurance_date_error_adjustment_kinds(
+            _join_unique_platform_notice_parts(message, error_message)
+        )
+        for kind in explicit_error_kinds:
+            if kind not in kinds:
+                kinds.append(kind)
+
         platform_next_day = self._platform_next_quote_start_date(client)
-        start_day = _platform_effective_quote_date(candidate_date or platform_next_day, min_day=platform_next_day)
-        if not start_day:
-            start_day = platform_next_day
+        commercial_start = ""
+        compulsory_start = ""
+        if "bi" in kinds:
+            commercial_start = _platform_effective_quote_date(
+                commercial_candidate or platform_next_day,
+                min_day=platform_next_day,
+            ) or platform_next_day
+        if "ci" in kinds:
+            compulsory_start = _platform_effective_quote_date(
+                compulsory_candidate or platform_next_day,
+                min_day=platform_next_day,
+            ) or platform_next_day
+        if request_body:
+            body_for_compare = _clean_used_fuel_request_body(_json_obj(request_body))
+            form_for_compare = _clean_vehicle_cert_fields(_json_obj(body_for_compare.get("quoteForm")))
+            vehicle_for_compare = _clean_vehicle_cert_fields(_json_obj(body_for_compare.get("vehicleForm")))
+            filtered_kinds: List[str] = []
+            for kind in kinds:
+                target_day = commercial_start if kind == "bi" else compulsory_start
+                if _insurance_date_adjustment_needed(
+                    form_for_compare,
+                    vehicle_for_compare,
+                    kind=kind,
+                    target_day=target_day,
+                ):
+                    filtered_kinds.append(kind)
+            kinds = filtered_kinds
+            if "bi" not in kinds:
+                commercial_start = ""
+                commercial_candidate = ""
+                raw_commercial_candidate = ""
+            if "ci" not in kinds:
+                compulsory_start = ""
+                compulsory_candidate = ""
+                raw_compulsory_candidate = ""
+            if not kinds:
+                return {}
         return {
             "message": message or "平台提示需要修改保险期间，已按平台当前时间自动调整。",
-            "start_date": start_day,
-            "commercial_start_date": start_day if "bi" in kinds else "",
-            "compulsory_start_date": start_day if "ci" in kinds else "",
+            "start_date": _first_text(commercial_start, compulsory_start),
+            "commercial_start_date": commercial_start,
+            "compulsory_start_date": compulsory_start,
+            "raw_commercial_start_date": raw_commercial_candidate,
+            "raw_compulsory_start_date": raw_compulsory_candidate,
             "adjustment_kinds": kinds,
             "source": "platform_current_time_and_quote_prompt",
         }
@@ -4246,26 +4669,72 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         kinds = [item for item in (adjustment.get("adjustment_kinds") if isinstance(adjustment.get("adjustment_kinds"), list) else []) if item in {"bi", "ci"}]
         bi_day = _date_text(adjustment.get("commercial_start_date"))
         ci_day = _date_text(adjustment.get("compulsory_start_date"))
+        applied_bi_day = ""
+        applied_ci_day = ""
+        bi_changed = False
         changed = False
 
-        if "bi" in kinds and bi_day:
-            if _to_str(form.get("prpCmain.startDate")).strip() != bi_day:
-                form["prpCmain.startDate"] = bi_day
+        if (
+            "bi" in kinds
+            and bi_day
+            and _insurance_date_adjustment_needed(
+                form,
+                vehicle,
+                kind="bi",
+                target_day=bi_day,
+            )
+        ):
+            apply_bi_day = _insurance_date_adjustment_target_day(
+                form,
+                vehicle,
+                kind="bi",
+                target_day=bi_day,
+            )
+        else:
+            apply_bi_day = ""
+        if apply_bi_day:
+            applied_bi_day = apply_bi_day
+            if _to_str(form.get("prpCmain.startDate")).strip() != apply_bi_day:
+                form["prpCmain.startDate"] = apply_bi_day
                 changed = True
-            if _to_str(vehicle.get("startDateBI")).strip() != bi_day:
-                vehicle["startDateBI"] = bi_day
+                bi_changed = True
+            if _to_str(vehicle.get("startDateBI")).strip() != apply_bi_day:
+                vehicle["startDateBI"] = apply_bi_day
                 changed = True
-        if "ci" in kinds and ci_day:
-            if _to_str(form.get("prpCmain.startDateCI")).strip() != ci_day:
-                form["prpCmain.startDateCI"] = ci_day
+                bi_changed = True
+        if (
+            "ci" in kinds
+            and ci_day
+            and _insurance_date_adjustment_needed(
+                form,
+                vehicle,
+                kind="ci",
+                target_day=ci_day,
+            )
+        ):
+            apply_ci_day = _insurance_date_adjustment_target_day(
+                form,
+                vehicle,
+                kind="ci",
+                target_day=ci_day,
+            )
+        else:
+            apply_ci_day = ""
+        if apply_ci_day:
+            applied_ci_day = apply_ci_day
+            if _to_str(form.get("prpCmain.startDateCI")).strip() != apply_ci_day:
+                form["prpCmain.startDateCI"] = apply_ci_day
                 changed = True
-            if _to_str(vehicle.get("startDateCI")).strip() != ci_day:
-                vehicle["startDateCI"] = ci_day
+            if _to_str(vehicle.get("startDateCI")).strip() != apply_ci_day:
+                vehicle["startDateCI"] = apply_ci_day
                 changed = True
-            form["prpCmain.endDateCI"] = _end_date_text(ci_day)
+            end_date_ci = _end_date_text(apply_ci_day)
+            if end_date_ci and _to_str(form.get("prpCmain.endDateCI")).strip() != end_date_ci:
+                form["prpCmain.endDateCI"] = end_date_ci
+                changed = True
 
         recalculated_actual_value = ""
-        if changed and "bi" in kinds and selected:
+        if bi_changed and selected:
             try:
                 actual_value_result = self._query_actual_value(client, vehicle, defaults, selected, precise_vehicle, profile=profile)
                 platform_purchase_price = _vehicle_platform_purchase_price(selected, precise_vehicle)
@@ -4301,12 +4770,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if not changed:
             return body, False, {}
 
+        applied_kinds = [
+            kind
+            for kind, day in (("bi", applied_bi_day), ("ci", applied_ci_day))
+            if day
+        ]
         notice = {
             "type": "insurance_date_adjust",
             "message": _to_str(adjustment.get("message")).strip(),
-            "commercial_start_date": bi_day,
-            "compulsory_start_date": ci_day,
-            "adjustment_kinds": kinds,
+            "commercial_start_date": applied_bi_day,
+            "compulsory_start_date": applied_ci_day,
+            "adjustment_kinds": applied_kinds,
             "actual_value": recalculated_actual_value,
             "source": adjustment.get("source") or "platform_prompt",
         }
@@ -4368,13 +4842,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     client,
                     getattr(exc, "platform_response", None),
                     error_message=str(exc),
+                    request_body=body,
                 )
                 adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
                 if not changed:
-                    if adjustment and adjustment.get("message") and not notices:
-                        ready_notice = _insurance_date_notice_from_adjustment(adjustment)
-                        ready_notice["already_effective"] = True
-                        remember_notice(adjustment, ready_notice)
                     exc.platform_auto_notices = [
                         *getattr(exc, "platform_auto_notices", []),
                         *notices,
@@ -4384,13 +4855,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 body = adjusted_body
                 continue
 
-            adjustment = self._insurance_date_adjustment_from_platform_response(client, quote_response)
+            adjustment = self._insurance_date_adjustment_from_platform_response(client, quote_response, request_body=body)
             adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
             if not changed:
-                if adjustment and adjustment.get("message") and not notices:
-                    ready_notice = _insurance_date_notice_from_adjustment(adjustment)
-                    ready_notice["already_effective"] = True
-                    remember_notice(adjustment, ready_notice)
                 return body, quote_response, notices
             remember_notice(adjustment, notice)
             body = adjusted_body

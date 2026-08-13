@@ -60,7 +60,6 @@ from app.services.quote_assistant_service import (
     create_platform_account_profile as _create_platform_account_profile,
     delete_platform_default_config as _delete_platform_default_config,
     get_platform_account_profile as _get_platform_account_profile,
-    get_pending_duplicate_quote_confirm_payload as _get_pending_duplicate_quote_confirm_payload,
     list_platform_default_configs as _list_platform_default_configs,
     list_platform_account_profiles as _list_platform_account_profiles,
     list_platform_account_types as _list_platform_account_types,
@@ -652,19 +651,12 @@ async def get_ai_history(
                 "metadata": filtered_metadata,
             }
         )
-    pending_duplicate_confirm = None
-    if can_quote_use:
-        pending_duplicate_confirm = await _get_pending_duplicate_quote_confirm_payload(
-            db,
-            owner_user_id=owner_user_id,
-            session_id=session_id,
-        )
     return {
         "session_id": session_id,
         "items": items,
         "next_cursor": page.get("next_cursor") if isinstance(page, dict) else None,
         "has_more": bool(page.get("has_more")) if isinstance(page, dict) else False,
-        "pending_duplicate_confirm": pending_duplicate_confirm,
+        "pending_duplicate_confirm": None,
     }
 
 

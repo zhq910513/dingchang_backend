@@ -433,7 +433,6 @@ def _session_preview_needs_recompute(value: Any) -> bool:
         "已完成识别归位",
         "默认参数已更新",
         "我没完全看懂这条指令",
-        "重复投保提示",
         "等待重复投保确认",
         "平台提示可能重复投保",
     )
@@ -492,6 +491,26 @@ def _safe_chat_text_for_display(text: Any) -> str:
 
     safe = sanitize_quote_user_message(redact_quote_sensitive_text(text), "")
     return safe or ""
+
+
+def _client_message_id_for_history(value: Any) -> str:
+    text = _to_str(value).strip()
+    if not text or len(text) > 64:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", text):
+        return ""
+    return text
+
+
+def _public_message_id_from_client_id(session_id: Any, client_msg_id: Any) -> str:
+    """Keep frontend retries idempotent without requiring global client id uniqueness."""
+    client_id = _client_message_id_for_history(client_msg_id)
+    if not client_id:
+        return ""
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", _to_str(session_id))[:12]
+    if not sid:
+        return client_id[:64]
+    return f"{sid}_{client_id}"[:64]
 
 
 def _looks_like_garbled_exception_detail(text: str) -> bool:
@@ -1213,6 +1232,7 @@ async def db_append_message(
         role: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     owner = _safe_int(owner_user_id, 0)
     row = await _db_get_session_row(db, owner_user_id=owner, session_id=session_id)
@@ -1222,7 +1242,7 @@ async def db_append_message(
     now = _now_db()
     safe_content = _to_str(content)
     msg = QuoteAssistantMessage(
-        message_id=_new_id(),
+        message_id=_to_str(message_id).strip() or _new_id(),
         session_id=row.session_id,
         owner_user_id=owner,
         role=_to_str(role) or "assistant",
@@ -1243,6 +1263,139 @@ async def db_append_message(
 
     await db.flush()
     return _message_row_to_dict(msg)
+
+
+async def _db_get_message_by_public_id(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        message_id: str,
+) -> Optional[QuoteAssistantMessage]:
+    owner = _safe_int(owner_user_id, 0)
+    msg_id = _to_str(message_id).strip()
+    sid = _to_str(session_id).strip()
+    if owner <= 0 or not sid or not msg_id:
+        return None
+    return (
+        await db.execute(
+            select(QuoteAssistantMessage)
+            .where(
+                QuoteAssistantMessage.owner_user_id == owner,
+                QuoteAssistantMessage.session_id == sid,
+                QuoteAssistantMessage.message_id == msg_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _db_cached_response_after_user_message(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        user_row: QuoteAssistantMessage,
+        model: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip()
+    if owner <= 0 or not sid or user_row is None:
+        return None
+    user_meta = user_row.metadata_json if isinstance(user_row.metadata_json, dict) else {}
+    cached = user_meta.get("cached_response")
+    if isinstance(cached, dict):
+        return {
+            "session_id": sid,
+            "reply": _to_str(cached.get("reply")),
+            "intent": _to_str(cached.get("intent"), "chat") or "chat",
+            "trace_id": _to_str(cached.get("trace_id"), _new_id()[:16]) or _new_id()[:16],
+            "confidence": float(cached.get("confidence") or 0.0),
+            "actions": cached.get("actions") if isinstance(cached.get("actions"), list) else [],
+            "usage": cached.get("usage") if isinstance(cached.get("usage"), dict) else None,
+            "model": _to_str(cached.get("model") or model, "rule-engine") or "rule-engine",
+            "data": cached.get("data") if isinstance(cached.get("data"), dict) else None,
+            "silent": bool(cached.get("silent") is True or _to_str(cached.get("silent")).strip().lower() == "true"),
+            "ui_visible": not (cached.get("ui_visible") is False or _to_str(cached.get("ui_visible")).strip().lower() == "false"),
+            "user_message": _message_row_to_dict(user_row),
+            "assistant_message": cached.get("assistant_message") if isinstance(cached.get("assistant_message"), dict) else None,
+            "stream": None,
+            "cached": True,
+        }
+    next_user_id = (
+        await db.execute(
+            select(func.min(QuoteAssistantMessage.id))
+            .where(
+                QuoteAssistantMessage.owner_user_id == owner,
+                QuoteAssistantMessage.session_id == sid,
+                QuoteAssistantMessage.role == "user",
+                QuoteAssistantMessage.id > user_row.id,
+            )
+        )
+    ).scalar_one_or_none()
+    stmt = (
+        select(QuoteAssistantMessage)
+        .where(
+            QuoteAssistantMessage.owner_user_id == owner,
+            QuoteAssistantMessage.session_id == sid,
+            QuoteAssistantMessage.role == "assistant",
+            QuoteAssistantMessage.id > user_row.id,
+        )
+        .order_by(desc(QuoteAssistantMessage.id))
+        .limit(1)
+    )
+    if next_user_id:
+        stmt = stmt.where(QuoteAssistantMessage.id < int(next_user_id))
+    assistant_row = (await db.execute(stmt)).scalar_one_or_none()
+    if assistant_row is None:
+        return None
+
+    meta = assistant_row.metadata_json if isinstance(assistant_row.metadata_json, dict) else {}
+    return {
+        "session_id": sid,
+        "reply": _to_str(assistant_row.content),
+        "intent": _to_str(meta.get("intent"), "chat") or "chat",
+        "trace_id": _to_str(meta.get("trace_id"), _new_id()[:16]) or _new_id()[:16],
+        "confidence": float(meta.get("confidence") or 0.0),
+        "actions": meta.get("actions") if isinstance(meta.get("actions"), list) else [],
+        "usage": None,
+        "model": _to_str(model, "rule-engine") or "rule-engine",
+        "data": meta.get("data") if isinstance(meta.get("data"), dict) else None,
+        "silent": bool(meta.get("silent") is True or _to_str(meta.get("silent")).strip().lower() == "true"),
+        "ui_visible": not (meta.get("ui_visible") is False or _to_str(meta.get("ui_visible")).strip().lower() == "false"),
+        "user_message": _message_row_to_dict(user_row),
+        "assistant_message": _message_row_to_dict(assistant_row),
+        "stream": None,
+        "cached": True,
+    }
+
+
+async def _db_store_cached_response_on_user_message(
+        db: AsyncSession,
+        *,
+        owner_user_id: str | int,
+        session_id: str,
+        message_id: str,
+        response: Dict[str, Any],
+) -> None:
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip()
+    msg_id = _to_str(message_id).strip()
+    if owner <= 0 or not sid or not msg_id or not isinstance(response, dict):
+        return
+    row = await _db_get_message_by_public_id(
+        db,
+        owner_user_id=owner,
+        session_id=sid,
+        message_id=msg_id,
+    )
+    if row is None:
+        return
+    meta = dict(row.metadata_json or {})
+    meta["cached_response"] = _safe_history_value(response)
+    row.metadata_json = meta
+    row.updated_at = _now_db()
+    await db.flush()
 
 
 async def db_recall_session_images(
@@ -3455,16 +3608,41 @@ async def send_message(
         hide_unlabeled_sms_code=hide_unlabeled_sms_code,
     )
     user_msg = None
+    stable_user_message_id = _public_message_id_from_client_id(real_session_id, client_msg_id)
     if not suppress_user_message or has_history_images:
+        existing_user_row = None
         if db is not None:
-            user_msg = await db_append_message(
-                db,
-                owner_user_id=owner_user_id,
-                session_id=real_session_id,
-                role="user",
-                content=user_content,
-                metadata=user_metadata,
+            existing_user_row = (
+                await _db_get_message_by_public_id(
+                    db,
+                    owner_user_id=owner_user_id,
+                    session_id=real_session_id,
+                    message_id=stable_user_message_id,
+                )
+                if stable_user_message_id
+                else None
             )
+            if existing_user_row is not None:
+                cached_result = await _db_cached_response_after_user_message(
+                    db,
+                    owner_user_id=owner_user_id,
+                    session_id=real_session_id,
+                    user_row=existing_user_row,
+                    model=model,
+                )
+                if cached_result is not None:
+                    return cached_result
+                user_msg = _message_row_to_dict(existing_user_row)
+            else:
+                user_msg = await db_append_message(
+                    db,
+                    owner_user_id=owner_user_id,
+                    session_id=real_session_id,
+                    role="user",
+                    content=user_content,
+                    metadata=user_metadata,
+                    message_id=stable_user_message_id,
+                )
         else:
             user_msg = _store.append_message(
                 owner_user_id=owner_user_id,
@@ -3525,7 +3703,7 @@ async def send_message(
     if not isinstance(meta, dict):
         meta = {}
 
-    return {
+    result_payload = {
         "session_id": real_session_id,
         "reply": _to_str(assistant_msg.get("content")),
         "intent": _to_str(meta.get("intent"), "chat") or "chat",
@@ -3541,6 +3719,15 @@ async def send_message(
         "assistant_message": assistant_msg,
         "stream": None,
     }
+    if hidden_assistant_response and db is not None and stable_user_message_id:
+        await _db_store_cached_response_on_user_message(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=real_session_id,
+            message_id=stable_user_message_id,
+            response=result_payload,
+        )
+    return result_payload
 
 
 __all__ = [

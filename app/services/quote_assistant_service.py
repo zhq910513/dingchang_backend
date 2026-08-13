@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from sqlalchemy import and_, desc, false as sql_false, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import lazyload, selectinload
 
@@ -31,6 +32,7 @@ from app.models.quote_assistant import (
     QuoteCase,
     QuoteCaseEvent,
     QuoteCaseImage,
+    QuoteAssistantMessage,
     QuotePlatformAccountEvent,
     QuotePlatformAccountLoginTask,
     QuotePlatformAccountProfile,
@@ -4999,6 +5001,9 @@ def _login_challenge_ttl_seconds(platform_code: Any, challenge_type: Any = "") -
 
 def _runtime_detail(result: Optional[PlatformRuntimeResult], default_message: str) -> str:
     status = _runtime_status(result)
+    platform_message = _runtime_platform_dialog_message(result, "")
+    if platform_message:
+        return sanitize_quote_user_message(platform_message, default_message)
     message = _to_str(getattr(result, "message", "") if result is not None else "").strip()
     if message:
         return sanitize_quote_user_message(message, default_message)
@@ -5070,6 +5075,9 @@ def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) 
     for key in ("error_code", "code", "reason", "business_status"):
         if _to_str(data.get(key)).strip().lower() in {"duplicate_quote", "duplicate_quote_confirm_required"}:
             return True
+    platform_dialog = _json_obj(data.get("platform_dialog"))
+    if _to_str(platform_dialog.get("subtype")).strip().lower() == "insurance_date_adjust":
+        return False
     raw = " ".join(
         _to_str(x)
         for x in (
@@ -5080,6 +5088,13 @@ def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) 
         )
         if _to_str(x).strip()
     )
+    compact = re.sub(r"\s+", "", raw)
+    if (
+        "重复投保" in compact
+        and ("保险期间" in compact or "起保" in compact or "起期" in compact)
+        and re.search(r"(?:调整为|调整至|改为|改至|变更为|同步至|建议).{0,32}\d{4}", compact)
+    ):
+        return False
     return bool(re.search(r"(?:重复|已报价|已经报价|不能重复).{0,12}(?:报价|投保)?", raw))
 
 
@@ -5276,10 +5291,10 @@ def _quote_platform_dialog_response(
         platform_code=platform_code,
         platform_name=platform_name,
     )
-    dialog_subtype = _to_str(dialog.get("subtype")).strip().lower()
-    visible_to_chat = not bool(dialog.get("confirm_required"))
-    if dialog_subtype == "insurance_date_adjust":
-        visible_to_chat = True
+    # The assistant no longer waits on frontend platform-dialog popups. Any
+    # platform prompt that reaches this response path must be visible as chat
+    # text, otherwise quote-command failures look like a silent no-op.
+    visible_to_chat = True
     payload = {
         "quote_case": {
             "id": case.id,
@@ -5319,6 +5334,74 @@ def _quote_platform_dialog_response(
             "ui_visible": visible_to_chat,
             "data": data,
             "actions": actions or [],
+        },
+    )
+
+
+def _quote_platform_text_notice_response(
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    runtime_result: Optional[PlatformRuntimeResult],
+    platform_code: str,
+    platform_name: str,
+    trace_id: str,
+    message: str,
+    result_status: str = RESULT_NOT_READY,
+    response_status: str = "success",
+    notice_type: str = "platform_notice",
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Return a platform prompt as normal chat text without creating a modal state."""
+    safe_message = sanitize_quote_user_message(
+        message,
+        f"{platform_name or '平台'}返回报价提示，请核实后重试。",
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "login_state": task.login_state,
+            "trace_id": trace_id,
+            "error_detail": safe_message,
+        },
+        "quote_runtime": _runtime_result_payload(runtime_result),
+        "platform_notice": {
+            "type": notice_type,
+            "message": safe_message,
+            "platform_code": platform_code,
+            "platform_name": platform_name,
+        },
+        "ui_visible": True,
+    }
+    payload.update(_json_obj(extra_payload))
+    data = _mk_data(
+        result_status=result_status,
+        message=safe_message,
+        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = False
+    data["ui_visible"] = True
+    return (
+        safe_message,
+        {
+            "status": response_status,
+            "intent": "quote",
+            "trace_id": trace_id,
+            "silent": False,
+            "ui_visible": True,
+            "data": data,
+            "actions": [],
         },
     )
 
@@ -6428,6 +6511,14 @@ def looks_like_short_quote_command(text: Any) -> bool:
         "现在报",
         "现在报价",
         "提交报价",
+        "继续报",
+        "继续报价",
+        "继续投保",
+        "确认报价",
+        "确认投保",
+        "确认继续",
+        "确认继续报价",
+        "确认继续投保",
         "全保",
         "人保全保",
         "全保报价",
@@ -6579,6 +6670,21 @@ def _normalize_quote_date_text(value: Any) -> str:
     year, month, day = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
     try:
         return datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _quote_end_date_text(start_date: Any) -> str:
+    text = _normalize_quote_date_text(start_date)
+    if not text:
+        return ""
+    try:
+        start = datetime.strptime(text, "%Y-%m-%d")
+        try:
+            next_year = start.replace(year=start.year + 1)
+        except ValueError:
+            next_year = start.replace(year=start.year + 1, day=28)
+        return (next_year - timedelta(days=1)).strftime("%Y-%m-%d")
     except ValueError:
         return ""
 
@@ -9559,6 +9665,158 @@ def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, acco
     return f"{display_name}风险水平：{risk_score or '-'} 分"
 
 
+def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> Dict[str, str]:
+    """Return platform-auto-adjusted start dates that should persist for later requotes."""
+    adjustments: Dict[str, str] = {}
+
+    def collect(notice_any: Any) -> None:
+        notice = _json_obj(notice_any)
+        if _to_str(notice.get("type")).strip() != "insurance_date_adjust":
+            return
+        bi_day = _normalize_quote_date_text(notice.get("commercial_start_date"))
+        ci_day = _normalize_quote_date_text(notice.get("compulsory_start_date"))
+        if bi_day:
+            adjustments["commercial_start_date"] = bi_day
+        if ci_day:
+            adjustments["compulsory_start_date"] = ci_day
+
+    for notice_any in _json_list(_json_obj(result).get("platform_auto_notices")):
+        collect(notice_any)
+
+    request_body = _json_obj(_json_obj(result).get("request_body"))
+    preflight = _json_obj(request_body.get("preflight"))
+    collect(preflight.get("insuranceDateAutoAdjusted"))
+    return adjustments
+
+
+def _quote_snapshot_with_auto_adjusted_dates(
+    snapshot: Mapping[str, Any],
+    adjustments: Mapping[str, Any],
+    *,
+    adjusted_request_body: Any = None,
+) -> Dict[str, Any]:
+    safe_snapshot = deepcopy(_json_obj(snapshot))
+    normalized = dict(_json_obj(safe_snapshot.get("normalized_data")))
+    changed = False
+    for key in ("commercial_start_date", "compulsory_start_date"):
+        day = _normalize_quote_date_text(adjustments.get(key))
+        if day and _to_str(normalized.get(key)).strip() != day:
+            normalized[key] = day
+            changed = True
+    if changed:
+        safe_snapshot["normalized_data"] = _clean_quote_dynamic_data(normalized)
+    request_body = deepcopy(_json_obj(adjusted_request_body)) or dict(_json_obj(safe_snapshot.get("request_body")))
+    if adjusted_request_body and request_body != _json_obj(safe_snapshot.get("request_body")):
+        changed = True
+    quote_form = dict(_json_obj(request_body.get("quoteForm")))
+    vehicle = dict(_json_obj(request_body.get("vehicleForm")))
+    if adjustments.get("commercial_start_date"):
+        day = _normalize_quote_date_text(adjustments.get("commercial_start_date"))
+        if _to_str(quote_form.get("prpCmain.startDate")).strip() != day:
+            quote_form["prpCmain.startDate"] = day
+            changed = True
+        if _to_str(vehicle.get("startDateBI")).strip() != day:
+            vehicle["startDateBI"] = day
+            changed = True
+    if adjustments.get("compulsory_start_date"):
+        day = _normalize_quote_date_text(adjustments.get("compulsory_start_date"))
+        if _to_str(quote_form.get("prpCmain.startDateCI")).strip() != day:
+            quote_form["prpCmain.startDateCI"] = day
+            changed = True
+        if _to_str(vehicle.get("startDateCI")).strip() != day:
+            vehicle["startDateCI"] = day
+            changed = True
+        end_day = _quote_end_date_text(day)
+        if end_day and _to_str(quote_form.get("prpCmain.endDateCI")).strip() != end_day:
+            quote_form["prpCmain.endDateCI"] = end_day
+            changed = True
+    if not changed:
+        return safe_snapshot
+    if quote_form:
+        request_body["quoteForm"] = quote_form
+    if vehicle:
+        request_body["vehicleForm"] = vehicle
+    if request_body:
+        safe_snapshot["request_body"] = request_body
+    safe_snapshot.pop("material_fingerprint", None)
+    safe_snapshot.pop("quote_fingerprint", None)
+    return _snapshot_with_quote_fingerprint(safe_snapshot)
+
+
+def _quote_task_with_final_request_body(task: QuoteTask, result: Mapping[str, Any]) -> bool:
+    final_request_body = _json_obj(_json_obj(result).get("request_body"))
+    if not final_request_body:
+        return False
+
+    changed = False
+    request_payload = dict(_json_obj(task.request_payload))
+    if _json_obj(request_payload.get("request_body")) != final_request_body:
+        request_payload["request_body"] = final_request_body
+        task.request_payload = request_payload
+        changed = True
+
+    snapshot = deepcopy(_json_obj(task.submitted_snapshot))
+    if snapshot and _json_obj(snapshot.get("request_body")) != final_request_body:
+        snapshot["request_body"] = final_request_body
+        snapshot.pop("quote_fingerprint", None)
+        task.submitted_snapshot = _snapshot_with_quote_fingerprint(snapshot)
+        changed = True
+
+    if changed:
+        task.updated_at = _now()
+    return changed
+
+
+async def _persist_quote_auto_adjusted_dates_to_case(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    result: Mapping[str, Any],
+) -> Dict[str, str]:
+    adjustments = _quote_result_insurance_date_auto_adjustments(result)
+    request_body_changed = _quote_task_with_final_request_body(task, result)
+    if not adjustments:
+        if request_body_changed:
+            await db.flush()
+        return {}
+
+    changed = False
+    normalized = dict(_json_obj(case.normalized_data))
+    draft = dict(_json_obj(case.draft_order_data))
+    for key, day in adjustments.items():
+        if day and _to_str(normalized.get(key)).strip() != day:
+            normalized[key] = day
+            changed = True
+        if day and _to_str(draft.get(key)).strip() != day:
+            draft[key] = day
+            changed = True
+    if changed:
+        case.normalized_data = _clean_quote_dynamic_data(normalized)
+        case.draft_order_data = _clean_quote_dynamic_data(draft)
+        case.updated_at = _now()
+
+    next_snapshot = _quote_snapshot_with_auto_adjusted_dates(
+        task.submitted_snapshot,
+        adjustments,
+        adjusted_request_body=_json_obj(_json_obj(result).get("request_body")),
+    )
+    if next_snapshot != _json_obj(task.submitted_snapshot):
+        task.submitted_snapshot = next_snapshot
+        final_request_body = _json_obj(next_snapshot.get("request_body"))
+        if final_request_body:
+            task.request_payload = {
+                **_json_obj(task.request_payload),
+                "request_body": final_request_body,
+            }
+        task.updated_at = _now()
+        changed = True
+
+    if changed or request_body_changed:
+        await db.flush()
+    return adjustments
+
+
 async def _persist_unemitted_quote_auto_notices(
     db: AsyncSession,
     *,
@@ -9577,7 +9835,7 @@ async def _persist_unemitted_quote_auto_notices(
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type != "insurance_date_adjust":
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             continue
         if notice.get("emitted_to_chat") is True:
             continue
@@ -9588,12 +9846,28 @@ async def _persist_unemitted_quote_auto_notices(
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
-
+        stable_key = _quote_auto_notice_dedupe_key(
+            trace_id=trace_id,
+            task_id=task_id,
+            notice_type=notice_type,
+            message=message,
+        )
+        if await _quote_auto_notice_already_persisted(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=case.session_id,
+            dedupe_key=stable_key,
+            message=message,
+            trace_id=trace_id,
+        ):
+            notice["emitted_to_chat"] = True
+            continue
         auto_notice_payload = {
             "type": notice_type,
             "message": message,
             "source": _to_str(notice.get("source")).strip() or "platform_prompt",
             "fallback_persisted": True,
+            "dedupe_key": stable_key,
         }
         if notice_type == "insurance_date_adjust":
             auto_notice_payload.update(
@@ -9605,6 +9879,12 @@ async def _persist_unemitted_quote_auto_notices(
                         for item in _json_list(notice.get("adjustment_kinds"))
                         if _to_str(item).strip() in {"bi", "ci"}
                     ],
+                }
+            )
+        elif notice_type == "duplicate_quote_notice":
+            auto_notice_payload.update(
+                {
+                    "duplicateVin": _json_obj(notice.get("duplicateVin")),
                 }
             )
         payload = {
@@ -9627,26 +9907,232 @@ async def _persist_unemitted_quote_auto_notices(
             ),
             "actions": [],
         }
-        await db_append_message(
-            db,
-            owner_user_id=owner_user_id,
-            session_id=case.session_id,
-            role="assistant",
-            content=message,
-            metadata=metadata,
-        )
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="platform_notice",
-            role="assistant",
-            content=redact_quote_sensitive_text(message),
-            payload=payload,
-        )
+        try:
+            async with db.begin_nested():
+                await db_append_message(
+                    db,
+                    owner_user_id=owner_user_id,
+                    session_id=case.session_id,
+                    role="assistant",
+                    content=message,
+                    metadata=metadata,
+                    message_id=_quote_auto_notice_message_id(stable_key),
+                )
+                await _add_event(
+                    db,
+                    case=case,
+                    owner_user_id=owner_user_id,
+                    event_type="platform_notice",
+                    role="assistant",
+                    content=redact_quote_sensitive_text(message),
+                    payload=payload,
+                )
+        except IntegrityError as exc:
+            if not _is_quote_auto_notice_duplicate_error(exc):
+                raise
         notice["emitted_to_chat"] = True
         emitted += 1
     return emitted
+
+
+def _quote_auto_notice_dedupe_key(
+    *,
+    trace_id: Any,
+    task_id: Any,
+    notice_type: Any,
+    message: Any,
+) -> str:
+    source = "|".join(
+        (
+            _to_str(trace_id).strip(),
+            _to_str(task_id).strip(),
+            _to_str(notice_type).strip().lower(),
+            re.sub(r"\s+", "", _to_str(message)),
+        )
+    )
+    return hashlib.sha1(source.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _quote_auto_notice_key_from_metadata(metadata: Any) -> str:
+    data = _json_obj(_json_obj(metadata).get("data"))
+    payload = _json_obj(data.get("payload"))
+    notice = _json_obj(payload.get("platform_auto_notice"))
+    return _to_str(notice.get("dedupe_key")).strip()
+
+
+def _quote_auto_notice_message_id(dedupe_key: Any) -> str:
+    return f"qa-notice-{_to_str(dedupe_key).strip()}"[:64]
+
+
+def _is_quote_auto_notice_duplicate_error(exc: IntegrityError) -> bool:
+    text = _to_str(exc).lower()
+    is_unique_violation = (
+        "duplicate" in text
+        or "1062" in text
+        or "unique constraint" in text
+        or "unique violation" in text
+    )
+    is_auto_notice_message_key = (
+        "message_id" in text
+        or "uq_quote_assistant_message_id" in text
+    )
+    return is_unique_violation and is_auto_notice_message_key
+
+
+async def _quote_auto_notice_already_persisted(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Any,
+    dedupe_key: str,
+    message: str,
+    trace_id: str,
+) -> bool:
+    """Check durable chat history before the fallback writes a duplicate notice."""
+    owner = _safe_int(owner_user_id, 0)
+    sid = _to_str(session_id).strip()
+    if owner <= 0 or not sid or not dedupe_key:
+        return False
+    rows = (
+        await db.execute(
+            select(
+                QuoteAssistantMessage.content,
+                QuoteAssistantMessage.metadata_json,
+            )
+            .where(
+                QuoteAssistantMessage.owner_user_id == owner,
+                QuoteAssistantMessage.session_id == sid,
+                QuoteAssistantMessage.role == "assistant",
+            )
+            .order_by(desc(QuoteAssistantMessage.id))
+            .limit(40)
+        )
+    ).all()
+    compact_message = re.sub(r"\s+", "", message)
+    for content, metadata in rows:
+        if _quote_auto_notice_key_from_metadata(metadata) == dedupe_key:
+            return True
+        metadata_trace = _to_str(_json_obj(metadata).get("trace_id")).strip()
+        if (
+            trace_id
+            and metadata_trace == trace_id
+            and re.sub(r"\s+", "", _to_str(content)) == compact_message
+        ):
+            return True
+    return False
+
+
+async def _persist_runtime_auto_notices(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    runtime_result: Optional[PlatformRuntimeResult],
+    trace_id: str,
+    task_id: Any,
+    platform_code: str,
+    platform_name: str,
+) -> int:
+    """Persist notices emitted before an automatic retry even when the retry later fails."""
+    runtime_data = _json_obj(getattr(runtime_result, "data", None) if runtime_result is not None else None)
+    notices = _json_list(runtime_data.get("platform_auto_notices"))
+    if not notices:
+        return 0
+    return await _persist_unemitted_quote_auto_notices(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        result={"platform_auto_notices": notices},
+        trace_id=trace_id,
+        task_id=task_id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+
+
+async def _persist_platform_text_notice_if_recently_absent(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    message: str,
+    trace_id: str,
+    task_id: Any,
+    platform_code: str,
+    platform_name: str,
+    notice_type: str = "platform_notice",
+) -> bool:
+    safe_message = sanitize_quote_user_message(message, "")
+    if not safe_message or not case.session_id:
+        return False
+    stable_key = _quote_auto_notice_dedupe_key(
+        trace_id=trace_id,
+        task_id=task_id,
+        notice_type=notice_type,
+        message=safe_message,
+    )
+    if await _quote_auto_notice_already_persisted(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=case.session_id,
+        dedupe_key=stable_key,
+        message=safe_message,
+        trace_id=trace_id,
+    ):
+        return False
+    from app.services.ai_assistant_service import db_append_message
+
+    payload = {
+        "quote_case": {"id": case.id, "status": CASE_STATUS_READY},
+        "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
+        "platform_code": _to_str(platform_code).strip().upper(),
+        "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
+        "platform_auto_notice": {
+            "type": notice_type,
+            "message": safe_message,
+            "source": "quote_runtime_retry",
+            "dedupe_key": stable_key,
+        },
+        "ui_visible": True,
+    }
+    metadata = {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "data": _mk_data(
+            result_status=RESULT_NOT_READY,
+            message=safe_message,
+            entities={"quote_case_id": case.id, "quote_task_id": _safe_int(task_id, 0), "order_id": case.order_id},
+            payload=payload,
+        ),
+        "actions": [],
+    }
+    try:
+        async with db.begin_nested():
+            await db_append_message(
+                db,
+                owner_user_id=owner_user_id,
+                session_id=case.session_id,
+                role="assistant",
+                content=safe_message,
+                metadata=metadata,
+                message_id=_quote_auto_notice_message_id(stable_key),
+            )
+            await _add_event(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                event_type="platform_notice",
+                role="assistant",
+                content=redact_quote_sensitive_text(safe_message),
+                payload=payload,
+            )
+    except IntegrityError as exc:
+        if _is_quote_auto_notice_duplicate_error(exc):
+            return False
+        raise
+    await db.flush()
+    return True
 
 
 def _attach_quote_auto_notice_callback(
@@ -9660,11 +10146,16 @@ def _attach_quote_auto_notice_callback(
     platform_code: str,
     platform_name: str,
 ) -> PlatformAccountContext:
-    """Let synchronous platform code publish a user-visible notice before auto retrying."""
+    """Publish a platform prompt before the worker continues an automatic retry.
 
+    Both quote entry paths commit the case, task, and user message before the
+    synchronous PICC worker starts. A short independent transaction can
+    therefore persist the raw prompt in chat first; if it ever fails, the main
+    quote transaction retains the notice in the runtime result as a fallback.
+    """
     owner = _safe_int(owner_user_id, 0)
     sid = _to_str(session_id).strip()
-    if owner <= 0 or not sid:
+    if owner <= 0 or not sid or _safe_int(case_id, 0) <= 0 or _safe_int(task_id, 0) <= 0:
         return platform_ctx
     try:
         loop = asyncio.get_running_loop()
@@ -9676,53 +10167,72 @@ def _attach_quote_auto_notice_callback(
     async def persist_notice(notice_any: Any) -> bool:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type != "insurance_date_adjust":
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             return False
         message = sanitize_quote_user_message(notice.get("message"), "")
         if not message:
             return False
+        stable_key = _quote_auto_notice_dedupe_key(
+            trace_id=trace_id,
+            task_id=task_id,
+            notice_type=notice_type,
+            message=message,
+        )
+
         from app.core.db import async_session_factory
         from app.services.ai_assistant_service import db_append_message
-
-        auto_notice_payload = {
-            "type": notice_type,
-            "message": message,
-            "source": _to_str(notice.get("source")).strip() or "platform_prompt",
-        }
-        if notice_type == "insurance_date_adjust":
-            auto_notice_payload.update(
-                {
-                    "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
-                    "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
-                    "adjustment_kinds": [
-                        item
-                        for item in (_json_list(notice.get("adjustment_kinds")))
-                        if _to_str(item).strip() in {"bi", "ci"}
-                    ],
-                }
-            )
-        payload = {
-            "quote_case": {"id": _safe_int(case_id, 0), "status": CASE_STATUS_READY},
-            "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
-            "platform_code": _to_str(platform_code).strip().upper(),
-            "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
-            "platform_auto_notice": auto_notice_payload,
-            "ui_visible": True,
-        }
-        metadata = {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": trace_id,
-            "data": _mk_data(
-                result_status=RESULT_NOT_READY,
-                message=message,
-                entities={"quote_case_id": _safe_int(case_id, 0), "quote_task_id": _safe_int(task_id, 0)},
-                payload=payload,
-            ),
-            "actions": [],
-        }
         async with async_session_factory() as notice_db:
             try:
+                if await _quote_auto_notice_already_persisted(
+                    notice_db,
+                    owner_user_id=owner,
+                    session_id=sid,
+                    dedupe_key=stable_key,
+                    message=message,
+                    trace_id=trace_id,
+                ):
+                    return True
+                auto_notice_payload = {
+                    "type": notice_type,
+                    "message": message,
+                    "source": _to_str(notice.get("source")).strip() or "platform_prompt",
+                    "dedupe_key": stable_key,
+                }
+                if notice_type == "insurance_date_adjust":
+                    auto_notice_payload.update(
+                        {
+                            "commercial_start_date": _to_str(notice.get("commercial_start_date")).strip(),
+                            "compulsory_start_date": _to_str(notice.get("compulsory_start_date")).strip(),
+                            "adjustment_kinds": [
+                                item
+                                for item in _json_list(notice.get("adjustment_kinds"))
+                                if _to_str(item).strip() in {"bi", "ci"}
+                            ],
+                        }
+                    )
+                else:
+                    auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
+
+                payload = {
+                    "quote_case": {"id": _safe_int(case_id, 0), "status": CASE_STATUS_READY},
+                    "quote_task": {"id": _safe_int(task_id, 0), "status": TASK_STATUS_RUNNING, "trace_id": trace_id},
+                    "platform_code": _to_str(platform_code).strip().upper(),
+                    "platform_name": _to_str(platform_name).strip() or _platform_display_name(platform_code),
+                    "platform_auto_notice": auto_notice_payload,
+                    "ui_visible": True,
+                }
+                metadata = {
+                    "status": "success",
+                    "intent": "quote",
+                    "trace_id": trace_id,
+                    "data": _mk_data(
+                        result_status=RESULT_NOT_READY,
+                        message=message,
+                        entities={"quote_case_id": _safe_int(case_id, 0), "quote_task_id": _safe_int(task_id, 0)},
+                        payload=payload,
+                    ),
+                    "actions": [],
+                }
                 await db_append_message(
                     notice_db,
                     owner_user_id=owner,
@@ -9730,21 +10240,26 @@ def _attach_quote_auto_notice_callback(
                     role="assistant",
                     content=message,
                     metadata=metadata,
+                    message_id=_quote_auto_notice_message_id(stable_key),
                 )
-                if _safe_int(case_id, 0) > 0:
-                    notice_db.add(
-                        QuoteCaseEvent(
-                            quote_case_id=_safe_int(case_id, 0),
-                            owner_user_id=owner,
-                            session_id=sid,
-                            event_type="platform_notice",
-                            role="assistant",
-                            content=redact_quote_sensitive_text(message),
-                            payload=payload,
-                        )
+                notice_db.add(
+                    QuoteCaseEvent(
+                        quote_case_id=_safe_int(case_id, 0),
+                        owner_user_id=owner,
+                        session_id=sid,
+                        event_type="platform_notice",
+                        role="assistant",
+                        content=redact_quote_sensitive_text(message),
+                        payload=payload,
                     )
+                )
                 await notice_db.commit()
                 return True
+            except IntegrityError as exc:
+                await notice_db.rollback()
+                if _is_quote_auto_notice_duplicate_error(exc):
+                    return True
+                raise
             except Exception:
                 await notice_db.rollback()
                 raise
@@ -9767,13 +10282,11 @@ def _attach_quote_auto_notice_callback(
         if key in emitted_keys:
             return True
         try:
-            try:
-                if asyncio.get_running_loop() is loop:
-                    return False
-            except RuntimeError:
-                pass
             future = asyncio.run_coroutine_threadsafe(persist_notice(notice), loop)
-            ok = bool(future.result(timeout=8))
+            # The worker must publish the raw platform prompt before retrying.
+            # The completed runtime result also carries the notice for durable
+            # fallback persistence if this independent write ever fails.
+            ok = bool(future.result(timeout=3))
             if ok:
                 emitted_keys.add(key)
             return ok
@@ -12219,6 +12732,79 @@ async def _retry_quote_with_next_platform_account(
     )
 
 
+async def _auto_retry_duplicate_quote_once(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_account: QuotePlatformAccountProfile,
+    platform_name: str,
+    config_type_name: Optional[str],
+    operator_role_name: Any = "",
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    if _snapshot_has_duplicate_quote_confirmation(snapshot):
+        return None
+    warning = _to_str(_json_obj(task.request_payload).get("duplicate_quote_warning") or task.error_detail).strip()
+    if warning:
+        await _persist_platform_text_notice_if_recently_absent(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            message=warning,
+            trace_id=trace_id,
+            task_id=task.id,
+            platform_code=case.platform_code or platform_account.platform_code,
+            platform_name=platform_name,
+            notice_type="duplicate_quote_notice",
+        )
+    confirmed_snapshot = _duplicate_quote_confirmed_snapshot(snapshot)
+    task.error_detail = (warning or "平台提示重复投保，已自动确认后重试")[:1800]
+    task.response_payload = {
+        **_json_obj(task.response_payload),
+        "duplicate_quote_auto_retry": True,
+        "duplicate_quote_warning": warning,
+    }
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": task.status,
+            "trace_id": trace_id,
+            "duplicate_quote_auto_retry": True,
+            "warning": warning,
+        },
+    )
+    await db.flush()
+    return await _continue_quote_with_platform_account(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        snapshot=confirmed_snapshot,
+        trace_id=trace_id,
+        platform_account=platform_account,
+        merged_entities={
+            "quote_case_id": case.id,
+            "order_id": case.order_id,
+            "platform_code": case.platform_code or platform_account.platform_code,
+            "platform_name": platform_name,
+        },
+        normalized_data=_json_obj(confirmed_snapshot.get("normalized_data")),
+        images_by_slot=_json_obj(confirmed_snapshot.get("images_by_slot")),
+        attached_images=[],
+        config_type_name=config_type_name,
+        attempted_account_ids=None,
+        reply_prefix="",
+        operator_role_name=operator_role_name,
+    )
+
+
 def _fake_quote_result(snapshot: Dict[str, Any], *, platform_code: str, platform_name: str, trace_id: str) -> Dict[str, Any]:
     data = snapshot.get("normalized_data") if isinstance(snapshot, dict) else {}
     if not isinstance(data, dict):
@@ -12622,18 +13208,46 @@ async def _complete_waiting_task(
             payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": task.error_detail},
         )
         await db.flush()
+        await _persist_runtime_auto_notices(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            runtime_result=quote_runtime_result,
+            trace_id=trace_id,
+            task_id=task.id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+        )
+        await db.flush()
         if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
-            await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-            return await _start_duplicate_quote_confirm_task(
+            warning = _duplicate_quote_warning_from_runtime(quote_runtime_result)
+            task.request_payload = {**_json_obj(task.request_payload), "duplicate_quote_warning": warning}
+            retry_duplicate = await _auto_retry_duplicate_quote_once(
                 db,
                 case=case,
+                task=task,
                 owner_user_id=owner_user_id,
                 snapshot=snapshot,
                 trace_id=trace_id,
                 platform_account=platform_account,
+                platform_name=platform_name,
+                config_type_name=_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
+                or (platform_account.account_type_name if platform_account else None),
+                operator_role_name=operator_role_name,
+            )
+            if retry_duplicate is not None:
+                return retry_duplicate
+            return _quote_platform_text_notice_response(
+                case=case,
+                task=task,
                 runtime_result=quote_runtime_result,
-                login_mode="sms_verified",
-                existing_task=task,
+                platform_code=platform_code,
+                platform_name=platform_name,
+                trace_id=trace_id,
+                message=warning,
+                result_status=RESULT_NOT_READY,
+                response_status="success",
+                notice_type="duplicate_quote_notice",
             )
         if _is_runtime_session_expired_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -12818,6 +13432,13 @@ async def _complete_waiting_task(
         perf["total_ms"] = _elapsed_ms(perf_started)
         task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
 
+    auto_date_adjustments = await _persist_quote_auto_adjusted_dates_to_case(
+        db,
+        case=case,
+        task=task,
+        result=result,
+    )
+
     _log_quote_perf(
         stage="success",
         trace_id=trace_id,
@@ -12833,7 +13454,13 @@ async def _complete_waiting_task(
         owner_user_id=owner_user_id,
         event_type="task",
         role="system",
-        payload={"task_id": task.id, "status": "success", "trace_id": trace_id, "result": result},
+        payload={
+            "task_id": task.id,
+            "status": "success",
+            "trace_id": trace_id,
+            "result": result,
+            "insurance_date_auto_adjustments": auto_date_adjustments,
+        },
     )
     await db.flush()
     await _persist_unemitted_quote_auto_notices(
@@ -12865,16 +13492,6 @@ async def _complete_waiting_task(
         },
         "quote_result": result,
     }
-    platform_dialog = _platform_dialog_from_source(
-        _json_obj(result.get("platform_dialog")) or _json_obj(_json_obj(getattr(quote_runtime_result, "data", None)).get("platform_dialog")),
-        trace_id=trace_id,
-        task_id=task.id,
-        case_id=case.id,
-        platform_code=platform_code,
-        platform_name=platform_name,
-    )
-    if platform_dialog:
-        payload["platform_dialog"] = platform_dialog
     response_data = _mk_data(
         result_status=RESULT_SUCCESS,
         message="报价流程已完成",
@@ -12884,8 +13501,6 @@ async def _complete_waiting_task(
     response_data["quote_case"] = payload["quote_case"]
     response_data["quote_task"] = payload["quote_task"]
     response_data["quote_result"] = result
-    if platform_dialog:
-        response_data["platform_dialog"] = platform_dialog
     return reply, {
         "status": "success",
         "intent": "quote",
@@ -13119,18 +13734,45 @@ async def _complete_quote_without_sms(
             payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": error_detail, "login_mode": login_mode},
         )
         await db.flush()
+        await _persist_runtime_auto_notices(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            runtime_result=quote_runtime_result,
+            trace_id=trace_id,
+            task_id=task.id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+        )
+        await db.flush()
         if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
-            await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-            return await _start_duplicate_quote_confirm_task(
+            warning = _duplicate_quote_warning_from_runtime(quote_runtime_result)
+            task.request_payload = {**_json_obj(task.request_payload), "duplicate_quote_warning": warning}
+            retry_duplicate = await _auto_retry_duplicate_quote_once(
                 db,
                 case=case,
+                task=task,
                 owner_user_id=owner_user_id,
                 snapshot=snapshot,
                 trace_id=trace_id,
                 platform_account=platform_account,
+                platform_name=platform_name,
+                config_type_name=account_type_name or platform_account.account_type_name,
+                operator_role_name=operator_role_name,
+            )
+            if retry_duplicate is not None:
+                return retry_duplicate
+            return _quote_platform_text_notice_response(
+                case=case,
+                task=task,
                 runtime_result=quote_runtime_result,
-                login_mode=login_mode,
-                existing_task=task,
+                platform_code=platform_code,
+                platform_name=platform_name,
+                trace_id=trace_id,
+                message=warning,
+                result_status=RESULT_NOT_READY,
+                response_status="success",
+                notice_type="duplicate_quote_notice",
             )
         if _is_runtime_session_expired_result(quote_runtime_result):
             retry = await _retry_quote_with_next_platform_account(
@@ -13334,6 +13976,12 @@ async def _complete_quote_without_sms(
     perf["quota_update_ms"] = _elapsed_ms(quota_update_started)
     perf["total_ms"] = _elapsed_ms(perf_started)
     task.response_payload = {**_json_obj(task.response_payload), "perf": perf}
+    auto_date_adjustments = await _persist_quote_auto_adjusted_dates_to_case(
+        db,
+        case=case,
+        task=task,
+        result=result,
+    )
     _log_quote_perf(
         stage="success",
         trace_id=trace_id,
@@ -13349,7 +13997,14 @@ async def _complete_quote_without_sms(
         owner_user_id=owner_user_id,
         event_type="task",
         role="system",
-        payload={"task_id": task.id, "status": TASK_STATUS_SUCCESS, "trace_id": trace_id, "result": result, "login_mode": login_mode},
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_SUCCESS,
+            "trace_id": trace_id,
+            "result": result,
+            "login_mode": login_mode,
+            "insurance_date_auto_adjustments": auto_date_adjustments,
+        },
     )
     await db.flush()
     await _persist_unemitted_quote_auto_notices(
@@ -13383,16 +14038,6 @@ async def _complete_quote_without_sms(
         "platform_account": _credential_public_payload(platform_account),
         "quote_result": result,
     }
-    platform_dialog = _platform_dialog_from_source(
-        _json_obj(result.get("platform_dialog")) or _json_obj(_json_obj(getattr(quote_runtime_result, "data", None)).get("platform_dialog")),
-        trace_id=trace_id,
-        task_id=task.id,
-        case_id=case.id,
-        platform_code=platform_code,
-        platform_name=platform_name,
-    )
-    if platform_dialog:
-        payload["platform_dialog"] = platform_dialog
     return reply, {
         "status": "success",
         "intent": "quote",
@@ -14441,24 +15086,17 @@ async def handle_quote_message(
         session_id=session_id,
         for_update=True,
     )
+    duplicate_auto_confirm_result: Optional[Tuple[str, Dict[str, Any]]] = None
     if joint_sales_image_adjustment and duplicate_confirm_pair:
         case, task = duplicate_confirm_pair
-        await db.flush()
-        return (
-            "当前正在等待是否继续重复投保，请先在弹窗中确认或取消后，再调整非车金额。",
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": task.trace_id or _new_trace_id(),
-                "data": _mk_data(
-                    result_status=RESULT_NOT_READY,
-                    message="当前正在等待重复投保确认",
-                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                    payload={"joint_sales_image_adjustment": joint_sales_image_adjustment},
-                ),
-                "actions": [],
-            },
+        duplicate_auto_confirm_result = await _complete_waiting_duplicate_quote_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            operator_role_name=_ctx_role_name(ctx),
         )
+        duplicate_confirm_pair = None
     if joint_sales_image_adjustment:
         source_pair = await _latest_success_quote_task_for_session(
             db,
@@ -14477,6 +15115,8 @@ async def handle_quote_message(
                 adjustment=joint_sales_image_adjustment,
                 source_pair=source_pair,
             )
+        if duplicate_auto_confirm_result is not None:
+            return duplicate_auto_confirm_result
     if duplicate_confirm_pair:
         _, duplicate_task = duplicate_confirm_pair
         duplicate_product_state_changed = _quote_product_state_changes_current(
@@ -14486,6 +15126,39 @@ async def handle_quote_message(
         )
     else:
         duplicate_product_state_changed = False
+
+    # New quotes no longer create this state, but old data can still contain a
+    # task created by the retired popup flow. Recover it on the next quote
+    # command, never on unrelated chat input. A cancellation or a
+    # material/product adjustment still takes precedence below.
+    if duplicate_confirm_pair and not (
+        _is_duplicate_quote_cancel_text(text)
+        or quote_field_overrides
+        or quote_data_overrides
+        or transfer_vehicle_command
+        or quote_date_overrides
+        or duplicate_product_state_changed
+    ) and (signal.get("is_quote") or looks_like_short_quote_command(text)):
+        case, task = duplicate_confirm_pair
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "trace_id": task.trace_id,
+                "legacy_duplicate_quote_auto_recovered": True,
+            },
+        )
+        return await _complete_waiting_duplicate_quote_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            operator_role_name=_ctx_role_name(ctx),
+        )
 
     if duplicate_confirm_pair and (quote_field_overrides or quote_data_overrides or transfer_vehicle_command or quote_date_overrides or duplicate_product_state_changed):
         case, task = duplicate_confirm_pair
@@ -14523,26 +15196,6 @@ async def handle_quote_message(
             )
             await db.flush()
         duplicate_confirm_pair = None
-
-    if _is_duplicate_quote_confirmation_text(text) or _is_duplicate_quote_cancel_text(text):
-        if not duplicate_confirm_pair:
-            return (
-                "",
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": _new_trace_id(),
-                    "silent": True,
-                    "ui_visible": False,
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message="",
-                        entities={},
-                        payload={},
-                    ),
-                    "actions": [],
-                },
-            )
 
     if duplicate_confirm_pair and _is_duplicate_quote_cancel_text(text):
         case, task = duplicate_confirm_pair
@@ -14582,7 +15235,6 @@ async def handle_quote_message(
         )
     if duplicate_confirm_pair and signal.get("is_quote"):
         case, task = duplicate_confirm_pair
-        warning = _to_str(_json_obj(task.request_payload).get("duplicate_quote_warning") or task.error_detail).strip()
         await _add_event(
             db,
             case=case,
@@ -14590,34 +15242,14 @@ async def handle_quote_message(
             event_type="chat",
             role="user",
             content=text,
-            payload={"duplicate_quote_confirm_pending": True},
+            payload={"duplicate_quote_auto_confirmed": True},
         )
-        await db.flush()
-        payload = {
-            "quote_case": {"id": case.id, "case_no": case.case_no, "status": case.status},
-            "quote_task": {"id": task.id, "status": task.status, "trace_id": task.trace_id},
-            "duplicate_quote_warning": warning,
-            "ui_visible": False,
-        }
-        data = _mk_data(
-            result_status=RESULT_NOT_READY,
-            message="平台提示可能重复投保，等待确认",
-            entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-            payload=payload,
-        )
-        data["silent"] = True
-        data["ui_visible"] = False
-        return (
-            _duplicate_quote_confirm_reply_text(warning, platform_name=case.platform_name or case.platform_code or ""),
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": task.trace_id or _new_trace_id(),
-                "silent": True,
-                "ui_visible": False,
-                "data": data,
-                "actions": [],
-            },
+        return await _complete_waiting_duplicate_quote_task(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            operator_role_name=_ctx_role_name(ctx),
         )
 
     platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
