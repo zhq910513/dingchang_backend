@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +45,8 @@ from app.services.quote_platforms.platforms.picc.business import (
     _proposal_start_datetime_from_quote_response,
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
+    _picc_encrypt_renewal_policy_no,
+    _pick_renewal_policy_candidate,
 )
 
 
@@ -58,6 +62,47 @@ class _QuoteResponseClient:
 
     def request_json(self, *args: object, **kwargs: object) -> dict:
         return self.response
+
+
+class _RecordingClient:
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.config = SimpleNamespace(base_url="https://jiangx.yxgl-picc.cn:41001")
+
+    def request_json(self, *args: object, **kwargs: object) -> dict:
+        self.calls.append((args, kwargs))
+        return self.response
+
+
+class _HarRouteClient:
+    def __init__(self, routes: dict[str, dict]) -> None:
+        self.routes = routes
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.config = SimpleNamespace(base_url="https://jiangx.yxgl-picc.cn:41001")
+
+    def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+        self.calls.append((path, kwargs))
+        for key, response in self.routes.items():
+            if key in path:
+                return response
+        raise AssertionError(f"Unexpected HAR route: {method} {path}")
+
+
+def _load_0813_renewal_har() -> dict:
+    matches = list(Path(r"D:\HuaweiMoveData\Users\king\Documents").glob("0813*.har"))
+    if not matches:
+        raise unittest.SkipTest("未找到 0813 正确续保 HAR，跳过 HAR 对齐测试")
+    return json.loads(matches[0].read_text(encoding="utf-8-sig"))
+
+
+def _har_response_json(har: dict, entry_index: int) -> dict:
+    return json.loads(har["log"]["entries"][entry_index]["response"]["content"].get("text") or "{}")
+
+
+def _har_form_params(har: dict, entry_index: int) -> dict:
+    text = har["log"]["entries"][entry_index]["request"].get("postData", {}).get("text") or ""
+    return dict(urllib.parse.parse_qsl(text, keep_blank_values=True))
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
@@ -156,7 +201,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(energy_form["prpCcarShipTax.payStartDate"], "2026-01-01")
         self.assertEqual(energy_form["prpCcarShipTax.payEndDate"], "2026-12-31")
 
-    def test_explicit_default_config_can_override_profile_license_and_tax_fields(self) -> None:
+    def test_invalid_default_license_is_ignored_but_tax_fields_can_override_profile(self) -> None:
         from app.services.quote_platforms.platforms.picc.business import (
             NEW_ENERGY_USED_ACCOUNT_TYPE,
             _motor_quote_profile,
@@ -197,8 +242,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             [],
             profile=_motor_quote_profile(NEW_ENERGY_USED_ACCOUNT_TYPE),
         )
-        self.assertEqual(form["prpCitemCar.licenseType"], "99")
-        self.assertEqual(form["prpCitemCar.licenseColorCode"], "88")
+        self.assertEqual(form["prpCitemCar.licenseType"], "52")
+        self.assertEqual(form["prpCitemCar.licenseColorCode"], "52")
         self.assertEqual(form["prpCcarShipTax.taxType"], "7")
         self.assertEqual(form["prpCcarShipTax.calculateMode"], "CX")
         self.assertEqual(form["prpCcarShipTax.taxAbateType"], "9")
@@ -678,6 +723,216 @@ class QuotePromptStateRegressionTests(unittest.TestCase):
             },
         )
         self.assertEqual(preview, "")
+
+
+class PiccRenewalHarRegressionTests(unittest.TestCase):
+    def test_0813_renewal_prefill_and_result_with_default_joint_sales(self) -> None:
+        har = _load_0813_renewal_har()
+        renewal_rows = _har_response_json(har, 4)["data"]["list"]
+        summaries = [_adapter()._renewal_candidate_summary(row) for row in renewal_rows]
+        selected = _pick_renewal_policy_candidate(summaries)
+        self.assertEqual(selected["policy_no"], "PDZA202536040000299779")
+        self.assertEqual(
+            _picc_encrypt_renewal_policy_no(selected["policy_no"]),
+            "kLClt0iQAjKsv9l7wKpMCWDViiZKruKN919RBCDiGkA=",
+        )
+
+        adapter = _adapter()
+        client = _RecordingClient(_har_response_json(har, 8))
+        prefill = adapter._fetch_renewal_policy_prefill(client, selected)
+        call_kwargs = client.calls[-1][1]
+        self.assertEqual(call_kwargs["params"]["policyNo"], "kLClt0iQAjKsv9l7wKpMCWDViiZKruKN919RBCDiGkA=")
+        self.assertEqual(
+            call_kwargs["params"]["policyNoEncode"],
+            "KSGmIBQGIvub4cWWlqxslOgiZU+x62r8hFwPhTql4WIxH/8ed8GqCoiMTL1LFqZu",
+        )
+
+        vehicle_data = adapter._renewal_prefill_vehicle_data(prefill, selected)
+        self.assertEqual(vehicle_data["plate_no"], "赣G872F6")
+        self.assertEqual(vehicle_data["vin"], "L6T7622Z6MF008872")
+        self.assertEqual(vehicle_data["engine_no"], "M3GA4904371")
+        self.assertEqual(vehicle_data["commercial_start_date"], "2026-08-25")
+        self.assertEqual(vehicle_data["compulsory_start_date"], "2026-08-24")
+        defaults = vehicle_data["renewal_quote_field_defaults"]
+        self.assertEqual(defaults["第三者责任险"], "300")
+        self.assertEqual(defaults["车上人员责任险（司机）"], "40000")
+        self.assertEqual(defaults["车上人员责任险（乘客）"], "20000")
+        self.assertEqual(defaults["共享主险限额"], True)
+        self.assertNotIn("机动车损失保险", defaults)
+
+        request_body = {
+            "accountTypeName": "油车-旧",
+            "vehicleForm": vehicle_data["renewal_request_body_seed"]["vehicleForm"],
+            "ownerForm": vehicle_data["renewal_request_body_seed"]["ownerForm"],
+            "quoteForm": _har_form_params(har, 52),
+            "jointSaleForm": {
+                "tujiaAnshun": {
+                    "enabled": True,
+                    "success": True,
+                    "premium": "398",
+                    "amount": "200000",
+                }
+            },
+            "preflight": {},
+        }
+        ctx = SimpleNamespace(account_type_name="油车-旧")
+        result = adapter._build_used_fuel_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
+        self.assertEqual(result["risk_score"], 45)
+        self.assertEqual(str(result["premium_total"]), "3294.79")
+        self.assertEqual(result["result_card"]["commercial_premium"], "1741.79")
+        self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
+        self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
+        self.assertEqual(result["result_card"]["joint_sales_premium"], "398.00")
+        self.assertEqual(result["result_card"]["proposal_info"]["plate_no"], "赣G872F6")
+
+    def test_0813_renewal_prepare_builds_quote_body_like_har(self) -> None:
+        har = _load_0813_renewal_har()
+        renewal_rows = _har_response_json(har, 4)["data"]["list"]
+        selected = _pick_renewal_policy_candidate([_adapter()._renewal_candidate_summary(row) for row in renewal_rows])
+        client = _HarRouteClient(
+            {
+                "quotePolicy.do": _har_response_json(har, 8),
+                "jyQuery.do": _har_response_json(har, 11),
+                "QtPrpPreciseVehicleQuery.do": _har_response_json(har, 23),
+                "calActualVal.do": _har_response_json(har, 12),
+                "queryQtTaxabate.do": _har_response_json(har, 22),
+                "queryCarchecker.do": _har_response_json(har, 28),
+                "verifyPersonalAgtControl.do": _har_response_json(har, 51),
+                "duplicateInsuredVinNo.do": _har_response_json(har, 27),
+                "choosePlanInfoForJointSale.do": {
+                    "status": 0,
+                    "statusText": "Success",
+                    "data": {
+                        "planInfoListMap": {
+                            "05": [
+                                {"planName": "HAR fake", "planCode": "P1", "planPremium": "398", "planAmount": "200000"}
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+        payload = {
+            "quote_flow_type": "renewal_motor_quote",
+            "normalized_data": {
+                "account_type_name": "油车-旧",
+                "plate_no": "赣G872F6",
+                "engine_no": "M3GA4904371",
+                "vin": "L6T7622Z6MF008872",
+                "renewal_lookup": {
+                    "found": True,
+                    "selected": selected,
+                    "candidates": [],
+                },
+            },
+            "default_config_json": {},
+            "platform_default_config": {"resolved_type_name": "油车-旧"},
+        }
+        ctx = SimpleNamespace(account_type_name="油车-旧")
+        body = _adapter()._prepare_renewal_used_fuel_quote(client, ctx, payload, account_type_name="油车-旧")
+        form = body["quoteForm"]
+        self.assertEqual(form["prpCitemCar.licenseNo"], "赣G872F6")
+        self.assertEqual(form["prpCitemCar.licenseType"], "02")
+        self.assertEqual(form["prpCmain.startDate"], "2026-08-25")
+        self.assertEqual(form["prpCmain.startDateCI"], "2026-08-24")
+        self.assertEqual(form["prpCitemCar.actualValue"], "70155.60")
+        self.assertEqual(form["renewed"], "1")
+        self.assertEqual(form["lastPolicyNo"], "PDZA202536040000299779")
+        self.assertEqual(form["prpCitemCar.lastBIPolicyNo"], "PDAA202536040000208495")
+        self.assertEqual(form["prpCitemCar.lastCIPolicyNo"], "PDZA202536040000299779")
+        self.assertEqual(form["prpCitemCar.Nodamageyears"], "0")
+        self.assertEqual(form["prpCitemCarExt.noDamYearsBI"], "0")
+        self.assertEqual(form["prpCitemCarExt.lastDamagedBI"], "0")
+        self.assertEqual(form["prpCitemCarExt.lastDamagedCI"], "1")
+        self.assertEqual(form["prpCcarShipTax.leviedDate"], "2026-08-25")
+        self.assertEqual(form["prpCcarShipTax.payStartDate"], "2026-01-01")
+        self.assertEqual(form["prpCcarShipTax.payEndDate"], "2026-12-31")
+        self.assertEqual(form["monopolyCode"], "3604731000027")
+        self.assertEqual(form["groupCodeValidStatus"], "1")
+        self.assertEqual(form["prpCitemKindVos[1].kindCode"], "051050")
+        self.assertEqual(form["prpCitemKindVos[1].amount"], "70155.60")
+        self.assertEqual(form["prpCitemKindVos[2].kindCode"], "051051")
+        self.assertEqual(form["prpCitemKindVos[2].amount"], "300")
+        self.assertEqual(form["prpCitemKindVos[3].amount"], "40000")
+        self.assertEqual(form["prpCitemKindVos[4].amount"], "20000")
+        self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
+        self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["premium"], "398")
+        self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["amount"], "200000")
+
+    def test_0813_renewal_driver_passenger_adjustment_matches_final_har_quote(self) -> None:
+        har = _load_0813_renewal_har()
+        renewal_rows = _har_response_json(har, 4)["data"]["list"]
+        selected = _pick_renewal_policy_candidate([_adapter()._renewal_candidate_summary(row) for row in renewal_rows])
+        client = _HarRouteClient(
+            {
+                "quotePolicy.do": _har_response_json(har, 8),
+                "jyQuery.do": _har_response_json(har, 11),
+                "QtPrpPreciseVehicleQuery.do": _har_response_json(har, 23),
+                "calActualVal.do": _har_response_json(har, 12),
+                "queryQtTaxabate.do": _har_response_json(har, 22),
+                "queryCarchecker.do": _har_response_json(har, 28),
+                "verifyPersonalAgtControl.do": _har_response_json(har, 65),
+                "duplicateInsuredVinNo.do": _har_response_json(har, 27),
+                "choosePlanInfoForJointSale.do": {
+                    "status": 0,
+                    "statusText": "Success",
+                    "data": {
+                        "planInfoListMap": {
+                            "05": [
+                                {"planName": "HAR fake", "planCode": "P1", "planPremium": "398", "planAmount": "200000"}
+                            ]
+                        }
+                    },
+                },
+            }
+        )
+        payload = {
+            "quote_flow_type": "renewal_motor_quote",
+            "normalized_data": {
+                "account_type_name": "油车-旧",
+                "plate_no": "赣G872F6",
+                "engine_no": "M3GA4904371",
+                "vin": "L6T7622Z6MF008872",
+                "renewal_lookup": {
+                    "found": True,
+                    "selected": selected,
+                    "candidates": [selected],
+                },
+                "quote_field_overrides": {
+                    "车上人员责任险（司机）": "30000",
+                    "车上人员责任险（乘客）": "30000",
+                },
+            },
+            "default_config_json": {
+                "车上人员责任险（司机）": "30000",
+                "车上人员责任险（乘客）": "30000",
+                "途家安顺保费": "0",
+            },
+            "platform_default_config": {"resolved_type_name": "油车-旧"},
+        }
+        ctx = SimpleNamespace(account_type_name="油车-旧")
+        body = _adapter()._prepare_renewal_used_fuel_quote(client, ctx, payload, account_type_name="油车-旧")
+        form = body["quoteForm"]
+        self.assertEqual(form["prpCitemKindVos[3].kindCode"], "051052")
+        self.assertEqual(form["prpCitemKindVos[3].amount"], "30000")
+        self.assertEqual(form["prpCitemKindVos[4].kindCode"], "051053")
+        self.assertEqual(form["prpCitemKindVos[4].amount"], "30000")
+        self.assertEqual(form["prpCitemKindVos[5].amount"], "3000000")
+        self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
+        self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["premium"], "0")
+        self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["amount"], "0")
+
+        final_response = _har_response_json(har, 66)
+        self.assertEqual(final_response["data"]["sumYelPremium"], 0)
+        result = _adapter()._build_used_fuel_quote_result_from_response(ctx, {}, body, final_response)
+        self.assertEqual(result["risk_score"], 44)
+        self.assertEqual(str(result["premium_total"]), "2921.46")
+        self.assertEqual(result["result_card"]["commercial_premium"], "1766.46")
+        self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
+        self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
+        self.assertEqual(result["result_card"]["joint_sales_premium"], "")
+        self.assertEqual(result["result_card"]["total_without_vehicle_tax"], "2621.46")
+        self.assertEqual(result["result_card"]["total_with_vehicle_tax"], "2921.46")
 
 
 if __name__ == "__main__":

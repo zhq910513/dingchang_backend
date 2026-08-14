@@ -1123,6 +1123,13 @@ class AccountSessionActor:
         finally:
             self._business_waiters -= 1
 
+    async def query_renewal(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        self._business_waiters += 1
+        try:
+            return await self._execute_business_like(db, ctx, action="query_renewal", payload=quote_payload)
+        finally:
+            self._business_waiters -= 1
+
     async def query_joint_sales_plan(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         self._business_waiters += 1
         try:
@@ -1200,7 +1207,7 @@ class AccountSessionActor:
                         message=f"浏览器容器启动失败：{str(exc) or exc.__class__.__name__}",
                         data={"error_code": exc.__class__.__name__},
                     )
-                    if action in {"quote", "query_joint_sales_plan", "query_repair_codes"}:
+                    if action in {"quote", "query_renewal", "query_joint_sales_plan", "query_repair_codes"}:
                         snapshot.last_business_at = iso_now()
                     elif action == "keepalive":
                         snapshot.last_keepalive_at = iso_now()
@@ -1223,6 +1230,16 @@ class AccountSessionActor:
                         result = PlatformRuntimeResult(
                             status="failed",
                             message=f"平台报价执行异常：{str(exc) or exc.__class__.__name__}",
+                            data={"error_code": exc.__class__.__name__},
+                        )
+                    snapshot.last_business_at = iso_now()
+                elif action == "query_renewal":
+                    try:
+                        result = await _await_runtime_result(action, adapter.query_renewal(runtime_ctx, payload))
+                    except Exception as exc:
+                        result = PlatformRuntimeResult(
+                            status="failed",
+                            message=f"平台续保查询异常：{str(exc) or exc.__class__.__name__}",
                             data={"error_code": exc.__class__.__name__},
                         )
                     snapshot.last_business_at = iso_now()
@@ -1339,6 +1356,9 @@ class QuotePlatformSessionManager:
 
     async def quote(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await (await self.actor(ctx.platform_code, ctx.account_id)).quote(db, ctx, quote_payload)
+
+    async def query_renewal(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await (await self.actor(ctx.platform_code, ctx.account_id)).query_renewal(db, ctx, quote_payload)
 
     async def query_joint_sales_plan(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await (await self.actor(ctx.platform_code, ctx.account_id)).query_joint_sales_plan(db, ctx, quote_payload)

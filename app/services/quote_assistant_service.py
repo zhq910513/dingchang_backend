@@ -284,6 +284,17 @@ QUOTE_ACCOUNT_TYPE_ALIASES: Dict[str, str] = {
     "二手新能源车": "新能源车-旧",
 }
 QUOTE_ACCOUNT_TYPE_SET = set(QUOTE_ACCOUNT_TYPE_OPTIONS)
+QUOTE_FLOW_NORMAL = "normal_motor_quote"
+QUOTE_FLOW_RENEWAL = "renewal_motor_quote"
+QUOTE_FLOW_TYPE_KEY = "quote_flow_type"
+RENEWAL_LOOKUP_OPERATION = "renewal_lookup"
+LICENSE_TYPE_DECISION_KEY = "license_type_decision"
+LICENSE_TYPE_FUEL = "02"
+LICENSE_TYPE_NEW_ENERGY = "52"
+LICENSE_COLOR_BY_TYPE: Dict[str, str] = {
+    LICENSE_TYPE_FUEL: "01",
+    LICENSE_TYPE_NEW_ENERGY: "52",
+}
 
 ACCOUNT_LOGIN_NOT_LOGGED_IN = "not_logged_in"
 ACCOUNT_LOGIN_LOGGING_IN = "logging_in"
@@ -1058,6 +1069,7 @@ CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE: Dict[str, Tuple[Tuple[str, str], ...]] = {
 
 QUOTE_MANUAL_MATERIAL_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
     ("account_type_name", "报价类型", "select"),
+    ("license_type", "号牌种类", "select"),
     ("owner_name", "车主姓名", "text"),
     ("owner_phone", "车主手机号", "text"),
     ("id_number", "身份证号", "text"),
@@ -1151,6 +1163,44 @@ PICC_DANSHANG_COMMANDS = {
     "中国人保单商重报",
     "PICC单商重报",
 }
+PICC_RENEWAL_FULL_COVER_COMMANDS = {
+    "续保",
+    "人保续保",
+    "中国人保续保",
+    "PICC续保",
+    "续保报价",
+    "人保续保报价",
+    "中国人保续保报价",
+    "PICC续保报价",
+    "续保全保",
+    "人保续保全保",
+    "中国人保续保全保",
+    "PICC续保全保",
+    "续保全保报价",
+    "人保续保全保报价",
+    "中国人保续保全保报价",
+    "PICC续保全保报价",
+}
+PICC_RENEWAL_JIAOSAN_COMMANDS = {
+    "续保交三",
+    "人保续保交三",
+    "中国人保续保交三",
+    "PICC续保交三",
+    "续保交三报价",
+    "人保续保交三报价",
+    "中国人保续保交三报价",
+    "PICC续保交三报价",
+}
+PICC_RENEWAL_DANSHANG_COMMANDS = {
+    "续保单商",
+    "人保续保单商",
+    "中国人保续保单商",
+    "PICC续保单商",
+    "续保单商报价",
+    "人保续保单商报价",
+    "中国人保续保单商报价",
+    "PICC续保单商报价",
+}
 
 
 def _picc_quote_command_mode_from_compact(compact: str) -> str:
@@ -1197,6 +1247,31 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
         return "全保"
     return ""
 
+
+def _picc_quote_flow_command_from_compact(compact: str) -> Tuple[str, str]:
+    text = re.sub(r"\s+", "", _to_str(compact))
+    if not text:
+        return "", ""
+    if text in PICC_RENEWAL_DANSHANG_COMMANDS:
+        return QUOTE_FLOW_RENEWAL, "单商"
+    if text in PICC_RENEWAL_JIAOSAN_COMMANDS:
+        return QUOTE_FLOW_RENEWAL, "交三"
+    if text in PICC_RENEWAL_FULL_COVER_COMMANDS:
+        return QUOTE_FLOW_RENEWAL, "全保"
+    if "续保" in text and (
+        text.startswith("续保")
+        or text.startswith("人保续保")
+        or text.startswith("中国人保续保")
+        or text.upper().startswith("PICC续保")
+    ):
+        if "单商" in text:
+            return QUOTE_FLOW_RENEWAL, "单商"
+        if "交三" in text:
+            return QUOTE_FLOW_RENEWAL, "交三"
+        return QUOTE_FLOW_RENEWAL, "全保"
+    mode = _picc_quote_command_mode_from_compact(text)
+    return (QUOTE_FLOW_NORMAL, mode) if mode else ("", "")
+
 QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
     "车牌号",
     "号牌号码",
@@ -1237,6 +1312,7 @@ QUOTE_DATA_OVERRIDE_ALIASES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("issue_date", "行驶证发证日期", ("行驶证发证日期", "发证日期", "发证时间")),
     ("commercial_start_date", "商业起保日期", ("商业起保日期", "商业险起保日期", "商业起保", "商业险起期")),
     ("compulsory_start_date", "交强起保日期", ("交强起保日期", "交强险起保日期", "交强起保", "交强险起期")),
+    ("license_type", "号牌种类", ("号牌种类", "号牌类型", "牌照类型", "车牌类型", "牌照种类", "licenseType")),
 )
 
 QUOTE_DATA_OVERRIDE_LABELS: Dict[str, str] = {
@@ -1444,6 +1520,137 @@ def _quote_labeled_plate_no_present(value: Any) -> bool:
     return bool(re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)[:：=]?[\u4e00-\u9fff][A-Z][A-Z0-9]{4,6}", text))
 
 
+def _normalize_license_type_value(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value)).upper()
+    if not text:
+        return ""
+    if text in {LICENSE_TYPE_NEW_ENERGY, "新能源", "新能源车", "小型新能源汽车", "小型新能源汽车号牌", "绿色", "绿牌"}:
+        return LICENSE_TYPE_NEW_ENERGY
+    if text in {LICENSE_TYPE_FUEL, "油车", "燃油", "燃油车", "小型汽车", "小型汽车号牌", "蓝色", "蓝牌"}:
+        return LICENSE_TYPE_FUEL
+    if re.search(r"(?:新能源|绿牌|绿色|小型新能源)", text):
+        return LICENSE_TYPE_NEW_ENERGY
+    if re.search(r"(?:燃油|油车|蓝牌|蓝色|小型汽车号牌|小型汽车)", text):
+        return LICENSE_TYPE_FUEL
+    if text in LICENSE_COLOR_BY_TYPE:
+        return text
+    return ""
+
+
+def _license_color_for_type(license_type: Any) -> str:
+    return LICENSE_COLOR_BY_TYPE.get(_normalize_license_type_value(license_type), "")
+
+
+def _license_type_label(license_type: Any) -> str:
+    value = _normalize_license_type_value(license_type)
+    if value == LICENSE_TYPE_NEW_ENERGY:
+        return "52-小型新能源汽车"
+    if value == LICENSE_TYPE_FUEL:
+        return "02-小型汽车号牌"
+    return ""
+
+
+def _license_type_decision_payload(license_type: str, *, source: str, reason: str = "") -> Dict[str, Any]:
+    value = _normalize_license_type_value(license_type)
+    if not value:
+        return {}
+    return {
+        "license_type": value,
+        "license_color_code": _license_color_for_type(value),
+        "label": _license_type_label(value),
+        "source": _to_str(source).strip() or "unknown",
+        "reason": _to_str(reason).strip(),
+    }
+
+
+def _resolve_license_type_decision(
+    normalized_data: Dict[str, Any],
+    images_by_slot: Dict[str, List[Dict[str, Any]]],
+    *,
+    vehicle_type_detect: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    data = _json_obj(normalized_data)
+    previous = _json_obj(data.get(LICENSE_TYPE_DECISION_KEY))
+    previous_source = _to_str(previous.get("source")).strip()
+
+    data_overrides = _json_obj(data.get(QUOTE_DATA_OVERRIDES_KEY))
+    manual_source_value = data.get("license_type_override")
+    if not manual_source_value and "license_type" in data_overrides:
+        manual_source_value = data_overrides.get("license_type")
+    if not manual_source_value and previous_source == "user_override":
+        manual_source_value = data.get("license_type") or data.get("licenseType") or data.get("licensePlateType")
+    manual_value = _normalize_license_type_value(manual_source_value)
+    if manual_value:
+        return _license_type_decision_payload(manual_value, source="user_override", reason="用户指定号牌种类")
+
+    if previous_source in {"user_override", "renewal_lookup"}:
+        previous_value = _normalize_license_type_value(previous.get("license_type"))
+        if previous_value:
+            return _license_type_decision_payload(
+                previous_value,
+                source=previous_source,
+                reason=_to_str(previous.get("reason")).strip() or "沿用已确认号牌种类",
+            )
+
+    if _quote_new_energy_plate_no_present(data.get("plate_no")):
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="plate_no", reason="新能源号牌")
+
+    haystack = _quote_detect_haystack(data, images_by_slot or {})
+    compact_haystack = re.sub(r"\s+", "", haystack).lower()
+    if _quote_labeled_plate_no_present(haystack) and _quote_new_energy_plate_no_present(haystack):
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="ocr_plate_no", reason="OCR文本包含新能源号牌")
+    if re.search(
+        r"新能源|纯电动轿车|纯电|插电|混动|电动|新能源车辆|新能源类型为纯电动|new_energy|electric|bev|phev|ev|增程",
+        compact_haystack,
+        flags=re.IGNORECASE,
+    ):
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="ocr_energy_text", reason="材料文本包含新能源特征")
+    if re.search(r"汽油|柴油|燃油|fuel|gasoline|diesel", compact_haystack, flags=re.IGNORECASE):
+        return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="ocr_energy_text", reason="材料文本包含燃油特征")
+
+    detect = _json_obj(vehicle_type_detect)
+    energy_type = _to_str(detect.get("vehicle_energy_type")).strip()
+    if energy_type == "new_energy":
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="vehicle_energy_type", reason="车辆识别为新能源")
+    if energy_type == "fuel":
+        return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="vehicle_energy_type", reason="车辆识别为燃油")
+
+    account_type_name = _normalize_account_type_name(data.get("account_type_name") or detect.get("config_type_name"))
+    if "新能源" in account_type_name:
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="account_type", reason=f"报价类型为{account_type_name}")
+    if account_type_name:
+        return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="account_type", reason=f"报价类型为{account_type_name}")
+
+    previous_value = _normalize_license_type_value(previous.get("license_type"))
+    if previous_value and previous_source not in {"fallback"}:
+        return _license_type_decision_payload(
+            previous_value,
+            source=previous_source or "previous",
+            reason=_to_str(previous.get("reason")).strip() or "沿用上一轮号牌种类",
+        )
+
+    return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="fallback", reason="未识别到新能源特征，默认小型汽车号牌")
+
+
+def _apply_license_type_decision(
+    data: Dict[str, Any],
+    images_by_slot: Dict[str, List[Dict[str, Any]]],
+    *,
+    vehicle_type_detect: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = dict(_json_obj(data))
+    decision = _resolve_license_type_decision(out, images_by_slot, vehicle_type_detect=vehicle_type_detect)
+    if decision:
+        out[LICENSE_TYPE_DECISION_KEY] = decision
+        if _to_str(decision.get("source")).strip() != "fallback":
+            out["license_type"] = decision.get("license_type")
+            out["license_color_code"] = decision.get("license_color_code")
+        else:
+            out.pop("license_type", None)
+            out.pop("license_color_code", None)
+    return _compact_quote_data(out)
+
+
 def _quote_date_obj(value: Any) -> Optional[datetime]:
     text = _normalize_quote_date_text(value)
     if not text:
@@ -1641,7 +1848,8 @@ def _normalize_quote_case_data(
     merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean, merged_overrides))
     if merged_overrides:
         merged[QUOTE_DATA_OVERRIDES_KEY] = merged_overrides
-    return _apply_transfer_vehicle_state(merged)
+    merged = _apply_transfer_vehicle_state(merged)
+    return _apply_license_type_decision(merged, images_by_slot)
 
 
 def _same_material_text(left: Any, right: Any) -> bool:
@@ -2374,7 +2582,22 @@ def _detect_professional_quote_command(text: Any) -> Dict[str, Any]:
     compact = re.sub(r"\s+", "", _norm_text(text))
     if not compact:
         return {}
-    mode = _picc_quote_command_mode_from_compact(compact)
+    flow_type, mode = _picc_quote_flow_command_from_compact(compact)
+    if flow_type == QUOTE_FLOW_RENEWAL:
+        entities = {
+            "platform_code": "PICC",
+            "platform_name": "人保",
+            QUOTE_FLOW_TYPE_KEY: QUOTE_FLOW_RENEWAL,
+            "quote_command_mode": mode or "全保",
+        }
+        if mode == "交三":
+            entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = [QUOTE_LOSS_LABEL]
+        elif mode == "单商":
+            entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = [QUOTE_COMPULSORY_LABEL]
+        else:
+            entities[QUOTE_PRODUCT_EXCLUSIONS_KEY] = []
+        return {"is_quote": True, "entities": entities}
+    mode = mode or _picc_quote_command_mode_from_compact(compact)
     if mode == "交三":
         return {
             "is_quote": True,
@@ -2512,6 +2735,8 @@ def _quote_data_override_value_pattern(field_key: str) -> str:
         return r"([A-Za-z0-9\-]{4,32})"
     if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
         return r"(\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2})"
+    if field_key == "license_type":
+        return r"(02|52|小型新能源汽车号牌|小型新能源汽车|小型汽车号牌|小型汽车|新能源车|新能源|燃油车|燃油|油车|绿牌|蓝牌|绿色|蓝色)"
     if field_key in {"owner_name", "id_name"}:
         return r"([\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,40})"
     if field_key == "vehicle_model":
@@ -2551,6 +2776,8 @@ def _clean_quote_data_override_value(field_key: str, value: Any) -> Any:
         return None
     if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
         return _normalize_quote_date_text(raw) or None
+    if field_key == "license_type":
+        return _normalize_license_type_value(raw) or None
     if field_key in {"vin", "engine_no", "plate_no", "id_number"}:
         raw = re.sub(r"\s+", "", raw).upper()
     if field_key == "owner_phone":
@@ -2580,6 +2807,10 @@ def _merge_quote_data_overrides(*items: Any) -> Dict[str, Any]:
         merged["id_name"] = merged["owner_name"]
     if _to_str(merged.get("id_name")).strip() and not _to_str(merged.get("owner_name")).strip():
         merged["owner_name"] = merged["id_name"]
+    license_type = _normalize_license_type_value(merged.get("license_type"))
+    if license_type:
+        merged["license_type"] = license_type
+        merged["license_type_override"] = license_type
     return merged
 
 
@@ -2650,6 +2881,33 @@ def extract_quote_data_overrides(text: Any) -> Dict[str, Any]:
                 overrides[field_key] = cleaned
                 consumed.append(match.span())
                 break
+    direct_value_fields = {
+        "first_register_date",
+        "issue_date",
+        "commercial_start_date",
+        "compulsory_start_date",
+        "license_type",
+        "vin",
+        "engine_no",
+        "plate_no",
+        "id_number",
+    }
+    for scan_text in scan_texts:
+        consumed = consumed_by_text.setdefault(scan_text, [])
+        for field_key, _label, alias in _quote_data_override_alias_items():
+            if field_key in overrides or field_key not in direct_value_fields:
+                continue
+            value_pattern = _quote_data_override_value_pattern(field_key)
+            pattern = rf"{re.escape(alias)}\s*{separator}\s*{value_pattern}"
+            for match in re.finditer(pattern, scan_text, flags=re.IGNORECASE):
+                if any(not (match.end() <= start or match.start() >= end) for start, end in consumed):
+                    continue
+                cleaned = _clean_quote_data_override_value(field_key, match.group(1))
+                if cleaned in (None, ""):
+                    continue
+                overrides[field_key] = cleaned
+                consumed.append(match.span())
+                break
     compact_only = re.sub(r"\s+", "", raw_text).upper()
     if "vin" not in overrides and re.fullmatch(r"[A-Z0-9]{17}", compact_only):
         cleaned = _clean_quote_data_override_value("vin", compact_only)
@@ -2679,9 +2937,9 @@ def _quote_text_has_explicit_data_override_operator(text: Any) -> bool:
 
 
 def detect_quote_data_override_signal(text: Any) -> Dict[str, Any]:
-    if not _quote_text_has_explicit_data_override_operator(text):
-        return {"is_override": False, "entities": {}, "overrides": {}}
     overrides = extract_quote_data_overrides(text)
+    if not overrides and not _quote_text_has_explicit_data_override_operator(text):
+        return {"is_override": False, "entities": {}, "overrides": {}}
     return {
         "is_override": bool(overrides),
         "entities": {QUOTE_DATA_OVERRIDES_KEY: overrides, "force_requote": True} if overrides else {},
@@ -2753,6 +3011,58 @@ def _quote_product_state_changes_current(
     else:
         return False
     return desired != current
+
+
+def _quote_flow_type_from_case_data(value: Any) -> str:
+    data = _json_obj(value)
+    flow_type = _to_str(data.get(QUOTE_FLOW_TYPE_KEY)).strip()
+    if flow_type in {QUOTE_FLOW_NORMAL, QUOTE_FLOW_RENEWAL}:
+        return flow_type
+    if _has_reusable_renewal_quote_context(data):
+        return QUOTE_FLOW_RENEWAL
+    return ""
+
+
+def _resolve_followup_quote_flow_type(
+    *,
+    current_flow_type: Any,
+    merged_entities: Any,
+    case_data: Any,
+    quote_state_changed: bool,
+) -> str:
+    flow_type = _to_str(current_flow_type).strip() or QUOTE_FLOW_NORMAL
+    entities = _json_obj(merged_entities)
+    if not quote_state_changed or QUOTE_FLOW_TYPE_KEY in entities:
+        return flow_type
+    inherited_flow_type = _quote_flow_type_from_case_data(case_data)
+    if inherited_flow_type and inherited_flow_type != QUOTE_FLOW_NORMAL:
+        return inherited_flow_type
+    return flow_type
+
+
+def _merge_quote_product_exclusions_for_command(
+    *,
+    current_exclusions: Any,
+    merged_entities: Any,
+    quote_command_mode: str,
+    quote_product_exclusions: Any,
+) -> Tuple[List[str], bool]:
+    current = _normalize_quote_product_exclusions(current_exclusions)
+    entities = _json_obj(merged_entities)
+    incoming = _normalize_quote_product_exclusions(entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    explicit_exclusions = _normalize_quote_product_exclusions(quote_product_exclusions)
+    mode = _to_str(quote_command_mode).strip()
+    if mode == "全保":
+        return _normalize_quote_product_exclusions(explicit_exclusions), True
+    if mode == "单商":
+        return _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *explicit_exclusions]), True
+    if mode == "交三":
+        return _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *explicit_exclusions]), True
+    if explicit_exclusions:
+        return _normalize_quote_product_exclusions([*current, *incoming]), True
+    if QUOTE_PRODUCT_EXCLUSIONS_KEY in entities:
+        return incoming, True
+    return current, False
 
 
 def _extract_quote_repair_code_command(text: Any) -> Dict[str, Any]:
@@ -2905,7 +3215,7 @@ async def _resolve_quote_repair_code_command(
             "matched": None,
         }
 
-    account = await _select_quote_platform_account(
+    account = await _select_logged_quote_platform_account(
         db,
         owner_user_id=owner_user_id,
         platform_code="PICC",
@@ -3625,6 +3935,86 @@ def _quote_platform_account_manage_actions(
     ]
 
 
+async def _quote_platform_login_gate_response(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    role_name: Any,
+    platform_code: str,
+    platform_name: str,
+    account_type_name: Optional[str] = None,
+    entities: Optional[Dict[str, Any]] = None,
+    case: Optional[QuoteCase] = None,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    code = _to_str(platform_code).strip().upper()
+    name = _to_str(platform_name).strip() or _platform_display_name(code)
+    if owner_user_id <= 0 or not code or not name:
+        return None
+    logged_account = await _select_logged_quote_platform_account(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code=code,
+        account_type_name=account_type_name,
+    )
+    if logged_account is not None:
+        return None
+
+    has_enabled = await _has_enabled_quote_platform_account(
+        db,
+        owner_user_id=owner_user_id,
+        platform_code=code,
+        account_type_name=None,
+    )
+    type_hint = f"（类型：{_normalize_account_type_name(account_type_name)}）" if _normalize_account_type_name(account_type_name) else ""
+    if has_enabled:
+        admin_text = f"{name}{type_hint}当前没有已登录可用账号，请先登录平台账号后再报价。"
+        contact_text = f"{name}平台账号当前没有已登录可用会话，请联系管理员处理。"
+        message_key = "平台账号没有已登录可用会话"
+    else:
+        admin_text = f"{name}{type_hint}当前没有可用平台账号，请先新增、启用并登录账号后再报价。"
+        contact_text = f"{name}平台账号暂不可用，请联系管理员处理。"
+        message_key = "平台账号暂不可用"
+    message = _quote_account_action_text(role_name, admin_text, contact_text)
+    payload: Dict[str, Any] = {
+        "platform_account_login_gate": {
+            "platform_code": code,
+            "platform_name": name,
+            "account_type_name": _normalize_account_type_name(account_type_name),
+            "has_enabled_account": bool(has_enabled),
+            "has_logged_account": False,
+        }
+    }
+    if case is not None:
+        payload["quote_case"] = {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "session_id": case.session_id,
+            "platform_code": case.platform_code,
+            "platform_name": case.platform_name,
+        }
+    return (
+        message,
+        {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": _new_trace_id(),
+            "data": _mk_data(
+                result_status=RESULT_NEED_MORE,
+                message=message_key,
+                entities={**(entities or {}), "platform_code": code, "platform_name": name},
+                payload=payload,
+            ),
+            "actions": _quote_platform_account_manage_actions(
+                role_name,
+                platform_code=code,
+                platform_name=name,
+            ),
+        },
+    )
+
+
 def _quote_quota_exhausted_message(
     platform_name: str,
     account: Optional[QuotePlatformAccountProfile],
@@ -3984,6 +4374,14 @@ def detect_quote_vehicle_type(
         "vehicle_energy_type": energy_type,
         "vehicle_energy_type_name": energy_name,
         "config_type_name": config_type_name,
+        "license_type_decision": _resolve_license_type_decision(
+            data,
+            slots,
+            vehicle_type_detect={
+                "vehicle_energy_type": energy_type,
+                "config_type_name": config_type_name,
+            },
+        ),
         "is_transfer_vehicle": bool(transfer_state.get("is_transfer_vehicle")),
         "transfer_date": _to_str(transfer_state.get("transfer_date")).strip(),
         "transfer_vehicle_source": _to_str(transfer_state.get("transfer_vehicle_source")).strip(),
@@ -4356,6 +4754,70 @@ def list_quote_platforms() -> List[Dict[str, Any]]:
         {"platform_code": code, "platform_name": name, "aliases": list(aliases)}
         for code, (name, aliases) in PLATFORM_ALIASES.items()
     ]
+
+
+def _platform_account_health_summary(row: Optional[QuotePlatformAccountProfile]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    return {
+        "account_type_name": _normalize_account_type_name(_loaded_value(row, "account_type_name")) or "",
+        "login_status": _loaded_value(row, "login_status") or ACCOUNT_LOGIN_NOT_LOGGED_IN,
+        "quota_status": _loaded_value(row, "quota_status") or ACCOUNT_QUOTA_UNKNOWN,
+    }
+
+
+async def get_quote_platform_account_health(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+) -> Dict[str, Any]:
+    if owner_user_id <= 0:
+        return {"ok": False, "items": [], "missing": []}
+    items: List[Dict[str, Any]] = []
+    for code in PLATFORM_ALIASES.keys():
+        if code not in DEVELOPED_QUOTE_PLATFORM_CODES:
+            continue
+        platform_name = _platform_display_name(code)
+        account = await _select_logged_quote_platform_account(
+            db,
+            owner_user_id=owner_user_id,
+            platform_code=code,
+            account_type_name=None,
+        )
+        has_enabled = await _has_enabled_quote_platform_account(
+            db,
+            owner_user_id=owner_user_id,
+            platform_code=code,
+            account_type_name=None,
+        )
+        healthy = account is not None
+        if healthy:
+            status = "ok"
+            message = f"{platform_name}已有已登录可用账号"
+        elif has_enabled:
+            status = "no_alive_account"
+            message = f"{platform_name}暂无存活可用账号，请确认账号已登录、未等待验证码且额度未满"
+        else:
+            status = "no_enabled_account"
+            message = f"{platform_name}暂无可用平台账号，请先新增、启用并登录账号"
+        items.append(
+            {
+                "platform_code": code,
+                "platform_name": platform_name,
+                "developed": True,
+                "ok": healthy,
+                "status": status,
+                "message": message,
+                "has_enabled_account": bool(has_enabled),
+                "account": _platform_account_health_summary(account),
+            }
+        )
+    missing = [item for item in items if not item.get("ok")]
+    return {
+        "ok": not missing,
+        "items": items,
+        "missing": missing,
+    }
 
 
 async def list_platform_account_types(
@@ -5820,7 +6282,7 @@ async def _select_quote_platform_account(
             owner_rank = 0 if _safe_int(_loaded_value(row, "owner_user_id"), 0) == int(owner_user_id) else 1
             auto_rank = 0 if bool(_loaded_value(row, "auto_login")) else 1
             last_used = _to_str(_loaded_value(row, "last_used_at")).strip()
-            return (type_rank, login_rank, owner_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
+            return (login_rank, type_rank, owner_rank, auto_rank, last_used, int(_loaded_value(row, "id") or 0))
 
         rows.sort(key=account_rank)
     account_ids = [int(row.id) for row in rows if getattr(row, "id", None)]
@@ -5851,6 +6313,84 @@ async def _select_quote_platform_account(
                 continue
         return row
     return None
+
+
+async def _select_logged_quote_platform_account(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    platform_code: str,
+    account_type_name: Optional[str] = None,
+    exclude_account_ids: Optional[Iterable[int]] = None,
+) -> Optional[QuotePlatformAccountProfile]:
+    code = _to_str(platform_code).strip().upper()
+    if owner_user_id <= 0 or not code:
+        return None
+    excluded = {int(x) for x in (exclude_account_ids or []) if _safe_int(x, 0)}
+    stmt = select(QuotePlatformAccountProfile).where(
+        QuotePlatformAccountProfile.platform_code == code,
+        QuotePlatformAccountProfile.enabled == True,  # noqa: E712
+        QuotePlatformAccountProfile.login_status.in_([ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED]),
+    )
+    if excluded:
+        stmt = stmt.where(QuotePlatformAccountProfile.id.notin_(excluded))
+    rows = (
+        await db.execute(
+            stmt.order_by(
+                (QuotePlatformAccountProfile.login_status == ACCOUNT_LOGIN_AUTHENTICATED).desc(),
+                QuotePlatformAccountProfile.last_used_at.asc(),
+                QuotePlatformAccountProfile.id.asc(),
+            )
+        )
+    ).scalars().all()
+    if not rows:
+        return None
+
+    type_name = _normalize_account_type_name(account_type_name)
+    if type_name:
+        preferred_type_names = set(_account_type_db_names(type_name))
+
+        def account_rank(row: QuotePlatformAccountProfile) -> Tuple[int, int, int, str, int]:
+            row_type = _normalize_account_type_name(_loaded_value(row, "account_type_name"))
+            if row_type in preferred_type_names:
+                type_rank = 0
+            elif row_type:
+                type_rank = 1
+            else:
+                type_rank = 2
+            login_rank = 0 if _loaded_value(row, "login_status") == ACCOUNT_LOGIN_AUTHENTICATED else 1
+            owner_rank = 0 if _safe_int(_loaded_value(row, "owner_user_id"), 0) == int(owner_user_id) else 1
+            return (login_rank, type_rank, owner_rank, _to_str(_loaded_value(row, "last_used_at")).strip(), int(_loaded_value(row, "id") or 0))
+
+        rows.sort(key=account_rank)
+
+    account_ids = [int(row.id) for row in rows if getattr(row, "id", None)]
+    account_by_id = {int(row.id): row for row in rows if getattr(row, "id", None)}
+    quota_by_account = await _load_account_quota_map(db, account_ids, accounts_by_id=account_by_id)
+    now = _now()
+    for row in rows:
+        quota = quota_by_account.get(int(row.id))
+        if quota is not None and (_quota_remaining_count(quota) or 0) <= 0:
+            row.quota_status = ACCOUNT_QUOTA_FULL
+            row.quota_reset_at = quota.period_end_at
+            row.updated_at = now
+            continue
+        if quota is None and row.quota_status == ACCOUNT_QUOTA_FULL:
+            continue
+        if quota is not None and row.quota_status == ACCOUNT_QUOTA_FULL:
+            reset_at = row.quota_reset_at
+            if not reset_at or now < reset_at:
+                continue
+        if not await _account_has_usable_session_snapshot(row):
+            continue
+        return row
+    return None
+
+
+async def _account_has_usable_session_snapshot(account: QuotePlatformAccountProfile) -> bool:
+    snapshot = await quote_platform_session_manager.store.load(account)
+    status = _to_str(getattr(snapshot, "status", "")).strip().lower() if snapshot is not None else ""
+    return status in {SESSION_STATUS_AUTHENTICATED, SESSION_STATUS_DEGRADED}
 
 
 async def _has_enabled_quote_platform_account(
@@ -8279,6 +8819,7 @@ QUOTE_ENTITY_FIELD_KEYS = tuple(
             "transfer_vehicle_override",
             QUOTE_DATA_OVERRIDES_KEY,
             QUOTE_PRODUCT_EXCLUSIONS_KEY,
+            QUOTE_FLOW_TYPE_KEY,
             "quote_command_mode",
         }
     )
@@ -8373,6 +8914,18 @@ def _missing_requirements(
     return missing
 
 
+def _renewal_lookup_missing_requirements(normalized_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = _clean_quote_dynamic_data(_json_obj(normalized_data))
+    missing: List[Dict[str, Any]] = []
+    if not _to_str(data.get("plate_no")).strip():
+        missing.append({"type": "field", "key": "plate_no", "label": "号牌号码"})
+    # HAR confirms the current PICC renewal lookup uses the last four
+    # characters of the engine number. Do not guess an unverified VIN variant.
+    if not _to_str(data.get("engine_no")).strip():
+        missing.append({"type": "field", "key": "engine_no", "label": "发动机号"})
+    return missing
+
+
 def _missing_item_text(item: Dict[str, Any]) -> str:
     label = _to_str(item.get("label") or item.get("key")).strip() or "未知项目"
     detail = _format_missing_detail(item.get("detail"))
@@ -8456,6 +9009,12 @@ def _quote_material_form_field(
         field["required"] = True
         field["options"] = [{"label": item, "value": item} for item in QUOTE_ACCOUNT_TYPE_OPTIONS]
         field["placeholder"] = "请选择报价类型"
+    elif key == "license_type":
+        field["options"] = [
+            {"label": "02-小型汽车号牌", "value": LICENSE_TYPE_FUEL},
+            {"label": "52-小型新能源汽车", "value": LICENSE_TYPE_NEW_ENERGY},
+        ]
+        field["placeholder"] = "请选择号牌种类"
     elif field_type == "date":
         field["placeholder"] = "请选择或输入日期"
     else:
@@ -8576,7 +9135,12 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
         for key, value in _json_obj(values).items()
         if key != "account_type_name" and _to_str(value).strip()
     }
-    return _clean_quote_dynamic_data(raw, derive_owner_name=False) if raw else {}
+    overrides = _clean_quote_dynamic_data(raw, derive_owner_name=False) if raw else {}
+    license_type = _normalize_license_type_value(raw.get("license_type"))
+    if license_type:
+        overrides["license_type"] = license_type
+        overrides["license_type_override"] = license_type
+    return overrides
 
 
 async def _quote_case_by_id_for_form(
@@ -11670,7 +12234,9 @@ async def _start_sms_task(
     platform_account: QuotePlatformAccountProfile,
     challenge_result: Optional[PlatformRuntimeResult] = None,
     challenge_prompt: str = "",
+    operation: str = "",
 ) -> QuoteTask:
+    normalized_operation = _to_str(operation).strip() or "quote"
     waiting = (
         await db.execute(
             select(QuoteTask)
@@ -11685,6 +12251,7 @@ async def _start_sms_task(
         )
     ).scalars().first()
     if waiting:
+        waiting_operation = _to_str(_json_obj(waiting.request_payload).get("operation")).strip() or "quote"
         if _is_sms_task_expired(waiting):
             await _expire_waiting_sms_task(
                 db,
@@ -11694,7 +12261,7 @@ async def _start_sms_task(
                 reason="短信验证码已过期",
             )
             await db.flush()
-        else:
+        elif waiting_operation == normalized_operation:
             case.status = CASE_STATUS_WAITING_SMS
             case.current_task_id = waiting.id
             case.updated_at = _now()
@@ -11727,6 +12294,7 @@ async def _start_sms_task(
         trace_id=trace_id,
         request_payload={
             "mode": "stub",
+            "operation": normalized_operation,
             "login": "sms_required",
             "owner_user_id": owner_user_id,
             "platform_account": account_snapshot,
@@ -12390,7 +12958,7 @@ async def _continue_quote_with_platform_account(
             },
         )
 
-    if platform_account.login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}:
+    if platform_account.login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED} and await _account_has_usable_session_snapshot(platform_account):
         reply, meta = await _complete_quote_without_sms(
             db,
             case=case,
@@ -12405,157 +12973,6 @@ async def _continue_quote_with_platform_account(
         )
         return reply, meta
 
-    if not bool(platform_account.auto_login):
-        retry = await _retry_quote_with_next_platform_account(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=account_snapshot,
-            trace_id=trace_id,
-            current_account=platform_account,
-            config_type_name=selected_type_name,
-            merged_entities=merged_entities,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            attached_images=attached_images,
-            attempted_account_ids=attempted_account_ids,
-            reason_text="未开启自动登录",
-            operator_role_name=operator_role_name,
-        )
-        if retry is not None:
-            return retry
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="status",
-            role="assistant",
-            payload={
-                "status": "ready",
-                "need_manual_account_login": True,
-                "platform_account": _credential_public_payload(platform_account),
-            },
-        )
-        await db.flush()
-        payload = _case_payload(
-            case=case,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            missing=[],
-            attached_images=attached_images or [],
-            platform_account=platform_account,
-        )
-        admin_text = f"{platform_name}报价资料已齐，但所选账号未开启自动登录。请先在右上角“平台账号管理”里点击该账号的“登录”。"
-        return (
-            f"{reply_prefix}{_quote_account_action_text(operator_role_name, admin_text, f'{platform_name}报价资料已齐，但平台账号需要管理员登录处理，请联系管理员处理。')}",
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_NEED_MORE,
-                    message="账号未开启自动登录，等待手动登录",
-                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                    payload=payload,
-                ),
-                "actions": _quote_platform_account_manage_actions(
-                    operator_role_name,
-                    platform_code=platform_code,
-                    platform_name=platform_name,
-                ),
-            },
-        )
-
-    await db.flush()
-    await db.commit()
-    login_runtime_result = await quote_platform_runtime.login(_platform_account_context(platform_account), db=db)
-    login_status = _runtime_status(login_runtime_result)
-    if login_status in RUNTIME_SESSION_DEGRADED_STATUSES and bool(_json_obj(login_runtime_result.data).get("preserved_previous_session")):
-        platform_account.login_status = ACCOUNT_LOGIN_DEGRADED
-        platform_account.last_error = _runtime_detail(login_runtime_result, "平台登录未完成")
-        platform_account.last_check_at = _now()
-        platform_account.updated_at = _now()
-        await db.flush()
-        reply, meta = await _complete_quote_without_sms(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=account_snapshot,
-            trace_id=trace_id,
-            platform_account=platform_account,
-            login_mode="preserved_session_after_login_failure",
-            attempted_account_ids=attempted_account_ids,
-            account_type_name=config_type_name,
-            operator_role_name=operator_role_name,
-        )
-        return reply, meta
-    if not _is_runtime_login_success(login_status) and not _is_runtime_challenge(login_status):
-        platform_account.login_status = ACCOUNT_LOGIN_FAILED
-        platform_account.last_error = _runtime_detail(login_runtime_result, "平台登录失败")
-        platform_account.last_check_at = _now()
-        platform_account.updated_at = _now()
-        await db.flush()
-        retry = await _retry_quote_with_next_platform_account(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=account_snapshot,
-            trace_id=trace_id,
-            current_account=platform_account,
-            config_type_name=selected_type_name,
-            merged_entities=merged_entities,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            attached_images=attached_images,
-            attempted_account_ids=attempted_account_ids,
-            reason_text=f"登录失败：{platform_account.last_error}",
-            operator_role_name=operator_role_name,
-        )
-        if retry is not None:
-            return retry
-        admin_text = f"{platform_name}登录失败：{platform_account.last_error}。请在平台账号管理中检查账号后重试。"
-        return (
-            f"{reply_prefix}{_quote_account_action_text(operator_role_name, admin_text, f'{platform_name}登录失败，请联系管理员处理。')}",
-            {
-                "status": "failed",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_FAILED,
-                    message=platform_account.last_error,
-                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                    payload={"platform_account": _credential_public_payload(platform_account)},
-                ),
-                "actions": _quote_platform_account_manage_actions(
-                    operator_role_name,
-                    platform_code=platform_code,
-                    platform_name=platform_name,
-                ),
-            },
-        )
-
-    if _is_runtime_login_success(login_status):
-        reply, meta = await _complete_quote_without_sms(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            snapshot=account_snapshot,
-            trace_id=trace_id,
-            platform_account=platform_account,
-            login_mode="auto_login_without_code",
-            attempted_account_ids=attempted_account_ids,
-            account_type_name=config_type_name,
-            operator_role_name=operator_role_name,
-        )
-        return reply, meta
-
-    challenge_prompt = await _mark_quote_account_challenge_attention(
-        db,
-        account=platform_account,
-        runtime_result=login_runtime_result,
-        operator_user_id=owner_user_id,
-        source="quote_flow",
-    )
     retry = await _retry_quote_with_next_platform_account(
         db,
         case=case,
@@ -12569,95 +12986,459 @@ async def _continue_quote_with_platform_account(
         images_by_slot=images_by_slot,
         attached_images=attached_images,
         attempted_account_ids=attempted_account_ids,
-        reason_text=f"需要验证码：{challenge_prompt}",
+        reason_text="当前账号没有已登录可用会话",
         operator_role_name=operator_role_name,
     )
     if retry is not None:
         return retry
 
-    if _quote_account_needs_admin_contact(operator_role_name):
-        case.status = CASE_STATUS_READY
-        case.current_task_id = None
-        case.updated_at = _now()
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="status",
-            role="assistant",
-            payload={
-                "status": "ready",
-                "need_admin_platform_account_login": True,
-                "platform_account_id": platform_account.id,
-                "platform_code": platform_code,
-            },
-        )
-        await db.flush()
-        payload = _case_payload(
-            case=case,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            missing=[],
-            attached_images=attached_images or [],
-            platform_account=platform_account,
-        )
-        return (
-            f"{reply_prefix}{platform_name}报价资料已齐，但平台账号需要验证码或安全码，请联系管理员处理。",
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_NEED_MORE,
-                    message="平台账号需要管理员处理",
-                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                    payload=payload,
-                ),
-                "actions": [],
-            },
-        )
-
-    task = await _start_sms_task(
+    case.status = CASE_STATUS_READY
+    case.current_task_id = None
+    case.updated_at = _now()
+    await _add_event(
         db,
         case=case,
         owner_user_id=owner_user_id,
-        snapshot=account_snapshot,
-        trace_id=trace_id,
-        platform_account=platform_account,
-        challenge_result=login_runtime_result,
-        challenge_prompt=challenge_prompt,
+        event_type="status",
+        role="assistant",
+        payload={
+            "status": "ready",
+            "need_platform_account_login": True,
+            "platform_account_id": platform_account.id,
+            "platform_code": platform_code,
+        },
     )
     await db.flush()
-
     payload = _case_payload(
         case=case,
         normalized_data=normalized_data,
         images_by_slot=images_by_slot,
         missing=[],
         attached_images=attached_images or [],
-        task=task,
         platform_account=platform_account,
     )
-    account_payload = _credential_public_payload(platform_account) or {}
-    prompt = _to_str(task.error_detail).strip() or challenge_prompt or "请输入收到的验证码"
-    reply = (
-        f"{platform_name}报价必填项已满足，但当前账号登录需要验证码。\n"
-        f"- 平台提示：{prompt}\n"
-        f"- 已复用平台登录资料：{account_payload.get('login_phone_mask') or task.sms_phone_mask or '业务员手机号'}\n"
-        "请在聊天框直接输入收到的 4-8 位短信验证码。"
+    admin_text = f"{platform_name}报价资料已齐，但当前没有已登录且存活可用的平台账号。请先在右上角“平台账号管理”完成登录后再报价。"
+    contact_text = f"{platform_name}报价资料已齐，但平台账号没有已登录可用会话，请联系管理员处理。"
+    return (
+        f"{reply_prefix}{_quote_account_action_text(operator_role_name, admin_text, contact_text)}",
+        {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "data": _mk_data(
+                result_status=RESULT_NEED_MORE,
+                message="平台账号没有已登录可用会话",
+                entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
+                payload=payload,
+            ),
+            "actions": _quote_platform_account_manage_actions(
+                operator_role_name,
+                platform_code=platform_code,
+                platform_name=platform_name,
+            ),
+        },
     )
-    return reply, {
-        "status": "success",
-        "intent": "quote",
-        "trace_id": trace_id,
-        "data": _mk_data(
-            result_status=RESULT_NOT_READY,
-            message="已触发平台登录短信验证，等待验证码",
-            entities={**merged_entities, "quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-            payload=payload,
+
+
+def _renewal_lookup_primary_candidate(value: Any) -> Dict[str, Any]:
+    candidates = [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+    if not candidates:
+        return {}
+    flagged = [item for item in candidates if _to_str(item.get("renewal_or_copy_flag")).strip() == "1"]
+    pool = flagged or candidates
+    return min(
+        pool,
+        key=lambda item: (
+            re.sub(r"\D+", "", _to_str(item.get("end_date"))),
+            0 if _to_str(item.get("risk_code")).strip().upper() == "DAA" else 1,
         ),
-        "actions": [_mk_action("输入短信验证码")],
+    )
+
+
+def _has_reusable_renewal_quote_context(value: Any) -> bool:
+    lookup = _json_obj(_json_obj(value).get("renewal_lookup"))
+    found = lookup.get("found")
+    if found is not True and _to_str(found).strip().lower() not in {"1", "true", "yes"}:
+        return False
+    selected = _json_obj(lookup.get("selected"))
+    policy_no = (
+        _to_str(selected.get("policy_no")).strip()
+        or _to_str(selected.get("policyNo")).strip()
+        or _to_str(lookup.get("selected_policy_no")).strip()
+    )
+    policy_no_encode = (
+        _to_str(selected.get("policy_no_encode")).strip()
+        or _to_str(selected.get("policyNoEncode")).strip()
+        or _to_str(lookup.get("selected_policy_no_encode")).strip()
+    )
+    return bool(policy_no and policy_no_encode)
+
+
+async def _complete_renewal_lookup_without_sms(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_account: QuotePlatformAccountProfile,
+    login_mode: str,
+    task: Optional[QuoteTask] = None,
+    operator_role_name: Any = "",
+) -> Tuple[str, Dict[str, Any]]:
+    platform_code = case.platform_code or platform_account.platform_code or "PICC"
+    platform_name = case.platform_name or platform_account.platform_name or "人保"
+    if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
+
+    if task is None:
+        task = QuoteTask(
+            quote_case_id=case.id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            status=TASK_STATUS_RUNNING,
+            login_state="authenticated",
+            sms_phone_mask=platform_account.login_phone_mask,
+            trace_id=trace_id,
+            request_payload={
+                "operation": RENEWAL_LOOKUP_OPERATION,
+                "login": login_mode,
+                "owner_user_id": owner_user_id,
+                "platform_account": _credential_public_payload(platform_account),
+                "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
+                "normalized_data": _json_obj(snapshot.get("normalized_data")),
+            },
+            response_payload={},
+            result_payload={},
+            submitted_snapshot=snapshot,
+            started_at=_now(),
+        )
+        db.add(task)
+        await db.flush()
+    else:
+        task.status = TASK_STATUS_RUNNING
+        task.login_state = "authenticated"
+        task.error_detail = None
+        task.request_payload = {
+            **_json_obj(task.request_payload),
+            "operation": RENEWAL_LOOKUP_OPERATION,
+            "login": login_mode,
+            "platform_account": _credential_public_payload(platform_account),
+            "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
+            "normalized_data": _json_obj(snapshot.get("normalized_data")),
+        }
+        task.updated_at = _now()
+
+    case.status = CASE_STATUS_READY
+    case.current_task_id = task.id
+    case.updated_at = _now()
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_RUNNING,
+            "trace_id": trace_id,
+            "operation": RENEWAL_LOOKUP_OPERATION,
+            "login_mode": login_mode,
+        },
+    )
+    await db.flush()
+    await db.commit()
+
+    platform_ctx = _platform_account_quote_context(
+        platform_account,
+        account_type_name=_normalize_account_type_name(
+            _json_obj(snapshot.get("vehicle_type_detect")).get("config_type_name")
+            or platform_account.account_type_name
+        ),
+    )
+    started = time.perf_counter()
+    runtime_result = await quote_platform_runtime.query_renewal(platform_ctx, snapshot, db=db)
+    perf = {"login_mode": login_mode, "renewal_lookup_ms": _elapsed_ms(started)}
+    runtime_status = _runtime_status(runtime_result)
+    runtime_data = _json_obj(getattr(runtime_result, "data", None))
+    business_status = _to_str(runtime_data.get("business_status")).strip()
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
+
+    task.response_payload = {
+        "renewal_lookup": _runtime_result_payload(runtime_result),
+        "perf": perf,
     }
+    task.finished_at = _now()
+    task.updated_at = _now()
+    case.status = CASE_STATUS_READY
+    case.current_task_id = task.id
+    case.updated_at = _now()
+
+    if runtime_status not in {"success", "ok"}:
+        _apply_platform_account_runtime_status(platform_account, runtime_result, default_error="人保续保查询失败")
+        detail = _runtime_detail(runtime_result, "人保续保查询失败")
+        task.status = TASK_STATUS_FAILED
+        task.login_state = "authenticated"
+        task.error_detail = detail
+        platform_account.last_error = detail
+        platform_account.last_check_at = _now()
+        platform_account.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": task.status,
+                "trace_id": trace_id,
+                "operation": RENEWAL_LOOKUP_OPERATION,
+                "reason": detail,
+            },
+        )
+        await db.flush()
+        if _is_runtime_session_expired_result(runtime_result) and _quote_account_needs_admin_contact(operator_role_name):
+            detail = f"{platform_name}账号登录已过期，请联系管理员处理。"
+        return (
+            f"{platform_name}续保查询失败：{detail}",
+            {
+                "status": "failed",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={
+                        "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
+                        "platform_account": _credential_public_payload(platform_account),
+                        "renewal_lookup": _runtime_result_payload(runtime_result),
+                    },
+                ),
+                "actions": [],
+            },
+        )
+
+    lookup = _json_obj(runtime_data.get("renewal_lookup"))
+    candidates = lookup.get("candidates") if isinstance(lookup.get("candidates"), list) else []
+    primary = _renewal_lookup_primary_candidate(candidates)
+    lookup_found = bool(runtime_data.get("renewal_found")) and bool(primary)
+    if not lookup_found or business_status == "renewal_not_found":
+        detail = _runtime_detail(runtime_result, "没有此车辆信息或不是可续保车辆")
+        task.status = TASK_STATUS_SUCCESS
+        task.login_state = "authenticated"
+        task.error_detail = detail
+        task.result_payload = {
+            "renewal_lookup": {
+                "found": False,
+                "vehicle": _json_obj(lookup.get("vehicle")),
+                "candidates": [],
+            }
+        }
+        await _mark_platform_account_used(
+            db,
+            account_id=platform_account.id,
+            owner_user_id=owner_user_id,
+            login_state=ACCOUNT_LOGIN_AUTHENTICATED,
+            consume_quota=False,
+        )
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": task.status,
+                "trace_id": trace_id,
+                "operation": RENEWAL_LOOKUP_OPERATION,
+                "renewal_found": False,
+                "reason": detail,
+            },
+        )
+        await db.flush()
+        return (
+            detail,
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_NOT_READY,
+                    message=detail,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={
+                        "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
+                        "renewal_lookup": task.result_payload["renewal_lookup"],
+                    },
+                ),
+                "actions": [],
+            },
+        )
+
+    updated_data = dict(_json_obj(case.normalized_data))
+    updated_data[QUOTE_FLOW_TYPE_KEY] = QUOTE_FLOW_RENEWAL
+    selected_license_type = _normalize_license_type_value(primary.get("license_type"))
+    updated_data["renewal_lookup"] = {
+        "found": True,
+        # Keep the complete selected row. A later command such as "司乘改3万"
+        # must be able to reuse this renewal context and call quotePolicy.do.
+        "selected": primary,
+        "candidates": candidates,
+        "selected_policy_no": _to_str(primary.get("policy_no")).strip(),
+        "selected_policy_no_encode": _to_str(primary.get("policy_no_encode")).strip(),
+        "selected_risk_code": _to_str(primary.get("risk_code")).strip(),
+        "selected_end_date": _to_str(primary.get("end_date")).strip(),
+        "selected_license_type": selected_license_type,
+        "candidate_count": len(candidates),
+    }
+    if selected_license_type:
+        updated_data["license_type"] = selected_license_type
+        updated_data["license_color_code"] = _license_color_for_type(selected_license_type)
+        updated_data[LICENSE_TYPE_DECISION_KEY] = _license_type_decision_payload(
+            selected_license_type,
+            source="renewal_lookup",
+            reason="人保续保查询返回号牌种类",
+        )
+    case.normalized_data = _normalize_quote_case_data(
+        base_data=updated_data,
+        order_data={},
+        text_data={},
+        images_by_slot=_json_obj(snapshot.get("images_by_slot")),
+    )
+    case.draft_order_data = case.normalized_data
+    task.status = TASK_STATUS_SUCCESS
+    task.login_state = "authenticated"
+    task.error_detail = None
+    task.result_payload = {
+        "renewal_lookup": {
+            "found": True,
+            "vehicle": _json_obj(lookup.get("vehicle")),
+            "selected": primary,
+            "candidate_count": len(candidates),
+        }
+    }
+    await _mark_platform_account_used(
+        db,
+        account_id=platform_account.id,
+        owner_user_id=owner_user_id,
+        login_state=ACCOUNT_LOGIN_AUTHENTICATED,
+        consume_quota=False,
+    )
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": task.status,
+            "trace_id": trace_id,
+            "operation": RENEWAL_LOOKUP_OPERATION,
+            "renewal_found": True,
+            "selected": primary,
+        },
+    )
+    await db.flush()
+    await db.commit()
+
+    refreshed_images = await _active_images_by_slot(db, int(case.id))
+    refreshed_normalized = _normalize_quote_case_data(
+        base_data=_json_obj(case.normalized_data),
+        order_data={},
+        text_data={},
+        images_by_slot=refreshed_images,
+    )
+    case.normalized_data = refreshed_normalized
+    case.draft_order_data = refreshed_normalized
+    quote_snapshot = _snapshot_payload(case=case, normalized_data=refreshed_normalized, images_by_slot=refreshed_images)
+    quote_snapshot = {
+        **quote_snapshot,
+        "vehicle_type_detect": detect_quote_vehicle_type(refreshed_normalized, refreshed_images),
+        "quote_flow_type": QUOTE_FLOW_RENEWAL,
+        QUOTE_PRODUCT_EXCLUSIONS_KEY: _normalize_quote_product_exclusions(
+            refreshed_normalized.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
+        ),
+    }
+    quote_trace_id = _new_trace_id()
+    return await _continue_quote_with_platform_account(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        snapshot=quote_snapshot,
+        trace_id=quote_trace_id,
+        platform_account=platform_account,
+        merged_entities={
+            "platform_code": platform_code,
+            "platform_name": platform_name,
+            QUOTE_FLOW_TYPE_KEY: QUOTE_FLOW_RENEWAL,
+            "quote_case_id": case.id,
+            "renewal_lookup_task_id": task.id,
+        },
+        normalized_data=refreshed_normalized,
+        images_by_slot=refreshed_images,
+        attached_images=[],
+        config_type_name=_normalize_account_type_name(
+            _json_obj(quote_snapshot.get("vehicle_type_detect")).get("config_type_name")
+            or "油车-旧"
+        ),
+        operator_role_name=operator_role_name,
+    )
+
+
+async def _continue_renewal_lookup_with_platform_account(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    owner_user_id: int,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_account: QuotePlatformAccountProfile,
+    operator_role_name: Any = "",
+) -> Tuple[str, Dict[str, Any]]:
+    platform_code = case.platform_code or platform_account.platform_code or "PICC"
+    platform_name = case.platform_name or platform_account.platform_name or "人保"
+    if platform_account.login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED} and await _account_has_usable_session_snapshot(platform_account):
+        return await _complete_renewal_lookup_without_sms(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            login_mode="reuse_authenticated",
+            operator_role_name=operator_role_name,
+        )
+
+    message = _quote_account_action_text(
+        operator_role_name,
+        f"{platform_name}续保资料已齐，但当前账号没有可用登录会话。请先完成平台账号登录后再发起续保查询。",
+        f"{platform_name}续保资料已齐，但平台账号没有可用登录会话，请联系管理员处理。",
+    )
+    return (
+        message,
+        {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "data": _mk_data(
+                result_status=RESULT_NEED_MORE,
+                message="平台账号没有可用登录会话",
+                entities={"quote_case_id": case.id, "order_id": case.order_id},
+                payload={"platform_account": _credential_public_payload(platform_account)},
+            ),
+            "actions": _quote_platform_account_manage_actions(
+                operator_role_name,
+                platform_code=platform_code,
+                platform_name=platform_name,
+            ),
+        },
+    )
 
 
 async def _retry_quote_with_next_platform_account(
@@ -12687,7 +13468,7 @@ async def _retry_quote_with_next_platform_account(
     selected_type = _normalize_account_type_name(config_type_name) or _normalize_account_type_name(
         current_account.account_type_name
     )
-    next_account = await _select_quote_platform_account(
+    next_account = await _select_logged_quote_platform_account(
         db,
         owner_user_id=owner_user_id,
         platform_code=case.platform_code or current_account.platform_code or "",
@@ -13071,6 +13852,44 @@ async def _complete_waiting_task(
             task=task,
             platform_account=platform_account,
             response_payload={"challenge": _runtime_result_payload(challenge_result)},
+        )
+
+    task_operation = _to_str(_json_obj(task.request_payload).get("operation")).strip() or "quote"
+    if task_operation == RENEWAL_LOOKUP_OPERATION:
+        if platform_account is None:
+            task.status = TASK_STATUS_FAILED
+            task.login_state = "failed"
+            task.error_detail = "平台账号不存在，请重新发起续保查询"
+            task.finished_at = _now()
+            task.updated_at = _now()
+            case.status = CASE_STATUS_READY
+            case.current_task_id = task.id
+            case.updated_at = _now()
+            await db.flush()
+            return (
+                f"{platform_name}续保查询失败：{task.error_detail}",
+                {
+                    "status": "failed",
+                    "intent": "quote",
+                    "trace_id": trace_id,
+                    "data": _mk_data(
+                        result_status=RESULT_FAILED,
+                        message=task.error_detail,
+                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                        payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
+                    ),
+                },
+            )
+        return await _complete_renewal_lookup_without_sms(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            login_mode="sms_verified",
+            task=task,
+            operator_role_name=operator_role_name,
         )
 
     task.request_payload = {
@@ -14813,6 +15632,7 @@ async def handle_quote_message(
     )
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
+    quote_flow_type = _to_str(merged_entities.get(QUOTE_FLOW_TYPE_KEY)).strip() or QUOTE_FLOW_NORMAL
     quote_product_exclusions = _extract_quote_product_exclusions(text)
     quote_command_mode = _to_str(merged_entities.get("quote_command_mode")).strip()
     if quote_command_mode == "全保":
@@ -15311,6 +16131,15 @@ async def handle_quote_message(
             reason=QUOTE_SUPERSEDED_MESSAGE,
         )
         old_draft = _json_obj(case.draft_order_data)
+        old_case_data = _json_obj(case.normalized_data) or old_draft
+        quote_flow_type = _resolve_followup_quote_flow_type(
+            current_flow_type=quote_flow_type,
+            merged_entities=merged_entities,
+            case_data=old_case_data,
+            quote_state_changed=quote_state_changed,
+        )
+        if quote_flow_type != QUOTE_FLOW_NORMAL or QUOTE_FLOW_TYPE_KEY in merged_entities:
+            merged_entities[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
         merged_overrides = _merge_quote_config_overrides(
             old_draft.get("quote_field_overrides"),
             quote_field_overrides,
@@ -15320,30 +16149,25 @@ async def handle_quote_message(
             quote_data_overrides,
         )
         text_patch: Dict[str, Any] = {**quote_date_overrides, **transfer_vehicle_text_data}
+        if quote_flow_type != QUOTE_FLOW_NORMAL or QUOTE_FLOW_TYPE_KEY in merged_entities:
+            text_patch[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
         if merged_overrides:
             text_patch["quote_field_overrides"] = merged_overrides
         if merged_data_overrides:
             text_patch.update(merged_data_overrides)
             text_patch[QUOTE_DATA_OVERRIDES_KEY] = merged_data_overrides
-        old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
-        incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
-        if quote_command_mode == "全保":
-            merged_product_exclusions: List[str] = _normalize_quote_product_exclusions(quote_product_exclusions)
-        elif quote_command_mode == "单商":
-            merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *quote_product_exclusions])
-        elif quote_command_mode == "交三":
-            merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
-        elif quote_product_exclusions:
-            merged_product_exclusions = _normalize_quote_product_exclusions([*old_product_exclusions, *incoming_product_exclusions])
-        elif QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
-            merged_product_exclusions = incoming_product_exclusions
-        else:
-            merged_product_exclusions = []
-        if quote_product_exclusions or quote_command_mode in {"全保", "交三", "单商"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+        old_product_exclusions = _normalize_quote_product_exclusions(old_case_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+        merged_product_exclusions, product_state_explicit = _merge_quote_product_exclusions_for_command(
+            current_exclusions=old_product_exclusions,
+            merged_entities=merged_entities,
+            quote_command_mode=quote_command_mode,
+            quote_product_exclusions=quote_product_exclusions,
+        )
+        if product_state_explicit or (quote_state_changed and old_product_exclusions):
             text_patch[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
         images_by_slot = await _active_images_by_slot(db, case.id)
         next_normalized = _normalize_quote_case_data(
-            base_data=_json_obj(case.normalized_data) or old_draft,
+            base_data=old_case_data,
             order_data={},
             text_data=text_patch,
             images_by_slot=images_by_slot,
@@ -15497,6 +16321,20 @@ async def handle_quote_message(
 
     order_data = _order_data(order)
     old_draft = _json_obj(case.draft_order_data)
+    old_case_data = _json_obj(case.normalized_data) or old_draft
+    resolved_quote_flow_type = _resolve_followup_quote_flow_type(
+        current_flow_type=quote_flow_type,
+        merged_entities=merged_entities,
+        case_data=old_case_data,
+        quote_state_changed=quote_state_changed,
+    )
+    if resolved_quote_flow_type != quote_flow_type:
+        # Follow-up parameter changes should stay inside the active branch
+        # (for example renewal quotePolicy.do) unless the command explicitly switches flow.
+        quote_flow_type = resolved_quote_flow_type
+    if quote_flow_type != QUOTE_FLOW_NORMAL or QUOTE_FLOW_TYPE_KEY in merged_entities:
+        merged_entities[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
+        text_data[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
     merged_quote_field_overrides = _merge_quote_config_overrides(
         old_draft.get("quote_field_overrides"),
         merged_entities.get("quote_field_overrides"),
@@ -15510,21 +16348,14 @@ async def handle_quote_message(
     if merged_quote_data_overrides:
         text_data.update(merged_quote_data_overrides)
         text_data[QUOTE_DATA_OVERRIDES_KEY] = merged_quote_data_overrides
-    old_product_exclusions = _normalize_quote_product_exclusions(old_draft.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
-    incoming_product_exclusions = _normalize_quote_product_exclusions(merged_entities.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
-    if quote_command_mode == "全保":
-        merged_product_exclusions = _normalize_quote_product_exclusions(quote_product_exclusions)
-    elif quote_command_mode == "单商":
-        merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *quote_product_exclusions])
-    elif quote_command_mode == "交三":
-        merged_product_exclusions = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *quote_product_exclusions])
-    elif quote_product_exclusions:
-        merged_product_exclusions = _normalize_quote_product_exclusions([*old_product_exclusions, *incoming_product_exclusions])
-    elif QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
-        merged_product_exclusions = incoming_product_exclusions
-    else:
-        merged_product_exclusions = []
-    if quote_product_exclusions or quote_command_mode in {"全保", "交三", "单商"} or QUOTE_PRODUCT_EXCLUSIONS_KEY in merged_entities:
+    old_product_exclusions = _normalize_quote_product_exclusions(old_case_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    merged_product_exclusions, product_state_explicit = _merge_quote_product_exclusions_for_command(
+        current_exclusions=old_product_exclusions,
+        merged_entities=merged_entities,
+        quote_command_mode=quote_command_mode,
+        quote_product_exclusions=quote_product_exclusions,
+    )
+    if product_state_explicit or (quote_state_changed and old_product_exclusions):
         text_data[QUOTE_PRODUCT_EXCLUSIONS_KEY] = merged_product_exclusions
 
     await _sync_order_images_to_case(db, case=case, owner_user_id=owner_user_id, order=order)
@@ -15537,7 +16368,7 @@ async def handle_quote_message(
 
     images_by_slot = await _active_images_by_slot(db, case.id)
     normalized_data = _normalize_quote_case_data(
-        base_data=old_draft,
+        base_data=old_case_data,
         order_data=order_data,
         text_data=text_data,
         images_by_slot=images_by_slot,
@@ -15550,7 +16381,7 @@ async def handle_quote_message(
     vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
     auto_account_type_name = _normalize_account_type_name(vehicle_type_detect.get("config_type_name"))
     selected_account_type_name = account_type_name or auto_account_type_name
-    platform_account = await _select_quote_platform_account(
+    platform_account = await _select_logged_quote_platform_account(
         db,
         owner_user_id=owner_user_id,
         platform_code=platform_code,
@@ -15564,12 +16395,15 @@ async def handle_quote_message(
             platform_code=platform_code,
             account_type_name=None,
         )
-    missing = _missing_requirements(
-        normalized_data,
-        images_by_slot,
-        platform_code=platform_code,
-        account_type_name=selected_account_type_name,
-    )
+    if quote_flow_type == QUOTE_FLOW_RENEWAL:
+        missing = _renewal_lookup_missing_requirements(normalized_data)
+    else:
+        missing = _missing_requirements(
+            normalized_data,
+            images_by_slot,
+            platform_code=platform_code,
+            account_type_name=selected_account_type_name,
+        )
     case.missing_requirements = missing
     missing_account = platform_account is None
     account_pool_unavailable = bool(missing_account and platform_has_enabled_account)
@@ -15731,6 +16565,58 @@ async def handle_quote_message(
 
     snapshot = _snapshot_payload(case=case, normalized_data=normalized_data, images_by_slot=images_by_slot)
     trace_id = _new_trace_id()
+    if quote_flow_type == QUOTE_FLOW_RENEWAL:
+        if _has_reusable_renewal_quote_context(normalized_data):
+            snapshot = await apply_platform_default_config_to_snapshot(
+                db,
+                snapshot={
+                    **snapshot,
+                    "vehicle_type_detect": vehicle_type_detect,
+                    "quote_flow_type": QUOTE_FLOW_RENEWAL,
+                    QUOTE_PRODUCT_EXCLUSIONS_KEY: _normalize_quote_product_exclusions(
+                        normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
+                    ),
+                },
+                platform_code=platform_code,
+                account_type_name=platform_account.account_type_name,
+                config_type_name=selected_account_type_name,
+            )
+            return await _continue_quote_with_platform_account(
+                db,
+                case=case,
+                owner_user_id=owner_user_id,
+                snapshot=snapshot,
+                trace_id=trace_id,
+                platform_account=platform_account,
+                merged_entities={
+                    **merged_entities,
+                    QUOTE_FLOW_TYPE_KEY: QUOTE_FLOW_RENEWAL,
+                    "quote_case_id": case.id,
+                },
+                normalized_data=normalized_data,
+                images_by_slot=images_by_slot,
+                attached_images=attached_images,
+                config_type_name=selected_account_type_name,
+                reply_prefix=override_reply_prefix,
+                operator_role_name=operator_role_name,
+            )
+        snapshot = {
+            **snapshot,
+            "vehicle_type_detect": vehicle_type_detect,
+            "quote_flow_type": QUOTE_FLOW_RENEWAL,
+            QUOTE_PRODUCT_EXCLUSIONS_KEY: _normalize_quote_product_exclusions(
+                normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
+            ),
+        }
+        return await _continue_renewal_lookup_with_platform_account(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            operator_role_name=operator_role_name,
+        )
     snapshot = await apply_platform_default_config_to_snapshot(
         db,
         snapshot=snapshot,
@@ -15956,7 +16842,7 @@ async def handle_quote_material_status(
             case.status = CASE_STATUS_READY if not missing else CASE_STATUS_COLLECTING
         case.updated_at = _now()
         await db.flush()
-    platform_account = await _select_quote_platform_account(
+    platform_account = await _select_logged_quote_platform_account(
         db,
         owner_user_id=owner_user_id,
         platform_code=case.platform_code or "",

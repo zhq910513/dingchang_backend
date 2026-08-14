@@ -56,6 +56,9 @@ class QuotePlatformAdapter:
     async def quote(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="success", data={"mode": "stub"})
 
+    async def query_renewal(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return PlatformRuntimeResult(status="failed", message="当前平台暂不支持续保查询")
+
     async def query_joint_sales_plan(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="failed", message="当前平台暂不支持途家安顺保额查询")
 

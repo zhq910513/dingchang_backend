@@ -60,6 +60,7 @@ from app.services.quote_assistant_service import (
     create_platform_account_profile as _create_platform_account_profile,
     delete_platform_default_config as _delete_platform_default_config,
     get_platform_account_profile as _get_platform_account_profile,
+    get_quote_platform_account_health as _get_quote_platform_account_health,
     list_platform_default_configs as _list_platform_default_configs,
     list_platform_account_profiles as _list_platform_account_profiles,
     list_platform_account_types as _list_platform_account_types,
@@ -666,6 +667,20 @@ async def list_quote_platforms(
 ):
     _owner_user_id_or_401(ctx)
     return {"ok": True, "data": {"platforms": _list_quote_platforms()}}
+
+
+@router.get("/platform-account-health")
+async def quote_platform_account_health(
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    require_quote_assistant_quote_use_access(role_name=ctx.primary_role)
+    try:
+        result = await _get_quote_platform_account_health(db, owner_user_id=owner_user_id)
+        return {"ok": True, "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_quote_api_error_detail(e))
 
 
 @router.get("/platform-default-configs")

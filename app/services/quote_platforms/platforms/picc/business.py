@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import re
@@ -9,6 +10,8 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Mapping, Optional
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult, QuotePlatformAdapter
 from app.services.quote_platforms.platforms.picc.base import (
@@ -59,9 +62,13 @@ QUERY_QUALITY_FLAG_PATH = "/khyx/newFront/qth/price/queryQualityFlag.do"
 GET_CLUB_GIFT_DISPLAY_INFO_PATH = "/khyx/newFront/qth/price/getClubGiftDisplayInfo.do"
 QUERY_CAR_CHECKER_PATH = "/khyx/newFront/common/queryCarchecker.do"
 GET_CURRENT_TIME_PATH = "/khyx/newFront/price/getCurrentTime.do"
+RENEWAL_CHECK_OWNER_PATH = "/khyx/newFront/price/checkIsOwner.do"
+RENEWAL_QUOTE_SEARCH_PATH = "/khyx/newFront/qth/price/quoteRenew.do"
+RENEWAL_QUOTE_POLICY_PATH = "/khyx/newFront/qth/price/quotePolicy.do"
 QUOTE_PATH = "/khyx/newFront/qth/price/quote.do"
 QUERY_QUOTE_TIMES_PATH = "/khyx/newFront/qth/price/queryQuoteTimes.do"
 CLEAR_JS_QUOTATION_NO_PATH = "/khyx/newFront/qth/price/clearJSQuotationNo.do"
+RENEWAL_POLICY_AES_KEY = b"8F6B2AK33DZE20A05E74C231B47AC8F9"
 TZ_BJ = timezone(timedelta(hours=8))
 
 JOINT_SALES_QUOTATION_FIELDS = {
@@ -763,6 +770,17 @@ def _clean_money_text_or_empty(value: Any) -> str:
     return _clean_money_text(value) if _has_text(value) else ""
 
 
+def _picc_encrypt_renewal_policy_no(value: Any) -> str:
+    text = _to_str(value).strip()
+    if not text:
+        return ""
+    raw = text.encode("utf-8")
+    pad_size = 16 - (len(raw) % 16)
+    padded = raw + bytes([pad_size]) * pad_size
+    encryptor = Cipher(algorithms.AES(RENEWAL_POLICY_AES_KEY), modes.ECB()).encryptor()
+    return base64.b64encode(encryptor.update(padded) + encryptor.finalize()).decode("ascii")
+
+
 def _int_text(value: Any, default: str = "0") -> str:
     try:
         return str(int(_money(value, default)))
@@ -817,6 +835,23 @@ def _end_date_text(start_date: Any) -> str:
     except ValueError:
         next_year = start.replace(year=start.year + 1, day=28)
     return (next_year - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _renewal_next_start_date(end_date: Any) -> str:
+    end_day = _parse_date(end_date)
+    if not end_day:
+        return _next_day_text()
+    return (end_day + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _year_start_date(value: Any) -> str:
+    day = _parse_date(value)
+    return f"{day.year}-01-01" if day else ""
+
+
+def _year_end_date(value: Any) -> str:
+    day = _parse_date(value)
+    return f"{day.year}-12-31" if day else ""
 
 
 def _use_years(enroll_date: Any, today: Optional[date] = None) -> str:
@@ -1778,6 +1813,25 @@ def _pick_highest_price_vehicle(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return max(rows, key=_vehicle_price)
 
 
+def _renewal_row_end_sort_value(row: Mapping[str, Any]) -> tuple[str, str]:
+    end_key = re.sub(r"\D+", "", _to_str(row.get("end_date") or row.get("endDate")))
+    risk_code = _to_str(row.get("risk_code") or row.get("riskCode")).strip().upper()
+    risk_rank = "0" if risk_code == "DAA" else "1" if risk_code == "DZA" else "2"
+    return end_key, risk_rank
+
+
+def _pick_renewal_policy_candidate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows:
+        return {}
+    flagged = [
+        row
+        for row in rows
+        if _to_str(row.get("renewal_or_copy_flag") or row.get("renewalOrCopyFlag")).strip() == "1"
+    ]
+    pool = flagged or rows
+    return min(pool, key=_renewal_row_end_sort_value)
+
+
 def _quote_loss_override_amount(quote_payload: Mapping[str, Any], defaults: Optional[Mapping[str, Any]] = None) -> Decimal:
     if defaults is not None and _product_excluded(defaults, PRODUCT_LOSS):
         return Decimal("0")
@@ -2265,6 +2319,53 @@ def _profile_license_color_code(profile: Mapping[str, Any], energy_fields: Mappi
     return _profile_text(profile, "license_color_code", "01") or "01"
 
 
+def _normalize_license_type_value(value: Any) -> str:
+    text = re.sub(r"\s+", "", _to_str(value)).upper()
+    if not text:
+        return ""
+    if text in {"52", "新能源", "新能源车", "小型新能源汽车", "小型新能源汽车号牌", "绿色", "绿牌"}:
+        return "52"
+    if text in {"02", "油车", "燃油", "燃油车", "小型汽车", "小型汽车号牌", "蓝色", "蓝牌"}:
+        return "02"
+    if re.search(r"(?:新能源|绿牌|绿色|小型新能源)", text):
+        return "52"
+    if re.search(r"(?:燃油|油车|蓝牌|蓝色|小型汽车号牌|小型汽车)", text):
+        return "02"
+    return text if text in {"02", "52"} else ""
+
+
+def _license_color_for_type(value: Any) -> str:
+    license_type = _normalize_license_type_value(value)
+    if license_type == "52":
+        return "52"
+    if license_type == "02":
+        return "01"
+    return ""
+
+
+def _license_decision_fields(value: Any) -> Dict[str, str]:
+    decision = _json_obj(value)
+    if _to_str(decision.get("source")).strip() == "fallback":
+        return {}
+    license_type = _normalize_license_type_value(
+        decision.get("license_type")
+        or decision.get("licenseType")
+        or decision.get("license_plate_type")
+        or decision.get("licensePlateType")
+    )
+    if not license_type:
+        return {}
+    return {
+        "license_type": license_type,
+        "license_color_code": _first_text(
+            _normalize_license_type_value(decision.get("license_color_code") or decision.get("licenseColorCode")),
+            _license_color_for_type(license_type),
+        ),
+        "source": _to_str(decision.get("source")).strip(),
+        "reason": _to_str(decision.get("reason")).strip(),
+    }
+
+
 def _profile_tax_defaults(
     profile: Mapping[str, Any],
     energy_fields: Mapping[str, Any],
@@ -2298,16 +2399,51 @@ def _profile_license_fields(
     profile: Mapping[str, Any],
     energy_fields: Mapping[str, Any],
     defaults: Mapping[str, Any],
+    vehicle: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, str]:
+    vehicle_obj = _json_obj(vehicle)
+    decision_fields = _license_decision_fields(vehicle_obj.get("license_type_decision"))
+    if decision_fields:
+        return {
+            "license_type": decision_fields["license_type"],
+            "license_color_code": _first_text(
+                decision_fields.get("license_color_code"),
+                _license_color_for_type(decision_fields["license_type"]),
+            ),
+        }
+
+    profile_license_type = _normalize_license_type_value(_profile_license_type(profile, energy_fields))
+    profile_license_color_code = _profile_license_color_code(profile, energy_fields)
+    default_license_type = _normalize_license_type_value(_field_value(defaults, "号牌种类", "licenseType"))
+    default_license_color_code = _to_str(_field_value(defaults, "车牌颜色代码", "licenseColorCode")).strip()
+
+    if default_license_type:
+        return {
+            "license_type": default_license_type,
+            "license_color_code": _first_text(
+                default_license_color_code,
+                _license_color_for_type(default_license_type),
+            ),
+        }
+
+    vehicle_license_type = _normalize_license_type_value(
+        vehicle_obj.get("licenseType")
+        or vehicle_obj.get("license_type")
+    )
+    if vehicle_license_type and (
+        not profile_license_type
+        or vehicle_license_type == profile_license_type
+    ):
+        return {
+            "license_type": vehicle_license_type,
+            "license_color_code": _first_text(
+                _normalize_license_type_value(vehicle_obj.get("licenseColorCode") or vehicle_obj.get("license_color_code")),
+                _license_color_for_type(vehicle_license_type),
+            ),
+        }
     return {
-        "license_type": _first_text(
-            _field_value(defaults, "号牌种类", "licenseType"),
-            _profile_license_type(profile, energy_fields),
-        ),
-        "license_color_code": _first_text(
-            _field_value(defaults, "车牌颜色代码", "licenseColorCode"),
-            _profile_license_color_code(profile, energy_fields),
-        ),
+        "license_type": profile_license_type or "02",
+        "license_color_code": _first_text(profile_license_color_code, _license_color_for_type(profile_license_type), "01"),
     }
 
 
@@ -2468,7 +2604,7 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     profile = _motor_quote_profile(body.get("accountTypeName"))
     defaults = _json_obj(body.get("defaultFields"))
     energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=profile)
-    license_fields = _profile_license_fields(profile, energy_fields, defaults)
+    license_fields = _profile_license_fields(profile, energy_fields, defaults, vehicle=vehicle)
     tax_fields = _profile_tax_field_values(
         profile,
         energy_fields,
@@ -2669,6 +2805,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
     async def quote(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await asyncio.to_thread(self._quote_sync, ctx, quote_payload)
 
+    async def query_renewal(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        return await asyncio.to_thread(self._query_renewal_sync, ctx, quote_payload)
+
     async def query_joint_sales_plan(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await asyncio.to_thread(self._query_joint_sales_plan_sync, ctx, quote_payload)
 
@@ -2742,6 +2881,498 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
             )
         return result
+
+    def _renewal_lookup_vehicle(
+        self,
+        ctx: PlatformAccountContext,
+        quote_payload: Mapping[str, Any],
+    ) -> Dict[str, str]:
+        payload = _json_obj(quote_payload)
+        normalized = _clean_vehicle_cert_fields(_json_obj(payload.get("normalized_data")))
+        detected = _json_obj(payload.get("vehicle_type_detect"))
+        account_type = _normalize_account_type(
+            detected.get("config_type_name")
+            or payload.get("account_type_name")
+            or ctx.account_type_name
+            or USED_FUEL_ACCOUNT_TYPE
+        )
+        profile = _motor_quote_profile(account_type) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
+        decision = _json_obj(normalized.get("license_type_decision"))
+        license_type = _normalize_license_type_value(
+            normalized.get("license_type")
+            or normalized.get("licenseType")
+            or decision.get("license_type")
+            or decision.get("licenseType")
+            or _profile_text(profile, "license_type")
+        )
+        if not license_type:
+            license_type = "52" if "新能源" in account_type else "02"
+        return {
+            "plate_no": _clean_vehicle_cert_value("plate_no", normalized.get("plate_no")),
+            "engine_no": _clean_vehicle_cert_value("engine_no", normalized.get("engine_no")),
+            "vin": _clean_vehicle_cert_value("vin", normalized.get("vin")),
+            "license_type": license_type,
+            "license_color_code": _license_color_for_type(license_type),
+        }
+
+    def _renewal_candidate_summary(self, row: Mapping[str, Any]) -> Dict[str, Any]:
+        item = _json_obj(row)
+        return {
+            "policy_no": _to_str(item.get("policyNo")).strip(),
+            "policy_no_encode": _to_str(item.get("policyNoEncode")).strip(),
+            "relation_policy_no": _to_str(item.get("relationPolicyNo")).strip(),
+            "relation_policy_no_encode": _to_str(item.get("relationPolicyNoEncode")).strip(),
+            "risk_code": _to_str(item.get("riskCode")).strip(),
+            "license_no": _to_str(item.get("licenseNo")).strip(),
+            "license_type": _normalize_license_type_value(item.get("licenseType")),
+            "engine_no": _clean_vehicle_cert_value("engine_no", item.get("engineNo")),
+            "vin": _clean_vehicle_cert_value("vin", item.get("frameNo") or item.get("vinNo")),
+            "insured_name": _to_str(item.get("insuredName")).strip(),
+            "end_date": _to_str(item.get("endDate")).strip(),
+            "renewal_or_copy_flag": _to_str(item.get("renewalOrCopyFlag")).strip(),
+            "car_kind_code": _to_str(item.get("carKindCode")).strip(),
+            "no_dam_years_bi": _to_str(item.get("noDamYearsBI")).strip(),
+            "no_dam_years_ci": _to_str(item.get("noDamYearsCI")).strip(),
+            "last_damaged_bi": _to_str(item.get("lastDamagedBI")).strip(),
+            "last_damaged_ci": _to_str(item.get("lastDamagedCI")).strip(),
+            "raw": item,
+        }
+
+    def _query_renewal_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
+        client: Optional[PiccProtocolClient] = None
+        vehicle: Dict[str, str] = {}
+        try:
+            vehicle = self._renewal_lookup_vehicle(ctx, quote_payload)
+            plate_no = _to_str(vehicle.get("plate_no")).strip()
+            engine_no = re.sub(r"[^A-Z0-9]", "", _to_str(vehicle.get("engine_no")).upper())
+            vin = re.sub(r"[^A-Z0-9]", "", _to_str(vehicle.get("vin")).upper())
+            license_type = _normalize_license_type_value(vehicle.get("license_type")) or "02"
+            if not plate_no:
+                raise PiccRequestError("人保续保查询缺少号牌号码")
+            if not engine_no and not vin:
+                raise PiccRequestError("人保续保查询缺少发动机号或车架号")
+
+            client = self._client(ctx)
+            headers = {"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"}
+            owner_check = client.request_json(
+                "GET",
+                RENEWAL_CHECK_OWNER_PATH,
+                purpose="business",
+                params={
+                    "lastPolicyNo": "",
+                    "licenseNo4Renew": plate_no,
+                    "vinNo": vin,
+                    "taskId": "",
+                },
+                headers=headers,
+            )
+            _ensure_platform_success(owner_check, action="续保车主校验")
+            is_owner = _to_str(_json_obj(owner_check).get("data")).strip().lower() == "true"
+            lookup_params = {
+                "lastPolicyNo": "",
+                "engineNo4Renew1": "",
+                "frameNo4Renew1": "",
+                "licenseNo4Renew": plate_no,
+                "licenseType4Renew": license_type,
+                "engineNo4Renew2": engine_no[-4:] if engine_no else "",
+                "frameNo4Renew2": "",
+                "frameNo4Renew3": "",
+                "rows": 10,
+                "page": 1,
+                "sort": "endDate",
+                "order": "desc",
+                "isOwner": "true" if is_owner else "false",
+                "khyxRenewByLicenseNo": "0",
+                "taskId": "",
+            }
+            renewal_response = client.request_json(
+                "GET",
+                RENEWAL_QUOTE_SEARCH_PATH,
+                purpose="business",
+                params=lookup_params,
+                headers=headers,
+            )
+            _ensure_platform_success(renewal_response, action="续保查询")
+            response_data = _json_obj(_json_obj(renewal_response).get("data"))
+            raw_rows = response_data.get("list")
+            candidates = [
+                self._renewal_candidate_summary(row)
+                for row in raw_rows
+                if isinstance(row, Mapping)
+            ] if isinstance(raw_rows, list) else []
+            candidates = [row for row in candidates if row.get("policy_no") or row.get("policy_no_encode")]
+            lookup_payload = {
+                "vehicle": vehicle,
+                "check_is_owner": is_owner,
+                "params": lookup_params,
+                "candidates": candidates,
+            }
+            if not candidates:
+                message = _platform_message(renewal_response, "")
+                if not re.search(
+                    r"(没有此车辆信息|不是可续保车辆|不可续保|无续保信息|未查询到续保)",
+                    re.sub(r"\s+", "", message),
+                ):
+                    message = "没有此车辆信息或不是可续保车辆"
+                return PlatformRuntimeResult(
+                    status="success",
+                    message=message,
+                    data=success_data(
+                        client,
+                        extra={
+                            "business_status": "renewal_not_found",
+                            "renewal_found": False,
+                            "renewal_lookup": lookup_payload,
+                            "platform_response": _platform_debug_payload(renewal_response),
+                        },
+                    ),
+                )
+            return PlatformRuntimeResult(
+                status="success",
+                message="已查询到可续保保单",
+                data=success_data(
+                    client,
+                    extra={
+                        "business_status": "renewal_found",
+                        "renewal_found": True,
+                        "renewal_lookup": lookup_payload,
+                        "platform_response": _platform_debug_payload(renewal_response),
+                    },
+                ),
+            )
+        except PiccSessionExpiredError as exc:
+            return PlatformRuntimeResult(
+                status="expired",
+                message=str(exc) or "PICC 登录已过期，请重新登录",
+                data={
+                    "business_status": "16",
+                    "error_code": exc.__class__.__name__,
+                    "renewal_lookup": {"vehicle": vehicle},
+                },
+            )
+        except PiccTransientGatewayError as exc:
+            payload: Dict[str, Any] = {
+                "error_code": exc.__class__.__name__,
+                "transient": True,
+                "renewal_lookup": {"vehicle": vehicle},
+            }
+            if client is not None:
+                payload = success_data(client, extra=payload)
+            return PlatformRuntimeResult(
+                status="network_error",
+                message=str(exc) or "PICC 平台网关临时异常，请稍后重试",
+                data=payload,
+            )
+        except PiccRequestError as exc:
+            payload = {
+                "error_code": exc.__class__.__name__,
+                "error_stage": getattr(exc, "action", "") or "renewal_lookup",
+                "renewal_lookup": {"vehicle": vehicle},
+            }
+            if isinstance(exc, PiccBusinessRequestError):
+                payload["platform_response"] = _platform_debug_payload(getattr(exc, "platform_response", None))
+                payload["platform_dialog"] = _platform_business_error_dialog(getattr(exc, "platform_response", None))
+            if client is not None:
+                payload = success_data(client, extra=payload)
+            return PlatformRuntimeResult(status="failed", message=str(exc) or "人保续保查询失败", data=payload)
+        except Exception as exc:
+            payload = {
+                "error_code": exc.__class__.__name__,
+                "error_stage": "renewal_lookup",
+                "renewal_lookup": {"vehicle": vehicle},
+            }
+            if client is not None:
+                payload = success_data(client, extra=payload)
+            return PlatformRuntimeResult(status="failed", message=str(exc) or "人保续保查询失败", data=payload)
+
+    def _fetch_renewal_policy_prefill(
+        self,
+        client: PiccProtocolClient,
+        candidate: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        row = _json_obj(candidate.get("raw")) or _json_obj(candidate)
+        policy_no = _to_str(row.get("policyNo") or candidate.get("policy_no")).strip()
+        policy_no_encode = _to_str(row.get("policyNoEncode") or candidate.get("policy_no_encode")).strip()
+        if not policy_no or not policy_no_encode:
+            raise PiccRequestError("人保续保一键回填缺少保单号或加密保单号")
+        encrypted_policy_no = _picc_encrypt_renewal_policy_no(policy_no)
+        data = client.request_json(
+            "GET",
+            RENEWAL_QUOTE_POLICY_PATH,
+            purpose="business",
+            params={
+                "policyNo": encrypted_policy_no,
+                "policyNoEncode": policy_no_encode,
+            },
+            headers={"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"},
+        )
+        _ensure_platform_success(data, action="续保一键回填")
+        payload = _json_obj(_json_obj(data).get("data"))
+        if not payload:
+            raise PiccRequestError("人保续保一键回填未返回可用资料")
+        return {
+            "request": {
+                "policyNo": encrypted_policy_no,
+                "policyNoEncode": policy_no_encode,
+                "plainPolicyNo": policy_no,
+            },
+            "response": payload,
+            "platform_response": _platform_debug_payload(data),
+        }
+
+    def _renewal_prefill_vehicle_data(self, prefill: Mapping[str, Any], candidate: Mapping[str, Any]) -> Dict[str, Any]:
+        data = _json_obj(prefill.get("response") or prefill)
+        car = _clean_vehicle_cert_fields(_json_obj(data.get("renewItemCarVo")))
+        main = _json_obj(data.get("renewMainVo"))
+        selected_license_type = _normalize_license_type_value(
+            car.get("licenseType")
+            or candidate.get("license_type")
+            or _json_obj(candidate.get("raw")).get("licenseType")
+        )
+        vin = _clean_vehicle_cert_value("vin", _first_text(car.get("vinNo"), car.get("frameNo"), candidate.get("vin")))
+        engine_no = _clean_vehicle_cert_value("engine_no", _first_text(car.get("engineNo"), candidate.get("engine_no")))
+        plate_no = _clean_vehicle_cert_value("plate_no", _first_text(car.get("licenseNo"), candidate.get("license_no")))
+        start_date_bi = _renewal_next_start_date(main.get("endDate") or candidate.get("end_date"))
+        start_date_ci = _renewal_next_start_date(main.get("endDateCI") or candidate.get("end_date"))
+        out = {
+            "account_type_name": USED_FUEL_ACCOUNT_TYPE,
+            "plate_no": plate_no,
+            "engine_no": engine_no,
+            "vin": vin,
+            "owner_name": _first_text(car.get("carOwner"), candidate.get("insured_name")),
+            "vehicle_model": _first_text(car.get("brandName"), car.get("modelName")),
+            "vehicle_brand_name": _first_text(car.get("brandName"), car.get("modelName")),
+            "first_register_date": _date_text(car.get("enrollDate")),
+            "commercial_start_date": start_date_bi,
+            "compulsory_start_date": start_date_ci,
+            "approved_passenger_count": _first_text(car.get("seatCount"), "5"),
+            "license_type": selected_license_type,
+            "license_color_code": _license_color_for_type(selected_license_type),
+            "license_type_decision": _json_obj(
+                {
+                    "license_type": selected_license_type,
+                    "license_color_code": _license_color_for_type(selected_license_type),
+                    "source": "renewal_policy_prefill",
+                    "reason": "人保续保一键回填返回号牌种类",
+                }
+            ),
+            "renewal_policy_prefill": {
+                "policy_no": _first_text(main.get("policyNo"), candidate.get("policy_no")),
+                "policy_ci_no": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
+                "proposal_no_bi": _first_text(main.get("proposalNoBI"), _json_obj(data.get("renewMainSub")).get("proposalNoBI")),
+                "proposal_no_ci": _first_text(main.get("proposalNoCI"), _json_obj(data.get("renewMainSub")).get("proposalNoCI")),
+                "start_date_bi": start_date_bi,
+                "start_date_ci": start_date_ci,
+            },
+        }
+        quote_overrides = self._renewal_product_defaults_from_prefill(data)
+        if quote_overrides:
+            out["renewal_quote_field_defaults"] = quote_overrides
+        vehicle_form = {
+            "licenseNo": plate_no,
+            "licenseType": selected_license_type,
+            "licenseColorCode": _license_color_for_type(selected_license_type),
+            "engineNo": engine_no,
+            "vin": vin,
+            "carKindCode": _first_text(car.get("carKindCode"), candidate.get("car_kind_code"), "A01"),
+            "useNatureCode": _first_text(car.get("useNatureCode"), "211"),
+            "enrollDate": _date_text(car.get("enrollDate")),
+            "startDateBI": start_date_bi,
+            "startDateCI": start_date_ci,
+            "modelName": _first_text(car.get("brandName"), car.get("modelName")),
+            "rawModelName": _first_text(car.get("brandName"), car.get("modelName")),
+            "seatCount": _first_text(car.get("seatCount"), "5"),
+            "purchasePrice": _clean_money_text_or_empty(car.get("purchasePrice")),
+            "actualValue": _money_text_or_empty(car.get("actualValue")),
+            "modelCode": _to_str(car.get("modelCode")).strip(),
+            "platformModelCode": _to_str(car.get("modelCode")).strip(),
+            "selectedVehicleId": _to_str(car.get("modelCode")).strip(),
+            "selectedModelName": _first_text(car.get("brandName"), car.get("modelName")),
+        }
+        out["renewal_request_body_seed"] = {
+            "vehicleForm": _clean_vehicle_cert_fields(vehicle_form),
+            "ownerForm": {
+                "ownerName": _first_text(car.get("carOwner"), candidate.get("insured_name")),
+            },
+            "preflight": {
+                "renewalPolicyPrefill": {
+                    "request": _json_obj(prefill.get("request")),
+                    "policyNo": _first_text(main.get("policyNo"), candidate.get("policy_no")),
+                    "policyCINo": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
+                }
+            },
+        }
+        return _clean_vehicle_cert_fields({key: value for key, value in out.items() if value not in (None, "")})
+
+    def _renewal_product_defaults_from_prefill(self, policy_data: Mapping[str, Any]) -> Dict[str, Any]:
+        rows = policy_data.get("renewItemKindVoList") if isinstance(policy_data.get("renewItemKindVoList"), list) else []
+        defaults: Dict[str, Any] = {}
+        for row_any in rows:
+            row = _json_obj(row_any)
+            kind_code = _to_str(row.get("kindCode")).strip()
+            amount = _clean_money_text_or_empty(row.get("amount"))
+            unit_amount = _clean_money_text_or_empty(row.get("unitAmount"))
+            if kind_code == "051051" and amount:
+                defaults.setdefault(PRODUCT_THIRD_PARTY, _wan_or_amount_to_wan_text(amount, "300"))
+            elif kind_code == "051052" and (unit_amount or amount):
+                defaults.setdefault(PRODUCT_DRIVER, unit_amount or amount)
+            elif kind_code == "051053" and (unit_amount or amount):
+                defaults.setdefault(PRODUCT_PASSENGER, unit_amount or amount)
+            elif kind_code == "051063" and amount:
+                defaults.setdefault(PRODUCT_MEDICAL_THIRD, amount)
+                if _to_str(row.get("sharedAmountFlag")).strip() == "1":
+                    defaults.setdefault(PRODUCT_SHARED_LIMIT, True)
+            elif kind_code == "051074" and amount:
+                defaults.setdefault(PRODUCT_COMPULSORY, _wan_or_amount_to_wan_text(amount, "20"))
+        return defaults
+
+    def _apply_renewal_prefill_to_quote_body(
+        self,
+        body: Mapping[str, Any],
+        renewal_data: Mapping[str, Any],
+        prefill: Mapping[str, Any],
+        selected: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        out = _clean_used_fuel_request_body(body)
+        form = _clean_vehicle_cert_fields(_json_obj(out.get("quoteForm")))
+        vehicle = _clean_vehicle_cert_fields(_json_obj(out.get("vehicleForm")))
+        if not form:
+            out["quoteForm"] = form
+            return out
+
+        policy = _json_obj(renewal_data.get("renewal_policy_prefill"))
+        response = _json_obj(prefill.get("response"))
+        car = _clean_vehicle_cert_fields(_json_obj(response.get("renewItemCarVo")))
+        main = _json_obj(response.get("renewMainVo"))
+        main_sub = _json_obj(response.get("renewMainSub"))
+
+        policy_no_bi = _first_text(
+            policy.get("policy_no"),
+            main.get("policyNo"),
+            main_sub.get("policyNoBI"),
+            selected.get("relation_policy_no") if _to_str(selected.get("risk_code")).strip().upper() == "DZA" else selected.get("policy_no"),
+        )
+        policy_no_ci = _first_text(
+            policy.get("policy_ci_no"),
+            main.get("policyCINo"),
+            main_sub.get("policyNoCI"),
+            selected.get("policy_no") if _to_str(selected.get("risk_code")).strip().upper() == "DZA" else selected.get("relation_policy_no"),
+        )
+        start_date_bi = _first_text(
+            _date_text(policy.get("start_date_bi")),
+            _date_text(renewal_data.get("commercial_start_date")),
+            form.get("prpCmain.startDate"),
+        )
+        start_date_ci = _first_text(
+            _date_text(policy.get("start_date_ci")),
+            _date_text(renewal_data.get("compulsory_start_date")),
+            form.get("prpCmain.startDateCI"),
+        )
+
+        form.update(
+            {
+                "renewed": "1",
+                "lastPolicyNo": policy_no_ci or policy_no_bi,
+                "prpCitemCar.lastBIPolicyNo": policy_no_bi,
+                "prpCitemCar.lastCIPolicyNo": policy_no_ci,
+                "prpCitemCar.Nodamageyears": _first_text(main.get("noDamYearsBI"), selected.get("no_dam_years_bi"), "0"),
+                "prpCitemCarExt.noDamYearsBI": _first_text(main.get("noDamYearsBI"), selected.get("no_dam_years_bi"), "0"),
+                "prpCitemCarExt.lastDamagedBI": _first_text(main.get("lastDamagedBI"), selected.get("last_damaged_bi"), "0"),
+                "prpCitemCarExt.lastDamagedCI": _first_text(main.get("lastDamagedCI"), selected.get("last_damaged_ci"), "0"),
+                "prpCitemCarExt.thisDamagedBI": _first_text(main.get("thisDamagedBI"), "0"),
+                "prpCcarShipTax.leviedDate": _first_text(start_date_bi, start_date_ci, form.get("prpCcarShipTax.leviedDate")),
+                "prpCcarShipTax.payStartDate": _first_text(
+                    form.get("prpCcarShipTax.payStartDate"),
+                    _year_start_date(start_date_ci or start_date_bi),
+                ),
+                "prpCcarShipTax.payEndDate": _first_text(
+                    form.get("prpCcarShipTax.payEndDate"),
+                    _year_end_date(start_date_ci or start_date_bi),
+                ),
+                "prpCcarShipTax.taxAbateAmount": _first_text(main.get("taxabateamount"), car.get("taxabateamount"), "0"),
+                "prpCcarShipTax.taxAbateProportion": _first_text(main.get("taxabateproportion"), car.get("taxabateproportion"), "0"),
+            }
+        )
+        if _to_str(car.get("lastUserclassificationCode")).strip():
+            form["prpCitemCar.lastUserclassificationCode"] = _to_str(car.get("lastUserclassificationCode")).strip()
+        if _to_str(car.get("lastCarChecker")).strip():
+            form["prpCitemCar.lastCarChecker"] = _to_str(car.get("lastCarChecker")).strip()
+        if _to_str(car.get("lastEndDateBI")).strip():
+            form["prpCitemCar.lastEndDateBI"] = _to_str(car.get("lastEndDateBI")).strip()
+        if _to_str(car.get("lastEndDateCI")).strip():
+            form["prpCitemCar.lastEndDateCI"] = _to_str(car.get("lastEndDateCI")).strip()
+        if _to_str(car.get("taxRegistryNumber")).strip():
+            form["prpCcarShipTax.taxregistrynumber"] = _to_str(car.get("taxRegistryNumber")).strip()
+        if _to_str(car.get("taxcomcode")).strip():
+            form["prpCcarShipTax.taxcomcode"] = _to_str(car.get("taxcomcode")).strip()
+        if _to_str(car.get("taxcomname")).strip():
+            form["prpCcarShipTax.taxcomname"] = _to_str(car.get("taxcomname")).strip()
+
+        vehicle["lastBIPolicyNo"] = policy_no_bi
+        vehicle["lastCIPolicyNo"] = policy_no_ci
+        vehicle["lastDamagedBI"] = form.get("prpCitemCarExt.lastDamagedBI")
+        vehicle["lastDamagedCI"] = form.get("prpCitemCarExt.lastDamagedCI")
+        vehicle["noDamYearsBI"] = form.get("prpCitemCarExt.noDamYearsBI")
+        out["quoteForm"] = _clean_vehicle_cert_fields(form)
+        out["vehicleForm"] = _clean_vehicle_cert_fields(vehicle)
+        return _clean_used_fuel_request_body(out)
+
+    def _prepare_renewal_used_fuel_quote(
+        self,
+        client: PiccProtocolClient,
+        ctx: PlatformAccountContext,
+        quote_payload: Dict[str, Any],
+        *,
+        account_type_name: str = USED_FUEL_ACCOUNT_TYPE,
+    ) -> Dict[str, Any]:
+        payload = _json_obj(quote_payload)
+        normalized_data = _json_obj(payload.get("normalized_data"))
+        renewal_lookup = _json_obj(normalized_data.get("renewal_lookup") or payload.get("renewal_lookup"))
+        selected = _json_obj(renewal_lookup.get("selected"))
+        if not selected:
+            candidates = renewal_lookup.get("candidates") if isinstance(renewal_lookup.get("candidates"), list) else []
+            selected = _pick_renewal_policy_candidate([dict(item) for item in candidates if isinstance(item, Mapping)])
+        if not selected:
+            # Older cases stored only the selected policy summary. Keep those
+            # sessions requotable after an adjustment such as "司乘改3万".
+            legacy_policy_no = _to_str(renewal_lookup.get("selected_policy_no")).strip()
+            legacy_policy_no_encode = _to_str(renewal_lookup.get("selected_policy_no_encode")).strip()
+            if legacy_policy_no and legacy_policy_no_encode:
+                selected = {
+                    "policy_no": legacy_policy_no,
+                    "policy_no_encode": legacy_policy_no_encode,
+                    "risk_code": _to_str(renewal_lookup.get("selected_risk_code")).strip(),
+                    "end_date": _to_str(renewal_lookup.get("selected_end_date")).strip(),
+                    "license_type": _normalize_license_type_value(renewal_lookup.get("selected_license_type")),
+                }
+        if not selected:
+            raise PiccRequestError("人保续保报价缺少可用续保保单，请重新发起续保查询")
+        prefill = self._fetch_renewal_policy_prefill(client, selected)
+        renewal_data = self._renewal_prefill_vehicle_data(prefill, selected)
+        merged_normalized = _deep_merge(normalized_data, renewal_data)
+        renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
+        user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
+        default_config = _picc_business_defaults(payload.get("default_config_json"))
+        merged_defaults = dict(default_config)
+        for key, value in renewal_defaults.items():
+            if key not in user_overrides:
+                merged_defaults[key] = value
+        merged_defaults.update(user_overrides)
+        renewal_payload = dict(payload)
+        renewal_payload["normalized_data"] = merged_normalized
+        renewal_payload["default_config_json"] = merged_defaults
+        body = self._prepare_used_fuel_quote(client, ctx, renewal_payload, account_type_name=account_type_name)
+        body = self._apply_renewal_prefill_to_quote_body(body, renewal_data, prefill, selected)
+        preflight = dict(_json_obj(body.get("preflight")))
+        preflight["renewalPolicyPrefill"] = {
+            **_json_obj(prefill.get("request")),
+            "selected": selected,
+            "vehicle": _json_obj(renewal_data.get("renewal_request_body_seed")).get("vehicleForm"),
+            "policy": _json_obj(renewal_data.get("renewal_policy_prefill")),
+        }
+        body["preflight"] = preflight
+        body["renewalPolicyPrefill"] = _json_obj(renewal_data.get("renewal_policy_prefill"))
+        return _clean_used_fuel_request_body(body)
 
     def _query_joint_sales_plan_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         payload = _json_obj(quote_payload)
@@ -3104,7 +3735,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if is_real_quote:
                 runtime_stage = "prepare_quote"
                 auto_notice_callback = _json_obj(ctx.payload).get("auto_notice_callback")
-                request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
+                if _to_str(_json_obj(quote_payload).get("quote_flow_type")).strip() == "renewal_motor_quote":
+                    request_body = self._prepare_renewal_used_fuel_quote(
+                        client,
+                        ctx,
+                        quote_payload,
+                        account_type_name=real_account_type,
+                    )
+                else:
+                    request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
                 duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
                 if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
                     preflight = dict(_json_obj(request_body.get("preflight")))
@@ -3671,6 +4310,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "isEnergyCar": quote_form.get("prpCitemCar.isEnergyCar"),
                     "vehicleFuelType": quote_form.get("prpCitemCar.vehicleFuelType"),
                 },
+                "licenseResolve": {
+                    "licenseType": vehicle.get("licenseType") or quote_form.get("prpCitemCar.licenseType"),
+                    "licenseColorCode": vehicle.get("licenseColorCode") or quote_form.get("prpCitemCar.licenseColorCode"),
+                    "decision": _json_obj(vehicle.get("license_type_decision")),
+                },
                 "actualValue": {"offline": True, "value": _money_text(actual_value)},
                 "selectedVehicle": selected,
                 "quoteFormError": quote_form_error,
@@ -3801,6 +4445,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "vehicleEnergyType": quote_form.get("prpCitemCar.energyType"),
                     "isEnergyCar": quote_form.get("prpCitemCar.isEnergyCar"),
                     "vehicleFuelType": quote_form.get("prpCitemCar.vehicleFuelType"),
+                },
+                "licenseResolve": {
+                    "licenseType": vehicle.get("licenseType") or quote_form.get("prpCitemCar.licenseType"),
+                    "licenseColorCode": vehicle.get("licenseColorCode") or quote_form.get("prpCitemCar.licenseColorCode"),
+                    "decision": _json_obj(vehicle.get("license_type_decision")),
                 },
                 "actualValue": actual_value_result,
                 "taxabate": taxabate_result,
@@ -4029,14 +4678,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if _money(ton_count) == 0:
             ton_count = ""
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, precise_vehicle, vehicle=vehicle, profile=prof)
-        license_fields = _profile_license_fields(prof, energy_fields, defaults)
+        license_fields = _profile_license_fields(prof, energy_fields, defaults, vehicle=vehicle)
         tax_fields = _profile_tax_field_values(prof, energy_fields, defaults, start_date_ci)
-        resolved_license_type = _to_str(
-            _field_value(defaults, "号牌种类", "licenseType", fallback=license_fields["license_type"])
-        )
-        resolved_license_color_code = _to_str(
-            _field_value(defaults, "车牌颜色代码", "licenseColorCode", fallback=license_fields["license_color_code"])
-        )
+        resolved_license_type = license_fields["license_type"]
+        resolved_license_color_code = license_fields["license_color_code"]
 
         compulsory_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"), "20")
         loss_amount = _money_text(_first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value))
@@ -4356,7 +5001,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             },
             profile=prof,
         )
-        license_fields = _profile_license_fields(prof, initial_energy_fields, defaults)
+        license_fields = _profile_license_fields(
+            prof,
+            initial_energy_fields,
+            defaults,
+            vehicle={
+                "license_type_decision": data.get("license_type_decision"),
+                "licenseType": data.get("license_type") or data.get("licenseType"),
+                "licenseColorCode": data.get("license_color_code") or data.get("licenseColorCode"),
+            },
+        )
         model_terms = _used_fuel_model_query_terms(
             raw_model_name,
             vehicle_type,
@@ -4368,6 +5022,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "licenseNo": license_no,
             "licenseType": license_fields["license_type"],
             "licenseColorCode": license_fields["license_color_code"],
+            "license_type_decision": _json_obj(data.get("license_type_decision")),
             "engineNo": engine_no,
             "vin": vin,
             "transferDate": transfer_date,
@@ -4452,7 +5107,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle = _clean_vehicle_cert_fields(vehicle)
         prof = _json_obj(profile)
         energy_fields = _resolve_vehicle_energy_fields(defaults, selected, {}, vehicle=vehicle, profile=prof)
-        license_fields = _profile_license_fields(prof, energy_fields, defaults)
+        license_fields = _profile_license_fields(prof, energy_fields, defaults, vehicle=vehicle)
         purchase_price = _first_text(selected.get("purchasePrice"), selected.get("priceP"), selected.get("priceT"))
         params = {
             "vin": vehicle.get("vin") or "",
@@ -5020,8 +5675,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         claim_ci_raw = _first_text(ci_risk.get("claimTimes"), data.get("lastDamagedCI"))
         claim_bi = _safe_int_local(claim_bi_raw, 0) if _has_text(claim_bi_raw) else ""
         claim_ci = _safe_int_local(claim_ci_raw, 0) if _has_text(claim_ci_raw) else ""
-        platform_joint_sales_premium_present = _has_text(data.get("sumYelPremium"))
-        platform_joint_sales_premium = _money(data.get("sumYelPremium")) if platform_joint_sales_premium_present else Decimal("0")
+        platform_joint_sales_premium_raw_present = _has_text(data.get("sumYelPremium"))
+        platform_joint_sales_premium = _money(data.get("sumYelPremium")) if platform_joint_sales_premium_raw_present else Decimal("0")
+        platform_joint_sales_premium_present = platform_joint_sales_premium_raw_present and platform_joint_sales_premium > 0
         joint_sales_premium_present = platform_joint_sales_premium_present
         joint_sales_premium = platform_joint_sales_premium
         tujia_premium = _money(tujia_anshun.get("premium"))
