@@ -1102,6 +1102,7 @@ QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者", "三责")),
     ("车上人员责任险（司机）", ("车上人员责任险（司机）", "车上人员责任险(司机)", "司机责任险", "司机险", "司机")),
     ("车上人员责任险（乘客）", ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客责任险", "乘客险", "乘客")),
+    ("机动车增值服务特约条款（道路救援服务）", ("机动车增值服务特约条款（道路救援服务）", "附加机动车增值服务特约条款（道路救援服务）", "道路救援服务", "道路救援", "救援")),
     ("交强", ("交强险", "交强", "交强主险")),
     ("共享主险限额", ("共享主险限额", "主险限额共享")),
 )
@@ -1112,6 +1113,7 @@ QUOTE_SHARED_LIMIT_LABEL = "共享主险限额"
 QUOTE_LOSS_LABEL = "机动车损失保险"
 QUOTE_DRIVER_LABEL = "车上人员责任险（司机）"
 QUOTE_PASSENGER_LABEL = "车上人员责任险（乘客）"
+QUOTE_ROAD_RESCUE_LABEL = "机动车增值服务特约条款（道路救援服务）"
 QUOTE_COMPULSORY_LABEL = "交强"
 QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
@@ -2445,7 +2447,19 @@ def _config_numeric_decimal(value: Any) -> Optional[Decimal]:
 
 def _quote_config_field_allows_zero(field_name: Any) -> bool:
     label = re.sub(r"\s+", "", _to_str(field_name).strip())
-    return label in {"途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车", "送修码启用"}
+    return label in {
+        "途家安顺保费",
+        "途家安顺",
+        "途顺家安",
+        "途家安顺非车保费",
+        "非车",
+        "送修码启用",
+        "机动车增值服务特约条款（道路救援服务）",
+        "附加机动车增值服务特约条款（道路救援服务）",
+        "道路救援服务",
+        "道路救援",
+        "救援",
+    }
 
 
 def _quote_false_text() -> str:
@@ -2528,6 +2542,7 @@ def _normalize_quote_product_exclusions(value: Any) -> List[str]:
         QUOTE_DRIVER_LABEL,
         QUOTE_PASSENGER_LABEL,
         QUOTE_MEDICAL_THIRD_LABEL,
+        QUOTE_ROAD_RESCUE_LABEL,
     }
     for item in items:
         label = _canonical_quote_config_override_label(item)
@@ -2551,6 +2566,7 @@ def _extract_quote_product_exclusions(text: Any) -> List[str]:
         QUOTE_DRIVER_LABEL,
         QUOTE_PASSENGER_LABEL,
         QUOTE_MEDICAL_THIRD_LABEL,
+        QUOTE_ROAD_RESCUE_LABEL,
     }
     exclusions: List[str] = []
     for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:
@@ -4143,12 +4159,19 @@ def _account_event_snapshot(row: Optional[QuotePlatformAccountProfile]) -> Dict[
 
 
 def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[str, Any]:
+    platform_code = _loaded_value(row, "platform_code")
+    account_type_name = _normalize_account_type_name(_loaded_value(row, "account_type_name")) or ""
+    default_values = _platform_default_values_with_legacy_fixes(
+        platform_code,
+        account_type_name,
+        _json_obj(_loaded_value(row, "default_values_json")),
+    )
     return {
         "id": _loaded_value(row, "id"),
-        "platform_code": _loaded_value(row, "platform_code"),
+        "platform_code": platform_code,
         "platform_name": _loaded_value(row, "platform_name"),
-        "account_type_name": _normalize_account_type_name(_loaded_value(row, "account_type_name")) or "",
-        "default_values": _json_obj(_loaded_value(row, "default_values_json")),
+        "account_type_name": account_type_name,
+        "default_values": default_values,
         "enabled": bool(_loaded_value(row, "enabled")),
         "created_by": _loaded_value(row, "created_by"),
         "updated_by": _loaded_value(row, "updated_by"),
@@ -4191,6 +4214,25 @@ def platform_builtin_default_values(platform_code: Any, account_type_name: Any) 
         except Exception:
             return {}
     return {}
+
+
+def _platform_default_values_with_legacy_fixes(
+    platform_code: Any,
+    account_type_name: Any,
+    default_values: Any,
+) -> Dict[str, Any]:
+    values = dict(_json_obj(default_values))
+    code = _to_str(platform_code).strip().upper()
+    type_name = _normalize_account_type_name(account_type_name)
+    if code != "PICC" or type_name != "新能源车-旧":
+        return values
+
+    builtin = platform_builtin_default_values(code, type_name)
+    for key in (QUOTE_DRIVER_LABEL, QUOTE_PASSENGER_LABEL):
+        raw = _to_str(values.get(key)).strip()
+        if raw in {"1", "10000"} and _to_str(builtin.get(key)).strip() in {"4", "40000"}:
+            values[key] = builtin[key]
+    return values
 
 
 def _build_quote_request_body(default_values: Dict[str, Any], normalized_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -7229,6 +7271,40 @@ def _quote_end_date_text(start_date: Any) -> str:
         return ""
 
 
+def _quote_period_time_texts(hour: Any = "", minute: Any = "") -> Tuple[str, str]:
+    parsed_hour = _safe_int(hour, -1)
+    parsed_minute = _safe_int(minute, 0) if _to_str(minute).strip() else 0
+    if 0 <= parsed_hour <= 23 and 0 <= parsed_minute <= 59:
+        return str(parsed_hour), str(parsed_minute)
+    return "0", "0"
+
+
+def _quote_period_time_explicit(hour: Any = "", minute: Any = "") -> bool:
+    if not _to_str(hour).strip():
+        return False
+    parsed_hour = _safe_int(hour, -1)
+    parsed_minute = _safe_int(minute, 0) if _to_str(minute).strip() else 0
+    return 0 <= parsed_hour <= 23 and 0 <= parsed_minute <= 59
+
+
+def _quote_ci_end_date_text(start_date: Any, start_hour: Any = "", start_minute: Any = "") -> str:
+    text = _normalize_quote_date_text(start_date)
+    if not text:
+        return ""
+    hour, minute = _quote_period_time_texts(start_hour, start_minute)
+    if hour == "0" and minute == "0":
+        return _quote_end_date_text(text)
+    try:
+        start = datetime.strptime(text, "%Y-%m-%d")
+        try:
+            next_year = start.replace(year=start.year + 1)
+        except ValueError:
+            next_year = start.replace(year=start.year + 1, day=28)
+        return next_year.strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
 def extract_quote_fields(text: Any) -> Dict[str, Any]:
     t = _norm_text(text)
     up = t.upper()
@@ -8919,10 +8995,8 @@ def _renewal_lookup_missing_requirements(normalized_data: Dict[str, Any]) -> Lis
     missing: List[Dict[str, Any]] = []
     if not _to_str(data.get("plate_no")).strip():
         missing.append({"type": "field", "key": "plate_no", "label": "号牌号码"})
-    # HAR confirms the current PICC renewal lookup uses the last four
-    # characters of the engine number. Do not guess an unverified VIN variant.
-    if not _to_str(data.get("engine_no")).strip():
-        missing.append({"type": "field", "key": "engine_no", "label": "发动机号"})
+    if not _to_str(data.get("engine_no")).strip() and not _to_str(data.get("vin")).strip():
+        missing.append({"type": "field", "key": "engine_or_vin", "label": "发动机号或车架号"})
     return missing
 
 
@@ -10241,8 +10315,16 @@ def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> 
         ci_day = _normalize_quote_date_text(notice.get("compulsory_start_date"))
         if bi_day:
             adjustments["commercial_start_date"] = bi_day
+            if _quote_period_time_explicit(notice.get("commercial_start_hour"), notice.get("commercial_start_minute")):
+                hour, minute = _quote_period_time_texts(notice.get("commercial_start_hour"), notice.get("commercial_start_minute"))
+                adjustments["commercial_start_hour"] = hour
+                adjustments["commercial_start_minute"] = minute
         if ci_day:
             adjustments["compulsory_start_date"] = ci_day
+            if _quote_period_time_explicit(notice.get("compulsory_start_hour"), notice.get("compulsory_start_minute")):
+                hour, minute = _quote_period_time_texts(notice.get("compulsory_start_hour"), notice.get("compulsory_start_minute"))
+                adjustments["compulsory_start_hour"] = hour
+                adjustments["compulsory_start_minute"] = minute
 
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices")):
         collect(notice_any)
@@ -10262,10 +10344,21 @@ def _quote_snapshot_with_auto_adjusted_dates(
     safe_snapshot = deepcopy(_json_obj(snapshot))
     normalized = dict(_json_obj(safe_snapshot.get("normalized_data")))
     changed = False
-    for key in ("commercial_start_date", "compulsory_start_date"):
-        day = _normalize_quote_date_text(adjustments.get(key))
-        if day and _to_str(normalized.get(key)).strip() != day:
-            normalized[key] = day
+    normalized_updates = {
+        "commercial_start_date": _normalize_quote_date_text(adjustments.get("commercial_start_date")),
+        "compulsory_start_date": _normalize_quote_date_text(adjustments.get("compulsory_start_date")),
+    }
+    if _quote_period_time_explicit(adjustments.get("commercial_start_hour"), adjustments.get("commercial_start_minute")):
+        hour, minute = _quote_period_time_texts(adjustments.get("commercial_start_hour"), adjustments.get("commercial_start_minute"))
+        normalized_updates["commercial_start_hour"] = hour
+        normalized_updates["commercial_start_minute"] = minute
+    if _quote_period_time_explicit(adjustments.get("compulsory_start_hour"), adjustments.get("compulsory_start_minute")):
+        hour, minute = _quote_period_time_texts(adjustments.get("compulsory_start_hour"), adjustments.get("compulsory_start_minute"))
+        normalized_updates["compulsory_start_hour"] = hour
+        normalized_updates["compulsory_start_minute"] = minute
+    for key, value in normalized_updates.items():
+        if value and _to_str(normalized.get(key)).strip() != value:
+            normalized[key] = value
             changed = True
     if changed:
         safe_snapshot["normalized_data"] = _clean_quote_dynamic_data(normalized)
@@ -10282,6 +10375,16 @@ def _quote_snapshot_with_auto_adjusted_dates(
         if _to_str(vehicle.get("startDateBI")).strip() != day:
             vehicle["startDateBI"] = day
             changed = True
+        if _quote_period_time_explicit(adjustments.get("commercial_start_hour"), adjustments.get("commercial_start_minute")):
+            hour, minute = _quote_period_time_texts(adjustments.get("commercial_start_hour"), adjustments.get("commercial_start_minute"))
+            if _safe_int(quote_form.get("prpCmain.starthourbi"), 0) != _safe_int(hour, 0):
+                quote_form["prpCmain.starthourbi"] = hour
+                changed = True
+            if _safe_int(quote_form.get("prpCmain.startminutebi"), 0) != _safe_int(minute, 0):
+                quote_form["prpCmain.startminutebi"] = minute
+                changed = True
+            vehicle["startHourBI"] = hour
+            vehicle["startMinuteBI"] = minute
     if adjustments.get("compulsory_start_date"):
         day = _normalize_quote_date_text(adjustments.get("compulsory_start_date"))
         if _to_str(quote_form.get("prpCmain.startDateCI")).strip() != day:
@@ -10290,10 +10393,33 @@ def _quote_snapshot_with_auto_adjusted_dates(
         if _to_str(vehicle.get("startDateCI")).strip() != day:
             vehicle["startDateCI"] = day
             changed = True
-        end_day = _quote_end_date_text(day)
+        ci_hour = adjustments.get("compulsory_start_hour")
+        ci_minute = adjustments.get("compulsory_start_minute")
+        has_ci_time = _quote_period_time_explicit(ci_hour, ci_minute)
+        if has_ci_time:
+            ci_hour, ci_minute = _quote_period_time_texts(ci_hour, ci_minute)
+        else:
+            ci_hour, ci_minute = "", ""
+        end_day = _quote_ci_end_date_text(day, ci_hour, ci_minute) if has_ci_time else _quote_end_date_text(day)
         if end_day and _to_str(quote_form.get("prpCmain.endDateCI")).strip() != end_day:
             quote_form["prpCmain.endDateCI"] = end_day
             changed = True
+        if has_ci_time:
+            expected_end_hour = "24" if ci_hour == "0" and ci_minute == "0" else ci_hour
+            if _safe_int(quote_form.get("prpCmain.starthourci"), 0) != _safe_int(ci_hour, 0):
+                quote_form["prpCmain.starthourci"] = ci_hour
+                changed = True
+            if _safe_int(quote_form.get("prpCmain.startminuteci"), 0) != _safe_int(ci_minute, 0):
+                quote_form["prpCmain.startminuteci"] = ci_minute
+                changed = True
+            if _safe_int(quote_form.get("prpCmain.endhourci"), 24) != _safe_int(expected_end_hour, 24):
+                quote_form["prpCmain.endhourci"] = expected_end_hour
+                changed = True
+            if _safe_int(quote_form.get("prpCmain.endminuteci"), 0) != _safe_int(ci_minute, 0):
+                quote_form["prpCmain.endminuteci"] = ci_minute
+                changed = True
+            vehicle["startHourCI"] = ci_hour
+            vehicle["startMinuteCI"] = ci_minute
     if not changed:
         return safe_snapshot
     if quote_form:
@@ -10348,12 +10474,16 @@ async def _persist_quote_auto_adjusted_dates_to_case(
     changed = False
     normalized = dict(_json_obj(case.normalized_data))
     draft = dict(_json_obj(case.draft_order_data))
-    for key, day in adjustments.items():
-        if day and _to_str(normalized.get(key)).strip() != day:
-            normalized[key] = day
+    for key, value in adjustments.items():
+        if key in {"commercial_start_date", "compulsory_start_date"}:
+            value = _normalize_quote_date_text(value)
+        else:
+            value = _to_str(value).strip()
+        if value and _to_str(normalized.get(key)).strip() != value:
+            normalized[key] = value
             changed = True
-        if day and _to_str(draft.get(key)).strip() != day:
-            draft[key] = day
+        if value and _to_str(draft.get(key)).strip() != value:
+            draft[key] = value
             changed = True
     if changed:
         case.normalized_data = _clean_quote_dynamic_data(normalized)
@@ -10394,6 +10524,7 @@ async def _persist_unemitted_quote_auto_notices(
 ) -> int:
     emitted = 0
     seen: Set[str] = set()
+    seen_messages: List[str] = []
     from app.services.ai_assistant_service import db_append_message
 
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
@@ -10401,15 +10532,22 @@ async def _persist_unemitted_quote_auto_notices(
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
         if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             continue
-        if notice.get("emitted_to_chat") is True:
-            continue
         message = sanitize_quote_user_message(notice.get("message"), "")
         if not message:
             continue
-        dedupe_key = re.sub(r"\s+", "", message)
+        dedupe_key = _quote_auto_notice_compact_message(message)
+        if notice.get("emitted_to_chat") is True:
+            if dedupe_key:
+                seen.add(dedupe_key)
+                seen_messages.append(dedupe_key)
+            continue
         if dedupe_key in seen:
             continue
+        if any(_quote_auto_notice_message_overlaps(dedupe_key, previous) for previous in seen_messages):
+            notice["emitted_to_chat"] = True
+            continue
         seen.add(dedupe_key)
+        seen_messages.append(dedupe_key)
         stable_key = _quote_auto_notice_dedupe_key(
             trace_id=trace_id,
             task_id=task_id,
@@ -10511,16 +10649,37 @@ def _quote_auto_notice_dedupe_key(
             _to_str(trace_id).strip(),
             _to_str(task_id).strip(),
             _to_str(notice_type).strip().lower(),
-            re.sub(r"\s+", "", _to_str(message)),
+            _quote_auto_notice_compact_message(message),
         )
     )
     return hashlib.sha1(source.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def _quote_auto_notice_key_from_metadata(metadata: Any) -> str:
+def _quote_auto_notice_compact_message(message: Any) -> str:
+    return re.sub(r"\s+", "", _to_str(message))
+
+
+def _quote_auto_notice_message_overlaps(left: Any, right: Any) -> bool:
+    """Treat a platform prompt summary and its full text as the same chat notice."""
+    a = _quote_auto_notice_compact_message(left)
+    b = _quote_auto_notice_compact_message(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 24:
+        return False
+    return a in b or b in a
+
+
+def _quote_auto_notice_payload_from_metadata(metadata: Any) -> Dict[str, Any]:
     data = _json_obj(_json_obj(metadata).get("data"))
     payload = _json_obj(data.get("payload"))
-    notice = _json_obj(payload.get("platform_auto_notice"))
+    return _json_obj(payload.get("platform_auto_notice"))
+
+
+def _quote_auto_notice_key_from_metadata(metadata: Any) -> str:
+    notice = _quote_auto_notice_payload_from_metadata(metadata)
     return _to_str(notice.get("dedupe_key")).strip()
 
 
@@ -10572,17 +10731,20 @@ async def _quote_auto_notice_already_persisted(
             .limit(40)
         )
     ).all()
-    compact_message = re.sub(r"\s+", "", message)
+    compact_message = _quote_auto_notice_compact_message(message)
     for content, metadata in rows:
         if _quote_auto_notice_key_from_metadata(metadata) == dedupe_key:
             return True
-        metadata_trace = _to_str(_json_obj(metadata).get("trace_id")).strip()
-        if (
-            trace_id
-            and metadata_trace == trace_id
-            and re.sub(r"\s+", "", _to_str(content)) == compact_message
-        ):
-            return True
+        metadata_obj = _json_obj(metadata)
+        metadata_trace = _to_str(metadata_obj.get("trace_id")).strip()
+        if trace_id and metadata_trace == trace_id:
+            row_notice = _quote_auto_notice_payload_from_metadata(metadata_obj)
+            row_message = _to_str(row_notice.get("message")).strip() or _to_str(content)
+            row_compact = _quote_auto_notice_compact_message(row_message)
+            if row_compact == compact_message:
+                return True
+            if row_notice and _quote_auto_notice_message_overlaps(row_compact, compact_message):
+                return True
     return False
 
 
@@ -11011,6 +11173,9 @@ def _picc_proposal_display_name(name: Any) -> str:
         "医保外医疗费用责任险（第三者责任险）": "附加医保外医疗费用责任险（机动车第三者责任保险）",
         "医保外医疗费用责任险(第三者责任险)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
         "医保外医疗费用责任险(三者)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+        "道路救援": "附加机动车增值服务特约条款（道路救援服务）",
+        "道路救援服务": "附加机动车增值服务特约条款（道路救援服务）",
+        "机动车增值服务特约条款（道路救援服务）": "附加机动车增值服务特约条款（道路救援服务）",
     }
     return mapping.get(text, text)
 
@@ -13072,6 +13237,43 @@ def _has_reusable_renewal_quote_context(value: Any) -> bool:
         or _to_str(lookup.get("selected_policy_no_encode")).strip()
     )
     return bool(policy_no and policy_no_encode)
+
+
+def _should_auto_probe_renewal_before_normal_quote(
+    *,
+    platform_code: Any,
+    quote_flow_type: Any,
+    account_type_name: Any,
+    normalized_data: Any,
+) -> bool:
+    if _to_str(platform_code).strip().upper() != "PICC":
+        return False
+    if _to_str(quote_flow_type).strip() != QUOTE_FLOW_NORMAL:
+        return False
+    type_name = _normalize_account_type_name(account_type_name)
+    if type_name not in {"油车-旧", "新能源车-旧"}:
+        return False
+    data = _clean_quote_dynamic_data(_json_obj(normalized_data))
+    if _has_reusable_renewal_quote_context(data):
+        return False
+    return bool(_to_str(data.get("plate_no")).strip() and (_to_str(data.get("engine_no")).strip() or _to_str(data.get("vin")).strip()))
+
+
+def _is_silent_auto_renewal_not_found_response(response: Mapping[str, Any]) -> bool:
+    payload = _json_obj(_json_obj(_json_obj(response).get("data")).get("payload"))
+    lookup = _json_obj(payload.get("renewal_lookup"))
+    if lookup.get("found") is False:
+        return True
+    status = _to_str(_json_obj(response).get("status")).strip().lower()
+    result_status = _to_str(_json_obj(_json_obj(response).get("data")).get("result_status")).strip().lower()
+    message = _to_str(_json_obj(_json_obj(response).get("data")).get("message")).strip()
+    compact = re.sub(r"\s+", "", message)
+    return status == "success" and result_status in {RESULT_NOT_READY.lower(), "not_ready"} and bool(
+        re.search(
+            r"(没有此车辆信息|不是可续保车辆|不可续保|无续保信息|未查询到续保|没有续保信息)",
+            compact,
+        )
+    )
 
 
 async def _complete_renewal_lookup_without_sms(
@@ -16617,6 +16819,35 @@ async def handle_quote_message(
             platform_account=platform_account,
             operator_role_name=operator_role_name,
         )
+    if _should_auto_probe_renewal_before_normal_quote(
+        platform_code=platform_code,
+        quote_flow_type=quote_flow_type,
+        account_type_name=selected_account_type_name,
+        normalized_data=normalized_data,
+    ):
+        auto_renewal_reply, auto_renewal_response = await _continue_renewal_lookup_with_platform_account(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot={
+                **snapshot,
+                "vehicle_type_detect": vehicle_type_detect,
+                "quote_flow_type": QUOTE_FLOW_RENEWAL,
+                QUOTE_PRODUCT_EXCLUSIONS_KEY: _normalize_quote_product_exclusions(
+                    normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
+                ),
+            },
+            trace_id=trace_id,
+            platform_account=platform_account,
+            operator_role_name=operator_role_name,
+        )
+        if not _is_silent_auto_renewal_not_found_response(auto_renewal_response):
+            return auto_renewal_reply, auto_renewal_response
+        trace_id = _new_trace_id()
+        case.current_task_id = None
+        case.status = CASE_STATUS_READY
+        case.updated_at = _now()
+        await db.flush()
     snapshot = await apply_platform_default_config_to_snapshot(
         db,
         snapshot=snapshot,

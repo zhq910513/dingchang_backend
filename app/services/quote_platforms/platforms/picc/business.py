@@ -87,6 +87,7 @@ PRODUCT_DRIVER = "车上人员责任险（司机）"
 PRODUCT_PASSENGER = "车上人员责任险（乘客）"
 PRODUCT_SHARED_LIMIT = "共享主险限额"
 PRODUCT_MEDICAL_THIRD = "医保外医疗费用责任险（第三者责任险）"
+PRODUCT_ROAD_RESCUE = "机动车增值服务特约条款（道路救援服务）"
 PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
 PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
@@ -98,6 +99,13 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_PASSENGER: ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客险", "乘客责任险", "乘客"),
     PRODUCT_SHARED_LIMIT: ("共享主险限额", "主险限额共享"),
     PRODUCT_MEDICAL_THIRD: ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外"),
+    PRODUCT_ROAD_RESCUE: (
+        "机动车增值服务特约条款（道路救援服务）",
+        "附加机动车增值服务特约条款（道路救援服务）",
+        "道路救援服务",
+        "道路救援",
+        "救援",
+    ),
     PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途家安顺保费", "途家安顺", "途家安顺非车保费"),
 }
 
@@ -241,8 +249,8 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "product_defaults": {
             PRODUCT_COMPULSORY: "20",
             PRODUCT_THIRD_PARTY: "300",
-            PRODUCT_DRIVER: "1",
-            PRODUCT_PASSENGER: "1",
+            PRODUCT_DRIVER: "4",
+            PRODUCT_PASSENGER: "4",
             PRODUCT_MEDICAL_THIRD: "300",
             PRODUCT_SHARED_LIMIT: True,
         },
@@ -808,6 +816,28 @@ def _date_text(value: Any) -> str:
         return ""
 
 
+def _platform_datetime_parts(value: Any) -> Dict[str, str]:
+    """Parse PICC date values while preserving optional hour/minute."""
+    text = _to_str(value).strip()
+    day = _date_text(text)
+    if not day:
+        return {}
+    out = {"date": day, "hour": "", "minute": ""}
+    match = re.search(r"(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})日?", text)
+    if not match:
+        return out
+    suffix = re.sub(r"^[\sT]+", "", text[match.end():])
+    time_match = re.match(r"^(\d{1,2})(?:\s*[:：时点]\s*(\d{1,2}))?(?:分)?", suffix)
+    if not time_match:
+        return out
+    hour = _safe_int_local(time_match.group(1), -1)
+    minute = _safe_int_local(time_match.group(2), 0) if time_match.group(2) is not None else 0
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        out["hour"] = str(hour)
+        out["minute"] = str(minute)
+    return out
+
+
 def _next_day_text() -> str:
     return (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -835,6 +865,35 @@ def _end_date_text(start_date: Any) -> str:
     except ValueError:
         next_year = start.replace(year=start.year + 1, day=28)
     return (next_year - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _period_time_texts(hour: Any = "", minute: Any = "") -> tuple[str, str]:
+    parsed_hour = _safe_int_local(hour, -1)
+    parsed_minute = _safe_int_local(minute, 0) if _has_text(minute) else 0
+    if 0 <= parsed_hour <= 23 and 0 <= parsed_minute <= 59:
+        return str(parsed_hour), str(parsed_minute)
+    return "0", "0"
+
+
+def _period_time_explicit(hour: Any = "", minute: Any = "") -> bool:
+    if not _has_text(hour):
+        return False
+    parsed_hour = _safe_int_local(hour, -1)
+    parsed_minute = _safe_int_local(minute, 0) if _has_text(minute) else 0
+    return 0 <= parsed_hour <= 23 and 0 <= parsed_minute <= 59
+
+
+def _ci_end_date_text(start_date: Any, start_hour: Any = "", start_minute: Any = "") -> str:
+    start = _parse_date(start_date)
+    if not start:
+        return ""
+    hour, minute = _period_time_texts(start_hour, start_minute)
+    if hour == "0" and minute == "0":
+        return _end_date_text(start_date)
+    try:
+        return start.replace(year=start.year + 1).strftime("%Y-%m-%d")
+    except ValueError:
+        return start.replace(year=start.year + 1, day=28).strftime("%Y-%m-%d")
 
 
 def _renewal_next_start_date(end_date: Any) -> str:
@@ -1165,6 +1224,8 @@ def _insurance_date_adjustment_needed(
     *,
     kind: str,
     target_day: Any,
+    target_hour: Any = "",
+    target_minute: Any = "",
 ) -> bool:
     """Return whether the final request still needs its insurance dates synchronized."""
     target = _insurance_date_adjustment_target_day(
@@ -1191,8 +1252,22 @@ def _insurance_date_adjustment_needed(
 
     if any(_date_text(value) != target for value in current_values):
         return True
+    hour_key = "prpCmain.starthourci" if kind == "ci" else "prpCmain.starthourbi"
+    minute_key = "prpCmain.startminuteci" if kind == "ci" else "prpCmain.startminutebi"
+    expected_hour, expected_minute = _period_time_texts(target_hour, target_minute)
+    if _safe_int_local(form.get(hour_key), 0) != _safe_int_local(expected_hour, 0):
+        return True
+    if _safe_int_local(form.get(minute_key), 0) != _safe_int_local(expected_minute, 0):
+        return True
     if kind == "ci":
-        return _date_text(form.get("prpCmain.endDateCI")) != _end_date_text(target)
+        expected_end_date = _ci_end_date_text(target, expected_hour, expected_minute)
+        expected_end_hour = "24" if expected_hour == "0" and expected_minute == "0" else expected_hour
+        expected_end_minute = expected_minute
+        return (
+            _date_text(form.get("prpCmain.endDateCI")) != expected_end_date
+            or _safe_int_local(form.get("prpCmain.endhourci"), 24) != _safe_int_local(expected_end_hour, 24)
+            or _safe_int_local(form.get("prpCmain.endminuteci"), 0) != _safe_int_local(expected_end_minute, 0)
+        )
     return False
 
 
@@ -1202,6 +1277,10 @@ def _insurance_date_notice_from_adjustment(adjustment: Mapping[str, Any]) -> Dic
         "message": _to_str(adjustment.get("message")).strip(),
         "commercial_start_date": _date_text(adjustment.get("commercial_start_date")),
         "compulsory_start_date": _date_text(adjustment.get("compulsory_start_date")),
+        "commercial_start_hour": _to_str(adjustment.get("commercial_start_hour")).strip(),
+        "commercial_start_minute": _to_str(adjustment.get("commercial_start_minute")).strip(),
+        "compulsory_start_hour": _to_str(adjustment.get("compulsory_start_hour")).strip(),
+        "compulsory_start_minute": _to_str(adjustment.get("compulsory_start_minute")).strip(),
         "adjustment_kinds": [
             item
             for item in (adjustment.get("adjustment_kinds") if isinstance(adjustment.get("adjustment_kinds"), list) else [])
@@ -1312,6 +1391,44 @@ def _reinsure_suggested_start_dates(items: Any) -> Dict[str, str]:
     return dates
 
 
+def _reinsure_suggested_start_datetimes(items: Any) -> Dict[str, Dict[str, str]]:
+    """Collect suggested dates plus optional time from structured duplicate-insurance rows."""
+    values: Dict[str, Dict[str, str]] = {}
+    if not isinstance(items, list):
+        return values
+    for raw in items:
+        item = _json_obj(raw)
+        parts = _platform_datetime_parts(item.get("adviseStartDate"))
+        suggested_day = parts.get("date")
+        if not suggested_day:
+            continue
+        for kind in _reinsure_adjustment_kinds(item):
+            current_day = _date_text(_json_obj(values.get(kind)).get("date"))
+            if not current_day or suggested_day > current_day:
+                values[kind] = parts
+    return values
+
+
+def _reinsure_notice_suggested_start_datetime(message: Any) -> Dict[str, str]:
+    text = _platform_notice_text(message)
+    if not text:
+        return {}
+    compact = re.sub(r"\s+", "", text)
+    date_time_pattern = r"(\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?(?:\d{1,2}(?:[:：时点]\d{1,2})?分?)?)"
+    for pattern in (
+        rf"(?:系统建议|平台建议|建议).{{0,40}}(?:起保日期|保险期间|起期).{{0,24}}(?:调整为|调整至|改为|改至|变更为|同步至|为){date_time_pattern}",
+        rf"(?:起保日期|保险期间|起期).{{0,24}}(?:调整为|调整至|改为|改至|变更为|同步至|为){date_time_pattern}",
+        rf"(?:调整为|调整至|改为|改至|变更为|同步至){date_time_pattern}",
+    ):
+        match = re.search(pattern, compact)
+        if not match:
+            continue
+        parts = _platform_datetime_parts(match.group(1))
+        if parts.get("date"):
+            return parts
+    return {}
+
+
 def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
     text = _platform_notice_text(message)
     compact = re.sub(r"\s+", "", text)
@@ -1326,6 +1443,9 @@ def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
 
 
 def _reinsure_notice_suggested_start_date(message: Any) -> str:
+    parts = _reinsure_notice_suggested_start_datetime(message)
+    if parts.get("date"):
+        return _to_str(parts.get("date")).strip()
     text = _platform_notice_text(message)
     if not text:
         return ""
@@ -1385,8 +1505,10 @@ def _implicit_renewal_quote_adjustment_from_response(
     if not hint:
         return {}
     payload = _json_obj(_json_obj(platform_response).get("data"))
-    commercial_start = _date_text(payload.get("lastExpireDateBI"))
-    compulsory_start = _date_text(payload.get("lastExpireDateCI"))
+    commercial_parts = _platform_datetime_parts(payload.get("lastExpireDateBI"))
+    compulsory_parts = _platform_datetime_parts(payload.get("lastExpireDateCI"))
+    commercial_start = _to_str(commercial_parts.get("date")).strip()
+    compulsory_start = _to_str(compulsory_parts.get("date")).strip()
     kinds: List[str] = []
     if commercial_start:
         kinds.append("bi")
@@ -1398,6 +1520,10 @@ def _implicit_renewal_quote_adjustment_from_response(
         "message": hint,
         "commercial_start_date": commercial_start,
         "compulsory_start_date": compulsory_start,
+        "commercial_start_hour": _to_str(commercial_parts.get("hour")).strip(),
+        "commercial_start_minute": _to_str(commercial_parts.get("minute")).strip(),
+        "compulsory_start_hour": _to_str(compulsory_parts.get("hour")).strip(),
+        "compulsory_start_minute": _to_str(compulsory_parts.get("minute")).strip(),
         "adjustment_kinds": kinds,
         "source": "implicit_renewal_quote_hint",
     }
@@ -1427,15 +1553,19 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         return {}
     first_reinsure = _json_obj(reinsure_items[0]) if reinsure_items else {}
     suggested_dates = _reinsure_suggested_start_dates(reinsure_items)
+    suggested_datetimes = _reinsure_suggested_start_datetimes(reinsure_items)
     # Parse only the original platform notice. `_format_reinsure_items_prompt`
     # may include historical effective dates for display and must not turn them
     # into a synthetic date-adjustment instruction.
     notice_suggested_date = _reinsure_notice_suggested_start_date(notice)
+    notice_suggested_datetime = _reinsure_notice_suggested_start_datetime(notice)
     adjustment_kinds = list(suggested_dates.keys())
     if not adjustment_kinds and notice_suggested_date:
         adjustment_kinds = _reinsure_notice_adjustment_kinds(message)
         for kind in adjustment_kinds:
             suggested_dates[kind] = notice_suggested_date
+            if notice_suggested_datetime.get("date"):
+                suggested_datetimes[kind] = notice_suggested_datetime
     if not adjustment_kinds and first_reinsure:
         adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure)
     # A reinsure row without any usable suggested/effective date is historical
@@ -1458,6 +1588,10 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
         "confirm_action": {},
         "raw_suggested_commercial_start_date": _date_text(suggested_dates.get("bi")) if "bi" in adjustment_kinds else "",
         "raw_suggested_compulsory_start_date": _date_text(suggested_dates.get("ci")) if "ci" in adjustment_kinds else "",
+        "raw_suggested_commercial_start_hour": _to_str(_json_obj(suggested_datetimes.get("bi")).get("hour")).strip() if "bi" in adjustment_kinds else "",
+        "raw_suggested_commercial_start_minute": _to_str(_json_obj(suggested_datetimes.get("bi")).get("minute")).strip() if "bi" in adjustment_kinds else "",
+        "raw_suggested_compulsory_start_hour": _to_str(_json_obj(suggested_datetimes.get("ci")).get("hour")).strip() if "ci" in adjustment_kinds else "",
+        "raw_suggested_compulsory_start_minute": _to_str(_json_obj(suggested_datetimes.get("ci")).get("minute")).strip() if "ci" in adjustment_kinds else "",
         # Kept for compatibility with archived runtime payloads. These remain
         # raw platform values and are not local-date-adjusted.
         "suggested_commercial_start_date": _date_text(suggested_dates.get("bi")) if "bi" in adjustment_kinds else "",
@@ -2068,6 +2202,9 @@ def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "", 
     seats = _safe_int_local(seat_count, 0) if _has_text(seat_count) else 0
     if code == "051063" and shared_main_limit is True:
         return "共享主险限额"
+    if code == "051064":
+        quantity = _safe_int_local(row.get("quantity"), 0)
+        return f"{quantity}次" if quantity > 0 else "-"
     if amount <= 0:
         return "-"
     if code == "051050":
@@ -2948,6 +3085,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "plate_no": _clean_vehicle_cert_value("plate_no", normalized.get("plate_no")),
             "engine_no": _clean_vehicle_cert_value("engine_no", normalized.get("engine_no")),
             "vin": _clean_vehicle_cert_value("vin", normalized.get("vin")),
+            "last_policy_no": _clean_vehicle_cert_value(
+                "policy_no",
+                _first_text(
+                    normalized.get("last_policy_no"),
+                    normalized.get("lastPolicyNo"),
+                    normalized.get("policy_no"),
+                    normalized.get("policyNo"),
+                ),
+            ),
             "license_type": license_type,
             "license_color_code": _license_color_for_type(license_type),
         }
@@ -2975,6 +3121,67 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "raw": item,
         }
 
+    def _renewal_lookup_param_attempts(
+        self,
+        *,
+        plate_no: str,
+        engine_no: str,
+        vin: str,
+        last_policy_no: str,
+        license_type: str,
+        is_owner: bool,
+    ) -> List[Dict[str, Any]]:
+        base = {
+            "lastPolicyNo": "",
+            "engineNo4Renew1": "",
+            "frameNo4Renew1": "",
+            "licenseNo4Renew": plate_no,
+            "licenseType4Renew": license_type,
+            "engineNo4Renew2": "",
+            "frameNo4Renew2": "",
+            "frameNo4Renew3": "",
+            "rows": 10,
+            "page": 1,
+            "sort": "endDate",
+            "order": "desc",
+            "isOwner": "true" if is_owner else "false",
+            "khyxRenewByLicenseNo": "0",
+            "taskId": "",
+        }
+        attempts: List[Dict[str, Any]] = []
+        seen: set[tuple[tuple[str, str], ...]] = set()
+
+        def add(strategy: str, *, license_type_override: str = "", **updates: Any) -> None:
+            params = {
+                **base,
+                **({"licenseType4Renew": license_type_override} if license_type_override else {}),
+                **{key: _to_str(value).strip() for key, value in updates.items()},
+            }
+            if not any(
+                _to_str(params.get(key)).strip()
+                for key in ("lastPolicyNo", "engineNo4Renew1", "frameNo4Renew1", "engineNo4Renew2", "frameNo4Renew2", "frameNo4Renew3")
+            ):
+                return
+            signature = tuple(sorted((key, _to_str(value).strip()) for key, value in params.items()))
+            if signature in seen:
+                return
+            seen.add(signature)
+            attempts.append({"strategy": strategy, "params": params})
+
+        if last_policy_no:
+            policy_license_types = [license_type]
+            for fallback_type in ("02", "52"):
+                if fallback_type not in policy_license_types:
+                    policy_license_types.append(fallback_type)
+            for item_license_type in policy_license_types:
+                strategy = "last_policy_no" if item_license_type == license_type else f"last_policy_no_license_{item_license_type}"
+                add(strategy, license_type_override=item_license_type, lastPolicyNo=last_policy_no)
+        if len(engine_no) >= 4:
+            add("engine_last4", engineNo4Renew2=engine_no[-4:])
+        if len(vin) >= 6:
+            add("vin_last6", frameNo4Renew2=vin[-6:])
+        return attempts
+
     def _query_renewal_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         client: Optional[PiccProtocolClient] = None
         vehicle: Dict[str, str] = {}
@@ -2983,11 +3190,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             plate_no = _to_str(vehicle.get("plate_no")).strip()
             engine_no = re.sub(r"[^A-Z0-9]", "", _to_str(vehicle.get("engine_no")).upper())
             vin = re.sub(r"[^A-Z0-9]", "", _to_str(vehicle.get("vin")).upper())
+            last_policy_no = _to_str(vehicle.get("last_policy_no")).strip()
             license_type = _normalize_license_type_value(vehicle.get("license_type")) or "02"
             if not plate_no:
                 raise PiccRequestError("人保续保查询缺少号牌号码")
-            if not engine_no and not vin:
-                raise PiccRequestError("人保续保查询缺少发动机号或车架号")
+            if not engine_no and not vin and not last_policy_no:
+                raise PiccRequestError("人保续保查询缺少上年保单号、发动机号或车架号")
 
             client = self._client(ctx)
             headers = {"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"}
@@ -3005,43 +3213,89 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
             _ensure_platform_success(owner_check, action="续保车主校验")
             is_owner = _to_str(_json_obj(owner_check).get("data")).strip().lower() == "true"
-            lookup_params = {
-                "lastPolicyNo": "",
-                "engineNo4Renew1": "",
-                "frameNo4Renew1": "",
-                "licenseNo4Renew": plate_no,
-                "licenseType4Renew": license_type,
-                "engineNo4Renew2": engine_no[-4:] if engine_no else "",
-                "frameNo4Renew2": "",
-                "frameNo4Renew3": "",
-                "rows": 10,
-                "page": 1,
-                "sort": "endDate",
-                "order": "desc",
-                "isOwner": "true" if is_owner else "false",
-                "khyxRenewByLicenseNo": "0",
-                "taskId": "",
-            }
-            renewal_response = client.request_json(
-                "GET",
-                RENEWAL_QUOTE_SEARCH_PATH,
-                purpose="business",
-                params=lookup_params,
-                headers=headers,
+            lookup_attempts = self._renewal_lookup_param_attempts(
+                plate_no=plate_no,
+                engine_no=engine_no,
+                vin=vin,
+                last_policy_no=last_policy_no,
+                license_type=license_type,
+                is_owner=is_owner,
             )
-            _ensure_platform_success(renewal_response, action="续保查询")
-            response_data = _json_obj(_json_obj(renewal_response).get("data"))
-            raw_rows = response_data.get("list")
-            candidates = [
-                self._renewal_candidate_summary(row)
-                for row in raw_rows
-                if isinstance(row, Mapping)
-            ] if isinstance(raw_rows, list) else []
-            candidates = [row for row in candidates if row.get("policy_no") or row.get("policy_no_encode")]
+            if not lookup_attempts:
+                raise PiccRequestError("人保续保查询缺少可用查询条件")
+
+            candidates: List[Dict[str, Any]] = []
+            renewal_response: Dict[str, Any] = {}
+            lookup_params: Dict[str, Any] = {}
+            attempt_records: List[Dict[str, Any]] = []
+            not_found_pattern = re.compile(r"(没有此车辆信息|不是可续保车辆|不可续保|无续保信息|未查询到续保|没有续保信息)")
+            for attempt in lookup_attempts:
+                strategy = _to_str(attempt.get("strategy")).strip() or "unknown"
+                params = _json_obj(attempt.get("params"))
+                response: Dict[str, Any] = {}
+                try:
+                    response = client.request_json(
+                        "GET",
+                        RENEWAL_QUOTE_SEARCH_PATH,
+                        purpose="business",
+                        params=params,
+                        headers=headers,
+                    )
+                    _ensure_platform_success(response, action="续保查询")
+                except PiccBusinessRequestError as exc:
+                    message = _platform_message(getattr(exc, "platform_response", None), str(exc) or "续保查询失败")
+                    compact_message = re.sub(r"\s+", "", message)
+                    treat_as_not_found = bool(not_found_pattern.search(compact_message)) or (
+                        strategy == "last_policy_no" and "查询参数错误" in compact_message
+                    )
+                    attempt_records.append(
+                        {
+                            "strategy": strategy,
+                            "params": params,
+                            "status": "not_found" if treat_as_not_found else "failed",
+                            "message": message,
+                            "platform_response": _platform_debug_payload(getattr(exc, "platform_response", None)),
+                        }
+                    )
+                    if not treat_as_not_found:
+                        raise
+                    renewal_response = _json_obj(getattr(exc, "platform_response", None))
+                    lookup_params = params
+                    continue
+
+                response_data = _json_obj(_json_obj(response).get("data"))
+                raw_rows = response_data.get("list")
+                attempt_candidates = [
+                    self._renewal_candidate_summary(row)
+                    for row in raw_rows
+                    if isinstance(row, Mapping)
+                ] if isinstance(raw_rows, list) else []
+                attempt_candidates = [
+                    row
+                    for row in attempt_candidates
+                    if row.get("policy_no") or row.get("policy_no_encode")
+                ]
+                message = _platform_message(response, "")
+                attempt_records.append(
+                    {
+                        "strategy": strategy,
+                        "params": params,
+                        "status": "found" if attempt_candidates else "not_found",
+                        "message": message,
+                        "candidate_count": len(attempt_candidates),
+                    }
+                )
+                renewal_response = response
+                lookup_params = params
+                if attempt_candidates:
+                    candidates = attempt_candidates
+                    break
+
             lookup_payload = {
                 "vehicle": vehicle,
                 "check_is_owner": is_owner,
                 "params": lookup_params,
+                "attempts": attempt_records,
                 "candidates": candidates,
             }
             if not candidates:
@@ -3259,6 +3513,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 defaults.setdefault(PRODUCT_MEDICAL_THIRD, amount)
                 if _to_str(row.get("sharedAmountFlag")).strip() == "1":
                     defaults.setdefault(PRODUCT_SHARED_LIMIT, True)
+            elif kind_code == "051064":
+                quantity = _safe_int_local(row.get("quantity"), 0)
+                if quantity > 0:
+                    defaults.setdefault(PRODUCT_ROAD_RESCUE, str(quantity))
             elif kind_code == "051074" and amount:
                 defaults.setdefault(PRODUCT_COMPULSORY, _wan_or_amount_to_wan_text(amount, "20"))
         return defaults
@@ -3407,6 +3665,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "vehicle": _json_obj(renewal_data.get("renewal_request_body_seed")).get("vehicleForm"),
             "policy": _json_obj(renewal_data.get("renewal_policy_prefill")),
         }
+        if renewal_defaults:
+            preflight["renewalQuoteFieldDefaults"] = renewal_defaults
+            preflight["renewalQuoteFieldPriority"] = "会话明确调参值 > 续保接口返回值 > 默认参数配置"
         body["preflight"] = preflight
         body["renewalPolicyPrefill"] = _json_obj(renewal_data.get("renewal_policy_prefill"))
         return _clean_used_fuel_request_body(body)
@@ -3772,7 +4033,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if is_real_quote:
                 runtime_stage = "prepare_quote"
                 auto_notice_callback = _json_obj(ctx.payload).get("auto_notice_callback")
-                if _to_str(_json_obj(quote_payload).get("quote_flow_type")).strip() == "renewal_motor_quote":
+                flow_type = _to_str(_json_obj(quote_payload).get("quote_flow_type")).strip()
+                if flow_type == "renewal_motor_quote":
                     request_body = self._prepare_renewal_used_fuel_quote(
                         client,
                         ctx,
@@ -4673,7 +4935,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         passenger_quantity = max(seats - 1, 1)
         start_date_bi = _first_text(vehicle.get("startDateBI"), _next_day_text())
         start_date_ci = _first_text(vehicle.get("startDateCI"), _next_day_text())
-        end_date_ci = _end_date_text(start_date_ci)
+        start_hour_bi, start_minute_bi = _period_time_texts(vehicle.get("startHourBI"), vehicle.get("startMinuteBI"))
+        start_hour_ci, start_minute_ci = _period_time_texts(vehicle.get("startHourCI"), vehicle.get("startMinuteCI"))
+        end_date_ci = _ci_end_date_text(start_date_ci, start_hour_ci, start_minute_ci)
+        end_hour_ci = "24" if start_hour_ci == "0" and start_minute_ci == "0" else start_hour_ci
         owner_name = _to_str(owner.get("ownerName")).strip()
         selected_operate_config_id = _to_str(
             _field_value(defaults, "操作配置ID", "车型配置ID", "selectedOperateConfigId")
@@ -4733,6 +4998,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if shared_main_limit:
             medical_third_amount = _wan_or_amount_to_amount(third_party_amount, third_party_amount or "300")
+        road_rescue_quantity = _safe_int_local(_profile_product_default(defaults, prof, PRODUCT_ROAD_RESCUE, ""), 0)
 
         missing_config = []
         if not main_com_code:
@@ -4753,16 +5019,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         form: Dict[str, Any] = {
             "prpCmain.comCode": main_com_code,
             "prpCmain.startDate": start_date_bi,
-            "prpCmain.starthourbi": "0",
-            "prpCmain.startminutebi": "0",
+            "prpCmain.starthourbi": start_hour_bi,
+            "prpCmain.startminutebi": start_minute_bi,
             "prpCmain.endhourbi": "24",
             "prpCmain.endminutebi": "0",
             "prpCmain.startDateCI": start_date_ci,
-            "prpCmain.starthourci": "0",
-            "prpCmain.startminuteci": "0",
+            "prpCmain.starthourci": start_hour_ci,
+            "prpCmain.startminuteci": start_minute_ci,
             "prpCmain.endDateCI": end_date_ci,
-            "prpCmain.endhourci": "24",
-            "prpCmain.endminuteci": "0",
+            "prpCmain.endhourci": end_hour_ci,
+            "prpCmain.endminuteci": start_minute_ci,
             "prpCmain.custAuthorization": "0",
             "prpCmain.vehicleModelCode": vehicle_model_code,
             "prpCmain.insuredChooseUsedName": "0",
@@ -4900,26 +5166,41 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             form.pop("prpCitemCar.familyId", None)
         if _profile_text(prof, "is_energy_car") == "1" and _money(form.get("prpCitemCar.exhaustScale")) == 0:
             form.pop("prpCitemCar.exhaustScale", None)
-        product_specs = [
-            (compulsory_amount, "051074", PRODUCT_COMPULSORY),
-            (loss_amount, "051050", PRODUCT_LOSS),
-            (third_party_amount, "051051", PRODUCT_THIRD_PARTY),
-            (driver_amount, "051052", PRODUCT_DRIVER),
-            (passenger_amount, "051053", PRODUCT_PASSENGER),
-            (medical_third_amount, "051063", PRODUCT_MEDICAL_THIRD),
+        product_specs: List[Dict[str, Any]] = [
+            {"amount": compulsory_amount, "kind_code": "051074", "kind_name": PRODUCT_COMPULSORY},
+            {"amount": loss_amount, "kind_code": "051050", "kind_name": PRODUCT_LOSS},
+            {"amount": third_party_amount, "kind_code": "051051", "kind_name": PRODUCT_THIRD_PARTY},
+            {"amount": driver_amount, "kind_code": "051052", "kind_name": PRODUCT_DRIVER},
+            {"amount": passenger_amount, "kind_code": "051053", "kind_name": PRODUCT_PASSENGER},
+            {"amount": medical_third_amount, "kind_code": "051063", "kind_name": PRODUCT_MEDICAL_THIRD},
         ]
+        if road_rescue_quantity > 0:
+            product_specs.append(
+                {
+                    "amount": "",
+                    "kind_code": "051064",
+                    "kind_name": PRODUCT_ROAD_RESCUE,
+                    "quantity": str(road_rescue_quantity),
+                }
+            )
         excluded_products = _product_exclusions(defaults)
         product_rows = [
-            (amount, kind_code, kind_name)
-            for amount, kind_code, kind_name in product_specs
-            if _canonical_product_name(kind_name) not in excluded_products
+            spec
+            for spec in product_specs
+            if _canonical_product_name(spec.get("kind_name")) not in excluded_products
         ]
         medical_third_index: Optional[int] = None
-        for index, (amount, kind_code, kind_name) in enumerate(product_rows):
+        for index, spec in enumerate(product_rows):
+            amount = _to_str(spec.get("amount")).strip()
+            kind_code = _to_str(spec.get("kind_code")).strip()
+            kind_name = _to_str(spec.get("kind_name")).strip()
             form[f"prpCitemKindVos[{index}].amount"] = amount
             form[f"prpCitemKindVos[{index}].kindCode"] = kind_code
             form[f"prpCitemKindVos[{index}].kindName"] = kind_name
             form[f"prpCitemKindVos[{index}].chooseFlag"] = "true"
+            quantity = _to_str(spec.get("quantity")).strip()
+            if quantity:
+                form[f"prpCitemKindVos[{index}].quantity"] = quantity
             if kind_name == PRODUCT_MEDICAL_THIRD:
                 medical_third_index = index
         if medical_third_index is not None:
@@ -5068,6 +5349,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "enrollDate": enroll_date,
             "startDateBI": _first_text(_date_text(data.get("commercial_start_date")), _date_text(_field_value(defaults, "商业起保日期")), next_day),
             "startDateCI": _first_text(_date_text(data.get("compulsory_start_date")), _date_text(_field_value(defaults, "交强起保日期")), next_day),
+            "startHourBI": _first_text(data.get("commercial_start_hour"), data.get("startHourBI"), _field_value(defaults, "商业起保小时"), "0"),
+            "startMinuteBI": _first_text(data.get("commercial_start_minute"), data.get("startMinuteBI"), _field_value(defaults, "商业起保分钟"), "0"),
+            "startHourCI": _first_text(data.get("compulsory_start_hour"), data.get("startHourCI"), _field_value(defaults, "交强起保小时", "交强险起保小时"), "0"),
+            "startMinuteCI": _first_text(data.get("compulsory_start_minute"), data.get("startMinuteCI"), _field_value(defaults, "交强起保分钟", "交强险起保分钟"), "0"),
             "modelName": model_terms[0] if model_terms else raw_model_name,
             "rawModelName": raw_model_name,
             "brandNameHint": vehicle_brand_name,
@@ -5243,6 +5528,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         reinsure_items = dialog.get("reinsure_items") if isinstance(dialog.get("reinsure_items"), list) else []
         raw_commercial_candidate = _date_text(dialog.get("raw_suggested_commercial_start_date"))
         raw_compulsory_candidate = _date_text(dialog.get("raw_suggested_compulsory_start_date"))
+        raw_commercial_hour = _to_str(dialog.get("raw_suggested_commercial_start_hour")).strip()
+        raw_commercial_minute = _to_str(dialog.get("raw_suggested_commercial_start_minute")).strip()
+        raw_compulsory_hour = _to_str(dialog.get("raw_suggested_compulsory_start_hour")).strip()
+        raw_compulsory_minute = _to_str(dialog.get("raw_suggested_compulsory_start_minute")).strip()
         # Prefer the untouched value parsed from the platform response. The
         # legacy `suggested_*` fields are only a compatibility fallback.
         commercial_candidate = raw_commercial_candidate or _date_text(dialog.get("suggested_commercial_start_date"))
@@ -5271,12 +5560,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     kinds = repeat_kinds
                     message = platform_text or detect_text
                     candidate_day = _reinsure_notice_suggested_start_date(detect_text)
+                    candidate_datetime = _reinsure_notice_suggested_start_datetime(detect_text)
                     if "bi" in kinds:
                         commercial_candidate = candidate_day
                         raw_commercial_candidate = candidate_day
+                        raw_commercial_hour = _to_str(candidate_datetime.get("hour")).strip()
+                        raw_commercial_minute = _to_str(candidate_datetime.get("minute")).strip()
                     if "ci" in kinds:
                         compulsory_candidate = candidate_day
                         raw_compulsory_candidate = candidate_day
+                        raw_compulsory_hour = _to_str(candidate_datetime.get("hour")).strip()
+                        raw_compulsory_minute = _to_str(candidate_datetime.get("minute")).strip()
                 else:
                     implicit_renewal = _implicit_renewal_quote_adjustment_from_response(
                         platform_response,
@@ -5297,9 +5591,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         if "bi" in kinds:
                             commercial_candidate = _date_text(implicit_renewal.get("commercial_start_date"))
                             raw_commercial_candidate = commercial_candidate
+                            raw_commercial_hour = _to_str(implicit_renewal.get("commercial_start_hour")).strip()
+                            raw_commercial_minute = _to_str(implicit_renewal.get("commercial_start_minute")).strip()
                         if "ci" in kinds:
                             compulsory_candidate = _date_text(implicit_renewal.get("compulsory_start_date"))
                             raw_compulsory_candidate = compulsory_candidate
+                            raw_compulsory_hour = _to_str(implicit_renewal.get("compulsory_start_hour")).strip()
+                            raw_compulsory_minute = _to_str(implicit_renewal.get("compulsory_start_minute")).strip()
 
         if not kinds:
             return {}
@@ -5323,15 +5621,38 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 commercial_candidate or platform_next_day,
                 min_day=platform_next_day,
             ) or platform_next_day
+            if _date_text(commercial_candidate) != commercial_start:
+                raw_commercial_hour = ""
+                raw_commercial_minute = ""
         if "ci" in kinds:
             compulsory_start = _platform_effective_quote_date(
                 compulsory_candidate or platform_next_day,
                 min_day=platform_next_day,
             ) or platform_next_day
+            if _date_text(compulsory_candidate) != compulsory_start:
+                raw_compulsory_hour = ""
+                raw_compulsory_minute = ""
         if request_body:
             body_for_compare = _clean_used_fuel_request_body(_json_obj(request_body))
             form_for_compare = _clean_vehicle_cert_fields(_json_obj(body_for_compare.get("quoteForm")))
             vehicle_for_compare = _clean_vehicle_cert_fields(_json_obj(body_for_compare.get("vehicleForm")))
+            defaults_for_compare = _json_obj(body_for_compare.get("defaultFields"))
+            if (
+                "ci" in kinds
+                and compulsory_start
+                and not _period_time_explicit(raw_compulsory_hour, raw_compulsory_minute)
+                and _to_str(form_for_compare.get("renewed")).strip() != "1"
+                and adjustment_source == "implicit_renewal_quote_hint"
+            ):
+                configured_ci_hour = _field_value(defaults_for_compare, "交强起保小时", "交强险起保小时", "转保交强起保小时")
+                configured_ci_minute = _field_value(defaults_for_compare, "交强起保分钟", "交强险起保分钟", "转保交强起保分钟")
+                if _period_time_explicit(configured_ci_hour, configured_ci_minute):
+                    raw_compulsory_hour, raw_compulsory_minute = _period_time_texts(configured_ci_hour, configured_ci_minute)
+                else:
+                    bi_date = _date_obj(commercial_start)
+                    ci_date = _date_obj(compulsory_start)
+                    if bi_date and ci_date and (bi_date - ci_date).days == 1:
+                        raw_compulsory_hour, raw_compulsory_minute = "14", "0"
             filtered_kinds: List[str] = []
             for kind in kinds:
                 target_day = commercial_start if kind == "bi" else compulsory_start
@@ -5340,6 +5661,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     vehicle_for_compare,
                     kind=kind,
                     target_day=target_day,
+                    target_hour=raw_commercial_hour if kind == "bi" else raw_compulsory_hour,
+                    target_minute=raw_commercial_minute if kind == "bi" else raw_compulsory_minute,
                 ):
                     filtered_kinds.append(kind)
             kinds = filtered_kinds
@@ -5347,10 +5670,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 commercial_start = ""
                 commercial_candidate = ""
                 raw_commercial_candidate = ""
+                raw_commercial_hour = ""
+                raw_commercial_minute = ""
             if "ci" not in kinds:
                 compulsory_start = ""
                 compulsory_candidate = ""
                 raw_compulsory_candidate = ""
+                raw_compulsory_hour = ""
+                raw_compulsory_minute = ""
             if not kinds:
                 return {}
         return {
@@ -5358,6 +5685,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "start_date": _first_text(commercial_start, compulsory_start),
             "commercial_start_date": commercial_start,
             "compulsory_start_date": compulsory_start,
+            "commercial_start_hour": raw_commercial_hour,
+            "commercial_start_minute": raw_commercial_minute,
+            "compulsory_start_hour": raw_compulsory_hour,
+            "compulsory_start_minute": raw_compulsory_minute,
             "raw_commercial_start_date": raw_commercial_candidate,
             "raw_compulsory_start_date": raw_compulsory_candidate,
             "adjustment_kinds": kinds,
@@ -5385,6 +5716,32 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         kinds = [item for item in (adjustment.get("adjustment_kinds") if isinstance(adjustment.get("adjustment_kinds"), list) else []) if item in {"bi", "ci"}]
         bi_day = _date_text(adjustment.get("commercial_start_date"))
         ci_day = _date_text(adjustment.get("compulsory_start_date"))
+        bi_hour, bi_minute = _period_time_texts(
+            adjustment.get("commercial_start_hour"),
+            adjustment.get("commercial_start_minute"),
+        )
+        ci_hour, ci_minute = _period_time_texts(
+            adjustment.get("compulsory_start_hour"),
+            adjustment.get("compulsory_start_minute"),
+        )
+        if (
+            "ci" in kinds
+            and ci_day
+            and not _period_time_explicit(adjustment.get("compulsory_start_hour"), adjustment.get("compulsory_start_minute"))
+            and _to_str(form.get("renewed")).strip() != "1"
+            and _to_str(adjustment.get("source")).strip() == "implicit_renewal_quote_hint"
+        ):
+            configured_ci_hour = _field_value(defaults, "交强起保小时", "交强险起保小时", "转保交强起保小时")
+            configured_ci_minute = _field_value(defaults, "交强起保分钟", "交强险起保分钟", "转保交强起保分钟")
+            if _period_time_explicit(configured_ci_hour, configured_ci_minute):
+                ci_hour, ci_minute = _period_time_texts(configured_ci_hour, configured_ci_minute)
+            else:
+                bi_date = _date_obj(bi_day)
+                ci_date = _date_obj(ci_day)
+                # 0817 手工报价显示：普通 quote.do 返回“符合续保条件”且商业/交强到期差一天时，
+                # 页面会把交强按 14:00-14:00 提交；显式 quotePolicy 续保仍保持平台回填时间。
+                if bi_date and ci_date and (bi_date - ci_date).days == 1:
+                    ci_hour, ci_minute = "14", "0"
         applied_bi_day = ""
         applied_ci_day = ""
         bi_changed = False
@@ -5398,6 +5755,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 vehicle,
                 kind="bi",
                 target_day=bi_day,
+                target_hour=bi_hour,
+                target_minute=bi_minute,
             )
         ):
             apply_bi_day = _insurance_date_adjustment_target_day(
@@ -5418,6 +5777,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 vehicle["startDateBI"] = apply_bi_day
                 changed = True
                 bi_changed = True
+            if _safe_int_local(form.get("prpCmain.starthourbi"), 0) != _safe_int_local(bi_hour, 0):
+                form["prpCmain.starthourbi"] = bi_hour
+                changed = True
+            if _safe_int_local(form.get("prpCmain.startminutebi"), 0) != _safe_int_local(bi_minute, 0):
+                form["prpCmain.startminutebi"] = bi_minute
+                changed = True
         if (
             "ci" in kinds
             and ci_day
@@ -5426,6 +5791,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 vehicle,
                 kind="ci",
                 target_day=ci_day,
+                target_hour=ci_hour,
+                target_minute=ci_minute,
             )
         ):
             apply_ci_day = _insurance_date_adjustment_target_day(
@@ -5444,9 +5811,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if _to_str(vehicle.get("startDateCI")).strip() != apply_ci_day:
                 vehicle["startDateCI"] = apply_ci_day
                 changed = True
-            end_date_ci = _end_date_text(apply_ci_day)
+            end_date_ci = _ci_end_date_text(apply_ci_day, ci_hour, ci_minute)
             if end_date_ci and _to_str(form.get("prpCmain.endDateCI")).strip() != end_date_ci:
                 form["prpCmain.endDateCI"] = end_date_ci
+                changed = True
+            expected_end_hour = "24" if ci_hour == "0" and ci_minute == "0" else ci_hour
+            if _safe_int_local(form.get("prpCmain.starthourci"), 0) != _safe_int_local(ci_hour, 0):
+                form["prpCmain.starthourci"] = ci_hour
+                changed = True
+            if _safe_int_local(form.get("prpCmain.startminuteci"), 0) != _safe_int_local(ci_minute, 0):
+                form["prpCmain.startminuteci"] = ci_minute
+                changed = True
+            if _safe_int_local(form.get("prpCmain.endhourci"), 24) != _safe_int_local(expected_end_hour, 24):
+                form["prpCmain.endhourci"] = expected_end_hour
+                changed = True
+            if _safe_int_local(form.get("prpCmain.endminuteci"), 0) != _safe_int_local(ci_minute, 0):
+                form["prpCmain.endminuteci"] = ci_minute
                 changed = True
 
         recalculated_actual_value = ""
@@ -5496,6 +5876,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "message": _to_str(adjustment.get("message")).strip(),
             "commercial_start_date": applied_bi_day,
             "compulsory_start_date": applied_ci_day,
+            "commercial_start_hour": bi_hour if applied_bi_day else "",
+            "commercial_start_minute": bi_minute if applied_bi_day else "",
+            "compulsory_start_hour": ci_hour if applied_ci_day else "",
+            "compulsory_start_minute": ci_minute if applied_ci_day else "",
             "adjustment_kinds": applied_kinds,
             "actual_value": recalculated_actual_value,
             "source": adjustment.get("source") or "platform_prompt",
@@ -5536,11 +5920,29 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         auto_notice_callback: Any = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
         notices: List[Dict[str, Any]] = []
+        emitted_notice_signatures: set[tuple[str, str, str, str]] = set()
+        emitted_notice_texts: List[str] = []
         body = _clean_used_fuel_request_body(request_body)
 
         def remember_notice(adjustment: Mapping[str, Any], notice: Mapping[str, Any]) -> None:
             item = dict(_json_obj(notice))
-            emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
+            message_text = _to_str(adjustment.get("message")).strip()
+            message_compact = re.sub(r"\s+", "", message_text)
+            signature = (
+                message_text,
+                _date_text(notice.get("commercial_start_date")),
+                _date_text(notice.get("compulsory_start_date")),
+                ",".join(_to_str(x).strip() for x in (notice.get("adjustment_kinds") if isinstance(notice.get("adjustment_kinds"), list) else [])),
+            )
+            emitted = False
+            contained_by_emitted_notice = bool(
+                message_compact
+                and any(message_compact in previous for previous in emitted_notice_texts)
+            )
+            if signature not in emitted_notice_signatures and not contained_by_emitted_notice:
+                emitted_notice_signatures.add(signature)
+                emitted_notice_texts.append(message_compact)
+                emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
             if emitted:
                 item["emitted_to_chat"] = True
             notices.append(item)
@@ -5611,6 +6013,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if shared_main_limit:
             medical_third_amount = third_party_amount
+        road_rescue_quantity = _safe_int_local(_profile_product_default(defaults, prof, PRODUCT_ROAD_RESCUE, ""), 0)
         rows = [
             {"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))},
             {"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)},
@@ -5620,6 +6023,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             {"code": "BI_SHARED", "name": PRODUCT_SHARED_LIMIT, "required": True, "checked": shared_main_limit},
             {"code": "BI_MEDICAL_THIRD", "name": PRODUCT_MEDICAL_THIRD, "required": True, "insuredAmount": medical_third_amount},
         ]
+        if road_rescue_quantity > 0:
+            rows.append({"code": "BI_ROAD_RESCUE", "name": PRODUCT_ROAD_RESCUE, "required": False, "quantity": road_rescue_quantity})
         exclusions = _product_exclusions(defaults)
         if exclusions:
             rows = [row for row in rows if _canonical_product_name(row.get("name")) not in exclusions]
@@ -5632,6 +6037,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "机动车车上人员责任保险（司机）": PRODUCT_DRIVER,
             "机动车车上人员责任保险（乘客）": PRODUCT_PASSENGER,
             "附加医保外医疗费用责任险（机动车第三者责任保险）": PRODUCT_MEDICAL_THIRD,
+            "附加机动车增值服务特约条款（道路救援服务）": PRODUCT_ROAD_RESCUE,
             "交强险": "交强险",
         }
         return replacements.get(text, text)
@@ -5671,6 +6077,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         for row_any in item_rows:
             row = _json_obj(row_any)
             kind_code = _to_str(row.get("kindCode")).strip()
+            if kind_code == "051064" and not _has_text(row.get("quantity")):
+                form_index = _quote_form_kind_index(form, "051064")
+                if form_index is not None:
+                    quantity = _to_str(form.get(f"prpCitemKindVos[{form_index}].quantity")).strip()
+                    if quantity:
+                        row["quantity"] = quantity
             name = self._display_kind_name(row.get("kindName"))
             premium_present = _has_text(row.get("premium"))
             premium = _money(row.get("premium")) if premium_present else Decimal("0")

@@ -23,13 +23,19 @@ from app.services.quote_assistant_service import (
     _quote_end_date_text,
     _quote_auto_notice_message_id,
     _quote_snapshot_with_auto_adjusted_dates,
+    _quote_result_insurance_date_auto_adjustments,
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
+    _platform_default_values_with_legacy_fixes,
+    _normalize_quote_product_exclusions,
+    _extract_quote_product_exclusions,
+    extract_quote_config_overrides,
 )
 from app.services.ai_assistant_service import (
     _message_preview_text,
     _session_preview_needs_recompute,
 )
+from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
 from app.services.quote_platforms.base import PlatformRuntimeResult
 from app.services.quote_platforms.platforms.picc.business import (
     PiccBusinessAdapter,
@@ -96,6 +102,13 @@ def _load_0813_renewal_har() -> dict:
     return json.loads(matches[0].read_text(encoding="utf-8-sig"))
 
 
+def _load_0817_correct_quote_har() -> dict:
+    path = Path(r"D:\HuaweiMoveData\Users\king\Documents\0817正确报价.har")
+    if not path.exists():
+        raise unittest.SkipTest("未找到 0817 正确报价 HAR，跳过 HAR 对齐测试")
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
 def _har_response_json(har: dict, entry_index: int) -> dict:
     return json.loads(har["log"]["entries"][entry_index]["response"]["content"].get("text") or "{}")
 
@@ -106,6 +119,43 @@ def _har_form_params(har: dict, entry_index: int) -> dict:
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    def test_vehicle_cert_cleaning_keeps_engine_letter_l(self) -> None:
+        self.assertEqual(correct_vehicle_cert_field("engine_no", "W24L33464"), "W24L33464")
+        cleaned = clean_dynamic_data_for_ocr(
+            {
+                "engine_no": "W24L33464",
+                "vin": "LC0C76C4XR6182655",
+            }
+        )
+        self.assertEqual(cleaned["engine_no"], "W24L33464")
+        self.assertEqual(cleaned["vin"], "LC0C76C4XR6182655")
+
+    def test_new_energy_used_legacy_driver_passenger_defaults_are_patched(self) -> None:
+        source_values = {
+            "第三者责任险": "300",
+            "车上人员责任险（司机）": "1",
+            "车上人员责任险（乘客）": "1",
+        }
+        values = _platform_default_values_with_legacy_fixes(
+            "PICC",
+            "新能源车-旧",
+            source_values,
+        )
+        self.assertEqual(values["车上人员责任险（司机）"], "4")
+        self.assertEqual(values["车上人员责任险（乘客）"], "4")
+        self.assertEqual(source_values["车上人员责任险（司机）"], "1")
+
+        oil_values = _platform_default_values_with_legacy_fixes(
+            "PICC",
+            "油车-旧",
+            {
+                "车上人员责任险（司机）": "1",
+                "车上人员责任险（乘客）": "1",
+            },
+        )
+        self.assertEqual(oil_values["车上人员责任险（司机）"], "1")
+        self.assertEqual(oil_values["车上人员责任险（乘客）"], "1")
+
     def test_profile_defaults_cover_four_account_types(self) -> None:
         from app.services.quote_platforms.platforms.picc.business import (
             NEW_ENERGY_NEW_ACCOUNT_TYPE,
@@ -200,6 +250,45 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(energy_form["prpCcarShipTax.dutyPaidProofNo"], "0012061001")
         self.assertEqual(energy_form["prpCcarShipTax.payStartDate"], "2026-01-01")
         self.assertEqual(energy_form["prpCcarShipTax.payEndDate"], "2026-12-31")
+
+    def test_final_quote_form_reuses_persisted_period_time_fields(self) -> None:
+        from app.services.quote_platforms.platforms.picc.business import (
+            NEW_ENERGY_USED_ACCOUNT_TYPE,
+            _motor_quote_profile,
+            _picc_business_defaults,
+        )
+
+        adapter = _adapter()
+        form = adapter._build_used_fuel_quote_form(
+            _picc_business_defaults({}),
+            {
+                "licenseNo": "赣KF88172",
+                "engineNo": "W24L33464",
+                "vin": "LC0C76C4XR6182655",
+                "enrollDate": "2024-01-01",
+                "startDateBI": "2026-10-01",
+                "startHourBI": "0",
+                "startMinuteBI": "0",
+                "startDateCI": "2026-09-30",
+                "startHourCI": "14",
+                "startMinuteCI": "0",
+                "modelName": "测试车型",
+                "actualValue": "95600.18",
+                "purchasePrice": "95600.18",
+                "seatCount": "5",
+            },
+            {"ownerName": "夏玲珍", "ownerIdNo": "360402199001011234", "ownerPhone": "13900000000"},
+            {"vehicleId": "MODEL001", "vehicleModelCode": "PLAT001", "purchasePrice": "95600.18"},
+            {},
+            [],
+            profile=_motor_quote_profile(NEW_ENERGY_USED_ACCOUNT_TYPE),
+        )
+        self.assertEqual(form["prpCmain.startDate"], "2026-10-01")
+        self.assertEqual(form["prpCmain.starthourbi"], "0")
+        self.assertEqual(form["prpCmain.startDateCI"], "2026-09-30")
+        self.assertEqual(form["prpCmain.starthourci"], "14")
+        self.assertEqual(form["prpCmain.endDateCI"], "2027-09-30")
+        self.assertEqual(form["prpCmain.endhourci"], "14")
 
     def test_invalid_default_license_is_ignored_but_tax_fields_can_override_profile(self) -> None:
         from app.services.quote_platforms.platforms.picc.business import (
@@ -530,6 +619,67 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCmain.startDateCI"], "2026-08-20")
         self.assertEqual(vehicle["startDateCI"], "2026-08-20")
         self.assertEqual(form["prpCmain.endDateCI"], _quote_end_date_text("2026-08-20"))
+
+    def test_case_snapshot_persists_final_period_time_fields(self) -> None:
+        snapshot = {
+            "normalized_data": {
+                "commercial_start_date": "2026-08-18",
+                "compulsory_start_date": "2026-08-18",
+            },
+            "request_body": {
+                "quoteForm": {
+                    "prpCmain.startDate": "2026-08-18",
+                    "prpCmain.starthourbi": "0",
+                    "prpCmain.startminutebi": "0",
+                    "prpCmain.startDateCI": "2026-08-18",
+                    "prpCmain.starthourci": "0",
+                    "prpCmain.startminuteci": "0",
+                    "prpCmain.endDateCI": "2027-08-17",
+                    "prpCmain.endhourci": "24",
+                    "prpCmain.endminuteci": "0",
+                },
+                "vehicleForm": {
+                    "startDateBI": "2026-08-18",
+                    "startDateCI": "2026-08-18",
+                },
+            },
+        }
+        result = {
+            "platform_auto_notices": [
+                {
+                    "type": "insurance_date_adjust",
+                    "commercial_start_date": "2026-10-01",
+                    "commercial_start_hour": "0",
+                    "commercial_start_minute": "0",
+                    "compulsory_start_date": "2026-09-30",
+                    "compulsory_start_hour": "14",
+                    "compulsory_start_minute": "0",
+                }
+            ]
+        }
+        adjustments = _quote_result_insurance_date_auto_adjustments(result)
+        persisted = _quote_snapshot_with_auto_adjusted_dates(snapshot, adjustments)
+        form = persisted["request_body"]["quoteForm"]
+        vehicle = persisted["request_body"]["vehicleForm"]
+        self.assertEqual(persisted["normalized_data"]["commercial_start_date"], "2026-10-01")
+        self.assertEqual(persisted["normalized_data"]["commercial_start_hour"], "0")
+        self.assertEqual(persisted["normalized_data"]["compulsory_start_date"], "2026-09-30")
+        self.assertEqual(persisted["normalized_data"]["compulsory_start_hour"], "14")
+        self.assertEqual(form["prpCmain.startDateCI"], "2026-09-30")
+        self.assertEqual(form["prpCmain.starthourci"], "14")
+        self.assertEqual(form["prpCmain.endDateCI"], "2027-09-30")
+        self.assertEqual(form["prpCmain.endhourci"], "14")
+        self.assertEqual(vehicle["startHourCI"], "14")
+
+    def test_road_rescue_command_can_adjust_or_remove_product(self) -> None:
+        overrides = extract_quote_config_overrides("道路救援 7")
+        self.assertEqual(overrides["机动车增值服务特约条款（道路救援服务）"], "7")
+        exclusions = _extract_quote_product_exclusions("不要道路救援")
+        self.assertIn("机动车增值服务特约条款（道路救援服务）", exclusions)
+        self.assertIn(
+            "机动车增值服务特约条款（道路救援服务）",
+            _normalize_quote_product_exclusions(["道路救援"]),
+        )
 
     def test_duplicate_insurance_with_explicit_period_change_enters_retry_path(self) -> None:
         response = {
@@ -918,6 +1068,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCitemKindVos[4].kindCode"], "051053")
         self.assertEqual(form["prpCitemKindVos[4].amount"], "30000")
         self.assertEqual(form["prpCitemKindVos[5].amount"], "3000000")
+
         self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
         self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["premium"], "0")
         self.assertEqual(body["jointSaleForm"]["tujiaAnshun"]["amount"], "0")
@@ -933,6 +1084,54 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(result["result_card"]["joint_sales_premium"], "")
         self.assertEqual(result["result_card"]["total_without_vehicle_tax"], "2621.46")
         self.assertEqual(result["result_card"]["total_with_vehicle_tax"], "2921.46")
+
+    def test_0817_implicit_renewal_quote_adjusts_compulsory_hour_like_manual_har(self) -> None:
+        har = _load_0817_correct_quote_har()
+        source_form = _har_form_params(har, 133)
+        expected_form = _har_form_params(har, 174)
+        adapter = _adapter()
+        client = _HarRouteClient(
+            {
+                "getCurrentTime.do": {
+                    "status": 0,
+                    "data": {"currentTime": "2026-08-17"},
+                }
+            }
+        )
+        request_body = {
+            "accountTypeName": "新能源车-旧",
+            "quoteForm": source_form,
+            "vehicleForm": {
+                "startDateBI": source_form["prpCmain.startDate"],
+                "startDateCI": source_form["prpCmain.startDateCI"],
+            },
+            "defaultFields": {},
+            "preflight": {},
+        }
+
+        adjustment = adapter._insurance_date_adjustment_from_platform_response(
+            client,
+            _har_response_json(har, 133),
+            request_body=request_body,
+        )
+        self.assertEqual(adjustment["adjustment_kinds"], ["ci"])
+        self.assertEqual(adjustment["compulsory_start_date"], "2026-09-30")
+        self.assertEqual(adjustment["compulsory_start_hour"], "14")
+
+        adjusted_body, changed, notice = adapter._apply_insurance_date_adjustment_to_request_body(
+            client,
+            request_body,
+            adjustment,
+        )
+        self.assertTrue(changed)
+        adjusted_form = adjusted_body["quoteForm"]
+        self.assertEqual(adjusted_form["prpCmain.startDate"], expected_form["prpCmain.startDate"])
+        self.assertEqual(adjusted_form["prpCmain.starthourbi"], expected_form["prpCmain.starthourbi"])
+        self.assertEqual(adjusted_form["prpCmain.startDateCI"], expected_form["prpCmain.startDateCI"])
+        self.assertEqual(adjusted_form["prpCmain.starthourci"], expected_form["prpCmain.starthourci"])
+        self.assertEqual(adjusted_form["prpCmain.endDateCI"], expected_form["prpCmain.endDateCI"])
+        self.assertEqual(adjusted_form["prpCmain.endhourci"], expected_form["prpCmain.endhourci"])
+        self.assertEqual(notice["compulsory_start_hour"], "14")
 
 
 if __name__ == "__main__":
