@@ -1366,6 +1366,43 @@ def _reinsure_notice_adjustment_kinds(message: Any) -> List[str]:
     return kinds or ["bi"]
 
 
+def _implicit_renewal_quote_hint(message: Any) -> str:
+    text = _platform_notice_text(message)
+    compact = re.sub(r"\s+", "", text)
+    if not compact or "不符合续保条件" in compact:
+        return ""
+    if "已按照续保流程处理" in compact or "符合续保条件" in compact:
+        return text
+    return ""
+
+
+def _implicit_renewal_quote_adjustment_from_response(
+    platform_response: Any,
+    message: Any,
+) -> Dict[str, Any]:
+    """Detect PICC's successful quote response that silently turned into renewal."""
+    hint = _implicit_renewal_quote_hint(message)
+    if not hint:
+        return {}
+    payload = _json_obj(_json_obj(platform_response).get("data"))
+    commercial_start = _date_text(payload.get("lastExpireDateBI"))
+    compulsory_start = _date_text(payload.get("lastExpireDateCI"))
+    kinds: List[str] = []
+    if commercial_start:
+        kinds.append("bi")
+    if compulsory_start:
+        kinds.append("ci")
+    if not kinds:
+        return {}
+    return {
+        "message": hint,
+        "commercial_start_date": commercial_start,
+        "compulsory_start_date": compulsory_start,
+        "adjustment_kinds": kinds,
+        "source": "implicit_renewal_quote_hint",
+    }
+
+
 def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     payload = _json_obj(_json_obj(data).get("data"))
     if not payload:
@@ -5214,6 +5251,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             raw_commercial_candidate = commercial_candidate
         if not raw_compulsory_candidate:
             raw_compulsory_candidate = compulsory_candidate
+        adjustment_source = "platform_current_time_and_quote_prompt"
 
         if not kinds:
             platform_body = _json_obj(_json_obj(platform_response).get("data"))
@@ -5239,6 +5277,29 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     if "ci" in kinds:
                         compulsory_candidate = candidate_day
                         raw_compulsory_candidate = candidate_day
+                else:
+                    implicit_renewal = _implicit_renewal_quote_adjustment_from_response(
+                        platform_response,
+                        platform_text or detect_text or message,
+                    )
+                    if implicit_renewal:
+                        kinds = [
+                            item
+                            for item in (
+                                implicit_renewal.get("adjustment_kinds")
+                                if isinstance(implicit_renewal.get("adjustment_kinds"), list)
+                                else []
+                            )
+                            if _to_str(item).strip() in {"bi", "ci"}
+                        ]
+                        message = _to_str(implicit_renewal.get("message")).strip() or platform_text or detect_text
+                        adjustment_source = _to_str(implicit_renewal.get("source")).strip() or adjustment_source
+                        if "bi" in kinds:
+                            commercial_candidate = _date_text(implicit_renewal.get("commercial_start_date"))
+                            raw_commercial_candidate = commercial_candidate
+                        if "ci" in kinds:
+                            compulsory_candidate = _date_text(implicit_renewal.get("compulsory_start_date"))
+                            raw_compulsory_candidate = compulsory_candidate
 
         if not kinds:
             return {}
@@ -5300,7 +5361,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "raw_commercial_start_date": raw_commercial_candidate,
             "raw_compulsory_start_date": raw_compulsory_candidate,
             "adjustment_kinds": kinds,
-            "source": "platform_current_time_and_quote_prompt",
+            "source": adjustment_source,
         }
 
     def _apply_insurance_date_adjustment_to_request_body(
