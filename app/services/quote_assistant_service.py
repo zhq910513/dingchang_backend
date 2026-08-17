@@ -10532,7 +10532,7 @@ async def _persist_unemitted_quote_auto_notices(
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
         if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             continue
-        message = sanitize_quote_user_message(notice.get("message"), "")
+        message = _sanitize_duplicate_quote_warning(notice.get("message"), "")
         if not message:
             continue
         dedupe_key = _quote_auto_notice_compact_message(message)
@@ -10895,7 +10895,7 @@ def _attach_quote_auto_notice_callback(
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
         if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
             return False
-        message = sanitize_quote_user_message(notice.get("message"), "")
+        message = _sanitize_duplicate_quote_warning(notice.get("message"), "")
         if not message:
             return False
         stable_key = _quote_auto_notice_dedupe_key(

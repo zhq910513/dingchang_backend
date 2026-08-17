@@ -49,6 +49,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _insurance_date_adjustment_needed,
     _insurance_date_adjustment_target_day,
     _proposal_start_datetime_from_quote_response,
+    _quote_form_kind_index,
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
@@ -106,6 +107,20 @@ def _load_0817_correct_quote_har() -> dict:
     path = Path(r"D:\HuaweiMoveData\Users\king\Documents\0817正确报价.har")
     if not path.exists():
         raise unittest.SkipTest("未找到 0817 正确报价 HAR，跳过 HAR 对齐测试")
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _load_0818_smooth_quote_har() -> dict:
+    path = Path(r"D:\HuaweiMoveData\Users\king\Documents\0818最终完整顺畅报价.har")
+    if not path.exists():
+        raise unittest.SkipTest("未找到 0818 最终完整顺畅报价 HAR，跳过 HAR 对齐测试")
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _load_0818_original_quote_har() -> dict:
+    path = Path(r"D:\HuaweiMoveData\Users\king\Documents\0818正确报价.har")
+    if not path.exists():
+        raise unittest.SkipTest("未找到 0818 正确报价 HAR，跳过 HAR 对齐测试")
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
@@ -1132,6 +1147,135 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(adjusted_form["prpCmain.endDateCI"], expected_form["prpCmain.endDateCI"])
         self.assertEqual(adjusted_form["prpCmain.endhourci"], expected_form["prpCmain.endhourci"])
         self.assertEqual(notice["compulsory_start_hour"], "14")
+
+    def test_0818_sync_period_keeps_configured_coverages_and_adds_road_rescue(self) -> None:
+        har = _load_0818_smooth_quote_har()
+        source_form = _har_form_params(har, 72)
+        expected_form = _har_form_params(har, 142)
+        adapter = _adapter()
+        client = _HarRouteClient(
+            {
+                "getCurrentTime.do": {
+                    "status": 0,
+                    "data": {"currentTime": "2026-08-18"},
+                }
+            }
+        )
+        request_body = {
+            "accountTypeName": "新能源车-旧",
+            "quoteForm": source_form,
+            "vehicleForm": {
+                "startDateBI": source_form["prpCmain.startDate"],
+                "startDateCI": source_form["prpCmain.startDateCI"],
+                "seatCount": source_form.get("prpCitemCar.seatCount", "5"),
+            },
+            "defaultFields": {},
+            "preflight": {},
+        }
+
+        adjustment = adapter._insurance_date_adjustment_from_platform_response(
+            client,
+            _har_response_json(har, 72),
+            request_body=request_body,
+        )
+        self.assertEqual(adjustment["adjustment_kinds"], ["bi"])
+        self.assertEqual(adjustment["commercial_start_date"], "2026-10-01")
+        self.assertTrue(adjustment.get("reinsure_items"))
+
+        adjusted_body, changed, notice = adapter._apply_insurance_date_adjustment_to_request_body(
+            client,
+            request_body,
+            adjustment,
+        )
+        self.assertTrue(changed)
+        adjusted_form = adjusted_body["quoteForm"]
+        self.assertEqual(adjusted_form["prpCmain.startDate"], expected_form["prpCmain.startDate"])
+        self.assertEqual(adjusted_form["prpCitemKindVos[2].amount"], expected_form["prpCitemKindVos[2].amount"])
+        self.assertEqual(adjusted_form["prpCitemKindVos[3].amount"], expected_form["prpCitemKindVos[3].amount"])
+        self.assertEqual(adjusted_form["prpCitemKindVos[4].amount"], expected_form["prpCitemKindVos[4].amount"])
+        self.assertEqual(adjusted_form["prpCitemKindVos[5].amount"], expected_form["prpCitemKindVos[5].amount"])
+        self.assertEqual(adjusted_form["prpCitemKindVos[5].sharedAmountFlag"], expected_form["prpCitemKindVos[5].sharedAmountFlag"])
+        road_rescue_index = _quote_form_kind_index(adjusted_form, "051064")
+        self.assertIsNotNone(road_rescue_index)
+        self.assertEqual(adjusted_form[f"prpCitemKindVos[{road_rescue_index}].quantity"], "7")
+        self.assertEqual(notice["commercial_start_date"], "2026-10-01")
+
+    def test_0818_sync_period_restores_missing_passenger_before_medical(self) -> None:
+        har = _load_0818_original_quote_har()
+        source_form = _har_form_params(har, 52)
+        adapter = _adapter()
+        client = _HarRouteClient(
+            {
+                "getCurrentTime.do": {
+                    "status": 0,
+                    "data": {"currentTime": "2026-08-18"},
+                }
+            }
+        )
+        request_body = {
+            "accountTypeName": "新能源车-旧",
+            "quoteForm": source_form,
+            "vehicleForm": {
+                "startDateBI": source_form["prpCmain.startDate"],
+                "startDateCI": source_form["prpCmain.startDateCI"],
+                "seatCount": source_form.get("prpCitemCar.seatCount", "5"),
+            },
+            "defaultFields": {},
+            "preflight": {},
+        }
+
+        adjustment = adapter._insurance_date_adjustment_from_platform_response(
+            client,
+            _har_response_json(har, 52),
+            request_body=request_body,
+        )
+        adjusted_body, changed, _notice = adapter._apply_insurance_date_adjustment_to_request_body(
+            client,
+            request_body,
+            adjustment,
+        )
+        self.assertTrue(changed)
+        form = adjusted_body["quoteForm"]
+        self.assertEqual(form["prpCitemKindVos[2].kindCode"], "051051")
+        self.assertEqual(form["prpCitemKindVos[2].amount"], "300")
+        self.assertEqual(form["prpCitemKindVos[3].kindCode"], "051052")
+        self.assertEqual(form["prpCitemKindVos[3].amount"], "40000")
+        self.assertEqual(form["prpCitemKindVos[4].kindCode"], "051053")
+        self.assertEqual(form["prpCitemKindVos[4].amount"], "40000")
+        self.assertEqual(form["prpCitemKindVos[5].kindCode"], "051063")
+        self.assertEqual(form["prpCitemKindVos[5].amount"], "3000000")
+        self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
+        self.assertEqual(form["prpCitemKindVos[6].kindCode"], "051064")
+        self.assertEqual(form["prpCitemKindVos[6].quantity"], "7")
+
+    def test_0818_result_uses_request_road_rescue_quantity_when_response_returns_zero(self) -> None:
+        har = _load_0818_smooth_quote_har()
+        request_body = {
+            "accountTypeName": "新能源车-旧",
+            "quoteForm": _har_form_params(har, 142),
+            "vehicleForm": {
+                "licenseNo": "赣KF88172",
+                "vin": "LC0C76C4XR6182655",
+                "engineNo": "W24133464",
+                "seatCount": "5",
+            },
+            "ownerForm": {"ownerName": "柯雄"},
+            "jointSaleForm": {"tujiaAnshun": {"enabled": False, "success": True, "premium": "0", "amount": "0"}},
+            "preflight": {},
+        }
+        ctx = SimpleNamespace(account_type_name="新能源车-旧")
+        result = _adapter()._build_used_fuel_quote_result_from_response(
+            ctx,
+            {},
+            request_body,
+            _har_response_json(har, 142),
+        )
+        road_rescue = next(
+            item
+            for item in result["result_card"]["proposal_coverage_items"]
+            if item["code"] == "051064"
+        )
+        self.assertEqual(road_rescue["amount_text"], "7次")
 
 
 if __name__ == "__main__":

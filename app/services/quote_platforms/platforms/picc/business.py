@@ -56,6 +56,7 @@ TAXABATE_QUERY_PATH = "/khyx/newFront/qtr/price/queryQtTaxabate.do"
 CAL_ACTUAL_VALUE_PATH = "/khyx/newFront/price/calActualVal.do"
 VERIFY_AGENT_CONTROL_PATH = "/khyx/newFront/qth/price/verifyPersonalAgtControl.do"
 DUPLICATE_INSURED_VIN_PATH = "/khyx/newFront/qth/price/duplicateInsuredVinNo.do"
+QUERY_INSURED_BY_CAR_INFO_PATH = "/khyx/newFront/qth/price/queryInsuredByCarInfo.do"
 JOINT_SALE_PLAN_INFO_PATH = "/khyx/newFront/prpall/common/choosePlanInfoForJointSale.do"
 MONOPOLY_QUERY_PATH = "/khyx/newFront/qth/myinfo/monopoly/query.do"
 QUERY_QUALITY_FLAG_PATH = "/khyx/newFront/qth/price/queryQualityFlag.do"
@@ -2241,6 +2242,171 @@ def _quote_form_shared_main_limit(form: Mapping[str, Any]) -> Optional[bool]:
     return _checked(value, default=False)
 
 
+def _quote_form_next_kind_index(form: Mapping[str, Any]) -> int:
+    max_index = -1
+    for key in form.keys():
+        match = re.fullmatch(r"prpCitemKindVos\[(\d+)\]\.kindCode", _to_str(key).strip())
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return max_index + 1
+
+
+PICC_KIND_FORM_ORDER = {
+    "051074": 0,
+    "051050": 1,
+    "051051": 2,
+    "051052": 3,
+    "051053": 4,
+    "051063": 5,
+    "051064": 6,
+    "051085": 7,
+}
+
+
+def _reorder_quote_form_kind_rows(form: Dict[str, Any]) -> bool:
+    row_pattern = re.compile(r"prpCitemKindVos\[(\d+)\]\.(.+)")
+    rows: Dict[int, Dict[str, Any]] = {}
+    for key, value in list(form.items()):
+        match = row_pattern.fullmatch(_to_str(key).strip())
+        if match:
+            rows.setdefault(int(match.group(1)), {})[match.group(2)] = value
+    if not rows:
+        return False
+
+    old_indices = sorted(rows)
+    ordered_indices = sorted(
+        old_indices,
+        key=lambda index: (
+            PICC_KIND_FORM_ORDER.get(_to_str(rows[index].get("kindCode")).strip(), 1000),
+            index,
+        ),
+    )
+    index_map = {old_index: new_index for new_index, old_index in enumerate(ordered_indices)}
+    if all(index_map[index] == index for index in old_indices):
+        return False
+
+    for key in list(form.keys()):
+        if row_pattern.fullmatch(_to_str(key).strip()):
+            form.pop(key, None)
+    for old_index in ordered_indices:
+        new_index = index_map[old_index]
+        for suffix, value in rows[old_index].items():
+            form[f"prpCitemKindVos[{new_index}].{suffix}"] = value
+    return True
+
+
+def _set_quote_form_kind_row(
+    form: Dict[str, Any],
+    *,
+    kind_code: str,
+    kind_name: str,
+    amount: Any = None,
+    quantity: Any = None,
+    shared_amount_flag: Any = None,
+) -> bool:
+    index = _quote_form_kind_index(form, kind_code)
+    changed = False
+    if index is None:
+        index = _quote_form_next_kind_index(form)
+        form[f"prpCitemKindVos[{index}].kindCode"] = kind_code
+        form[f"prpCitemKindVos[{index}].kindName"] = kind_name
+        form[f"prpCitemKindVos[{index}].chooseFlag"] = "true"
+        changed = True
+    else:
+        if _to_str(form.get(f"prpCitemKindVos[{index}].kindName")).strip() != kind_name:
+            form[f"prpCitemKindVos[{index}].kindName"] = kind_name
+            changed = True
+        if _to_str(form.get(f"prpCitemKindVos[{index}].chooseFlag")).strip().lower() != "true":
+            form[f"prpCitemKindVos[{index}].chooseFlag"] = "true"
+            changed = True
+    if amount is not None:
+        amount_text = _to_str(amount).strip()
+        if _to_str(form.get(f"prpCitemKindVos[{index}].amount")).strip() != amount_text:
+            form[f"prpCitemKindVos[{index}].amount"] = amount_text
+            changed = True
+    if quantity is not None:
+        quantity_text = _to_str(quantity).strip()
+        if _to_str(form.get(f"prpCitemKindVos[{index}].quantity")).strip() != quantity_text:
+            form[f"prpCitemKindVos[{index}].quantity"] = quantity_text
+            changed = True
+    if shared_amount_flag is not None:
+        flag_text = _to_str(shared_amount_flag).strip()
+        if _to_str(form.get(f"prpCitemKindVos[{index}].sharedAmountFlag")).strip() != flag_text:
+            form[f"prpCitemKindVos[{index}].sharedAmountFlag"] = flag_text
+            changed = True
+    return changed
+
+
+def _reinsure_items_include_kind(reinsure_items: Any, kind_code: str, *name_markers: str) -> bool:
+    if not isinstance(reinsure_items, list):
+        return False
+    target = _to_str(kind_code).strip()
+    markers = tuple(_to_str(marker).strip() for marker in name_markers if _to_str(marker).strip())
+    for item_any in reinsure_items:
+        item = _json_obj(item_any)
+        coverage_list = item.get("itemList") if isinstance(item.get("itemList"), list) else []
+        for coverage_any in coverage_list:
+            coverage = _json_obj(coverage_any)
+            code = _to_str(_first_text(coverage.get("coverageRealCode"), coverage.get("coverageCode"))).strip()
+            name = _to_str(_first_text(coverage.get("coverageName"), coverage.get("coverageCode"))).strip()
+            if code == target or any(marker in name for marker in markers):
+                return True
+    return False
+
+
+def _normalize_platform_adjusted_quote_products(
+    form: Dict[str, Any],
+    defaults: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    adjustment: Mapping[str, Any],
+) -> bool:
+    """Keep configured core cover amounts after PICC's date/risk sync prompts."""
+
+    changed = False
+    exclusions = _product_exclusions(defaults)
+    third_party_config = _profile_product_default(defaults, profile, PRODUCT_THIRD_PARTY, "300")
+    third_party_wan = _wan_or_amount_to_wan_text(third_party_config, "300")
+    shared_main_limit = _checked(_profile_product_default(defaults, profile, PRODUCT_SHARED_LIMIT, True), default=True)
+    medical_third_amount = _wan_or_amount_to_amount(
+        _profile_product_default(defaults, profile, PRODUCT_MEDICAL_THIRD, third_party_config),
+        third_party_wan or "300",
+    )
+    if shared_main_limit:
+        medical_third_amount = _wan_or_amount_to_amount(third_party_wan, third_party_wan or "300")
+
+    core_specs = [
+        (PRODUCT_THIRD_PARTY, "051051", PRODUCT_THIRD_PARTY, third_party_wan, None),
+        (PRODUCT_DRIVER, "051052", PRODUCT_DRIVER, _wan_or_amount_to_amount(_profile_product_default(defaults, profile, PRODUCT_DRIVER, "2"), "2"), None),
+        (PRODUCT_PASSENGER, "051053", PRODUCT_PASSENGER, _wan_or_amount_to_amount(_profile_product_default(defaults, profile, PRODUCT_PASSENGER, "2"), "2"), None),
+        (PRODUCT_MEDICAL_THIRD, "051063", PRODUCT_MEDICAL_THIRD, medical_third_amount, "1" if shared_main_limit else "0"),
+    ]
+    for canonical_name, kind_code, kind_name, amount, shared_flag in core_specs:
+        if _canonical_product_name(canonical_name) in exclusions:
+            continue
+        changed = _set_quote_form_kind_row(
+            form,
+            kind_code=kind_code,
+            kind_name=kind_name,
+            amount=amount,
+            shared_amount_flag=shared_flag,
+        ) or changed
+
+    if (
+        _canonical_product_name(PRODUCT_ROAD_RESCUE) not in exclusions
+        and _reinsure_items_include_kind(adjustment.get("reinsure_items"), "051064", "道路救援")
+    ):
+        quantity = _safe_int_local(_profile_product_default(defaults, profile, PRODUCT_ROAD_RESCUE, ""), 0) or 7
+        changed = _set_quote_form_kind_row(
+            form,
+            kind_code="051064",
+            kind_name=PRODUCT_ROAD_RESCUE,
+            amount="",
+            quantity=str(quantity),
+        ) or changed
+    changed = _reorder_quote_form_kind_rows(form) or changed
+    return changed
+
+
 def _ensure_platform_success(data: Any, *, action: str) -> None:
     payload = _json_obj(data)
     if "status" in payload and int(payload.get("status") or 0) != 0:
@@ -3932,11 +4098,21 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         products = self._used_fuel_products(defaults, profile=profile, actual_value=actual_value, seat_count=vehicle.get("seatCount"))
         quote_form = self._build_used_fuel_quote_form(defaults, vehicle, owner, selected, precise_vehicle, products, profile=profile)
         preflight = dict(_json_obj(body.get("preflight")))
+        insured_customer = dict(_json_obj(preflight.get("insuredCustomer")))
+        if not insured_customer.get("attempted"):
+            insured_customer = self._query_insured_customer_by_car_best_effort(client, quote_form)
+        quote_form, insured_customer_applied = self._apply_insured_customer_to_quote_form(
+            quote_form,
+            _json_obj(insured_customer.get("selected")),
+        )
+        if insured_customer_applied:
+            insured_customer = {**insured_customer, "appliedFields": insured_customer_applied}
         preflight.update(
             {
                 "selectedVehicle": selected,
                 "preciseVehicle": precise_vehicle,
                 "actualValue": actual_value_result,
+                "insuredCustomer": insured_customer,
                 "vehicleModelAutoAccepted": {
                     "accepted": True,
                     "reason": "平台提示车型不一致，已自动使用平台返回车型码重试一次",
@@ -4709,6 +4885,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             vehicle["mainComCode"] = _first_text(checker_info.get("comCode"), vehicle.get("mainComCode"))
         products = self._used_fuel_products(defaults, profile=profile, actual_value=actual_value, seat_count=vehicle.get("seatCount"))
         quote_form = self._build_used_fuel_quote_form(defaults, vehicle, owner, selected, precise_vehicle, products, profile=profile)
+        insured_customer = self._query_insured_customer_by_car_best_effort(client, quote_form)
+        quote_form, insured_customer_applied = self._apply_insured_customer_to_quote_form(
+            quote_form,
+            _json_obj(insured_customer.get("selected")),
+        )
+        if insured_customer_applied:
+            insured_customer = {**insured_customer, "appliedFields": insured_customer_applied}
         prechecks = self._run_used_fuel_quote_prechecks(client, defaults, quote_form)
         joint_sale = self._query_tujia_anshun_plan_best_effort(client, defaults, quote_form)
 
@@ -4752,6 +4935,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
                 "actualValue": actual_value_result,
                 "taxabate": taxabate_result,
+                "insuredCustomer": insured_customer,
                 "carChecker": checker_info,
                 "quotePrechecks": prechecks,
                 "jointSale": {
@@ -4868,6 +5052,104 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if isinstance(rows, list) and rows and isinstance(rows[0], Mapping):
             return dict(rows[0])
         return {}
+
+    def _query_insured_customer_by_car_best_effort(
+        self,
+        client: PiccProtocolClient,
+        quote_form: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        vin = _to_str(_clean_vehicle_cert_value("vin", quote_form.get("prpCitemCar.vinNo") or quote_form.get("prpCitemCar.frameNo"))).strip()
+        license_no = _to_str(quote_form.get("prpCitemCar.licenseNo")).strip()
+        if not vin or not license_no:
+            return {
+                "attempted": False,
+                "found": False,
+                "reason": "missing_vin_or_license_no",
+            }
+        params = {
+            "carQuotationReqBody.vinNo": vin,
+            "carQuotationReqBody.licenseNo": license_no,
+            "carQuotationReqBody.toDoJumpFlag": "0",
+            "carQuotationReqBody.requestType": "1",
+        }
+        try:
+            data = client.request_json(
+                "GET",
+                QUERY_INSURED_BY_CAR_INFO_PATH,
+                purpose="business",
+                params=params,
+                headers={"Referer": f"{client.config.base_url}/khyxui/my-tools/quotation"},
+            )
+            payload = _json_obj(_json_obj(data).get("data"))
+            rows = payload.get("insuredList")
+            customers = [dict(row) for row in rows if isinstance(row, Mapping)] if isinstance(rows, list) else []
+            return {
+                "attempted": True,
+                "found": bool(customers),
+                "params": params,
+                "count": len(customers),
+                "status": _json_obj(data).get("status"),
+                "statusText": _json_obj(data).get("statusText") or "",
+                "selected": customers[0] if customers else {},
+            }
+        except Exception as exc:
+            return {
+                "attempted": True,
+                "found": False,
+                "params": params,
+                "error_code": exc.__class__.__name__,
+                "message": str(exc)[:300] or exc.__class__.__name__,
+            }
+
+    @staticmethod
+    def _apply_insured_customer_to_quote_form(
+        quote_form: Mapping[str, Any],
+        customer: Mapping[str, Any],
+    ) -> tuple[Dict[str, Any], List[str]]:
+        form = dict(quote_form)
+        row = _json_obj(customer)
+        if not row:
+            return form, []
+
+        applied: List[str] = []
+
+        def put(key: str, value: Any, *, overwrite: bool = True) -> None:
+            if value is None:
+                return
+            if isinstance(value, (Mapping, list, tuple, set)):
+                return
+            text = _to_str(value).strip()
+            if text == "":
+                return
+            if not overwrite and _to_str(form.get(key)).strip():
+                return
+            if form.get(key) != text:
+                applied.append(key)
+            form[key] = text
+
+        # HAR shows the page carrying the ECIF customer row as khyxCinsured[0].*
+        # and using the same row to fill owner/insured birthday, sex and age.
+        for key, value in row.items():
+            put(f"khyxCinsured[0].{key}", value)
+
+        identify_number = row.get("identifyNumber")
+        put("lastIdentifyNo", identify_number)
+
+        insured_type = _first_text(row.get("insuredType"), "1")
+        birthday = row.get("birthday")
+        age = row.get("age")
+        sex = row.get("sex")
+
+        for prefix in ("quoteInsured", "quoteCarOwner"):
+            put(f"{prefix}.insuredType", insured_type)
+            put(f"{prefix}.birthday", birthday)
+            put(f"{prefix}.age", age)
+            put(f"{prefix}.sex", sex)
+
+        name = row.get("insuredName")
+        put("carOwner", name, overwrite=False)
+        put("prpCcarShipTax.remark1", name, overwrite=False)
+        return form, applied
 
     def _run_used_fuel_quote_prechecks(
         self,
@@ -5693,6 +5975,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "raw_compulsory_start_date": raw_compulsory_candidate,
             "adjustment_kinds": kinds,
             "source": adjustment_source,
+            "reinsure_items": reinsure_items[:3] if reinsure_items else [],
         }
 
     def _apply_insurance_date_adjustment_to_request_body(
@@ -5828,6 +6111,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if _safe_int_local(form.get("prpCmain.endminuteci"), 0) != _safe_int_local(ci_minute, 0):
                 form["prpCmain.endminuteci"] = ci_minute
                 changed = True
+
+        if kinds and _normalize_platform_adjusted_quote_products(form, defaults, profile, adjustment):
+            changed = True
 
         recalculated_actual_value = ""
         if bi_changed and selected:
@@ -6077,7 +6363,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         for row_any in item_rows:
             row = _json_obj(row_any)
             kind_code = _to_str(row.get("kindCode")).strip()
-            if kind_code == "051064" and not _has_text(row.get("quantity")):
+            if kind_code == "051064" and _safe_int_local(row.get("quantity"), 0) <= 0:
                 form_index = _quote_form_kind_index(form, "051064")
                 if form_index is not None:
                     quantity = _to_str(form.get(f"prpCitemKindVos[{form_index}].quantity")).strip()
