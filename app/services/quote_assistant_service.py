@@ -419,21 +419,6 @@ def _quote_platform_name_from_command(text: Any) -> str:
     professional_entities = _json_obj(professional.get("entities"))
     if professional.get("is_quote") and professional_entities.get("platform_name"):
         return _to_str(professional_entities.get("platform_name")).strip()
-    stop_words = {"报价", "重新", "再次", "再", "重报", "平台"}
-    for line in re.split(r"[\r\n]+", raw):
-        compact = re.sub(r"\s+", "", _to_str(line))
-        if not compact:
-            continue
-        for pattern in (
-            r"^([\u4e00-\u9fffA-Za-z0-9]{1,32})(?:重新|再次|再)?报价$",
-            r"^([\u4e00-\u9fffA-Za-z0-9]{1,32})重报$",
-        ):
-            m = re.fullmatch(pattern, compact, flags=re.IGNORECASE)
-            if not m:
-                continue
-            name = _to_str(m.group(1)).strip()
-            if name and name not in stop_words:
-                return name[:32]
     return ""
 
 
@@ -1096,7 +1081,7 @@ CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE: Dict[str, Tuple[str, ...]] = {
 }
 
 QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车")),
+    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车", "意外", "意外险", "驾乘意外")),
     ("机动车损失保险", ("机动车损失保险", "车辆损失险", "车损险", "车损")),
     ("医保外医疗费用责任险（第三者责任险）", ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外")),
     ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者", "三责")),
@@ -1209,6 +1194,11 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
     text = re.sub(r"\s+", "", _to_str(compact))
     if not text:
         return ""
+    platform_prefixed = (
+        text.startswith("人保")
+        or text.startswith("中国人保")
+        or text.upper().startswith("PICC")
+    )
     if text in PICC_DANSHANG_COMMANDS:
         return "单商"
     if text in PICC_JIAOSAN_COMMANDS:
@@ -1218,7 +1208,8 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
     if (
         "单商" in text
         and (
-            text.startswith("单商")
+            platform_prefixed
+            or text.startswith("单商")
             or "人保单商" in text
             or "中国人保单商" in text
             or "PICC单商" in text.upper()
@@ -1228,7 +1219,8 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
     if (
         "交三" in text
         and (
-            text.startswith("交三")
+            platform_prefixed
+            or text.startswith("交三")
             or "人保交三" in text
             or "中国人保交三" in text
             or "PICC交三" in text.upper()
@@ -1238,7 +1230,8 @@ def _picc_quote_command_mode_from_compact(compact: str) -> str:
     if (
         "全保" in text
         and (
-            text.startswith("全保")
+            platform_prefixed
+            or text.startswith("全保")
             or "人保全保" in text
             or "中国人保全保" in text
             or "PICC全保" in text.upper()
@@ -1522,6 +1515,36 @@ def _quote_labeled_plate_no_present(value: Any) -> bool:
     return bool(re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)[:：=]?[\u4e00-\u9fff][A-Z][A-Z0-9]{4,6}", text))
 
 
+def _quote_new_energy_text_present(*values: Any) -> bool:
+    text = re.sub(r"\s+", "", " ".join(_to_str(value) for value in values if _to_str(value).strip()))
+    if not text:
+        return False
+    lowered = text.lower()
+    if re.search(r"非新能源|不是新能源", lowered, flags=re.IGNORECASE):
+        return False
+    if re.search(
+        r"新能源|绿牌|渐变绿|纯电动轿车|纯电|插电|插混|混动|油电|电动|燃料电池|氢能源|新能源车辆|新能源类型为纯电动|new_energy|electric|bev|phev|reev|增程",
+        lowered,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    model_values = [
+        re.sub(r"[^A-Z0-9]+", "", _to_str(value).upper())
+        for value in values
+        if re.search(r"[A-Za-z0-9]", _to_str(value))
+    ]
+    return any(re.search(r"(?:BEV|PHEV|REEV)(?:\d|[A-Z]|$)", item) for item in model_values)
+
+
+def _quote_fuel_text_present(*values: Any) -> bool:
+    text = re.sub(r"\s+", "", " ".join(_to_str(value) for value in values if _to_str(value).strip())).lower()
+    if not text:
+        return False
+    if re.search(r"非新能源|不是新能源|油车|蓝牌|蓝色号牌|汽油|柴油|燃油|fuel|gasoline|diesel", text, flags=re.IGNORECASE):
+        return True
+    return False
+
+
 def _normalize_license_type_value(value: Any) -> str:
     text = re.sub(r"\s+", "", _to_str(value)).upper()
     if not text:
@@ -1594,6 +1617,12 @@ def _resolve_license_type_decision(
                 reason=_to_str(previous.get("reason")).strip() or "沿用已确认号牌种类",
             )
 
+    field_license_type = _normalize_license_type_value(
+        data.get("license_type") or data.get("licenseType") or data.get("licensePlateType") or data.get("license_color_code")
+    )
+    if field_license_type == LICENSE_TYPE_NEW_ENERGY:
+        return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="license_type_field", reason="资料号牌种类为52")
+
     if _quote_new_energy_plate_no_present(data.get("plate_no")):
         return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="plate_no", reason="新能源号牌")
 
@@ -1601,14 +1630,12 @@ def _resolve_license_type_decision(
     compact_haystack = re.sub(r"\s+", "", haystack).lower()
     if _quote_labeled_plate_no_present(haystack) and _quote_new_energy_plate_no_present(haystack):
         return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="ocr_plate_no", reason="OCR文本包含新能源号牌")
-    if re.search(
-        r"新能源|纯电动轿车|纯电|插电|混动|电动|新能源车辆|新能源类型为纯电动|new_energy|electric|bev|phev|ev|增程",
-        compact_haystack,
-        flags=re.IGNORECASE,
-    ):
+    if _quote_new_energy_text_present(compact_haystack):
         return _license_type_decision_payload(LICENSE_TYPE_NEW_ENERGY, source="ocr_energy_text", reason="材料文本包含新能源特征")
-    if re.search(r"汽油|柴油|燃油|fuel|gasoline|diesel", compact_haystack, flags=re.IGNORECASE):
+    if _quote_fuel_text_present(compact_haystack):
         return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="ocr_energy_text", reason="材料文本包含燃油特征")
+    if field_license_type == LICENSE_TYPE_FUEL:
+        return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="license_type_field", reason="资料号牌种类为02")
 
     detect = _json_obj(vehicle_type_detect)
     energy_type = _to_str(detect.get("vehicle_energy_type")).strip()
@@ -4304,6 +4331,10 @@ def detect_quote_vehicle_type(
     has_new_energy_plate = _quote_new_energy_plate_no_present(data.get("plate_no")) or (
         has_labeled_plate_text and _quote_new_energy_plate_no_present(haystack)
     )
+    field_license_type = _normalize_license_type_value(
+        data.get("license_type") or data.get("licenseType") or data.get("licensePlateType") or data.get("license_color_code")
+    )
+    has_new_energy_license_type = field_license_type == LICENSE_TYPE_NEW_ENERGY
     has_meaningful_vehicle_text = bool(
         any(
             _to_str(data.get(key)).strip()
@@ -4338,25 +4369,26 @@ def detect_quote_vehicle_type(
     )
     explicit_new_energy_fuel = bool(
         fuel_energy_text == "电"
-        or re.search(r"新能源|纯电|插电|混动|电动|油电|electric|bev|phev|ev|增程", fuel_energy_text, flags=re.IGNORECASE)
+        or _quote_new_energy_text_present(
+            fuel_energy_text,
+            data.get("vehicle_model"),
+            data.get("vehicle_brand_name"),
+            data.get("manufacturer_name"),
+        )
     )
 
     energy_type = "unknown"
     energy_name = ""
-    if has_new_energy_plate:
+    if has_new_energy_plate or has_new_energy_license_type:
         energy_type = "new_energy"
         energy_name = "新能源"
-    elif re.search(r"非新能源|不是新能源", compact, flags=re.IGNORECASE):
+    elif _quote_fuel_text_present(compact) and re.search(r"非新能源|不是新能源", compact, flags=re.IGNORECASE):
         energy_type = "fuel"
         energy_name = "燃油"
-    elif explicit_new_energy_fuel or re.search(
-        r"新能源|纯电动轿车|纯电|插电|混动|电动|新能源车辆|新能源类型为纯电动|new_energy|electric|bev|phev|ev|增程",
-        compact,
-        flags=re.IGNORECASE,
-    ):
+    elif explicit_new_energy_fuel or _quote_new_energy_text_present(compact):
         energy_type = "new_energy"
         energy_name = "新能源"
-    elif re.search(r"汽油|柴油|燃油|fuel|gasoline|diesel", compact, flags=re.IGNORECASE):
+    elif _quote_fuel_text_present(compact) or field_license_type == LICENSE_TYPE_FUEL:
         energy_type = "fuel"
         energy_name = "燃油"
 
@@ -6898,6 +6930,7 @@ def _extract_account_type_from_quote_text(text: Any, platform_name: str, platfor
         body = re.sub(re.escape(alias), "", body, flags=flags)
     body = re.sub(r"(?:重新|再次|再)?报价.*$", "", body)
     body = re.sub(r"重报.*$", "", body)
+    body = re.sub(r"(?:全保|交三|单商业|单商)$", "", body)
     body = body.strip("，。；;:")
     normalized = _normalize_account_type_name(body)
     return normalized if normalized in QUOTE_ACCOUNT_TYPE_SET else None
@@ -6914,13 +6947,26 @@ def _quote_account_type_from_material_text(text: Any, extracted: Optional[Mappin
         re.search(r"(?:号牌号码|车牌号码|车牌号|号牌|车牌)[:：=]?[\u4e00-\u9fff][A-Z][A-Z0-9]{4,7}", compact, flags=re.IGNORECASE)
     )
     has_register_date = bool(_to_str(data.get("first_register_date")).strip())
+    field_license_type = _normalize_license_type_value(
+        data.get("license_type") or data.get("licenseType") or data.get("licensePlateType") or data.get("license_color_code")
+    )
     old_hint = bool(re.search(r"旧车|二手车|过户车|转移登记|行驶证|初登|初次登记|注册日期|登记日期", compact, flags=re.IGNORECASE))
     new_hint = bool(re.search(r"新车|新购|未上牌|车辆合格证|合格证|国产新车|进口新车", compact, flags=re.IGNORECASE))
     new_energy_hint = bool(
         _quote_new_energy_plate_no_present(data.get("plate_no"))
-        or re.search(r"新能源|纯电|插电|混动|电动|油电|增程|新能源车辆|纯电动轿车|EV|BEV|PHEV", compact, flags=re.IGNORECASE)
+        or field_license_type == LICENSE_TYPE_NEW_ENERGY
+        or _quote_new_energy_text_present(
+            compact,
+            data.get("fuel_type"),
+            data.get("fuel_kind"),
+            data.get("energy_type"),
+            data.get("vehicle_energy_type"),
+            data.get("vehicle_model"),
+            data.get("vehicle_brand_name"),
+            data.get("manufacturer_name"),
+        )
     )
-    fuel_hint = bool(re.search(r"油车|燃油|汽油|柴油|非新能源|不是新能源", compact, flags=re.IGNORECASE))
+    fuel_hint = bool(_quote_fuel_text_present(compact, data.get("fuel_type"), data.get("fuel_kind"), data.get("energy_type")))
 
     generic_usage_aliases = {"新车", "旧车", "二手车", "过户车"}
 
@@ -6984,6 +7030,22 @@ def _quote_vehicle_type_text_data(text: Any, extracted: Optional[Mapping[str, An
         "vehicle_energy_type": energy,
         "energy_type": energy,
     }
+
+
+def _looks_like_quote_vehicle_type_followup_command(text: Any) -> bool:
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return False
+    body = (
+        r"(?:新能源车?(?:新车|旧车)?|绿牌|"
+        r"油车(?:新车|旧车)?|燃油车?(?:新车|旧车)?|蓝牌|"
+        r"新车|旧车|非新能源车?|不是新能源车?)"
+    )
+    prefix = (
+        r"(?:这(?:个|辆|台)?车?(?:是|为)?|这是|这个是|类型(?:是|为)?|"
+        r"按|改成|改为|调整成|调整为|调成|设为|设置为|更正为|修正为|纠正为|改|调)?"
+    )
+    return bool(re.fullmatch(prefix + body, compact, flags=re.IGNORECASE))
 
 
 def _quote_text_material_field_count(data: Mapping[str, Any]) -> int:
@@ -10714,7 +10776,7 @@ async def _quote_auto_notice_already_persisted(
     """Check durable chat history before the fallback writes a duplicate notice."""
     owner = _safe_int(owner_user_id, 0)
     sid = _to_str(session_id).strip()
-    if owner <= 0 or not sid or not dedupe_key:
+    if owner <= 0 or not sid:
         return False
     rows = (
         await db.execute(
@@ -10732,13 +10794,22 @@ async def _quote_auto_notice_already_persisted(
         )
     ).all()
     compact_message = _quote_auto_notice_compact_message(message)
+    if not compact_message:
+        return False
     for content, metadata in rows:
-        if _quote_auto_notice_key_from_metadata(metadata) == dedupe_key:
+        if dedupe_key and _quote_auto_notice_key_from_metadata(metadata) == dedupe_key:
             return True
         metadata_obj = _json_obj(metadata)
         metadata_trace = _to_str(metadata_obj.get("trace_id")).strip()
+        row_notice = _quote_auto_notice_payload_from_metadata(metadata_obj)
+        if row_notice:
+            row_message = _to_str(row_notice.get("message")).strip() or _to_str(content)
+            row_compact = _quote_auto_notice_compact_message(row_message)
+            if row_compact == compact_message:
+                return True
+            if _quote_auto_notice_message_overlaps(row_compact, compact_message):
+                return True
         if trace_id and metadata_trace == trace_id:
-            row_notice = _quote_auto_notice_payload_from_metadata(metadata_obj)
             row_message = _to_str(row_notice.get("message")).strip() or _to_str(content)
             row_compact = _quote_auto_notice_compact_message(row_message)
             if row_compact == compact_message:
@@ -11539,7 +11610,17 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
     compact = re.sub(r"\s+", "", raw)
     if not compact or "报价" in compact or "重报" in compact:
         return {}
-    aliases = ("途家安顺保费", "途家安顺非车保费", "途顺家安保费", "途家安顺", "途顺家安", "非车")
+    aliases = (
+        "途家安顺保费",
+        "途家安顺非车保费",
+        "途顺家安保费",
+        "途家安顺",
+        "途顺家安",
+        "非车",
+        "意外险",
+        "驾乘意外",
+        "意外",
+    )
     alias_group = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
     remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "不需要")
     remove_group = "|".join(re.escape(word) for word in remove_words)
@@ -12309,6 +12390,51 @@ def _quote_superseded_silent_response(
     data = _mk_data(
         result_status=RESULT_NOT_READY,
         message="",
+        entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
+        payload=payload,
+    )
+    data["silent"] = True
+    data["ui_visible"] = False
+    return "", {
+        "status": "success",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "silent": True,
+        "ui_visible": False,
+        "data": data,
+        "actions": [],
+    }
+
+
+def _quote_notice_already_visible_silent_response(
+    *,
+    case: QuoteCase,
+    task: Optional[QuoteTask],
+    trace_id: str,
+    message: Any,
+) -> Tuple[str, Dict[str, Any]]:
+    payload = {
+        "quote_notice_already_visible": True,
+        "message": sanitize_quote_user_message(message, ""),
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+            "current_task_id": case.current_task_id,
+        },
+        "quote_task": {
+            "id": task.id if task is not None else None,
+            "status": task.status if task is not None else TASK_STATUS_FAILED,
+            "trace_id": trace_id,
+        },
+        "silent": True,
+        "ui_visible": False,
+    }
+    data = _mk_data(
+        result_status=RESULT_NOT_READY,
+        message="平台提示已写入聊天窗",
         entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
         payload=payload,
     )
@@ -14258,6 +14384,20 @@ async def _complete_waiting_task(
             )
             if retry_duplicate is not None:
                 return retry_duplicate
+            if await _quote_auto_notice_already_persisted(
+                db,
+                owner_user_id=owner_user_id,
+                session_id=case.session_id,
+                dedupe_key="",
+                message=warning,
+                trace_id=trace_id,
+            ):
+                return _quote_notice_already_visible_silent_response(
+                    case=case,
+                    task=task,
+                    trace_id=trace_id,
+                    message=warning,
+                )
             return _quote_platform_text_notice_response(
                 case=case,
                 task=task,
@@ -14364,6 +14504,20 @@ async def _complete_waiting_task(
             )
             if retry is not None:
                 return retry
+        if await _quote_auto_notice_already_persisted(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=case.session_id,
+            dedupe_key="",
+            message=task.error_detail,
+            trace_id=trace_id,
+        ):
+            return _quote_notice_already_visible_silent_response(
+                case=case,
+                task=task,
+                trace_id=trace_id,
+                message=task.error_detail,
+            )
         return _quote_platform_dialog_response(
             case=case,
             task=task,
@@ -14783,6 +14937,20 @@ async def _complete_quote_without_sms(
             )
             if retry_duplicate is not None:
                 return retry_duplicate
+            if await _quote_auto_notice_already_persisted(
+                db,
+                owner_user_id=owner_user_id,
+                session_id=case.session_id,
+                dedupe_key="",
+                message=warning,
+                trace_id=trace_id,
+            ):
+                return _quote_notice_already_visible_silent_response(
+                    case=case,
+                    task=task,
+                    trace_id=trace_id,
+                    message=warning,
+                )
             return _quote_platform_text_notice_response(
                 case=case,
                 task=task,
@@ -14903,6 +15071,20 @@ async def _complete_quote_without_sms(
             },
             "platform_account": _credential_public_payload(platform_account),
         }
+        if await _quote_auto_notice_already_persisted(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=case.session_id,
+            dedupe_key="",
+            message=error_detail,
+            trace_id=trace_id,
+        ):
+            return _quote_notice_already_visible_silent_response(
+                case=case,
+                task=task,
+                trace_id=trace_id,
+                message=error_detail,
+            )
         return _quote_platform_dialog_response(
             case=case,
             task=task,
@@ -15501,8 +15683,18 @@ async def handle_quote_text_material_message(
     if form_values:
         looks_like_material = True
     active_case_for_followup: Optional[QuoteCase] = None
-    if not looks_like_material and _quote_text_material_field_count(extracted) >= 1 and session_id:
+    vehicle_type_text_data = _quote_vehicle_type_text_data(text, extracted)
+    if (
+        not looks_like_material
+        and vehicle_type_text_data
+        and _looks_like_quote_vehicle_type_followup_command(text)
+        and session_id
+    ):
         active_case_for_followup = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
+        looks_like_material = active_case_for_followup is not None
+    if not looks_like_material and _quote_text_material_field_count(extracted) >= 1 and session_id:
+        if active_case_for_followup is None:
+            active_case_for_followup = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
         looks_like_material = _quote_case_has_pending_quote_check(active_case_for_followup)
     if not looks_like_material:
         return None
@@ -15519,7 +15711,7 @@ async def handle_quote_text_material_message(
             form_overrides,
         )
     text_data = _quote_text_data_from_entities(extracted, merged_entities)
-    type_data = _quote_vehicle_type_text_data(text, text_data)
+    type_data = vehicle_type_text_data or _quote_vehicle_type_text_data(text, text_data)
     if type_data:
         text_data = _merge_data(text_data, type_data)
         merged_entities = {**merged_entities, **type_data}

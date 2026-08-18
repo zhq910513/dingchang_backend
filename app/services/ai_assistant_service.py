@@ -3180,21 +3180,13 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
 
 
 def _fallback_reply() -> Tuple[str, Dict[str, Any]]:
-    msg = (
-        "我没完全看懂这条指令。\n"
-        "你可以试试：\n"
-        "- 太平洋报价\n"
-        "- 查看当前材料状态\n"
-        "- 识别任务123状态\n"
-        "- 查订单123\n"
-        "- 查车主 赣B12345"
-    )
+    msg = "指令错误：这条命令不在当前支持范围内，请使用已支持的报价、调参、手工、补资料或查询指令。"
     return msg, {
         "status": "success",
         "intent": "fallback",
         "trace_id": _new_id()[:16],
-        "data": _mk_data(result_status=RESULT_INVALID, message="无法识别指令"),
-        "actions": [_mk_action("查看当前材料状态"), _mk_action("太平洋报价"), _mk_action("识别任务状态")],
+        "data": _mk_data(result_status=RESULT_INVALID, message=msg),
+        "actions": [_mk_action("查看当前材料状态"), _mk_action("人保报价"), _mk_action("补资料")],
     }
 
 

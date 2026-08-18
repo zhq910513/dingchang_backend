@@ -9,7 +9,7 @@ import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -3078,7 +3078,7 @@ def _dedupe_model_terms(values: List[str]) -> List[str]:
     out: List[str] = []
     seen: set[str] = set()
     for value in values:
-        text = re.sub(r"\s+", "", _to_str(value).strip()).strip("*")
+        text = re.sub(r"\s+", " ", _to_str(value).strip()).strip("*")
         if not text:
             continue
         key = text.upper()
@@ -3089,6 +3089,72 @@ def _dedupe_model_terms(values: List[str]) -> List[str]:
     return out
 
 
+_ENGLISH_MODEL_BRAND_PREFIXES: Tuple[str, ...] = (
+    "MERCEDESBENZ",
+    "LANDROVER",
+    "VOLKSWAGEN",
+    "CHEVROLET",
+    "MITSUBISHI",
+    "CADILLAC",
+    "PORSCHE",
+    "HYUNDAI",
+    "LEXUS",
+    "TOYOTA",
+    "HONDA",
+    "NISSAN",
+    "BUICK",
+    "MAZDA",
+    "TESLA",
+    "VOLVO",
+    "AUDI",
+    "BENZ",
+    "FORD",
+    "JEEP",
+    "MINI",
+    "BMW",
+    "KIA",
+)
+
+
+def _english_model_code_terms(value: Any) -> List[str]:
+    """PICC model search is sensitive to spaces between English brand and model code."""
+
+    source = re.sub(r"\s+", " ", _to_str(value).strip()).strip("*")
+    if not source:
+        return []
+    compact = re.sub(r"\s+", "", source)
+    out: List[str] = []
+
+    def add(term: Any) -> None:
+        text = re.sub(r"\s+", " ", _to_str(term).strip()).strip("*")
+        if text:
+            out.append(text)
+
+    if re.search(r"[A-Za-z]{2,}\s+[A-Za-z]{0,5}\d[A-Za-z0-9]*", source):
+        add(source)
+
+    brand_group = "|".join(re.escape(item) for item in _ENGLISH_MODEL_BRAND_PREFIXES)
+    pattern = re.compile(
+        rf"(?P<prefix>[\u4e00-\u9fff]*)(?P<brand>{brand_group})(?P<model>[A-Za-z]{{0,5}}\d[A-Za-z0-9]*)(?P<suffix>[\u4e00-\u9fff]*)",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(compact):
+        prefix = match.group("prefix") or ""
+        brand = match.group("brand") or ""
+        model = match.group("model") or ""
+        suffix = match.group("suffix") or ""
+        if not brand or not model:
+            continue
+        spaced = f"{brand} {model}"
+        add(f"{prefix}{spaced}{suffix}")
+        add(f"{prefix}{spaced}")
+        add(f"{spaced}{suffix}")
+        add(spaced)
+        add(f"{model}{suffix}")
+        add(model)
+    return _dedupe_model_terms(out)
+
+
 def _used_fuel_model_query_terms(
     model_name: Any,
     vehicle_type: Any = "",
@@ -3097,7 +3163,8 @@ def _used_fuel_model_query_terms(
     brand_name: Any = "",
     vehicle_name: Any = "",
 ) -> List[str]:
-    raw = re.sub(r"\s+", "", _to_str(model_name).strip()).strip("*")
+    source = re.sub(r"\s+", " ", _to_str(model_name).strip()).strip("*")
+    raw = re.sub(r"\s+", "", source).strip("*")
     if not raw:
         return []
     no_brand_suffix = re.sub(r"(?<=[\u4e00-\u9fff])牌(?=[A-Z0-9])", "", raw)
@@ -3114,7 +3181,8 @@ def _used_fuel_model_query_terms(
     brand_typed = _join_model_term(brand, no_brand_suffix, name_hint)
     brand_plain = _join_model_term(brand, no_brand_suffix)
     named_plain = _join_model_term("", no_brand_suffix, name_hint)
-    return _dedupe_model_terms([brand_typed, brand_plain, named_plain, energy_typed, typed, no_brand_suffix, raw])
+    english_terms = _english_model_code_terms(source)
+    return _dedupe_model_terms([*english_terms, brand_typed, brand_plain, named_plain, energy_typed, typed, no_brand_suffix, raw])
 
 
 def _normalize_used_fuel_model_name(model_name: Any, vehicle_type: Any = "") -> str:
