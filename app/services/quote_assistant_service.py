@@ -1851,7 +1851,21 @@ def _quote_car_name_from_features(features: Any, fallback_text: Any = "") -> str
     text = _quote_feature_text(features, fallback_text)
     for label in ("CarName", "VehicleName"):
         value = _quote_labeled_ocr_value(text, label)
-        if value and re.search(r"[\u4e00-\u9fff]", value):
+        compact = re.sub(r"[\s\-_/]", "", value).upper()
+        # CarName is frequently an English/alphanumeric sales model (for
+        # example "CT200h"). Do not require Chinese characters here; the PICC
+        # catalogue accepts those model names directly. A standalone 17-char
+        # VIN remains invalid as a model hint and is handled by the platform
+        # resolver as a VIN prefix instead.
+        if (
+            value
+            and len(compact) >= 2
+            and (
+                re.search(r"[\u4e00-\u9fff]", value)
+                or re.fullmatch(r"[A-Z][A-Z0-9 ._-]{1,39}", value, flags=re.IGNORECASE)
+            )
+            and not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", compact)
+        ):
             return value
     return ""
 

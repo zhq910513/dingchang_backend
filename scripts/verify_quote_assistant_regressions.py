@@ -21,6 +21,7 @@ from app.services.quote_assistant_service import (
     _is_runtime_duplicate_quote_result,
     _runtime_detail,
     _active_image_extracted_data,
+    _quote_car_name_from_features,
     _quote_end_date_text,
     _quote_image_extracted_fields_from_features,
     _quote_auto_notice_message_id,
@@ -60,6 +61,8 @@ from app.services.quote_platforms.platforms.picc.business import (
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
     _vehicle_candidate_score,
+    _vehicle_model_hint_is_usable,
+    _vehicle_rows_correlated_to_vin,
     _used_fuel_model_query_terms,
 )
 
@@ -141,7 +144,7 @@ def _har_form_params(har: dict, entry_index: int) -> dict:
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
-    def test_merged_chinese_brand_model_code_has_standalone_fallback(self) -> None:
+    def test_merged_chinese_brand_model_code_is_not_guessed_as_a_sales_model(self) -> None:
         terms = _used_fuel_model_query_terms(
             "雷克萨斯JTHKR5BH",
             "小型轿车",
@@ -149,8 +152,16 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             vehicle_name="",
             vin="JTHKR5BH3J2327186",
         )
-        self.assertLess(terms.index("JTHKR5BH"), terms.index("雷克萨斯JTHKR5BH"))
-        self.assertIn("JTHKR5BH轿车", terms)
+        self.assertIn("JTHKR5BH", terms)
+        self.assertNotIn("CT200h", terms)
+        self.assertEqual(terms[-1], "JTHKR5BH")
+
+    def test_real_alphanumeric_model_hints_are_usable_but_vin_prefix_is_not(self) -> None:
+        vehicle = {"vin": "JTHKR5BH3J2327186"}
+        for model in ("CT200h", "ES300h", "Model3", "KONA"):
+            self.assertTrue(_vehicle_model_hint_is_usable(vehicle, model), model)
+        self.assertFalse(_vehicle_model_hint_is_usable(vehicle, "JTHKR5BH"))
+        self.assertFalse(_vehicle_model_hint_is_usable(vehicle, "雷克萨斯JTHKR5BH"))
 
         row = {
             "vehicleName": "JTHKR5BH 小型轿车",
@@ -164,12 +175,13 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
                     "rawModelName": "雷克萨斯JTHKR5BH",
                     "modelName": "雷克萨斯JTHKR5BH",
                     "brandNameHint": "",
+                    "vin": "JTHKR5BH3J2327186",
                 },
             ),
             0,
         )
 
-    def test_vehicle_query_retries_standalone_model_code_after_combined_name(self) -> None:
+    def test_vehicle_query_uses_certificate_sales_model_hint_before_vin_prefix(self) -> None:
         class _VehicleFallbackClient:
             def __init__(self) -> None:
                 self.config = SimpleNamespace(base_url="https://picc.test")
@@ -178,7 +190,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             def request_json(self, method: str, path: str, **kwargs: object) -> dict:
                 name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
                 self.names.append(name)
-                if "CT200h" in name:
+                if "CT200H" in name.upper():
                     return {
                         "status": 0,
                         "result": [
@@ -198,15 +210,39 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             "modelName": "雷克萨斯JTHKR5BH",
             "vehicleType": "小型轿车",
             "brandNameHint": "",
-            "vehicleNameHint": "",
+            "vehicleNameHint": "CT200h",
             "vin": "JTHKR5BH3J2327186",
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(len(rows["result"]), 1)
-        self.assertEqual(client.names, ["雷克萨斯LEXUS CT200h轿车*"])
-        self.assertEqual(vehicle["modelQueryMatched"], "雷克萨斯LEXUS CT200h轿车")
+        self.assertEqual(client.names[0].upper(), "CT200H*")
+        self.assertEqual(vehicle["modelQueryMatched"].upper(), "CT200H")
 
-    def test_vin_prefix_is_used_when_model_field_only_contains_brand(self) -> None:
+    def test_vin_prefix_only_query_returns_picc_fail_without_rows_and_continues(self) -> None:
+        class _OnlyVinPrefixClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
+                self.names.append(name)
+                return {"status": -1, "statusText": "Fail"}
+
+        client = _OnlyVinPrefixClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯JTHKR5BH",
+            "modelName": "雷克萨斯JTHKR5BH",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "",
+            "vehicleNameHint": "",
+            "vin": "JTHKR5BH3J2327186",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(rows["result"], [])
+        self.assertIn("JTHKR5BH*", client.names)
+
+    def test_vin_prefix_is_only_a_correlation_hint_when_model_field_only_contains_brand(self) -> None:
         terms = _used_fuel_model_query_terms(
             "雷克萨斯",
             "小型轿车",
@@ -214,13 +250,12 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             vehicle_name="",
             vin="JTHKR5BH3J2327186",
         )
-        self.assertLess(terms.index("CT200h"), terms.index("JTHKR5BH"))
-        self.assertIn("雷克萨斯LEXUS CT200h轿车", terms)
         self.assertIn("JTHKR5BH", terms)
-        self.assertIn("JTHKR5BH轿车", terms)
+        self.assertNotIn("CT200h", terms)
 
         row = {
-            "vehicleName": "JTHKR5BH 小型轿车",
+            "vehicleName": "雷克萨斯某车型",
+            "vehicleFgwCode": "JTHKR5BH",
             "modelCode": "PICC-MODEL-JTHKR5BH",
             "vehicleModelCode": "PICC-PLAT-JTHKR5BH",
         }
@@ -234,10 +269,10 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
                     "vin": "JTHKR5BH3J2327186",
                 },
             ),
-            0,
+            1000,
         )
 
-    def test_vin_prefix_query_is_reached_after_brand_queries(self) -> None:
+    def test_broad_brand_query_accepts_only_vin_correlated_rows(self) -> None:
         class _VinFallbackClient:
             def __init__(self) -> None:
                 self.config = SimpleNamespace(base_url="https://picc.test")
@@ -246,12 +281,13 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             def request_json(self, method: str, path: str, **kwargs: object) -> dict:
                 name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
                 self.names.append(name)
-                if "CT200h" in name:
+                if name.startswith("雷克萨斯*"):
                     return {
                         "status": 0,
                         "result": [
                             {
-                                "vehicleName": "JTHKR5BH 小型轿车",
+                                "vehicleName": "雷克萨斯某车型",
+                                "vehicleFgwCode": "JTHKR5BH",
                                 "modelCode": "PICC-MODEL-JTHKR5BH",
                                 "vehicleModelCode": "PICC-PLAT-JTHKR5BH",
                                 "purchasePrice": "280000",
@@ -271,8 +307,77 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(len(rows["result"]), 1)
-        self.assertEqual(client.names, ["雷克萨斯LEXUS CT200h轿车*"])
-        self.assertEqual(vehicle["modelQueryMatched"], "雷克萨斯LEXUS CT200h轿车")
+        self.assertIn("雷克萨斯*", client.names)
+        self.assertIn("VIN前缀关联", vehicle["modelQueryMatched"])
+
+    def test_broad_brand_rows_without_vin_correlation_are_rejected(self) -> None:
+        class _UnsafeBroadClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                return {
+                    "status": 0,
+                    "result": [
+                        {
+                            "vehicleName": "雷克萨斯其他车型",
+                            "vehicleFgwCode": "OTHER-VDS",
+                            "purchasePrice": "280000",
+                        }
+                    ],
+                }
+
+        client = _UnsafeBroadClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯",
+            "modelName": "雷克萨斯",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "",
+            "vin": "JTHKR5BH3J2327186",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(rows["result"], [])
+
+    def test_brand_and_vin_prefix_rows_without_correlation_are_rejected(self) -> None:
+        class _MergedHintClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                self.names.append(str(kwargs["params"]["jyVehicleRequest.vehicleName"]))
+                return {
+                    "status": 0,
+                    "result": [
+                        {
+                            "vehicleName": "雷克萨斯CT200h轿车",
+                            "vehicleFgwCode": "OTHER-VDS",
+                            "purchasePrice": "280000",
+                        }
+                    ],
+                }
+
+        client = _MergedHintClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯JTHKR5BH",
+            "modelName": "雷克萨斯JTHKR5BH",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "",
+            "vin": "JTHKR5BH3J2327186",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(rows["result"], [])
+        self.assertIn("JTHKR5BH*", client.names)
+
+    def test_car_name_accepts_alphanumeric_sales_model(self) -> None:
+        self.assertEqual(
+            _quote_car_name_from_features(
+                {"generic_ocr_text": "CarName CT200h VehicleType 小型轿车"}
+            ),
+            "CT200h",
+        )
 
     def test_vehicle_certificate_car_name_is_backfilled_from_historical_ocr_text(self) -> None:
         base_fields = {
