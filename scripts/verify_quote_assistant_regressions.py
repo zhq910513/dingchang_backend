@@ -20,12 +20,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.services.quote_assistant_service import (
     _is_runtime_duplicate_quote_result,
     _runtime_detail,
+    _active_image_extracted_data,
     _quote_end_date_text,
+    _quote_image_extracted_fields_from_features,
     _quote_auto_notice_message_id,
     _quote_snapshot_with_auto_adjusted_dates,
     _quote_result_insurance_date_auto_adjustments,
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
+    _normalize_quote_case_data,
     _platform_default_values_with_legacy_fixes,
     _normalize_quote_product_exclusions,
     _extract_quote_product_exclusions,
@@ -54,6 +57,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
     _pick_renewal_policy_candidate,
+    _used_fuel_model_query_terms,
 )
 
 
@@ -134,6 +138,50 @@ def _har_form_params(har: dict, entry_index: int) -> dict:
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    def test_vehicle_certificate_car_name_is_backfilled_from_historical_ocr_text(self) -> None:
+        base_fields = {
+            "vehicle_model": "DFL7000NAA2BEY",
+            "vehicle_brand_name": "东风日产牌",
+            "vin": "LGBH92E29NY123456",
+            "engine_no": "TZ200XS5UR",
+        }
+        fallback_text = "CarModelDFL7000NAA2BEY\nCarBrand东风日产牌\nCarName纯电动轿车\nVehicleType轿车"
+        text_features = {"ocr_extracted_fields": base_fields}
+
+        fields = _quote_image_extracted_fields_from_features(text_features, fallback_text)
+        self.assertEqual(fields.get("car_name"), "纯电动轿车")
+        self.assertEqual(fields.get("vehicle_model"), "DFL7000NAA2BEY")
+
+        images_by_slot = {
+            "vehicle_cert": [
+                {
+                    "text_features": text_features,
+                    "ocr_text_sample": fallback_text,
+                    "method": "order_slot",
+                }
+            ]
+        }
+        active = _active_image_extracted_data(images_by_slot)
+        self.assertEqual(active.get("car_name"), "纯电动轿车")
+
+        normalized = _normalize_quote_case_data(
+            base_data={},
+            order_data={},
+            text_data={},
+            images_by_slot=images_by_slot,
+        )
+        self.assertEqual(normalized.get("car_name"), "纯电动轿车")
+
+        terms = _used_fuel_model_query_terms(
+            "DFL7000NAA2BEY",
+            "轿车",
+            "纯电动轿车",
+            brand_name=normalized.get("vehicle_brand_name"),
+            vehicle_name=normalized.get("car_name"),
+        )
+        self.assertIn("东风日产DFL7000NAA2BEY纯电动轿车", terms)
+        self.assertIn("DFL7000NAA2BEY纯电动轿车", terms)
+
     def test_vehicle_cert_cleaning_keeps_engine_letter_l(self) -> None:
         self.assertEqual(correct_vehicle_cert_field("engine_no", "W24L33464"), "W24L33464")
         cleaned = clean_dynamic_data_for_ocr(

@@ -1319,6 +1319,7 @@ QUOTE_IMAGE_FIELDS_BY_SLOT: Dict[str, Tuple[str, ...]] = {
         "vin",
         "engine_no",
         "vehicle_model",
+        "car_name",
         "vehicle_type",
         "vehicle_brand_name",
         "manufacturer_name",
@@ -1780,8 +1781,87 @@ def _clean_quote_dynamic_data(data: Dict[str, Any], *, derive_owner_name: bool =
     return _compact_quote_data(cleaned)
 
 
-def _quote_image_extracted_fields_from_features(features: Any) -> Dict[str, Any]:
+_QUOTE_VEHICLE_CERT_OCR_LABELS = (
+    "CarModel",
+    "CarBrand",
+    "CarName",
+    "VehicleName",
+    "VehicleType",
+    "CertificateDate",
+    "CarColor",
+    "Displacement",
+    "Power",
+    "Manufacturer",
+    "ManufactureDate",
+    "EngineNo",
+    "FuelType",
+    "EmissionStandard",
+    "SteeringType",
+    "LimitPassenger",
+    "EngineType",
+    "TyreNum",
+    "SpeedLimit",
+    "TotalWeight",
+    "SaddleMass",
+    "VinNo",
+    "Wheelbase",
+    "AxleNum",
+    "CertificationNo",
+    "ChassisModel",
+    "ChassisID",
+    "SeatingCapacity",
+    "QualifySeal",
+    "CGSSeal",
+    "log_id",
+    "words_result_num",
+)
+
+
+def _quote_feature_text(features: Any, fallback_text: Any = "") -> str:
+    data = _json_obj(features)
+    generic = _json_obj(data.get("generic_ocr"))
+    return _to_str(
+        data.get("generic_ocr_text")
+        or generic.get("text")
+        or generic.get("words_result_text")
+        or fallback_text
+        or data.get("ocr_text_sample")
+    ).strip()
+
+
+def _quote_labeled_ocr_value(text: Any, label: str) -> str:
+    source = re.sub(r"\s+", " ", _to_str(text)).strip()
+    wanted = _to_str(label).strip()
+    if not source or not wanted:
+        return ""
+    terminators = [item for item in _QUOTE_VEHICLE_CERT_OCR_LABELS if item != wanted]
+    term_pattern = "|".join(re.escape(item) for item in terminators)
+    pattern = rf"(?:^|\s){re.escape(wanted)}\s*[:：]?\s*(.+?)(?=\s+(?:{term_pattern})\s*[:：]?|$)"
+    match = re.search(pattern, source, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    value = re.sub(r"\s+", "", match.group(1)).strip()
+    value = re.sub(r"(?:words|location|top|left|width|height)$", "", value, flags=re.IGNORECASE).strip()
+    if len(value) > 40:
+        return ""
+    return value
+
+
+def _quote_car_name_from_features(features: Any, fallback_text: Any = "") -> str:
+    text = _quote_feature_text(features, fallback_text)
+    for label in ("CarName", "VehicleName"):
+        value = _quote_labeled_ocr_value(text, label)
+        if value and re.search(r"[\u4e00-\u9fff]", value):
+            return value
+    return ""
+
+
+def _quote_image_extracted_fields_from_features(features: Any, fallback_text: Any = "") -> Dict[str, Any]:
     data = _json_obj(_json_obj(features).get("ocr_extracted_fields"))
+    if data and not _to_str(data.get("car_name")).strip():
+        car_name = _quote_car_name_from_features(features, fallback_text)
+        if car_name:
+            data["car_name"] = car_name
     return _clean_quote_dynamic_data(data, derive_owner_name=False) if data else {}
 
 
@@ -1808,7 +1888,8 @@ def _slot_filtered_extracted_fields(slot_key: str, image: Dict[str, Any]) -> Dic
     if not allowed:
         return {}
     fields = _json_obj(image.get("extracted_fields")) or _quote_image_extracted_fields_from_features(
-        image.get("text_features")
+        image.get("text_features"),
+        image.get("ocr_text_sample"),
     )
     if not fields:
         return {}
@@ -4282,6 +4363,8 @@ def _quote_detect_haystack(normalized_data: Dict[str, Any], images_by_slot: Dict
         "fuel_type",
         "fuel_kind",
         "vehicle_model",
+        "car_name",
+        "vehicle_name",
         "vehicle_brand_name",
         "manufacturer_name",
         "plate_no",
@@ -7925,7 +8008,7 @@ async def _set_single_active(db: AsyncSession, *, case_id: int, slot_key: str, k
             "id": row.id,
             "storage_key": row.storage_key,
             "confirmed_slot_key": row.confirmed_slot_key,
-            "extracted_fields": _quote_image_extracted_fields_from_features(row.text_features),
+            "extracted_fields": _quote_image_extracted_fields_from_features(row.text_features, row.ocr_text_sample),
         }
         for row in rows
     ]
@@ -9009,7 +9092,7 @@ async def _active_images_by_slot(db: AsyncSession, case_id: int) -> Dict[str, Li
                 "original_name": row.original_name,
                 "ocr_text_sample": row.ocr_text_sample or "",
                 "text_features": text_features,
-                "extracted_fields": _quote_image_extracted_fields_from_features(text_features),
+                "extracted_fields": _quote_image_extracted_fields_from_features(text_features, row.ocr_text_sample),
             }
         )
     return out

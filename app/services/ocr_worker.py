@@ -394,6 +394,7 @@ def _extract_vehicle_certificate(resp: Dict[str, Any]) -> Dict[str, Any]:
 
     out: Dict[str, Any] = {
         "vehicle_model": vehicle_model,
+        "car_name": getter("CarName") or getter("VehicleName"),
         "vehicle_type": vehicle_type,
         "vin": vin,
         "engine_no": engine_no,

@@ -173,6 +173,7 @@ _ALIASES_LOWER: Dict[str, str] = {key.lower(): value for key, value in _ALIASES.
 
 _TEXT_FIELDS = (
     "owner_name",
+    "car_name",
     "vehicle_model",
     "vehicle_type",
     "use_nature",
