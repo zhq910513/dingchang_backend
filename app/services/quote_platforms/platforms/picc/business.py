@@ -1947,23 +1947,76 @@ def _vehicle_row_haystack(row: Mapping[str, Any]) -> str:
     return _compact_vehicle_compare_text(" ".join(_to_str(row.get(key)) for key in keys))
 
 
+_VEHICLE_MODEL_CODE_RE = re.compile(
+    r"(?<![A-Z0-9])(?P<code>[A-Z][A-Z0-9_-]{3,})(?![A-Z0-9])",
+    flags=re.IGNORECASE,
+)
+
+
+def _vehicle_model_code_candidates(*values: Any) -> List[str]:
+    """Extract standalone alphanumeric model codes from OCR/model text."""
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        compact = re.sub(r"\s+", "", _to_str(value).strip()).upper()
+        if not compact:
+            continue
+        for match in _VEHICLE_MODEL_CODE_RE.finditer(compact):
+            code = match.group("code").strip("_-")
+            if len(code) < 4 or not any(char.isdigit() for char in code):
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _vehicle_leading_brand_from_model(value: Any) -> str:
+    """Extract a Chinese brand prefix when OCR merged it with the model code."""
+    compact = re.sub(r"\s+", "", _to_str(value).strip())
+    if not compact:
+        return ""
+    match = re.match(r"^(?P<brand>[\u4e00-\u9fff]{2,24})牌?(?=[A-Z0-9])", compact, flags=re.IGNORECASE)
+    return _vehicle_brand_prefix(match.group("brand")) if match else ""
+
+
+def _vehicle_brand_hint(vehicle: Mapping[str, Any]) -> str:
+    explicit = _vehicle_brand_prefix(vehicle.get("brandNameHint"))
+    if explicit:
+        return explicit
+    return _vehicle_leading_brand_from_model(
+        _first_text(vehicle.get("rawModelName"), vehicle.get("modelName"))
+    )
+
+
 def _vehicle_model_code_from_vehicle(vehicle: Mapping[str, Any]) -> str:
+    codes = _vehicle_model_code_candidates(
+        vehicle.get("rawModelName"),
+        vehicle.get("vehicleFgwCode"),
+        vehicle.get("modelName"),
+    )
+    if codes:
+        return codes[0]
     return _compact_vehicle_compare_text(
-        _first_text(
-            vehicle.get("rawModelName"),
-            vehicle.get("vehicleFgwCode"),
-            vehicle.get("modelName"),
-        )
+        _first_text(vehicle.get("rawModelName"), vehicle.get("modelName"))
     )
 
 
 def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any]) -> int:
     haystack = _vehicle_row_haystack(row)
+    model_codes = _vehicle_model_code_candidates(
+        vehicle.get("rawModelName"),
+        vehicle.get("vehicleFgwCode"),
+        vehicle.get("modelName"),
+    )
     model_code = _vehicle_model_code_from_vehicle(vehicle)
-    brand = _compact_vehicle_compare_text(_vehicle_brand_prefix(vehicle.get("brandNameHint")))
+    brand = _compact_vehicle_compare_text(_vehicle_brand_hint(vehicle))
     name_hint = _compact_vehicle_compare_text(_vehicle_name_hint(vehicle.get("vehicleNameHint")) or vehicle.get("energyModelSuffix"))
     score = 0
-    if model_code and model_code in haystack:
+    if any(code in haystack for code in model_codes):
+        score += 100
+    elif model_code and model_code in haystack:
         score += 100
     if brand and brand in haystack:
         score += 20
@@ -3290,13 +3343,34 @@ def _used_fuel_model_query_terms(
     if energy_suffix and not re.search(r"(纯电动|插电式|混合动力|新能源)", no_brand_suffix):
         energy_base = re.sub(r"(轿车|客车|货车|越野车|牵引车|专项作业车|摩托车|挂车)$", "", no_brand_suffix)
         energy_typed = f"{energy_base}{energy_suffix}"
-    brand = _vehicle_brand_prefix(brand_name)
+    brand = _vehicle_brand_prefix(brand_name) or _vehicle_leading_brand_from_model(raw)
     name_hint = _vehicle_name_hint(vehicle_name) or energy_suffix
     brand_typed = _join_model_term(brand, no_brand_suffix, name_hint)
     brand_plain = _join_model_term(brand, no_brand_suffix)
     named_plain = _join_model_term("", no_brand_suffix, name_hint)
     english_terms = _english_model_code_terms(source)
-    return _dedupe_model_terms([*english_terms, brand_typed, brand_plain, named_plain, energy_typed, typed, no_brand_suffix, raw])
+    standalone_model_terms: List[str] = []
+    for model_code in _vehicle_model_code_candidates(source, vehicle_name):
+        standalone_model_terms.extend(
+            (
+                model_code,
+                _join_model_term("", model_code, suffix),
+            )
+        )
+    return _dedupe_model_terms(
+        [
+            *english_terms,
+            brand_typed,
+            brand_plain,
+            named_plain,
+            energy_typed,
+            typed,
+            no_brand_suffix,
+            raw,
+            # Keep standalone model-code queries after combined-name attempts.
+            *standalone_model_terms,
+        ]
+    )
 
 
 def _normalize_used_fuel_model_name(model_name: Any, vehicle_type: Any = "") -> str:
