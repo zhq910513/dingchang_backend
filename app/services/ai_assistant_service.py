@@ -916,6 +916,14 @@ def _message_row_hidden_from_history(row: QuoteAssistantMessage) -> bool:
     meta = getattr(row, "metadata_json", None)
     if not isinstance(meta, dict):
         meta = {}
+    data = meta.get("data")
+    data = data if isinstance(data, dict) else {}
+    intent = _to_str(meta.get("intent") or data.get("intent")).strip().lower()
+    result_status = _to_str(data.get("result_status")).strip().lower()
+    # A fallback is not useful as a session-list preview, but it is a direct
+    # response to the operator and must remain visible after history reload.
+    if intent == "fallback" or result_status == RESULT_INVALID:
+        return False
     return _message_hidden_from_preview(getattr(row, "role", ""), meta)
 
 
@@ -3280,10 +3288,6 @@ async def _dispatch_rule_with_db(
     if intent != "quote" and re.fullmatch(r"\d{11}", _norm_text(text)) and await has_quote_case_waiting_for_login_phone(db, ctx):
         intent = "quote_credential"
         confidence = max(float(confidence or 0.0), 0.91)
-    if intent not in {"quote", "query_material_status", "quote_credential"} and waiting_sms_active:
-        intent = "quote"
-        confidence = max(float(confidence or 0.0), 0.9)
-
     if intent != "quote_credential" and looks_like_quote_material_form_command(text):
         form_result = await handle_quote_material_form_message(db, ctx=ctx, entities=entities, text=text)
         if form_result:
@@ -3297,18 +3301,22 @@ async def _dispatch_rule_with_db(
 
     image_result = None
     has_context_images = bool(_collect_context_images(ctx))
-    # Any uploaded image should enter the quote material organizer first.
-    # If a platform quote intent is already present, the organizer will
-    # auto-continue into the quote flow once required materials are ready.
+    # Only actual uploads enter the quote material organizer. Plain fallback
+    # text must not create/update cases or cancel an in-flight quote task.
     should_collect_images = has_context_images and intent != "quote_credential"
-    if intent not in {"quote", "quote_credential"} or should_collect_images:
+    if should_collect_images:
         image_result = await handle_quote_images_message(db, ctx=ctx, entities=entities, text=text)
 
     text_material_result = None
+    text_material_candidate = _looks_like_quote_text_material(
+        text,
+        extract_quote_fields(text),
+    )
     if (
         not image_result
         and intent not in {"quote", "quote_credential", "query_material_status"}
         and not has_context_images
+        and (intent != "fallback" or text_material_candidate)
     ):
         text_material_result = await handle_quote_text_material_message(db, ctx=ctx, entities=entities, text=text)
 
