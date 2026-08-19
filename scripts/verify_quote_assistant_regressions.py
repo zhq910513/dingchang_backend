@@ -1209,6 +1209,22 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "燃油车号牌种类不能是52"):
             _adapter()._validate_picc_quote_form_before_submit(form, account_type_name="油车-旧")
 
+    def test_quote_form_pre_submit_allows_blue_plate_hybrid_fields(self) -> None:
+        form = {
+            "prpCitemCar.licenseType": "02",
+            "prpCitemCar.licenseColorCode": "01",
+            "prpCitemCar.isEnergyCar": "1",
+            "prpCitemCar.vehicleFuelType": "D5",
+            "energyFlag": "1",
+            "energyTypePlat": "4",
+            "energyTypePlatTemp": "增程式混合动力",
+            "prpCitemKindVos[0].kindCode": "051051",
+            "prpCitemKindVos[0].kindName": "第三者责任险",
+            "prpCitemKindVos[0].chooseFlag": "true",
+            "prpCitemKindVos[0].amount": "300",
+        }
+        _adapter()._validate_picc_quote_form_before_submit(form, account_type_name="油车-旧")
+
     def test_renewal_lookup_attempts_try_engine_and_vin_with_02_and_52(self) -> None:
         attempts = _adapter()._renewal_lookup_param_attempts(
             plate_no="赣GD68721",

@@ -5941,8 +5941,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         elif normalized_type in {USED_FUEL_ACCOUNT_TYPE, NEW_FUEL_ACCOUNT_TYPE}:
             if license_type == "52":
                 problems.append("燃油车号牌种类不能是52")
-            if energy_type_plat in {"1", "2", "3", "4"} and is_energy_car in {"1", "true", "True"}:
-                problems.append("燃油车能源字段与新能源字段冲突")
         if problems:
             raise PiccRequestError("人保报价前校验失败：" + "；".join(problems[:8]))
 
