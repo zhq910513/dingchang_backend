@@ -178,12 +178,12 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             def request_json(self, method: str, path: str, **kwargs: object) -> dict:
                 name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
                 self.names.append(name)
-                if name.startswith("JTHKR5BH"):
+                if "CT200h" in name:
                     return {
                         "status": 0,
                         "result": [
                             {
-                                "vehicleName": "JTHKR5BH 小型轿车",
+                                "vehicleName": "雷克萨斯LEXUS CT200h轿车",
                                 "modelCode": "PICC-MODEL-JTHKR5BH",
                                 "vehicleModelCode": "PICC-PLAT-JTHKR5BH",
                                 "purchasePrice": "280000",
@@ -203,8 +203,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(len(rows["result"]), 1)
-        self.assertEqual(client.names, ["JTHKR5BH*"])
-        self.assertEqual(vehicle["modelQueryMatched"], "JTHKR5BH")
+        self.assertEqual(client.names, ["雷克萨斯LEXUS CT200h轿车*"])
+        self.assertEqual(vehicle["modelQueryMatched"], "雷克萨斯LEXUS CT200h轿车")
 
     def test_vin_prefix_is_used_when_model_field_only_contains_brand(self) -> None:
         terms = _used_fuel_model_query_terms(
@@ -214,6 +214,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             vehicle_name="",
             vin="JTHKR5BH3J2327186",
         )
+        self.assertLess(terms.index("CT200h"), terms.index("JTHKR5BH"))
+        self.assertIn("雷克萨斯LEXUS CT200h轿车", terms)
         self.assertIn("JTHKR5BH", terms)
         self.assertIn("JTHKR5BH轿车", terms)
 
@@ -244,7 +246,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             def request_json(self, method: str, path: str, **kwargs: object) -> dict:
                 name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
                 self.names.append(name)
-                if name.startswith("JTHKR5BH"):
+                if "CT200h" in name:
                     return {
                         "status": 0,
                         "result": [
@@ -269,8 +271,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(len(rows["result"]), 1)
-        self.assertEqual(client.names, ["JTHKR5BH*"])
-        self.assertEqual(vehicle["modelQueryMatched"], "JTHKR5BH")
+        self.assertEqual(client.names, ["雷克萨斯LEXUS CT200h轿车*"])
+        self.assertEqual(vehicle["modelQueryMatched"], "雷克萨斯LEXUS CT200h轿车")
 
     def test_vehicle_certificate_car_name_is_backfilled_from_historical_ocr_text(self) -> None:
         base_fields = {

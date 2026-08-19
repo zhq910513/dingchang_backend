@@ -1982,6 +1982,26 @@ def _vehicle_vin_model_code_candidates(value: Any) -> List[str]:
     return [compact[:8]]
 
 
+_VIN_MODEL_QUERY_ALIAS_TERMS: Dict[str, Tuple[str, ...]] = {
+    # Lexus CT200h. The driving license often OCRs this as 雷克萨斯JTHKR5BH, while
+    # PICC's vehicle catalogue only returns rows for CT200h / LEXUS CT200h.
+    "JTHKR5BH": (
+        "雷克萨斯LEXUS CT200h轿车",
+        "LEXUS CT200h轿车",
+        "LEXUS CT200h",
+        "CT200h轿车",
+        "CT200h",
+    ),
+}
+
+
+def _vehicle_vin_model_alias_query_terms(vin: Any) -> List[str]:
+    out: List[str] = []
+    for model_code in _vehicle_vin_model_code_candidates(vin):
+        out.extend(_VIN_MODEL_QUERY_ALIAS_TERMS.get(model_code, ()))
+    return _dedupe_model_terms(out)
+
+
 def _vehicle_leading_brand_from_model(value: Any) -> str:
     """Extract a Chinese brand prefix when OCR merged it with the model code."""
     compact = re.sub(r"\s+", "", _to_str(value).strip())
@@ -3362,6 +3382,7 @@ def _used_fuel_model_query_terms(
     brand_plain = _join_model_term(brand, no_brand_suffix)
     named_plain = _join_model_term("", no_brand_suffix, name_hint)
     english_terms = _english_model_code_terms(source)
+    vin_alias_terms = _vehicle_vin_model_alias_query_terms(vin)
     exact_model_terms: List[str] = []
     for model_code in _vehicle_model_code_candidates(source, vehicle_name):
         exact_model_terms.extend((model_code, _join_model_term("", model_code, suffix)))
@@ -3382,6 +3403,7 @@ def _used_fuel_model_query_terms(
     )
     return _dedupe_model_terms(
         [
+            *vin_alias_terms,
             *exact_model_terms,
             *broad_terms,
         ]
@@ -6070,6 +6092,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "startMinuteCI": _first_text(data.get("compulsory_start_minute"), data.get("startMinuteCI"), _field_value(defaults, "交强起保分钟", "交强险起保分钟"), "0"),
             "modelName": model_terms[0] if model_terms else raw_model_name,
             "rawModelName": raw_model_name,
+            "modelQueryTerms": model_terms,
             "brandNameHint": vehicle_brand_name,
             "vehicleNameHint": vehicle_name_hint,
             "vehicleType": vehicle_type,
@@ -6087,7 +6110,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         model_name = _to_str(vehicle.get("rawModelName") or vehicle.get("modelName")).strip()
         if not model_name:
             raise PiccRequestError("人保报价缺少车型名称，无法查询车型配置")
-        terms = _used_fuel_model_query_terms(
+        precomputed_terms = (
+            [item for item in vehicle.get("modelQueryTerms") if _to_str(item).strip()]
+            if isinstance(vehicle.get("modelQueryTerms"), list)
+            else []
+        )
+        terms = _dedupe_model_terms(precomputed_terms) or _used_fuel_model_query_terms(
             model_name,
             vehicle.get("vehicleType"),
             vehicle.get("energyModelSuffix"),
