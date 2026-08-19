@@ -768,6 +768,12 @@ def _money_text_or_empty(value: Any) -> str:
     return _money_text(value) if _has_text(value) else ""
 
 
+def _is_positive_amount(value: Any) -> bool:
+    if not _has_text(value):
+        return False
+    return _money(value) > Decimal("0")
+
+
 def _clean_money_text(value: Any, default: str = "0") -> str:
     amount = _money(value, default)
     if amount == amount.to_integral():
@@ -1985,23 +1991,105 @@ def _pick_highest_price_vehicle(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return max(rows, key=_vehicle_price)
 
 
-def _renewal_row_end_sort_value(row: Mapping[str, Any]) -> tuple[str, str]:
-    end_key = re.sub(r"\D+", "", _to_str(row.get("end_date") or row.get("endDate")))
+def _renewal_compare_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9\u4e00-\u9fff]", "", _to_str(value).upper())
+
+
+def _renewal_same_text(left: Any, right: Any) -> bool:
+    lval = _renewal_compare_text(left)
+    rval = _renewal_compare_text(right)
+    return bool(lval and rval and lval == rval)
+
+
+def _renewal_text_match_score(left: Any, right: Any, *, matched: int, mismatched: int) -> int:
+    lval = _renewal_compare_text(left)
+    rval = _renewal_compare_text(right)
+    if not lval or not rval:
+        return 0
+    return matched if lval == rval else -mismatched
+
+
+def _renewal_end_day(row: Mapping[str, Any]) -> Optional[date]:
+    return _parse_date(row.get("end_date") or row.get("endDate"))
+
+
+def _renewal_candidate_score(row: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> int:
+    current = _json_obj(current)
+    score = 0
+    score += _renewal_text_match_score(
+        row.get("license_no") or row.get("licenseNo"),
+        current.get("plate_no") or current.get("license_no"),
+        matched=100,
+        mismatched=160,
+    )
+    score += _renewal_text_match_score(
+        row.get("vin") or row.get("vinNo") or row.get("frameNo"),
+        current.get("vin"),
+        matched=120,
+        mismatched=420,
+    )
+    score += _renewal_text_match_score(
+        row.get("engine_no") or row.get("engineNo"),
+        current.get("engine_no"),
+        matched=90,
+        mismatched=220,
+    )
+    row_license_type = _normalize_license_type_value(row.get("license_type") or row.get("licenseType"))
+    current_license_type = _normalize_license_type_value(current.get("license_type") or current.get("licenseType"))
+    if row_license_type and current_license_type and row_license_type == current_license_type:
+        score += 50
+    elif row_license_type and current_license_type:
+        score -= 120
+    if _to_str(row.get("renewal_or_copy_flag") or row.get("renewalOrCopyFlag")).strip() == "1":
+        score += 30
+    if _to_str(row.get("policy_no_encode") or row.get("policyNoEncode")).strip():
+        score += 20
+    if _to_str(row.get("relation_policy_no_encode") or row.get("relationPolicyNoEncode")).strip():
+        score += 20
+    if _to_str(row.get("risk_code") or row.get("riskCode")).strip().upper() == "DAA":
+        score += 10
+
+    end_day = _renewal_end_day(row)
+    target_start = _parse_date(
+        current.get("commercial_start_date")
+        or current.get("compulsory_start_date")
+        or current.get("start_date")
+    )
+    if end_day and target_start:
+        score -= min(abs((end_day - (target_start - timedelta(days=1))).days), 365)
+    return score
+
+
+def _renewal_candidate_sort_value(row: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> tuple[int, int, int]:
+    end_day = _renewal_end_day(row)
+    end_ord = end_day.toordinal() if end_day else 0
     risk_code = _to_str(row.get("risk_code") or row.get("riskCode")).strip().upper()
-    risk_rank = "0" if risk_code == "DAA" else "1" if risk_code == "DZA" else "2"
-    return end_key, risk_rank
+    risk_rank = 2 if risk_code == "DAA" else 1 if risk_code == "DZA" else 0
+    return _renewal_candidate_score(row, current), end_ord, risk_rank
 
 
-def _pick_renewal_policy_candidate(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _renewal_candidate_selection_reason(row: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> str:
+    current = _json_obj(current)
+    reasons: List[str] = []
+    if _renewal_same_text(row.get("license_no") or row.get("licenseNo"), current.get("plate_no") or current.get("license_no")):
+        reasons.append("车牌一致")
+    if _renewal_same_text(row.get("vin") or row.get("vinNo") or row.get("frameNo"), current.get("vin")):
+        reasons.append("VIN一致")
+    if _renewal_same_text(row.get("engine_no") or row.get("engineNo"), current.get("engine_no")):
+        reasons.append("发动机号一致")
+    row_license_type = _normalize_license_type_value(row.get("license_type") or row.get("licenseType"))
+    current_license_type = _normalize_license_type_value(current.get("license_type") or current.get("licenseType"))
+    if row_license_type and current_license_type and row_license_type == current_license_type:
+        reasons.append("号牌种类一致")
+    if _to_str(row.get("renewal_or_copy_flag") or row.get("renewalOrCopyFlag")).strip() == "1":
+        reasons.append("平台标记可续保")
+    return "，".join(reasons) or "按候选评分和终保日期选择"
+
+
+def _pick_renewal_policy_candidate(rows: List[Dict[str, Any]], current: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     if not rows:
         return {}
-    flagged = [
-        row
-        for row in rows
-        if _to_str(row.get("renewal_or_copy_flag") or row.get("renewalOrCopyFlag")).strip() == "1"
-    ]
-    pool = flagged or rows
-    return min(pool, key=_renewal_row_end_sort_value)
+    return max(rows, key=lambda row: _renewal_candidate_sort_value(row, current))
 
 
 def _quote_loss_override_amount(quote_payload: Mapping[str, Any], defaults: Optional[Mapping[str, Any]] = None) -> Decimal:
@@ -2240,6 +2328,32 @@ def _quote_form_shared_main_limit(form: Mapping[str, Any]) -> Optional[bool]:
     if not _has_text(value):
         return None
     return _checked(value, default=False)
+
+
+def _quote_form_kind_rows(form: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    indexes: set[int] = set()
+    for key in form.keys():
+        match = re.fullmatch(r"prpCitemKindVos\[(\d+)\]\.[A-Za-z0-9_]+", _to_str(key).strip())
+        if match:
+            indexes.add(int(match.group(1)))
+    rows: List[Dict[str, Any]] = []
+    for index in sorted(indexes):
+        rows.append(
+            {
+                "index": index,
+                "kind_code": _to_str(form.get(f"prpCitemKindVos[{index}].kindCode")).strip(),
+                "kind_name": _to_str(form.get(f"prpCitemKindVos[{index}].kindName")).strip(),
+                "choose_flag": form.get(f"prpCitemKindVos[{index}].chooseFlag"),
+                "amount": form.get(f"prpCitemKindVos[{index}].amount"),
+                "quantity": form.get(f"prpCitemKindVos[{index}].quantity"),
+            }
+        )
+    return rows
+
+
+def _is_dangerous_quote_form_override_key(key: Any) -> bool:
+    text = _to_str(key).strip()
+    return bool(re.fullmatch(r"prpCitemKindVos\[\d+\]\.(kindCode|kindName|chooseFlag|amount)", text))
 
 
 def _quote_form_next_kind_index(form: Mapping[str, Any]) -> int:
@@ -3410,10 +3524,18 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             for item_license_type in policy_license_types:
                 strategy = "last_policy_no" if item_license_type == license_type else f"last_policy_no_license_{item_license_type}"
                 add(strategy, license_type_override=item_license_type, lastPolicyNo=last_policy_no)
+        lookup_license_types = [license_type]
+        for fallback_type in ("02", "52"):
+            if fallback_type not in lookup_license_types:
+                lookup_license_types.append(fallback_type)
         if len(engine_no) >= 4:
-            add("engine_last4", engineNo4Renew2=engine_no[-4:])
+            for item_license_type in lookup_license_types:
+                strategy = "engine_last4" if item_license_type == license_type else f"engine_last4_license_{item_license_type}"
+                add(strategy, license_type_override=item_license_type, engineNo4Renew2=engine_no[-4:])
         if len(vin) >= 6:
-            add("vin_last6", frameNo4Renew2=vin[-6:])
+            for item_license_type in lookup_license_types:
+                strategy = "vin_last6" if item_license_type == license_type else f"vin_last6_license_{item_license_type}"
+                add(strategy, license_type_override=item_license_type, frameNo4Renew2=vin[-6:])
         return attempts
 
     def _query_renewal_sync(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
@@ -3462,7 +3584,40 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             renewal_response: Dict[str, Any] = {}
             lookup_params: Dict[str, Any] = {}
             attempt_records: List[Dict[str, Any]] = []
+            candidate_map: Dict[str, Dict[str, Any]] = {}
             not_found_pattern = re.compile(r"(没有此车辆信息|不是可续保车辆|不可续保|无续保信息|未查询到续保|没有续保信息)")
+
+            def candidate_key(row: Mapping[str, Any]) -> str:
+                return (
+                    _to_str(row.get("policy_no_encode")).strip()
+                    or _to_str(row.get("policy_no")).strip()
+                    or "|".join(
+                        [
+                            _to_str(row.get("risk_code")).strip(),
+                            _renewal_compare_text(row.get("license_no")),
+                            _renewal_compare_text(row.get("vin")),
+                            _to_str(row.get("end_date")).strip(),
+                        ]
+                    )
+                )
+
+            def add_candidates(rows: List[Dict[str, Any]], strategy: str) -> None:
+                for row in rows:
+                    key = candidate_key(row)
+                    if not key:
+                        continue
+                    existing = candidate_map.get(key)
+                    if existing is None:
+                        existing = dict(row)
+                        existing["source_strategies"] = []
+                        candidate_map[key] = existing
+                    strategies = existing.get("source_strategies")
+                    if not isinstance(strategies, list):
+                        strategies = []
+                        existing["source_strategies"] = strategies
+                    if strategy not in strategies:
+                        strategies.append(strategy)
+
             for attempt in lookup_attempts:
                 strategy = _to_str(attempt.get("strategy")).strip() or "unknown"
                 params = _json_obj(attempt.get("params"))
@@ -3522,8 +3677,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 renewal_response = response
                 lookup_params = params
                 if attempt_candidates:
-                    candidates = attempt_candidates
-                    break
+                    add_candidates(attempt_candidates, strategy)
+
+            candidates = sorted(
+                candidate_map.values(),
+                key=lambda row: _renewal_candidate_sort_value(row, vehicle),
+                reverse=True,
+            )
+            selected = _pick_renewal_policy_candidate(candidates, vehicle)
+            selected_score = _renewal_candidate_score(selected, vehicle) if selected else 0
+            selected_reason = _renewal_candidate_selection_reason(selected, vehicle) if selected else ""
 
             lookup_payload = {
                 "vehicle": vehicle,
@@ -3531,6 +3694,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "params": lookup_params,
                 "attempts": attempt_records,
                 "candidates": candidates,
+                "selected": selected,
+                "selected_score": selected_score,
+                "selected_reason": selected_reason,
             }
             if not candidates:
                 message = _platform_message(renewal_response, "")
@@ -3542,6 +3708,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 return PlatformRuntimeResult(
                     status="success",
                     message=message,
+                    data=success_data(
+                        client,
+                        extra={
+                            "business_status": "renewal_not_found",
+                            "renewal_found": False,
+                            "renewal_lookup": lookup_payload,
+                            "platform_response": _platform_debug_payload(renewal_response),
+                        },
+                    ),
+                )
+            if selected and selected_score < 0:
+                lookup_payload["found"] = False
+                lookup_payload["reject_reason"] = "续保候选与当前车辆信息不一致"
+                return PlatformRuntimeResult(
+                    status="success",
+                    message="人保续保查询到候选保单，但与当前车辆信息不一致，已按未找到续保处理",
                     data=success_data(
                         client,
                         extra={
@@ -3659,8 +3841,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         plate_no = _clean_vehicle_cert_value("plate_no", _first_text(car.get("licenseNo"), candidate.get("license_no")))
         start_date_bi = _renewal_next_start_date(main.get("endDate") or candidate.get("end_date"))
         start_date_ci = _renewal_next_start_date(main.get("endDateCI") or candidate.get("end_date"))
+        account_type_name = NEW_ENERGY_USED_ACCOUNT_TYPE if selected_license_type == "52" else USED_FUEL_ACCOUNT_TYPE
         out = {
-            "account_type_name": USED_FUEL_ACCOUNT_TYPE,
+            "account_type_name": account_type_name,
             "plate_no": plate_no,
             "engine_no": engine_no,
             "vin": vin,
@@ -3737,13 +3920,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             kind_code = _to_str(row.get("kindCode")).strip()
             amount = _clean_money_text_or_empty(row.get("amount"))
             unit_amount = _clean_money_text_or_empty(row.get("unitAmount"))
-            if kind_code == "051051" and amount:
+            if kind_code == "051051" and _is_positive_amount(amount):
                 defaults.setdefault(PRODUCT_THIRD_PARTY, _wan_or_amount_to_wan_text(amount, "300"))
-            elif kind_code == "051052" and (unit_amount or amount):
-                defaults.setdefault(PRODUCT_DRIVER, unit_amount or amount)
-            elif kind_code == "051053" and (unit_amount or amount):
-                defaults.setdefault(PRODUCT_PASSENGER, unit_amount or amount)
-            elif kind_code == "051063" and amount:
+            elif kind_code == "051052":
+                value = unit_amount or amount
+                if _is_positive_amount(value):
+                    defaults.setdefault(PRODUCT_DRIVER, value)
+            elif kind_code == "051053":
+                value = unit_amount or amount
+                if _is_positive_amount(value):
+                    defaults.setdefault(PRODUCT_PASSENGER, value)
+            elif kind_code == "051063" and _is_positive_amount(amount):
                 defaults.setdefault(PRODUCT_MEDICAL_THIRD, amount)
                 if _to_str(row.get("sharedAmountFlag")).strip() == "1":
                     defaults.setdefault(PRODUCT_SHARED_LIMIT, True)
@@ -3751,7 +3938,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 quantity = _safe_int_local(row.get("quantity"), 0)
                 if quantity > 0:
                     defaults.setdefault(PRODUCT_ROAD_RESCUE, str(quantity))
-            elif kind_code == "051074" and amount:
+            elif kind_code == "051074" and _is_positive_amount(amount):
                 defaults.setdefault(PRODUCT_COMPULSORY, _wan_or_amount_to_wan_text(amount, "20"))
         return defaults
 
@@ -3860,7 +4047,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         selected = _json_obj(renewal_lookup.get("selected"))
         if not selected:
             candidates = renewal_lookup.get("candidates") if isinstance(renewal_lookup.get("candidates"), list) else []
-            selected = _pick_renewal_policy_candidate([dict(item) for item in candidates if isinstance(item, Mapping)])
+            selected = _pick_renewal_policy_candidate(
+                [dict(item) for item in candidates if isinstance(item, Mapping)],
+                normalized_data,
+            )
         if not selected:
             # Older cases stored only the selected policy summary. Keep those
             # sessions requotable after an adjustment such as "司乘改3万".
@@ -3878,19 +4068,35 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             raise PiccRequestError("人保续保报价缺少可用续保保单，请重新发起续保查询")
         prefill = self._fetch_renewal_policy_prefill(client, selected)
         renewal_data = self._renewal_prefill_vehicle_data(prefill, selected)
-        merged_normalized = _deep_merge(normalized_data, renewal_data)
+        # OCR / user-corrected case data stays above renewal prefill; renewal
+        # only supplies missing vehicle fields, except license type because it
+        # is platform-confirmed by quotePolicy.do and drives the account type.
+        merged_normalized = _deep_merge(renewal_data, normalized_data)
+        renewal_license_type = _normalize_license_type_value(renewal_data.get("license_type"))
+        if renewal_license_type:
+            merged_normalized["license_type"] = renewal_license_type
+            merged_normalized["license_color_code"] = _license_color_for_type(renewal_license_type)
+            merged_normalized["account_type_name"] = (
+                NEW_ENERGY_USED_ACCOUNT_TYPE if renewal_license_type == "52" else USED_FUEL_ACCOUNT_TYPE
+            )
+            merged_normalized["license_type_decision"] = _json_obj(renewal_data.get("license_type_decision"))
         renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
         user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
         default_config = _picc_business_defaults(payload.get("default_config_json"))
         merged_defaults = dict(default_config)
         for key, value in renewal_defaults.items():
-            if key not in user_overrides:
+            if key not in user_overrides and (
+                key == PRODUCT_SHARED_LIMIT
+                or key == PRODUCT_ROAD_RESCUE
+                or _is_positive_amount(value)
+            ):
                 merged_defaults[key] = value
         merged_defaults.update(user_overrides)
         renewal_payload = dict(payload)
         renewal_payload["normalized_data"] = merged_normalized
         renewal_payload["default_config_json"] = merged_defaults
-        body = self._prepare_used_fuel_quote(client, ctx, renewal_payload, account_type_name=account_type_name)
+        effective_account_type_name = _normalize_account_type(merged_normalized.get("account_type_name") or account_type_name)
+        body = self._prepare_used_fuel_quote(client, ctx, renewal_payload, account_type_name=effective_account_type_name)
         body = self._apply_renewal_prefill_to_quote_body(body, renewal_data, prefill, selected)
         preflight = dict(_json_obj(body.get("preflight")))
         preflight["renewalPolicyPrefill"] = {
@@ -3901,7 +4107,23 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         }
         if renewal_defaults:
             preflight["renewalQuoteFieldDefaults"] = renewal_defaults
-            preflight["renewalQuoteFieldPriority"] = "会话明确调参值 > 续保接口返回值 > 默认参数配置"
+            preflight["renewalQuoteFieldPriority"] = "会话明确调参值 > 有效续保接口返回值 > 默认参数配置 > profile内置默认值"
+            preflight["renewalMergeTrace"] = {
+                "effectiveAccountTypeName": effective_account_type_name,
+                "acceptedRenewalDefaults": {
+                    key: value
+                    for key, value in renewal_defaults.items()
+                    if key in merged_defaults and merged_defaults.get(key) == value
+                },
+                "ignoredRenewalDefaults": {
+                    key: value
+                    for key, value in renewal_defaults.items()
+                    if key not in user_overrides
+                    and key not in {PRODUCT_SHARED_LIMIT, PRODUCT_ROAD_RESCUE}
+                    and not _is_positive_amount(value)
+                },
+                "userOverrideKeys": list(user_overrides.keys()),
+            }
         body["preflight"] = preflight
         body["renewalPolicyPrefill"] = _json_obj(renewal_data.get("renewal_policy_prefill"))
         return _clean_used_fuel_request_body(body)
@@ -5560,15 +5782,68 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         # Allow advanced platform-specific overrides without changing the schema.
         extra_form = _json_obj_loose(defaults.get("PICC报价请求体覆盖") or defaults.get("quoteFormOverrides"))
         for key, value in extra_form.items():
-            if _to_str(key).strip():
-                form[_to_str(key).strip()] = value
+            form_key = _to_str(key).strip()
+            if not form_key:
+                continue
+            if _is_dangerous_quote_form_override_key(form_key):
+                raise PiccRequestError(f"人保报价请求体覆盖包含危险字段：{form_key}，请改用会话调参或默认参数配置")
+            form[form_key] = value
         form = _clean_vehicle_cert_fields(form)
         return {key: value for key, value in form.items() if value is not None}
+
+    def _validate_picc_quote_form_before_submit(
+        self,
+        form: Mapping[str, Any],
+        *,
+        account_type_name: Any = "",
+        flow_type: Any = "",
+    ) -> None:
+        del flow_type
+        required_amount_kind_codes = {
+            "051051": "第三者责任险",
+            "051052": PRODUCT_DRIVER,
+            "051053": PRODUCT_PASSENGER,
+            "051063": PRODUCT_MEDICAL_THIRD,
+        }
+        problems: List[str] = []
+        for row in _quote_form_kind_rows(form):
+            kind_code = _to_str(row.get("kind_code")).strip()
+            if not _checked(row.get("choose_flag"), default=False):
+                continue
+            if kind_code in required_amount_kind_codes and not _is_positive_amount(row.get("amount")):
+                problems.append(f"{required_amount_kind_codes[kind_code]}已选择，但保额无效")
+            if kind_code == "051064" and _safe_int_local(row.get("quantity"), 0) <= 0:
+                problems.append(f"{PRODUCT_ROAD_RESCUE}已选择，但次数无效")
+
+        normalized_type = _normalize_account_type(account_type_name)
+        license_type = _normalize_license_type_value(form.get("prpCitemCar.licenseType"))
+        energy_flag = _to_str(form.get("energyFlag")).strip()
+        is_energy_car = _to_str(form.get("prpCitemCar.isEnergyCar")).strip()
+        energy_type_plat = _to_str(form.get("energyTypePlat")).strip()
+        if "新能源" in normalized_type:
+            if license_type and license_type != "52":
+                problems.append("新能源旧车号牌种类不是52")
+            if energy_flag and energy_flag != "1":
+                problems.append("新能源旧车energyFlag不是1")
+            if is_energy_car and is_energy_car not in {"1", "true", "True"}:
+                problems.append("新能源旧车isEnergyCar不是1")
+        elif normalized_type in {USED_FUEL_ACCOUNT_TYPE, NEW_FUEL_ACCOUNT_TYPE}:
+            if license_type == "52":
+                problems.append("燃油车号牌种类不能是52")
+            if energy_type_plat in {"1", "2", "3", "4"} and is_energy_car in {"1", "true", "True"}:
+                problems.append("燃油车能源字段与新能源字段冲突")
+        if problems:
+            raise PiccRequestError("人保报价前校验失败：" + "；".join(problems[:8]))
 
     def _submit_used_fuel_quote(self, client: PiccProtocolClient, request_body: Mapping[str, Any]) -> Dict[str, Any]:
         form_body = _clean_vehicle_cert_fields(_json_obj(request_body.get("quoteForm")))
         if not form_body:
             raise PiccRequestError("人保报价请求体为空，无法提交报价")
+        self._validate_picc_quote_form_before_submit(
+            form_body,
+            account_type_name=request_body.get("accountTypeName"),
+            flow_type=request_body.get("quoteFlowType") or request_body.get("quote_flow_type"),
+        )
         data = client.request_json(
             "POST",
             QUOTE_PATH,

@@ -13414,27 +13414,110 @@ async def _continue_quote_with_platform_account(
     )
 
 
-def _renewal_lookup_primary_candidate(value: Any) -> Dict[str, Any]:
+def _renewal_context_compare_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9\u4e00-\u9fff]", "", _to_str(value).upper())
+
+
+def _renewal_context_same_text(left: Any, right: Any) -> bool:
+    lval = _renewal_context_compare_text(left)
+    rval = _renewal_context_compare_text(right)
+    return bool(lval and rval and lval == rval)
+
+
+def _renewal_context_text_match_score(left: Any, right: Any, *, matched: int, mismatched: int) -> int:
+    lval = _renewal_context_compare_text(left)
+    rval = _renewal_context_compare_text(right)
+    if not lval or not rval:
+        return 0
+    return matched if lval == rval else -mismatched
+
+
+def _renewal_context_license_type(value: Any) -> str:
+    data = _json_obj(value)
+    decision = _json_obj(data.get(LICENSE_TYPE_DECISION_KEY))
+    return _normalize_license_type_value(
+        data.get("license_type")
+        or data.get("licenseType")
+        or decision.get("license_type")
+        or decision.get("licenseType")
+    )
+
+
+def _renewal_candidate_score_for_current(row: Mapping[str, Any], current: Optional[Mapping[str, Any]] = None) -> int:
+    current = _json_obj(current)
+    score = 0
+    score += _renewal_context_text_match_score(
+        row.get("license_no") or row.get("licenseNo"),
+        current.get("plate_no") or current.get("license_no"),
+        matched=100,
+        mismatched=160,
+    )
+    score += _renewal_context_text_match_score(
+        row.get("vin") or row.get("vinNo") or row.get("frameNo"),
+        current.get("vin"),
+        matched=120,
+        mismatched=420,
+    )
+    score += _renewal_context_text_match_score(
+        row.get("engine_no") or row.get("engineNo"),
+        current.get("engine_no"),
+        matched=90,
+        mismatched=220,
+    )
+    row_license_type = _normalize_license_type_value(row.get("license_type") or row.get("licenseType"))
+    current_license_type = _renewal_context_license_type(current)
+    if row_license_type and current_license_type and row_license_type == current_license_type:
+        score += 50
+    elif row_license_type and current_license_type:
+        score -= 120
+    if _to_str(row.get("renewal_or_copy_flag") or row.get("renewalOrCopyFlag")).strip() == "1":
+        score += 30
+    if _to_str(row.get("policy_no_encode") or row.get("policyNoEncode")).strip():
+        score += 20
+    if _to_str(row.get("relation_policy_no_encode") or row.get("relationPolicyNoEncode")).strip():
+        score += 20
+    if _to_str(row.get("risk_code") or row.get("riskCode")).strip().upper() == "DAA":
+        score += 10
+    return score
+
+
+def _renewal_end_ord(value: Any) -> int:
+    text = _normalize_quote_date_text(value)
+    if not text:
+        return 0
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").toordinal()
+    except Exception:
+        return 0
+
+
+def _renewal_lookup_primary_candidate(value: Any, current: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     candidates = [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
     if not candidates:
         return {}
-    flagged = [item for item in candidates if _to_str(item.get("renewal_or_copy_flag")).strip() == "1"]
-    pool = flagged or candidates
-    return min(
-        pool,
+    return max(
+        candidates,
         key=lambda item: (
-            re.sub(r"\D+", "", _to_str(item.get("end_date"))),
-            0 if _to_str(item.get("risk_code")).strip().upper() == "DAA" else 1,
+            _renewal_candidate_score_for_current(item, current),
+            _renewal_end_ord(item.get("end_date") or item.get("endDate")),
+            2 if _to_str(item.get("risk_code")).strip().upper() == "DAA" else 1,
         ),
     )
 
 
 def _has_reusable_renewal_quote_context(value: Any) -> bool:
-    lookup = _json_obj(_json_obj(value).get("renewal_lookup"))
+    data = _json_obj(value)
+    lookup = _json_obj(data.get("renewal_lookup"))
     found = lookup.get("found")
     if found is not True and _to_str(found).strip().lower() not in {"1", "true", "yes"}:
         return False
-    selected = _json_obj(lookup.get("selected"))
+    selected = _json_obj(lookup.get("selected")) or {
+        "policy_no": _to_str(lookup.get("selected_policy_no")).strip(),
+        "policy_no_encode": _to_str(lookup.get("selected_policy_no_encode")).strip(),
+        "risk_code": _to_str(lookup.get("selected_risk_code")).strip(),
+        "end_date": _to_str(lookup.get("selected_end_date")).strip(),
+        "license_type": _normalize_license_type_value(lookup.get("selected_license_type")),
+    }
     policy_no = (
         _to_str(selected.get("policy_no")).strip()
         or _to_str(selected.get("policyNo")).strip()
@@ -13445,7 +13528,22 @@ def _has_reusable_renewal_quote_context(value: Any) -> bool:
         or _to_str(selected.get("policyNoEncode")).strip()
         or _to_str(lookup.get("selected_policy_no_encode")).strip()
     )
-    return bool(policy_no and policy_no_encode)
+    if not (policy_no and policy_no_encode):
+        return False
+
+    checks = (
+        (selected.get("license_no") or selected.get("licenseNo"), data.get("plate_no") or data.get("license_no")),
+        (selected.get("vin") or selected.get("vinNo") or selected.get("frameNo"), data.get("vin")),
+        (selected.get("engine_no") or selected.get("engineNo"), data.get("engine_no")),
+    )
+    for left, right in checks:
+        if _to_str(left).strip() and _to_str(right).strip() and not _renewal_context_same_text(left, right):
+            return False
+    selected_license_type = _normalize_license_type_value(selected.get("license_type") or selected.get("licenseType"))
+    current_license_type = _renewal_context_license_type(data)
+    if selected_license_type and current_license_type and selected_license_type != current_license_type:
+        return False
+    return True
 
 
 def _should_auto_probe_renewal_before_normal_quote(
@@ -13635,7 +13733,8 @@ async def _complete_renewal_lookup_without_sms(
 
     lookup = _json_obj(runtime_data.get("renewal_lookup"))
     candidates = lookup.get("candidates") if isinstance(lookup.get("candidates"), list) else []
-    primary = _renewal_lookup_primary_candidate(candidates)
+    lookup_vehicle = _json_obj(lookup.get("vehicle")) or _json_obj(case.normalized_data)
+    primary = _json_obj(lookup.get("selected")) or _renewal_lookup_primary_candidate(candidates, lookup_vehicle)
     lookup_found = bool(runtime_data.get("renewal_found")) and bool(primary)
     if not lookup_found or business_status == "renewal_not_found":
         detail = _runtime_detail(runtime_result, "没有此车辆信息或不是可续保车辆")
@@ -13706,10 +13805,16 @@ async def _complete_renewal_lookup_without_sms(
         "selected_end_date": _to_str(primary.get("end_date")).strip(),
         "selected_license_type": selected_license_type,
         "candidate_count": len(candidates),
+        "selected_score": lookup.get("selected_score"),
+        "selected_reason": lookup.get("selected_reason"),
     }
     if selected_license_type:
         updated_data["license_type"] = selected_license_type
         updated_data["license_color_code"] = _license_color_for_type(selected_license_type)
+        if selected_license_type == "52":
+            updated_data["account_type_name"] = "新能源车-旧"
+        elif selected_license_type == "02":
+            updated_data["account_type_name"] = "油车-旧"
         updated_data[LICENSE_TYPE_DECISION_KEY] = _license_type_decision_payload(
             selected_license_type,
             source="renewal_lookup",
@@ -13796,6 +13901,7 @@ async def _complete_renewal_lookup_without_sms(
         attached_images=[],
         config_type_name=_normalize_account_type_name(
             _json_obj(quote_snapshot.get("vehicle_type_detect")).get("config_type_name")
+            or refreshed_normalized.get("account_type_name")
             or "油车-旧"
         ),
         operator_role_name=operator_role_name,
@@ -15515,6 +15621,7 @@ async def handle_quote_images_message(
             platform_name=auto_platform_name,
             entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
         )
+    material_conflicts = _quote_material_issues(normalized_data, images_by_slot)
     missing = (
         _missing_requirements(
             normalized_data,
@@ -15523,7 +15630,7 @@ async def handle_quote_images_message(
             account_type_name=auto_account_type_name,
         )
         if quote_check_requested
-        else []
+        else material_conflicts
     )
     case.normalized_data = normalized_data
     case.draft_order_data = normalized_data
@@ -15578,10 +15685,13 @@ async def handle_quote_images_message(
 
     await db.flush()
 
-    visible_image_quote_check = bool(explicit_platform_quote and missing)
+    visible_image_quote_check = bool((explicit_platform_quote and missing) or (not quote_check_requested and material_conflicts))
     lines: List[str] = []
     if visible_image_quote_check:
-        lines.append(f"{auto_platform_name or platform_name or '平台'}报价资料还不完整，已中断本次报价。")
+        if quote_check_requested:
+            lines.append(f"{auto_platform_name or platform_name or '平台'}报价资料还不完整，已中断本次报价。")
+        else:
+            lines.append("资料冲突，已暂停本次材料归位。请确认后再报价。")
         conflict_labels = [_missing_item_text(item) for item in missing if item.get("type") == "data_conflict"]
         ordinary_labels = [_missing_item_text(item) for item in missing if item.get("type") != "data_conflict"]
         if ordinary_labels:

@@ -8,7 +8,7 @@ import sys
 import unittest
 import urllib.parse
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 from sqlalchemy.exc import IntegrityError
 
@@ -28,6 +28,7 @@ from app.services.quote_assistant_service import (
     _quote_result_insurance_date_auto_adjustments,
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
+    _has_reusable_renewal_quote_context,
     _normalize_quote_case_data,
     _platform_default_values_with_legacy_fixes,
     _normalize_quote_product_exclusions,
@@ -56,6 +57,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
+    _renewal_candidate_score,
     _pick_renewal_policy_candidate,
     _used_fuel_model_query_terms,
 )
@@ -939,11 +941,223 @@ class QuotePromptStateRegressionTests(unittest.TestCase):
 
 
 class PiccRenewalHarRegressionTests(unittest.TestCase):
+    def test_renewal_prefill_ignores_zero_amount_coverages(self) -> None:
+        adapter = _adapter()
+        defaults = adapter._renewal_product_defaults_from_prefill(
+            {
+                "renewItemKindVoList": [
+                    {"kindCode": "051051", "amount": "0"},
+                    {"kindCode": "051052", "unitAmount": "0", "amount": "0"},
+                    {"kindCode": "051053", "unitAmount": "", "amount": "0"},
+                    {"kindCode": "051063", "amount": "0", "sharedAmountFlag": "1"},
+                    {"kindCode": "051064", "quantity": "0"},
+                    {"kindCode": "051074", "amount": ""},
+                ]
+            }
+        )
+        self.assertNotIn("第三者责任险", defaults)
+        self.assertNotIn("车上人员责任险（司机）", defaults)
+        self.assertNotIn("车上人员责任险（乘客）", defaults)
+        self.assertNotIn("医保外医疗费用责任险（第三者责任险）", defaults)
+        self.assertNotIn("机动车增值服务特约条款（道路救援服务）", defaults)
+        self.assertNotIn("交强险", defaults)
+
+        positive_defaults = adapter._renewal_product_defaults_from_prefill(
+            {
+                "renewItemKindVoList": [
+                    {"kindCode": "051051", "amount": "3000000"},
+                    {"kindCode": "051052", "unitAmount": "30000"},
+                    {"kindCode": "051053", "unitAmount": "30000"},
+                    {"kindCode": "051063", "amount": "3000000", "sharedAmountFlag": "1"},
+                    {"kindCode": "051064", "quantity": "7"},
+                ]
+            }
+        )
+        self.assertEqual(positive_defaults["第三者责任险"], "300")
+        self.assertEqual(positive_defaults["车上人员责任险（司机）"], "30000")
+        self.assertEqual(positive_defaults["车上人员责任险（乘客）"], "30000")
+        self.assertEqual(positive_defaults["共享主险限额"], True)
+        self.assertEqual(positive_defaults["机动车增值服务特约条款（道路救援服务）"], "7")
+
+    def test_renewal_prepare_merge_keeps_default_when_renewal_default_is_zero(self) -> None:
+        adapter = _adapter()
+        captured: dict[str, object] = {}
+
+        def fake_fetch(self, client, selected):
+            return {"data": "prefill"}
+
+        def fake_prefill(self, prefill, selected):
+            return {
+                "account_type_name": "油车-旧",
+                "license_type": "02",
+                "license_color_code": "01",
+                "renewal_quote_field_defaults": {
+                    "车上人员责任险（司机）": "0",
+                    "车上人员责任险（乘客）": "",
+                    "第三者责任险": "300",
+                    "共享主险限额": True,
+                },
+            }
+
+        def fake_prepare(self, client, ctx, payload, account_type_name="油车-旧"):
+            captured["default_config_json"] = dict(payload["default_config_json"])
+            captured["normalized_data"] = dict(payload["normalized_data"])
+            captured["account_type_name"] = account_type_name
+            return {
+                "quoteForm": {},
+                "preflight": {},
+                "accountTypeName": account_type_name,
+            }
+
+        def fake_apply(self, body, renewal_data, prefill, selected):
+            return dict(body)
+
+        adapter._fetch_renewal_policy_prefill = MethodType(fake_fetch, adapter)
+        adapter._renewal_prefill_vehicle_data = MethodType(fake_prefill, adapter)
+        adapter._prepare_used_fuel_quote = MethodType(fake_prepare, adapter)
+        adapter._apply_renewal_prefill_to_quote_body = MethodType(fake_apply, adapter)
+
+        body = adapter._prepare_renewal_used_fuel_quote(
+            SimpleNamespace(),
+            SimpleNamespace(account_type_name="油车-旧"),
+            {
+                "quote_flow_type": "renewal_motor_quote",
+                "normalized_data": {
+                    "account_type_name": "油车-旧",
+                    "plate_no": "赣G12345",
+                    "engine_no": "E1234",
+                    "vin": "LHGCY1628T8046465",
+                    "renewal_lookup": {
+                        "found": True,
+                        "selected": {
+                            "policy_no": "P1",
+                            "policy_no_encode": "ENC1",
+                            "license_type": "02",
+                        },
+                    },
+                },
+                "default_config_json": {
+                    "车上人员责任险（司机）": "30000",
+                    "车上人员责任险（乘客）": "30000",
+                    "第三者责任险": "200",
+                },
+                "platform_default_config": {"resolved_type_name": "油车-旧"},
+            },
+            account_type_name="油车-旧",
+        )
+
+        merged_defaults = captured["default_config_json"]
+        self.assertEqual(merged_defaults["车上人员责任险（司机）"], "30000")
+        self.assertEqual(merged_defaults["车上人员责任险（乘客）"], "30000")
+        self.assertEqual(merged_defaults["第三者责任险"], "300")
+        self.assertEqual(merged_defaults["共享主险限额"], True)
+        self.assertEqual(body["preflight"]["renewalQuoteFieldPriority"], "会话明确调参值 > 有效续保接口返回值 > 默认参数配置 > profile内置默认值")
+
+    def test_quote_form_pre_submit_blocks_selected_zero_amounts(self) -> None:
+        form = {
+            "prpCitemCar.licenseType": "02",
+            "prpCitemKindVos[0].kindCode": "051052",
+            "prpCitemKindVos[0].kindName": "车上人员责任险（司机）",
+            "prpCitemKindVos[0].chooseFlag": "true",
+            "prpCitemKindVos[0].amount": "0",
+        }
+        with self.assertRaisesRegex(Exception, "司机.*保额无效"):
+            _adapter()._validate_picc_quote_form_before_submit(form, account_type_name="油车-旧")
+
+    def test_quote_form_pre_submit_blocks_energy_account_mismatch(self) -> None:
+        form = {
+            "prpCitemCar.licenseType": "52",
+            "prpCitemKindVos[0].kindCode": "051051",
+            "prpCitemKindVos[0].kindName": "第三者责任险",
+            "prpCitemKindVos[0].chooseFlag": "true",
+            "prpCitemKindVos[0].amount": "300",
+        }
+        with self.assertRaisesRegex(Exception, "燃油车号牌种类不能是52"):
+            _adapter()._validate_picc_quote_form_before_submit(form, account_type_name="油车-旧")
+
+    def test_renewal_lookup_attempts_try_engine_and_vin_with_02_and_52(self) -> None:
+        attempts = _adapter()._renewal_lookup_param_attempts(
+            plate_no="赣GD68721",
+            engine_no="W24133464",
+            vin="LC0C76C4XR6182655",
+            last_policy_no="",
+            license_type="02",
+            is_owner=True,
+        )
+        strategies = {item["strategy"] for item in attempts}
+        self.assertIn("engine_last4", strategies)
+        self.assertIn("engine_last4_license_52", strategies)
+        self.assertIn("vin_last6", strategies)
+        self.assertIn("vin_last6_license_52", strategies)
+        by_strategy = {item["strategy"]: item["params"] for item in attempts}
+        self.assertEqual(by_strategy["engine_last4_license_52"]["licenseType4Renew"], "52")
+        self.assertEqual(by_strategy["vin_last6_license_52"]["frameNo4Renew2"], "182655")
+
+    def test_renewal_candidate_scoring_prefers_exact_vin_over_earlier_flagged_engine_hit(self) -> None:
+        current = {
+            "plate_no": "赣GD68721",
+            "vin": "LC0C76C4XR6182655",
+            "engine_no": "W24133464",
+            "license_type": "52",
+            "commercial_start_date": "2026-10-01",
+        }
+        candidates = [
+            {
+                "policy_no": "WEAK_ENGINE",
+                "policy_no_encode": "ENC_WEAK_ENGINE",
+                "risk_code": "DAA",
+                "license_no": "赣G00000",
+                "vin": "LOTHER00000000000",
+                "engine_no": "W24133464",
+                "license_type": "02",
+                "end_date": "2026-08-01",
+                "renewal_or_copy_flag": "1",
+            },
+            {
+                "policy_no": "EXACT_VIN",
+                "policy_no_encode": "ENC_EXACT_VIN",
+                "risk_code": "DZA",
+                "license_no": "赣GD68721",
+                "vin": "LC0C76C4XR6182655",
+                "engine_no": "W24133464",
+                "license_type": "52",
+                "end_date": "2026-09-30",
+                "renewal_or_copy_flag": "0",
+            },
+        ]
+        selected = _pick_renewal_policy_candidate(candidates, current)
+        self.assertEqual(selected["policy_no"], "EXACT_VIN")
+        self.assertLess(_renewal_candidate_score(candidates[0], current), 0)
+
+    def test_reusable_renewal_context_rejects_changed_vehicle_identity(self) -> None:
+        base = {
+            "plate_no": "赣GD68721",
+            "vin": "LC0C76C4XR6182655",
+            "engine_no": "W24133464",
+            "license_type": "52",
+            "renewal_lookup": {
+                "found": True,
+                "selected": {
+                    "policy_no": "P1",
+                    "policy_no_encode": "ENC1",
+                    "license_no": "赣GD68721",
+                    "vin": "LC0C76C4XR6182655",
+                    "engine_no": "W24133464",
+                    "license_type": "52",
+                },
+            },
+        }
+        self.assertTrue(_has_reusable_renewal_quote_context(base))
+        changed_vin = dict(base, vin="LC0C76C4XR6182656")
+        self.assertFalse(_has_reusable_renewal_quote_context(changed_vin))
+        changed_license_type = dict(base, license_type="02")
+        self.assertFalse(_has_reusable_renewal_quote_context(changed_license_type))
+
     def test_0813_renewal_prefill_and_result_with_default_joint_sales(self) -> None:
         har = _load_0813_renewal_har()
         renewal_rows = _har_response_json(har, 4)["data"]["list"]
         summaries = [_adapter()._renewal_candidate_summary(row) for row in renewal_rows]
-        selected = _pick_renewal_policy_candidate(summaries)
+        selected = next(item for item in summaries if item["policy_no"] == "PDZA202536040000299779")
         self.assertEqual(selected["policy_no"], "PDZA202536040000299779")
         self.assertEqual(
             _picc_encrypt_renewal_policy_no(selected["policy_no"]),
