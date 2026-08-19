@@ -1972,6 +1972,16 @@ def _vehicle_model_code_candidates(*values: Any) -> List[str]:
     return out
 
 
+def _vehicle_vin_model_code_candidates(value: Any) -> List[str]:
+    """Extract the leading model/VDS code used by PICC from a 17-char VIN."""
+    compact = re.sub(r"[^A-Z0-9]", "", _to_str(value).strip().upper())
+    if len(compact) != 17 or not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", compact):
+        return []
+    # PICC's vehicle catalogue commonly indexes Lexus/Toyota models by the
+    # first eight VIN characters, e.g. JTHKR5BH3J2327186 -> JTHKR5BH.
+    return [compact[:8]]
+
+
 def _vehicle_leading_brand_from_model(value: Any) -> str:
     """Extract a Chinese brand prefix when OCR merged it with the model code."""
     compact = re.sub(r"\s+", "", _to_str(value).strip())
@@ -1996,6 +2006,7 @@ def _vehicle_model_code_from_vehicle(vehicle: Mapping[str, Any]) -> str:
         vehicle.get("vehicleFgwCode"),
         vehicle.get("modelName"),
     )
+    codes.extend(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
     if codes:
         return codes[0]
     return _compact_vehicle_compare_text(
@@ -2010,6 +2021,7 @@ def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any])
         vehicle.get("vehicleFgwCode"),
         vehicle.get("modelName"),
     )
+    model_codes.extend(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
     model_code = _vehicle_model_code_from_vehicle(vehicle)
     brand = _compact_vehicle_compare_text(_vehicle_brand_hint(vehicle))
     name_hint = _compact_vehicle_compare_text(_vehicle_name_hint(vehicle.get("vehicleNameHint")) or vehicle.get("energyModelSuffix"))
@@ -3329,6 +3341,7 @@ def _used_fuel_model_query_terms(
     *,
     brand_name: Any = "",
     vehicle_name: Any = "",
+    vin: Any = "",
 ) -> List[str]:
     source = re.sub(r"\s+", " ", _to_str(model_name).strip()).strip("*")
     raw = re.sub(r"\s+", "", source).strip("*")
@@ -3349,15 +3362,13 @@ def _used_fuel_model_query_terms(
     brand_plain = _join_model_term(brand, no_brand_suffix)
     named_plain = _join_model_term("", no_brand_suffix, name_hint)
     english_terms = _english_model_code_terms(source)
-    standalone_model_terms: List[str] = []
+    exact_model_terms: List[str] = []
     for model_code in _vehicle_model_code_candidates(source, vehicle_name):
-        standalone_model_terms.extend(
-            (
-                model_code,
-                _join_model_term("", model_code, suffix),
-            )
-        )
-    return _dedupe_model_terms(
+        exact_model_terms.extend((model_code, _join_model_term("", model_code, suffix)))
+    for model_code in _vehicle_vin_model_code_candidates(vin):
+        exact_model_terms.extend((model_code, _join_model_term("", model_code, suffix)))
+    exact_model_terms = _dedupe_model_terms(exact_model_terms)
+    broad_terms = _dedupe_model_terms(
         [
             *english_terms,
             brand_typed,
@@ -3367,8 +3378,12 @@ def _used_fuel_model_query_terms(
             typed,
             no_brand_suffix,
             raw,
-            # Keep standalone model-code queries after combined-name attempts.
-            *standalone_model_terms,
+        ]
+    )
+    return _dedupe_model_terms(
+        [
+            *exact_model_terms,
+            *broad_terms,
         ]
     )
 
@@ -6034,6 +6049,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             energy_model_suffix,
             brand_name=vehicle_brand_name,
             vehicle_name=vehicle_name_hint,
+            vin=vin,
         )
         vehicle = {
             "licenseNo": license_no,
@@ -6077,6 +6093,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             vehicle.get("energyModelSuffix"),
             brand_name=vehicle.get("brandNameHint"),
             vehicle_name=vehicle.get("vehicleNameHint"),
+            vin=vehicle.get("vin"),
         ) or [model_name]
         last_data: Any = {}
         for term in terms:

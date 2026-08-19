@@ -147,8 +147,9 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             "小型轿车",
             brand_name="",
             vehicle_name="",
+            vin="JTHKR5BH3J2327186",
         )
-        self.assertLess(terms.index("雷克萨斯JTHKR5BH"), terms.index("JTHKR5BH"))
+        self.assertLess(terms.index("JTHKR5BH"), terms.index("雷克萨斯JTHKR5BH"))
         self.assertIn("JTHKR5BH轿车", terms)
 
         row = {
@@ -202,8 +203,73 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(len(rows["result"]), 1)
-        self.assertIn("雷克萨斯JTHKR5BH*", client.names)
-        self.assertIn("JTHKR5BH*", client.names)
+        self.assertEqual(client.names, ["JTHKR5BH*"])
+        self.assertEqual(vehicle["modelQueryMatched"], "JTHKR5BH")
+
+    def test_vin_prefix_is_used_when_model_field_only_contains_brand(self) -> None:
+        terms = _used_fuel_model_query_terms(
+            "雷克萨斯",
+            "小型轿车",
+            brand_name="雷克萨斯",
+            vehicle_name="",
+            vin="JTHKR5BH3J2327186",
+        )
+        self.assertIn("JTHKR5BH", terms)
+        self.assertIn("JTHKR5BH轿车", terms)
+
+        row = {
+            "vehicleName": "JTHKR5BH 小型轿车",
+            "modelCode": "PICC-MODEL-JTHKR5BH",
+            "vehicleModelCode": "PICC-PLAT-JTHKR5BH",
+        }
+        self.assertGreater(
+            _vehicle_candidate_score(
+                row,
+                {
+                    "rawModelName": "雷克萨斯",
+                    "modelName": "雷克萨斯",
+                    "brandNameHint": "雷克萨斯",
+                    "vin": "JTHKR5BH3J2327186",
+                },
+            ),
+            0,
+        )
+
+    def test_vin_prefix_query_is_reached_after_brand_queries(self) -> None:
+        class _VinFallbackClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
+                self.names.append(name)
+                if name.startswith("JTHKR5BH"):
+                    return {
+                        "status": 0,
+                        "result": [
+                            {
+                                "vehicleName": "JTHKR5BH 小型轿车",
+                                "modelCode": "PICC-MODEL-JTHKR5BH",
+                                "vehicleModelCode": "PICC-PLAT-JTHKR5BH",
+                                "purchasePrice": "280000",
+                            }
+                        ],
+                    }
+                return {"status": 0, "result": []}
+
+        client = _VinFallbackClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯",
+            "modelName": "雷克萨斯",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "",
+            "vin": "JTHKR5BH3J2327186",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(len(rows["result"]), 1)
+        self.assertEqual(client.names, ["JTHKR5BH*"])
         self.assertEqual(vehicle["modelQueryMatched"], "JTHKR5BH")
 
     def test_vehicle_certificate_car_name_is_backfilled_from_historical_ocr_text(self) -> None:
