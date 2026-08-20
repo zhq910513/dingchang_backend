@@ -11319,24 +11319,7 @@ def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, acco
     display_name = result_platform_name or platform_name or "平台"
     if result_platform_code == "PICC" or display_name in {"人保", "中国人保", "PICC"}:
         display_name = "人保"
-    proposal = _json_obj(card.get("proposal_info"))
-    vehicle_model = _to_str(
-        proposal.get("vehicle_model")
-        or result.get("vehicle_model")
-        or card.get("vehicle_model")
-    ).strip()
-    parts = [f"{display_name}风险水平：{risk_score or '-'} 分"]
-    if vehicle_model and vehicle_model != "-":
-        parts.append(f"选定车型：{vehicle_model}")
-    match_method = _to_str(
-        proposal.get("model_match_method")
-        or proposal.get("modelQueryMatchLabel")
-        or result.get("model_match_method")
-        or card.get("model_match_method")
-    ).strip()
-    if match_method and match_method != "-":
-        parts.append(f"匹配方式：{match_method}")
-    return "；".join(parts)
+    return f"{display_name}风险水平：{risk_score or '-'} 分"
 
 
 def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> Dict[str, str]:

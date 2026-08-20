@@ -1005,23 +1005,24 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertFalse(_vehicle_model_hint_is_usable({"vin": ""}, "纯电动轿车"))
         self.assertFalse(_vehicle_model_hint_is_usable({"vin": ""}, "增程式混合动力"))
 
-    def test_quote_success_reply_includes_selected_vehicle_model(self) -> None:
-        reply = _quote_result_reply_text(
-            {
-                "platform_code": "PICC",
-                "risk_score": "42",
-                "result_card": {
-                    "proposal_info": {
-                        "vehicle_model": "雷克萨斯LEXUS CT200h轿车",
-                        "model_match_method": "销售车型直查",
-                    },
+    def test_quote_success_reply_hides_vehicle_model_resolution_details(self) -> None:
+        result = {
+            "platform_code": "PICC",
+            "risk_score": "42",
+            "result_card": {
+                "proposal_info": {
+                    "vehicle_model": "雷克萨斯LEXUS CT200h轿车",
+                    "model_match_method": "销售车型直查",
                 },
             },
-            platform_name="人保",
-        )
+        }
+        reply = _quote_result_reply_text(result, platform_name="人保")
         self.assertIn("风险水平：42 分", reply)
-        self.assertIn("选定车型：雷克萨斯LEXUS CT200h轿车", reply)
-        self.assertIn("匹配方式：销售车型直查", reply)
+        self.assertNotIn("选定车型", reply)
+        self.assertNotIn("匹配方式", reply)
+        proposal = result["result_card"]["proposal_info"]
+        self.assertEqual(proposal["vehicle_model"], "雷克萨斯LEXUS CT200h轿车")
+        self.assertEqual(proposal["model_match_method"], "销售车型直查")
 
     def test_vehicle_query_resource_codes_prefer_defaults_then_profile(self) -> None:
         self.assertEqual(
