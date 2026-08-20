@@ -155,6 +155,15 @@ def main() -> None:
         "missing-response-provenance",
         _result(quote_provenance={}),
     )
+    spoofed_normalized_source = _result()
+    spoofed_normalized_source["quote_provenance"]["normalized_amounts"]["commercial"]["source"] = "quote_response.fake"
+    _assert_rejected("spoofed-normalized-source-prefix", spoofed_normalized_source)
+    spoofed_evidence_source = _result()
+    spoofed_evidence_source["quote_provenance"]["core_premium_evidence"][0]["source"] = "quote_response.fake"
+    _assert_rejected("spoofed-core-evidence-source-prefix", spoofed_evidence_source)
+    spoofed_derived_source = _result()
+    spoofed_derived_source["quote_provenance"]["normalized_amounts"]["commercial"]["source"] = "derived_from_real_quote.fake"
+    _assert_rejected("spoofed-derived-source-prefix", spoofed_derived_source)
     _assert_rejected(
         "joint-sales-config-only",
         _result(

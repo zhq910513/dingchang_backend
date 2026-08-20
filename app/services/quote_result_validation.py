@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import re
 from typing import Any, Mapping
 
 
@@ -69,14 +70,28 @@ TRUSTED_JOINT_SALES_SOURCES = frozenset({
     "joint_sales_plan_response",
 })
 
-TRUSTED_RESPONSE_PATH_PREFIXES = (
-    "quote_response.",
-    "joint_sales_plan_response.",
+TRUSTED_EXACT_AMOUNT_SOURCES = frozenset(
+    {
+        "quote_response.data.biPremium",
+        "quote_response.data.ciPremium",
+        "quote_response.data.sumPayTax",
+        "quote_response.data.thisPayTax",
+        "quote_response.data.carShipTaxes",
+        "quote_response.data.sumYelPremium",
+        "quote_response.data.sumPremium",
+        "quote_response.data.totalPremium",
+        "quote_response.data.premiumTotal",
+        "joint_sales_plan_response.selected_plan.planPremium",
+        "derived_from_quote_response.data.prePayTax+delayPayTax",
+        "derived_from_quote_response.data.sumPremium+joint_sales_plan_response.selected_plan.planPremium",
+        "derived_from_quote_response_components",
+        "derived_from_quote_response_components+joint_sales_plan_response.selected_plan.planPremium",
+        "derived_from_real_quote",
+    }
 )
 
-TRUSTED_DERIVED_SOURCE_PREFIXES = (
-    "derived_from_quote_response",
-    "derived_from_real_quote",
+TRUSTED_AMOUNT_SOURCE_PATTERNS = (
+    re.compile(r"^quote_response(?:\.data)?\.itemKindTempList\[(?:\d+|\*)\]\.premium(?:\.sum)?$"),
 )
 
 
@@ -138,7 +153,9 @@ def _normalized_amount(
 
 def _trusted_normalized_source(source: Any) -> bool:
     text = _text(source).strip()
-    return text.startswith(TRUSTED_RESPONSE_PATH_PREFIXES + TRUSTED_DERIVED_SOURCE_PREFIXES)
+    return text in TRUSTED_EXACT_AMOUNT_SOURCES or any(
+        pattern.fullmatch(text) for pattern in TRUSTED_AMOUNT_SOURCE_PATTERNS
+    )
 
 
 def _summary_amount_category(name: Any) -> str:
@@ -197,7 +214,7 @@ def _trusted_positive_evidence(
 ) -> bool:
     for row in rows:
         source = _text(row.get("source")).strip()
-        if not source.startswith(TRUSTED_RESPONSE_PATH_PREFIXES):
+        if not _trusted_normalized_source(source):
             continue
         source_name = _text(row.get("name") or row.get("kind")).strip().lower()
         if source_names and source_name not in source_names:
