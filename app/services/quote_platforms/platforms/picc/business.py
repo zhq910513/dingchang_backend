@@ -171,6 +171,7 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "include_pay_last_year": False,
         "license_no_strategy": "new_car_placeholder",
         "enroll_date_fallback": "today",
+        "vehicle_query_resources": "0524",
         "product_defaults": {
             PRODUCT_COMPULSORY: "20",
             PRODUCT_THIRD_PARTY: "300",
@@ -201,6 +202,7 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "include_pay_last_year": True,
         "license_no_strategy": "required",
         "enroll_date_fallback": "",
+        "vehicle_query_resources": "0524",
         "product_defaults": {
             PRODUCT_COMPULSORY: "20",
             PRODUCT_THIRD_PARTY: "300",
@@ -231,6 +233,8 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "include_pay_last_year": False,
         "license_no_strategy": "new_car_placeholder",
         "enroll_date_fallback": "today",
+        # Keep 0524 until a verified NE-only resource code is confirmed by HAR.
+        "vehicle_query_resources": "0524",
         "product_defaults": {
             PRODUCT_COMPULSORY: "20",
             PRODUCT_THIRD_PARTY: "300",
@@ -261,6 +265,7 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "include_pay_last_year": True,
         "license_no_strategy": "required",
         "enroll_date_fallback": "",
+        "vehicle_query_resources": "0524",
         "product_defaults": {
             PRODUCT_COMPULSORY: "20",
             PRODUCT_THIRD_PARTY: "300",
@@ -2039,6 +2044,32 @@ def _vehicle_vin_prefix_is_model_code(vehicle: Mapping[str, Any], value: Any) ->
     }
 
 
+_VEHICLE_TYPE_SUFFIXES = ("轿车", "客车", "货车", "越野车", "牵引车", "专项作业车", "摩托车", "挂车")
+_VEHICLE_UNUSABLE_MODEL_HINTS = {
+    "轿车",
+    "小型轿车",
+    "客车",
+    "小型客车",
+    "车辆",
+    "汽车",
+    "新能源车",
+    "新能源",
+    "燃油车",
+    "纯电",
+    "纯电动",
+    "纯电动轿车",
+    "插电式混合动力",
+    "插电式混合动力轿车",
+    "混合动力",
+    "增程式",
+    "增程式混合动力",
+    "增程式混合动力轿车",
+    "燃料电池",
+    "汽油",
+    "柴油",
+}
+
+
 def _vehicle_model_hint_is_usable(vehicle: Mapping[str, Any], value: Any) -> bool:
     """Reject generic labels and VIN prefixes as sales-model names."""
     text = re.sub(r"\s+", "", _to_str(value).strip()).strip("*")
@@ -2054,26 +2085,126 @@ def _vehicle_model_hint_is_usable(vehicle: Mapping[str, Any], value: Any) -> boo
         for prefix in _vehicle_vin_model_code_candidates(vehicle.get("vin"))
     ):
         return False
-    if text in {
-        "轿车",
-        "小型轿车",
-        "客车",
-        "小型客车",
-        "车辆",
-        "汽车",
-        "新能源车",
-        "新能源",
-        "燃油车",
-        "纯电",
-        "纯电动",
-        "插电式混合动力",
-        "混合动力",
-        "增程式",
-        "汽油",
-        "柴油",
-    }:
+    if text in _VEHICLE_UNUSABLE_MODEL_HINTS:
+        return False
+    # Energy / body-type phrases must not be treated as sales models even when
+    # OCR puts them in CarName (e.g. "纯电动轿车").
+    if re.fullmatch(
+        r"(?:纯电动|插电式|增程式|燃料电池)?(?:混合动力)?(?:轿车|客车|货车|越野车)?",
+        text,
+    ):
         return False
     return len(text) >= 2
+
+
+def _vehicle_term_lacks_sales_specificity(term: Any, vehicle: Mapping[str, Any]) -> bool:
+    """Whether a query term is only brand / body-type and unsafe to auto-accept."""
+    compact = _compact_vehicle_compare_text(term)
+    if not compact:
+        return True
+    if _vehicle_vin_prefix_is_model_code(vehicle, compact):
+        return True
+    brand = _compact_vehicle_compare_text(_vehicle_brand_hint(vehicle))
+    if not brand:
+        brand = _compact_vehicle_compare_text(
+            _vehicle_leading_brand_from_model(_first_text(vehicle.get("rawModelName"), vehicle.get("modelName")))
+        )
+    raw = _compact_vehicle_compare_text(_first_text(vehicle.get("rawModelName"), vehicle.get("modelName")))
+    suffix = _compact_vehicle_compare_text(_vehicle_model_suffix_from_type(vehicle.get("vehicleType")))
+    broad = {item for item in (brand, raw, f"{brand}{suffix}" if brand and suffix else "", f"{raw}{suffix}" if raw and suffix else "") if item}
+    if compact in broad:
+        # Alphanumeric sales codes (CT200h / DFL7000…) are specific enough.
+        if re.search(r"[A-Z]+[0-9]|[0-9]+[A-Z]", compact, flags=re.IGNORECASE):
+            return False
+        return True
+    if any(prefix and prefix in compact for prefix in _vehicle_vin_model_code_candidates(vehicle.get("vin"))):
+        return True
+    return False
+
+
+def _vehicle_query_resource_codes(
+    *,
+    profile: Optional[Mapping[str, Any]] = None,
+    defaults: Optional[Mapping[str, Any]] = None,
+    vehicle: Optional[Mapping[str, Any]] = None,
+) -> List[str]:
+    """Resolve jyQuery resource codes: vehicle > defaults > profile > 0524."""
+    vehicle_obj = _json_obj(vehicle)
+    explicit: Any = None
+    for item in (
+        vehicle_obj.get("vehicleQueryResources"),
+        _field_value(defaults or {}, "车型查询资源码", "vehicleQueryResources", "jyVehicleRequest.resources"),
+        _profile_text(_json_obj(profile), "vehicle_query_resources"),
+    ):
+        if isinstance(item, (list, tuple)) and item:
+            explicit = item
+            break
+        text = _to_str(item).strip()
+        if text:
+            explicit = text
+            break
+    raw_items: List[str] = []
+    if isinstance(explicit, (list, tuple)):
+        raw_items.extend(_to_str(item).strip() for item in explicit)
+    elif explicit:
+        raw_items.extend(part.strip() for part in re.split(r"[,，|;/\s]+", _to_str(explicit)) if part.strip())
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw_items or ["0524"]:
+        code = re.sub(r"[^0-9A-Za-z]", "", _to_str(item).strip())
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out or ["0524"]
+
+
+def _vehicle_query_match_meta(
+    term: Any,
+    vehicle: Mapping[str, Any],
+    *,
+    vin_correlated: bool = False,
+) -> Dict[str, str]:
+    text = _to_str(term).strip()
+    if vin_correlated:
+        return {
+            "modelQueryMatched": f"{text}（VIN前缀关联）",
+            "modelQueryMatchKind": "vin_correlated",
+            "modelQueryMatchLabel": "VIN前缀关联",
+        }
+    hint = _to_str(vehicle.get("vehicleNameHint")).strip()
+    compact_term = _compact_vehicle_compare_text(text)
+    compact_hint = _compact_vehicle_compare_text(hint)
+    if hint and compact_hint and (
+        compact_term == compact_hint
+        or compact_hint in compact_term
+        or compact_term in compact_hint
+    ):
+        return {
+            "modelQueryMatched": text,
+            "modelQueryMatchKind": "sales_model",
+            "modelQueryMatchLabel": "销售车型直查",
+        }
+    return {
+        "modelQueryMatched": text,
+        "modelQueryMatchKind": "catalogue_term",
+        "modelQueryMatchLabel": "目录关键词",
+    }
+
+
+def _apply_vehicle_query_match_meta(
+    vehicle: Any,
+    term: Any,
+    *,
+    vin_correlated: bool = False,
+    resources: Any = "",
+) -> None:
+    if not isinstance(vehicle, dict):
+        return
+    meta = _vehicle_query_match_meta(term, vehicle, vin_correlated=vin_correlated)
+    vehicle.update(meta)
+    if resources:
+        vehicle["vehicleQueryResourcesUsed"] = _to_str(resources).strip()
 
 
 def _vehicle_vin_prefix_match_score(row: Mapping[str, Any], vehicle: Mapping[str, Any]) -> int:
@@ -2122,13 +2253,22 @@ def _vehicle_model_resolution_failure_message(
     raw_model = _to_str(vehicle.get("rawModelName") or vehicle.get("modelName")).strip() or "-"
     vin_prefix = _first_text(*_vehicle_vin_model_code_candidates(vehicle.get("vin")))
     name_hint = _to_str(vehicle.get("vehicleNameHint")).strip()
-    if vin_prefix and not _vehicle_model_hint_is_usable(vehicle, name_hint):
+    block_reason = _to_str(vehicle.get("modelQueryBlockReason")).strip()
+    usable_hint = _vehicle_model_hint_is_usable(vehicle, name_hint)
+    if block_reason in {"broad_brand_without_vin", "brand_only_without_vin_or_sales_model"}:
+        return (
+            f"车型名称【{raw_model}】仅识别到品牌级信息，"
+            "平台返回了候选但缺少车架号关联或销售车型（如 CT200h），"
+            "无法安全自动选定；请补充完整车架号，或在资料中填写销售车型/品牌型号后重试"
+        )
+    if vin_prefix and not usable_hint:
         return (
             f"车型名称【{raw_model}】仅识别到品牌或VIN前缀【{vin_prefix}】，"
             "未确认到可用于人保报价的销售车型；已尝试平台车型查询，"
             "请补充车辆品牌型号/车型名称后重试"
         )
-    tried_text = f"，已尝试：{'、'.join(tried_terms[:8])}" if tried_terms else ""
+    cleaned_tried = [item for item in tried_terms if _to_str(item).strip()]
+    tried_text = f"，已尝试：{'、'.join(cleaned_tried[:8])}" if cleaned_tried else ""
     return f"车型名称【{raw_model}】未查询到可用车型配置{tried_text}"
 
 
@@ -2160,7 +2300,12 @@ def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any])
     model_codes.extend(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
     model_code = _vehicle_model_code_from_vehicle(vehicle)
     brand = _compact_vehicle_compare_text(_vehicle_brand_hint(vehicle))
-    name_hint = _compact_vehicle_compare_text(_vehicle_name_hint(vehicle.get("vehicleNameHint")) or vehicle.get("energyModelSuffix"))
+    name_hint_raw = _vehicle_name_hint(vehicle.get("vehicleNameHint"))
+    name_hint = (
+        _compact_vehicle_compare_text(name_hint_raw)
+        if _vehicle_model_hint_is_usable(vehicle, name_hint_raw)
+        else ""
+    )
     score = 0
     score += _vehicle_vin_prefix_match_score(row, vehicle)
     if any(code in haystack for code in model_codes):
@@ -3320,7 +3465,7 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
 
 def _vehicle_model_suffix_from_type(value: Any) -> str:
     text = re.sub(r"\s+", "", _to_str(value))
-    for suffix in ("轿车", "客车", "货车", "越野车", "牵引车", "专项作业车", "摩托车", "挂车"):
+    for suffix in _VEHICLE_TYPE_SUFFIXES:
         if suffix in text:
             return suffix
     return ""
@@ -3333,6 +3478,12 @@ def _vehicle_brand_prefix(value: Any) -> str:
     # OCR usually returns values such as "长安牌"; the platform search box works better without "牌".
     text = re.sub(r"(品牌|车辆品牌|车辆名称|车辆品牌/车辆名称)", "", text)
     text = re.sub(r"牌$", "", text)
+    # Strip body-type tails so "雷克萨斯轿车" does not become a fake brand and
+    # later concatenate into "雷克萨斯轿车雷克萨斯".
+    for suffix in _VEHICLE_TYPE_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
     return text.strip()
 
 
@@ -3458,7 +3609,9 @@ def _used_fuel_model_query_terms(
         energy_base = re.sub(r"(轿车|客车|货车|越野车|牵引车|专项作业车|摩托车|挂车)$", "", no_brand_suffix)
         energy_typed = f"{energy_base}{energy_suffix}"
     brand = _vehicle_brand_prefix(brand_name) or _vehicle_leading_brand_from_model(raw)
-    name_hint = _vehicle_name_hint(vehicle_name) or energy_suffix
+    energy_branded = _join_model_term(brand, energy_typed) if energy_typed and brand else ""
+    name_hint = _vehicle_name_hint(vehicle_name)
+    # Never fall energy suffixes through as sales-model hints.
     usable_name_hint = _vehicle_model_hint_is_usable(
         {
             "vin": vin,
@@ -3485,6 +3638,7 @@ def _used_fuel_model_query_terms(
             brand_typed,
             brand_plain,
             named_plain,
+            energy_branded,
             energy_typed,
             typed,
             no_brand_suffix,
@@ -4537,7 +4691,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if _product_excluded(defaults, PRODUCT_LOSS)
             else _money(vehicle_search_preflight.get("requestedLossAmount"))
         )
-        rows = _vehicle_rows(self._query_vehicle_candidates(client, vehicle))
+        rows = _vehicle_rows(self._query_vehicle_candidates(client, vehicle, profile=profile, defaults=defaults))
         matching_rows: List[Dict[str, Any]] = []
         selected_code = ""
         wanted = {code.upper() for code in codes if code}
@@ -5328,14 +5482,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle = self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile)
         owner = self._used_fuel_owner(defaults, normalized_data)
 
-        search_result = self._query_vehicle_candidates(client, vehicle)
+        search_result = self._query_vehicle_candidates(client, vehicle, profile=profile, defaults=defaults)
         candidates = _vehicle_rows(search_result)
         selected = _pick_best_vehicle_candidate(candidates, vehicle, explicit_loss_amount=explicit_loss_amount)
         if not selected:
             tried_terms = [
-                _to_str(item).strip().rstrip("*")
+                text
                 for item in (vehicle.get("modelQueryTerms") if isinstance(vehicle.get("modelQueryTerms"), list) else [])
-                if _to_str(item).strip()
+                for text in [_to_str(item).strip().rstrip("*")]
+                if text
             ]
             raise PiccRequestError(_vehicle_model_resolution_failure_message(vehicle, tried_terms))
 
@@ -5423,6 +5578,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "selectedBy": _vehicle_selection_rule(explicit_loss_amount),
                     "selectedPrice": vehicle.get("purchasePrice"),
                     "selectedScore": _vehicle_candidate_score(selected, vehicle),
+                    "modelQueryMatched": vehicle.get("modelQueryMatched") or "",
+                    "modelQueryMatchKind": vehicle.get("modelQueryMatchKind") or "",
+                    "modelQueryMatchLabel": vehicle.get("modelQueryMatchLabel") or "",
+                    "vehicleQueryResourcesUsed": vehicle.get("vehicleQueryResourcesUsed") or "",
+                    "vehicleQueryResourcesTried": list(vehicle.get("vehicleQueryResourcesTried") or [])[:8],
+                    "modelQueryTerms": list(vehicle.get("modelQueryTerms") or [])[:12],
                     "requestedLossAmount": _clean_money_text(explicit_loss_amount) if explicit_loss_amount > 0 else "",
                     "lossThresholdPurchasePrice": _clean_money_text(_vehicle_loss_threshold(explicit_loss_amount)) if explicit_loss_amount > 0 else "",
                 },
@@ -6117,15 +6278,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         prof = _json_obj(profile)
         next_day = _next_day_text()
         vehicle_type = _first_text(data.get("vehicle_type"), _field_value(defaults, "车辆类型"))
-        raw_model_name = _first_text(data.get("vehicle_model"), _field_value(defaults, "车型名称", "品牌型号"))
-        vehicle_brand_name = _first_text(
-            data.get("vehicle_brand_name"),
-            _field_value(defaults, "车辆品牌/车辆名称", "车辆品牌", "品牌名称"),
-        )
+        raw_model_name = _first_text(data.get("vehicle_model"))
+        vehicle_brand_name = _first_text(data.get("vehicle_brand_name"))
         vehicle_name_hint = _first_text(
             data.get("vehicle_name"),
             data.get("car_name"),
-            _field_value(defaults, "车辆名称"),
         )
         engine_no = _first_text(data.get("engine_no"), _field_value(defaults, "发动机号"))
         vin = _first_text(data.get("vin"), _field_value(defaults, "VIN/车架号", "车架号"))
@@ -6205,7 +6362,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         }
         return _clean_vehicle_cert_fields(vehicle)
 
-    def _query_vehicle_candidates(self, client: PiccProtocolClient, vehicle: Mapping[str, Any]) -> Any:
+    def _query_vehicle_candidates(
+        self,
+        client: PiccProtocolClient,
+        vehicle: Mapping[str, Any],
+        *,
+        profile: Optional[Mapping[str, Any]] = None,
+        defaults: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
         cleaned_vehicle = _clean_vehicle_cert_fields(vehicle)
         if isinstance(vehicle, dict):
             vehicle.update(cleaned_vehicle)
@@ -6214,45 +6378,69 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         model_name = _to_str(vehicle.get("rawModelName") or vehicle.get("modelName")).strip()
         if not model_name:
             raise PiccRequestError("人保报价缺少车型名称，无法查询车型配置")
-        precomputed_terms = (
-            [item for item in vehicle.get("modelQueryTerms") if _to_str(item).strip()]
-            if isinstance(vehicle.get("modelQueryTerms"), list)
-            else []
-        )
-        terms = _dedupe_model_terms(precomputed_terms) or _used_fuel_model_query_terms(
-            model_name,
-            vehicle.get("vehicleType"),
-            vehicle.get("energyModelSuffix"),
-            brand_name=vehicle.get("brandNameHint"),
-            vehicle_name=vehicle.get("vehicleNameHint"),
-            vin=vehicle.get("vin"),
+        # Always rebuild terms from current vehicle fields. Stale modelQueryTerms on
+        # draft/retry bodies previously poisoned brand-only searches.
+        terms = _dedupe_model_terms(
+            _used_fuel_model_query_terms(
+                model_name,
+                vehicle.get("vehicleType"),
+                vehicle.get("energyModelSuffix"),
+                brand_name=vehicle.get("brandNameHint"),
+                vehicle_name=vehicle.get("vehicleNameHint"),
+                vin=vehicle.get("vin"),
+            )
         ) or [model_name]
+        resource_codes = _vehicle_query_resource_codes(profile=profile, defaults=defaults, vehicle=vehicle)
+        if isinstance(vehicle, dict):
+            vehicle["modelQueryTerms"] = terms
+            vehicle["vehicleQueryResourcesTried"] = list(resource_codes)
+            vehicle.pop("modelQueryBlockReason", None)
         last_data: Any = {}
         attempted_terms: set[str] = set()
+        has_vin_prefixes = bool(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
+        has_usable_sales_hint = _vehicle_model_hint_is_usable(vehicle, vehicle.get("vehicleNameHint"))
+
+        def _request_term(term: str, *, rows_limit: int) -> Any:
+            last_local: Any = {}
+            for resource_code in resource_codes:
+                params = {
+                    "jyVehicleRequest.resources": resource_code,
+                    "jyVehicleRequest.brandName": "",
+                    "jyVehicleRequest.vinno": vehicle.get("vin") or "",
+                    "jyVehicleRequest.vehicleName": term if term.endswith("*") else f"{term}*",
+                    "jyVehicleRequest.vehicleAlias": "",
+                    "jyVehicleRequest.vehicleId": "",
+                    "jyVehicleRequest.searchCode": "",
+                    "jyVehicleRequest.platModelCode": "",
+                    "page": 1,
+                    "rows": rows_limit,
+                }
+                data = client.request_json(
+                    "GET",
+                    VEHICLE_QUERY_PATH,
+                    purpose="business",
+                    params=params,
+                    headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
+                )
+                last_local = data
+                if isinstance(vehicle, dict):
+                    vehicle["vehicleQueryResourcesUsed"] = resource_code
+                try:
+                    _ensure_platform_success(data, action="车型配置查询")
+                except PiccBusinessRequestError:
+                    if _is_vehicle_query_no_data_response(data):
+                        continue
+                    raise
+                if _vehicle_rows(data):
+                    return data
+            return last_local
+
         for term in terms:
             term_key = _compact_vehicle_compare_text(term)
             if not term_key or term_key in attempted_terms:
                 continue
             attempted_terms.add(term_key)
-            params = {
-                "jyVehicleRequest.resources": "0524",
-                "jyVehicleRequest.brandName": "",
-                "jyVehicleRequest.vinno": vehicle.get("vin") or "",
-                "jyVehicleRequest.vehicleName": term if term.endswith("*") else f"{term}*",
-                "jyVehicleRequest.vehicleAlias": "",
-                "jyVehicleRequest.vehicleId": "",
-                "jyVehicleRequest.searchCode": "",
-                "jyVehicleRequest.platModelCode": "",
-                "page": 1,
-                "rows": 10,
-            }
-            data = client.request_json(
-                "GET",
-                VEHICLE_QUERY_PATH,
-                purpose="business",
-                params=params,
-                headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
-            )
+            data = _request_term(term, rows_limit=10)
             last_data = data
             try:
                 _ensure_platform_success(data, action="车型配置查询")
@@ -6261,7 +6449,21 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     continue
                 raise
             rows = _vehicle_rows(data)
-            if rows and _vehicle_query_term_requires_vin_correlation(term, vehicle):
+            if not rows:
+                continue
+            needs_vin_correlation = _vehicle_query_term_requires_vin_correlation(term, vehicle)
+            lacks_sales_specificity = _vehicle_term_lacks_sales_specificity(term, vehicle)
+            if needs_vin_correlation or (lacks_sales_specificity and not has_usable_sales_hint):
+                if not has_vin_prefixes:
+                    # Platform may have returned brand catalogue rows, but accepting
+                    # them without VIN correlation or a sales-model hint is unsafe.
+                    if isinstance(vehicle, dict):
+                        vehicle["modelQueryBlockReason"] = (
+                            "broad_brand_without_vin"
+                            if needs_vin_correlation
+                            else "brand_only_without_vin_or_sales_model"
+                        )
+                    continue
                 correlated_rows = _vehicle_rows_correlated_to_vin(rows, vehicle)
                 if not correlated_rows:
                     continue
@@ -6270,14 +6472,25 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if isinstance(vehicle, dict):
                     vehicle["modelName"] = term
                     vehicle["modelQueryTerms"] = terms
-                    vehicle["modelQueryMatched"] = f"{term}（VIN前缀关联）"
+                    _apply_vehicle_query_match_meta(
+                        vehicle,
+                        term,
+                        vin_correlated=True,
+                        resources=vehicle.get("vehicleQueryResourcesUsed"),
+                    )
+                    vehicle.pop("modelQueryBlockReason", None)
                 return correlated_data
-            if rows:
-                if isinstance(vehicle, dict):
-                    vehicle["modelName"] = term
-                    vehicle["modelQueryTerms"] = terms
-                    vehicle["modelQueryMatched"] = term
-                return data
+            if isinstance(vehicle, dict):
+                vehicle["modelName"] = term
+                vehicle["modelQueryTerms"] = terms
+                _apply_vehicle_query_match_meta(
+                    vehicle,
+                    term,
+                    vin_correlated=False,
+                    resources=vehicle.get("vehicleQueryResourcesUsed"),
+                )
+                vehicle.pop("modelQueryBlockReason", None)
+            return data
 
         # A VIN/VDS prefix is useful for correlating catalogue rows, but it is
         # not itself a sales model. When OCR only produced a brand plus that
@@ -6298,25 +6511,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if not term_key or term_key in attempted_terms:
                     continue
                 attempted_terms.add(term_key)
-                params = {
-                    "jyVehicleRequest.resources": "0524",
-                    "jyVehicleRequest.brandName": "",
-                    "jyVehicleRequest.vinno": vehicle.get("vin") or "",
-                    "jyVehicleRequest.vehicleName": f"{term}*",
-                    "jyVehicleRequest.vehicleAlias": "",
-                    "jyVehicleRequest.vehicleId": "",
-                    "jyVehicleRequest.searchCode": "",
-                    "jyVehicleRequest.platModelCode": "",
-                    "page": 1,
-                    "rows": 100,
-                }
-                data = client.request_json(
-                    "GET",
-                    VEHICLE_QUERY_PATH,
-                    purpose="business",
-                    params=params,
-                    headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
-                )
+                data = _request_term(term, rows_limit=100)
                 try:
                     _ensure_platform_success(data, action="车型配置查询")
                 except PiccBusinessRequestError:
@@ -6329,8 +6524,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     correlated_data = dict(_json_obj(data))
                     correlated_data["result"] = correlated_rows
                     if isinstance(vehicle, dict):
-                        vehicle["modelQueryMatched"] = f"{term}（VIN前缀关联）"
+                        _apply_vehicle_query_match_meta(
+                            vehicle,
+                            term,
+                            vin_correlated=True,
+                            resources=vehicle.get("vehicleQueryResourcesUsed"),
+                        )
                         vehicle["modelQueryTerms"] = terms
+                        vehicle.pop("modelQueryBlockReason", None)
                     return correlated_data
 
         # Do not return unrelated broad-search rows. The caller must stop with
@@ -7266,6 +7467,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "claim_summary": _proposal_claim_summary(data, claim_bi, claim_ci),
             "bi_start_date": _proposal_start_datetime_from_quote_response(data, form, kind="bi"),
             "ci_start_date": _proposal_start_datetime_from_quote_response(data, form, kind="ci"),
+            "model_match_method": _first_text(
+                vehicle.get("modelQueryMatchLabel"),
+                vehicle.get("modelQueryMatched"),
+            ),
+            "model_match_kind": _to_str(vehicle.get("modelQueryMatchKind")).strip(),
+            "model_query_matched": _to_str(vehicle.get("modelQueryMatched")).strip(),
         }
         result_card = {
             "style": "picc_proposal_table",

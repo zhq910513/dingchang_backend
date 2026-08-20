@@ -56,6 +56,7 @@ from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle
 from app.services.ocr_worker import _cache_put, _extract_by_type
 from app.services.quote_platforms import runtime as quote_platform_runtime
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
+from app.services.chat_session_lock import release_chat_session_lock_for_platform_io
 from app.services.quote_platforms.browser_manager import account_profile_dir
 from app.services.quote_platforms.platforms.picc.business import picc_motor_builtin_default_values
 from app.services.quote_platforms.platforms.picc.presentation import (
@@ -118,6 +119,41 @@ RESULT_NEED_MORE = "need_more_info"
 RESULT_NOT_READY = "not_ready"
 RESULT_FAILED = "failed"
 
+# Stable failure taxonomy for chat/API consumers. Do not rename without frontend sync.
+FAILURE_CODE_MATERIAL_MISSING = "material_missing"
+FAILURE_CODE_MATERIAL_CHANGED = "material_changed"
+FAILURE_CODE_DEFAULT_CONFIG_CHANGED = "default_config_changed"
+FAILURE_CODE_DEFAULT_CONFIG_MISSING = "default_config_missing"
+FAILURE_CODE_ACCOUNT_LOGIN = "account_login"
+FAILURE_CODE_SESSION_EXPIRED = "session_expired"
+FAILURE_CODE_QUOTA_FULL = "quota_full"
+FAILURE_CODE_PLATFORM = "platform"
+FAILURE_CODE_RESULT_MATERIALIZATION = "result_materialization"
+FAILURE_CODE_SMS_EXPIRED = "sms_expired"
+FAILURE_CODE_STALE_TIMEOUT = "stale_timeout"
+FAILURE_CODE_ACCOUNT_MISSING = "account_missing"
+FAILURE_CODE_CANCELLED_SUPERSEDED = "cancelled_superseded"
+FAILURE_CODE_DUPLICATE_QUOTE = "duplicate_quote"
+FAILURE_CODE_PREFLIGHT = "preflight_blocked"
+
+QUOTE_FAILURE_NEXT_ACTIONS: Dict[str, str] = {
+    FAILURE_CODE_MATERIAL_MISSING: "请补齐材料后重新发起报价",
+    FAILURE_CODE_MATERIAL_CHANGED: "请确认材料后重新发起报价",
+    FAILURE_CODE_DEFAULT_CONFIG_CHANGED: "请确认默认参数后重新发起报价",
+    FAILURE_CODE_DEFAULT_CONFIG_MISSING: "请在默认参数配置中新增并启用该账号类型后再发起报价",
+    FAILURE_CODE_ACCOUNT_LOGIN: "请完成平台账号登录后重新发起报价",
+    FAILURE_CODE_SESSION_EXPIRED: "请重新登录平台账号后再发起报价",
+    FAILURE_CODE_QUOTA_FULL: "请切换可用账号或联系管理员后再发起报价",
+    FAILURE_CODE_PLATFORM: "请根据平台提示核实后重试",
+    FAILURE_CODE_RESULT_MATERIALIZATION: "请重新发起报价以重新生成结果图",
+    FAILURE_CODE_SMS_EXPIRED: "请重新发送平台报价以获取新的验证码",
+    FAILURE_CODE_STALE_TIMEOUT: "请重新发起报价；若反复超时请检查账号会话",
+    FAILURE_CODE_ACCOUNT_MISSING: "请先配置并登录可用的平台账号",
+    FAILURE_CODE_CANCELLED_SUPERSEDED: "请继续当前最新报价请求",
+    FAILURE_CODE_DUPLICATE_QUOTE: "请确认是否继续重复投保后再报价",
+    FAILURE_CODE_PREFLIGHT: "请按清单补齐后重新发起报价",
+}
+
 ACTIVE_CASE_STATUSES = ("collecting", "ready", "waiting_sms", "waiting_duplicate_confirm", "failed", "quoted")
 ACTIVE_IMAGE_STATUS = "active"
 CASE_STATUS_QUOTED = "quoted"
@@ -125,7 +161,7 @@ CASE_STATUS_READY = "ready"
 CASE_STATUS_COLLECTING = "collecting"
 CASE_STATUS_WAITING_SMS = "waiting_sms"
 CASE_STATUS_WAITING_DUPLICATE_CONFIRM = "waiting_duplicate_confirm"
-CASE_STATUS_FAILED = "failed"
+CASE_STATUS_FAILED = "failed"  # legacy read-only; writers keep case ready/collecting after failure
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_FAILED = "failed"
 TASK_STATUS_RUNNING = "running"
@@ -136,6 +172,8 @@ QUOTE_MATERIAL_CHANGED_MESSAGE = "材料已更新，请重新发起报价"
 QUOTE_DUPLICATE_CONFIRM_REPLACED_MESSAGE = "报价调整已更新，请重新确认重复投保"
 QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE = "默认参数已更新，请重新发起报价"
 QUOTE_SUPERSEDED_MESSAGE = "报价参数已更新，旧报价已停止"
+QUOTE_STALE_TIMEOUT_MESSAGE = "报价任务超时，已自动中止"
+QUOTE_SMS_EXPIRED_MESSAGE = "短信验证码已过期"
 SINGLE_REQUIRED_SLOTS = ("vehicle_cert", "idcard_front", "driving_license_main")
 QUOTE_IMAGE_AUTO_CONFIRM_MIN_CONFIDENCE = 0.72
 QUOTE_IMAGE_OCR_CLASSIFY_ENABLED = os.getenv("QUOTE_IMAGE_OCR_CLASSIFY_ENABLED", "1") == "1"
@@ -1072,6 +1110,7 @@ QUOTE_MANUAL_MATERIAL_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
     ("commercial_start_date", "商业起保日期", "date"),
     ("compulsory_start_date", "交强起保日期", "date"),
     ("vehicle_model", "车型名称", "text"),
+    ("car_name", "销售车型", "text"),
 )
 
 QUOTE_MATERIAL_FORM_REQUIRED_BY_TYPE: Dict[str, Tuple[str, ...]] = {
@@ -1309,6 +1348,7 @@ QUOTE_DATA_OVERRIDE_ALIASES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("vin", "车架号", ("车辆识别代号", "VIN码", "VIN", "车架号", "车架")),
     ("engine_no", "发动机号", ("发动机号码", "发动机号", "发动机")),
     ("vehicle_model", "车型名称", ("车辆品牌/车辆名称", "车辆品牌/车辆型号", "品牌型号", "车型名称", "车辆型号", "车型")),
+    ("car_name", "销售车型", ("销售车型", "英文车型", "车型简称", "CarName", "VehicleName")),
     ("first_register_date", "初登日期", ("初登日期", "初登", "初次登记日期", "注册日期", "登记日期")),
     ("issue_date", "行驶证发证日期", ("行驶证发证日期", "发证日期", "发证时间")),
     ("commercial_start_date", "商业起保日期", ("商业起保日期", "商业险起保日期", "商业起保", "商业险起期")),
@@ -1345,6 +1385,8 @@ QUOTE_IMAGE_FIELDS_BY_SLOT: Dict[str, Tuple[str, ...]] = {
         "vin",
         "engine_no",
         "vehicle_model",
+        "car_name",
+        "vehicle_brand_name",
         "vehicle_type",
     ),
     "driving_license_sub": (
@@ -1876,12 +1918,165 @@ def _quote_car_name_from_features(features: Any, fallback_text: Any = "") -> str
     return ""
 
 
+_QUOTE_SALES_MODEL_CODE_RE = re.compile(
+    r"(?<![A-Z0-9])([A-Z]{1,8}\d[A-Z0-9]{0,12}|\d{2,5}[A-Z][A-Z0-9]{1,12})(?![A-Z0-9])",
+    flags=re.IGNORECASE,
+)
+_QUOTE_ENGLISH_BRAND_PREFIXES = (
+    "LEXUS",
+    "TOYOTA",
+    "HONDA",
+    "NISSAN",
+    "HYUNDAI",
+    "BUICK",
+    "MAZDA",
+    "TESLA",
+    "VOLVO",
+    "AUDI",
+    "BENZ",
+    "FORD",
+    "JEEP",
+    "MINI",
+    "BMW",
+    "KIA",
+)
+
+
+def _quote_normalize_sales_model_candidate(code: str) -> str:
+    text = _to_str(code).strip()
+    if not text:
+        return ""
+    upper = text.upper()
+    for brand in _QUOTE_ENGLISH_BRAND_PREFIXES:
+        if upper.startswith(brand) and len(upper) > len(brand):
+            rest = text[len(brand) :].lstrip(" -_")
+            if rest and re.search(r"\d", rest):
+                return rest
+    return text
+
+
+def _quote_sales_model_hint_from_model_text(value: Any, *, vin: Any = "") -> str:
+    """Extract a usable sales-model token such as CT200h from brand+model OCR text."""
+    source = re.sub(r"\s+", " ", _to_str(value).strip())
+    if not source:
+        return ""
+    compact = re.sub(r"[\s\-_/]", "", source)
+    vin_compact = re.sub(r"[^A-Z0-9]", "", _to_str(vin).strip().upper())
+    vin_prefix = vin_compact[:8] if len(vin_compact) == 17 else ""
+    candidates: List[str] = []
+    for match in _QUOTE_SALES_MODEL_CODE_RE.finditer(compact):
+        code = _quote_normalize_sales_model_candidate(match.group(1).strip())
+        if not code:
+            continue
+        upper = code.upper()
+        if vin_prefix and upper == vin_prefix:
+            continue
+        if len(upper) == 17 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", upper):
+            continue
+        # "雷克萨斯JTHKR5BH" style merges: reject 8-char VIN family prefixes when the
+        # text has no other Latin sales token beyond that prefix.
+        if len(upper) == 8 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{8}", upper):
+            remainder = re.sub(r"[\u4e00-\u9fff牌]", "", compact.upper().replace(upper, ""))
+            if not remainder:
+                continue
+        candidates.append(code)
+
+    def rank(code: str) -> tuple[int, int]:
+        # Prefer compact sales shapes like CT200h over long catalogue blobs.
+        shaped = 1 if re.fullmatch(r"[A-Za-z]{1,5}\d{2,4}[A-Za-z0-9]{0,6}", code) else 0
+        return (shaped, len(code))
+
+    ranked = sorted(
+        (code for code in candidates if re.search(r"[A-Za-z]", code) and re.search(r"\d", code)),
+        key=rank,
+        reverse=True,
+    )
+    if ranked:
+        return ranked[0]
+    return candidates[-1] if candidates else ""
+
+
+def _quote_leading_brand_from_model_text(value: Any) -> str:
+    compact = re.sub(r"\s+", "", _to_str(value).strip())
+    if not compact:
+        return ""
+    match = re.match(r"^(?P<brand>[\u4e00-\u9fff]{2,24})牌?(?=[A-Za-z0-9])", compact)
+    return match.group("brand") if match else ""
+
+
+def _quote_field_quality_score(field_key: str, value: Any, *, vin: Any = "") -> int:
+    text = _to_str(value).strip()
+    if not text:
+        return -1
+    key = _to_str(field_key).strip()
+    if key == "vin":
+        compact = re.sub(r"[^A-Z0-9]", "", text.upper())
+        if len(compact) == 17 and re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", compact):
+            return 100
+        if 11 <= len(compact) <= 20:
+            return 40
+        return 10
+    if key == "engine_no":
+        compact = re.sub(r"[^A-Z0-9]", "", text.upper())
+        return min(80, max(5, len(compact) * 4))
+    if key in {"vehicle_model", "car_name"}:
+        sales = _quote_sales_model_hint_from_model_text(text, vin=vin)
+        if sales and sales.upper() == re.sub(r"[\s\-_/]", "", text).upper():
+            return 90
+        if sales:
+            return 75
+        if re.search(r"[A-Za-z0-9]", text) and re.search(r"[\u4e00-\u9fff]", text):
+            return 55
+        if re.search(r"[\u4e00-\u9fff]", text):
+            return 25
+        return 35
+    return 1
+
+
+def _merge_quote_extracted_prefer(*items: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge OCR slot fields, preferring higher-quality VIN / model / engine values."""
+    out: Dict[str, Any] = {}
+    for item in items:
+        vin_context = out.get("vin")
+        for key, value in (item or {}).items():
+            if value in (None, ""):
+                continue
+            current = out.get(key)
+            if current in (None, ""):
+                out[key] = value
+                continue
+            vin_for_score = vin_context or (value if key == "vin" else "") or out.get("vin")
+            if _quote_field_quality_score(key, value, vin=vin_for_score) > _quote_field_quality_score(
+                key, current, vin=vin_for_score
+            ):
+                out[key] = value
+    return out
+
+
+def _backfill_quote_sales_model_fields(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(data or {})
+    vin = out.get("vin")
+    model = _to_str(out.get("vehicle_model")).strip()
+    car_name = _to_str(out.get("car_name")).strip()
+    if not car_name and model:
+        hint = _quote_sales_model_hint_from_model_text(model, vin=vin)
+        if hint:
+            out["car_name"] = hint
+    if not _to_str(out.get("vehicle_brand_name")).strip() and model:
+        brand = _quote_leading_brand_from_model_text(model)
+        if brand:
+            out["vehicle_brand_name"] = brand
+    return out
+
+
 def _quote_image_extracted_fields_from_features(features: Any, fallback_text: Any = "") -> Dict[str, Any]:
     data = _json_obj(_json_obj(features).get("ocr_extracted_fields"))
     if data and not _to_str(data.get("car_name")).strip():
         car_name = _quote_car_name_from_features(features, fallback_text)
         if car_name:
             data["car_name"] = car_name
+    if data:
+        data = _backfill_quote_sales_model_fields(data)
     return _clean_quote_dynamic_data(data, derive_owner_name=False) if data else {}
 
 
@@ -1895,6 +2090,7 @@ def _quote_image_features(features: Any, extracted_fields: Dict[str, Any]) -> Tu
         out["ocr_raw_extracted_field_keys"] = raw_field_keys
         out["ocr_cleaner_dropped_fields"] = sorted(k for k in raw_field_keys if k not in cleaned_fields)
     if cleaned_fields:
+        cleaned_fields = _backfill_quote_sales_model_fields(cleaned_fields)
         out["ocr_extracted_fields"] = cleaned_fields
         out["ocr_extracted_field_keys"] = sorted(cleaned_fields.keys())
     else:
@@ -1914,6 +2110,7 @@ def _slot_filtered_extracted_fields(slot_key: str, image: Dict[str, Any]) -> Dic
     if not fields:
         return {}
     cleaned = _clean_quote_dynamic_data(fields, derive_owner_name=False)
+    cleaned = _backfill_quote_sales_model_fields(cleaned)
     return {key: value for key, value in cleaned.items() if key in allowed}
 
 
@@ -1922,7 +2119,7 @@ def _slot_extracted_data_map(images_by_slot: Dict[str, List[Dict[str, Any]]]) ->
     for slot_key, rows in (images_by_slot or {}).items():
         merged: Dict[str, Any] = {}
         for image in rows or []:
-            merged = _merge_data(merged, _slot_filtered_extracted_fields(slot_key, image))
+            merged = _merge_quote_extracted_prefer(merged, _slot_filtered_extracted_fields(slot_key, image))
         if merged:
             out[slot_key] = merged
     return out
@@ -1932,8 +2129,8 @@ def _active_image_extracted_data(images_by_slot: Dict[str, List[Dict[str, Any]]]
     slot_data = _slot_extracted_data_map(images_by_slot)
     merged: Dict[str, Any] = {}
     for slot_key in ("driving_license_main", "driving_license_sub", "vehicle_cert", "idcard_back", "idcard_front", "related"):
-        merged = _merge_data(merged, slot_data.get(slot_key, {}))
-    return _clean_quote_dynamic_data(merged, derive_owner_name=True)
+        merged = _merge_quote_extracted_prefer(merged, slot_data.get(slot_key, {}))
+    return _clean_quote_dynamic_data(_backfill_quote_sales_model_fields(merged), derive_owner_name=True)
 
 
 def _slot_has_uploaded_quote_image(rows: List[Dict[str, Any]]) -> bool:
@@ -1976,6 +2173,7 @@ def _normalize_quote_case_data(
     text_overrides = _json_obj(text_clean.get(QUOTE_DATA_OVERRIDES_KEY))
     merged_overrides = _merge_quote_data_overrides(base_overrides, text_overrides)
     merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean, merged_overrides))
+    merged = _backfill_quote_sales_model_fields(merged)
     if merged_overrides:
         merged[QUOTE_DATA_OVERRIDES_KEY] = merged_overrides
     merged = _apply_transfer_vehicle_state(merged)
@@ -2164,6 +2362,107 @@ def _mk_data(
         "message": message,
         "entities": sanitize_quote_entities(entities),
         "payload": payload or {},
+    }
+
+
+def _quote_failure_next_action(failure_code: str) -> str:
+    return _to_str(QUOTE_FAILURE_NEXT_ACTIONS.get(_to_str(failure_code).strip(), "")).strip() or "请核实后重试"
+
+
+def _quote_failure_fields(
+    *,
+    code: str,
+    reason: str,
+    next_action: str = "",
+) -> Dict[str, str]:
+    failure_code = _to_str(code).strip() or FAILURE_CODE_PLATFORM
+    failure_reason = sanitize_quote_user_message(reason, "报价失败")
+    action = _to_str(next_action).strip() or _quote_failure_next_action(failure_code)
+    return {
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "next_action": action,
+    }
+
+
+def _attach_quote_failure(
+    data: Dict[str, Any],
+    *,
+    code: str,
+    reason: str,
+    next_action: str = "",
+) -> Dict[str, Any]:
+    """Attach stable failure fields on data + payload. Real failures must stay user-visible."""
+    fields = _quote_failure_fields(code=code, reason=reason, next_action=next_action)
+    data["failure_code"] = fields["failure_code"]
+    data["failure_reason"] = fields["failure_reason"]
+    data["next_action"] = fields["next_action"]
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+        data["payload"] = payload
+    payload.update(fields)
+    # Never hide a classified user-facing failure behind silent flags.
+    data["silent"] = False
+    data["ui_visible"] = True
+    return data
+
+
+def _failure_code_for_platform_dialog_subtype(subtype: str) -> str:
+    key = _to_str(subtype).strip().lower()
+    if key == "session_expired":
+        return FAILURE_CODE_SESSION_EXPIRED
+    if key == "quota_full":
+        return FAILURE_CODE_QUOTA_FULL
+    if key in {"duplicate_quote", "duplicate_quote_notice"}:
+        return FAILURE_CODE_DUPLICATE_QUOTE
+    return FAILURE_CODE_PLATFORM
+
+
+def _build_quote_user_failure_response(
+    *,
+    reply: str,
+    case: QuoteCase,
+    task: Optional[QuoteTask],
+    trace_id: str,
+    failure_code: str,
+    failure_reason: str = "",
+    next_action: str = "",
+    result_status: str = RESULT_FAILED,
+    response_status: str = "failed",
+    actions: Optional[List[Dict[str, Any]]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    entities: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Canonical user-visible quote failure / recoverable stop response."""
+    reason = sanitize_quote_user_message(failure_reason or reply, "报价失败")
+    safe_reply = sanitize_quote_user_message(reply or reason, reason)
+    data_payload = dict(payload or {})
+    data = _mk_data(
+        result_status=result_status,
+        message=safe_reply,
+        entities=entities
+        or {
+            "quote_case_id": case.id,
+            "quote_task_id": task.id if task is not None else None,
+            "order_id": case.order_id,
+        },
+        payload=data_payload,
+    )
+    _attach_quote_failure(
+        data,
+        code=failure_code,
+        reason=reason,
+        next_action=next_action,
+    )
+    return safe_reply, {
+        "status": response_status,
+        "intent": "quote",
+        "trace_id": trace_id,
+        "silent": False,
+        "ui_visible": True,
+        "data": data,
+        "actions": actions or [],
     }
 
 
@@ -2685,7 +2984,7 @@ def _extract_quote_product_exclusions(text: Any) -> List[str]:
     compact = re.sub(r"\s+", "", _norm_text(text))
     if not compact:
         return []
-    remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "非")
+    remove_words = QUOTE_CHAT_NEGATE_OBJECT_WORDS
     remove_group = "|".join(re.escape(word) for word in remove_words)
     removable = {
         QUOTE_COMPULSORY_LABEL,
@@ -2885,12 +3184,14 @@ def _quote_data_override_value_pattern(field_key: str) -> str:
         return r"([\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,40})"
     if field_key == "vehicle_model":
         return r"([^,，;；。\n\r]{2,90})"
+    if field_key == "car_name":
+        return r"([A-Za-z0-9][A-Za-z0-9 ._-]{1,39}|[\u4e00-\u9fffA-Za-z0-9]{2,40})"
     return r"([^\s,，,;；。]{1,128})"
 
 
 def _trim_quote_data_override_value(field_key: str, value: str) -> str:
     text = _to_str(value).strip()
-    if field_key not in {"owner_name", "id_name", "vehicle_model"} or not text:
+    if field_key not in {"owner_name", "id_name", "vehicle_model", "car_name"} or not text:
         return text
     current_aliases = {
         alias
@@ -2986,7 +3287,7 @@ def extract_quote_data_overrides(text: Any) -> Dict[str, Any]:
                 overlaps = any(not (match.end() <= start or match.start() >= end) for start, end in consumed)
                 if overlaps and field_key in overrides:
                     continue
-                if overlaps and field_key not in {"owner_name", "id_name", "vehicle_model"}:
+                if overlaps and field_key not in {"owner_name", "id_name", "vehicle_model", "car_name"}:
                     continue
                 cleaned = _clean_quote_data_override_value(field_key, match.group(1))
                 if cleaned in (None, ""):
@@ -5804,42 +6105,171 @@ def _duplicate_quote_warning_from_runtime(result: Optional[PlatformRuntimeResult
     return _sanitize_duplicate_quote_warning(warning, "平台提示该车辆可能重复投保，请核实后再继续报价。")
 
 
-def _is_duplicate_quote_confirmation_text(text: Any) -> bool:
-    compact = re.sub(r"\s+", "", _norm_text(text))
+# Chat polarity whitelist only. Never fuzzy-match or guess user intent.
+# Platform API confirm/modify prompts stay auto-handled elsewhere to reduce user ops.
+QUOTE_CHAT_POLARITY_AFFIRM = "affirm"
+QUOTE_CHAT_POLARITY_NEGATE = "negate"
+
+QUOTE_CHAT_AFFIRM_EXACT = frozenset(
+    {
+        "好",
+        "好的",
+        "行",
+        "可以",
+        "要的",
+        "没问题",
+        "确认",
+        "同意",
+        "是",
+        "是的",
+        "对",
+        "继续",
+        "继续报",
+        "继续报价",
+        "继续投保",
+        "确认继续",
+        "确认继续报价",
+        "确认继续投保",
+        "确认报价",
+        "确认投保",
+    }
+)
+QUOTE_CHAT_NEGATE_EXACT = frozenset(
+    {
+        "不",
+        "否",
+        "不要",
+        "不用",
+        "不需要",
+        "不要了",
+        "不用了",
+        "算了",
+        "取消",
+        "放弃",
+        "停止",
+        "中止",
+        "不继续",
+        "不要继续",
+        "不用继续",
+        "不报了",
+        "不报价",
+        "取消报价",
+        "放弃报价",
+        "停止报价",
+        "中止报价",
+        "取消重复报价",
+        "放弃重复报价",
+        "中止重复报价",
+        "取消重复投保",
+        "放弃重复投保",
+        "中止重复投保",
+    }
+)
+# Object-scoped negate ("不要车损"); keep tight and shared across parsers.
+QUOTE_CHAT_NEGATE_OBJECT_WORDS = (
+    "去掉",
+    "不要",
+    "取消",
+    "不买",
+    "不投",
+    "不保",
+    "去除",
+    "删除",
+    "关闭",
+    "不需要",
+    "不用",
+    "非",
+)
+QUOTE_DUPLICATE_CONFIRM_HINT = (
+    "没识别到明确指令。继续请直接发「继续报价」；取消请发「取消」。"
+)
+
+
+def _quote_chat_compact(text: Any) -> str:
+    return re.sub(r"\s+", "", _norm_text(text))
+
+
+def _quote_chat_polarity_exact(text: Any) -> Optional[str]:
+    """Return affirm/negate only for exact whitelist utterances; never guess."""
+    compact = _quote_chat_compact(text)
     if not compact:
+        return None
+    if compact in QUOTE_CHAT_NEGATE_EXACT:
+        return QUOTE_CHAT_POLARITY_NEGATE
+    if compact in QUOTE_CHAT_AFFIRM_EXACT:
+        return QUOTE_CHAT_POLARITY_AFFIRM
+    if re.fullmatch(r"(确认)?继续(报价|投保)?", compact):
+        return QUOTE_CHAT_POLARITY_AFFIRM
+    if re.fullmatch(r"确认(报价|投保|继续报价|继续投保)", compact):
+        return QUOTE_CHAT_POLARITY_AFFIRM
+    if re.fullmatch(r"(不|不用|不要)?(继续|确认)?(中止|取消|放弃|停止)(重复)?(报价|投保)?", compact):
+        return QUOTE_CHAT_POLARITY_NEGATE
+    return None
+
+
+def _looks_like_unclear_chat_polarity_attempt(text: Any) -> bool:
+    """Short utterances that seem yes/no-ish but are not whitelist → ask again."""
+    compact = _quote_chat_compact(text)
+    if not compact or len(compact) > 16:
         return False
+    if re.search(r"\d{4,}", compact):
+        return False
+    if _quote_chat_polarity_exact(compact) is not None:
+        return False
+    if compact in {"看着办", "随便", "这样吧", "先这样", "先这样吧", "再说", "都行", "你定", "随便吧"}:
+        return True
     return bool(
-        re.fullmatch(r"(确认)?继续(报价|投保)?", compact)
-        or re.fullmatch(r"确认(报价|投保|继续报价|继续投保)", compact)
-        or compact in {"继续报价", "确认继续", "确认继续报价", "确认报价", "继续投保", "确认投保"}
+        re.search(
+            r"好|行|可|要|确认|继续|同意|取消|放弃|不要|不用|算了|停止|中止|否|嗯|ok|yes|no",
+            compact,
+            flags=re.IGNORECASE,
+        )
     )
+
+
+def _duplicate_quote_unclear_command_response(
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    trace_id: str = "",
+) -> Tuple[str, Dict[str, Any]]:
+    return _build_quote_user_failure_response(
+        reply=QUOTE_DUPLICATE_CONFIRM_HINT,
+        case=case,
+        task=task,
+        trace_id=trace_id or task.trace_id or _new_trace_id(),
+        failure_code=FAILURE_CODE_DUPLICATE_QUOTE,
+        failure_reason="重复投保确认指令不明确",
+        next_action="继续请发「继续报价」；取消请发「取消」",
+        result_status=RESULT_NEED_MORE,
+        response_status="success",
+        actions=[
+            _mk_action("继续报价"),
+            _mk_action("取消"),
+        ],
+        payload={
+            "duplicate_quote_confirm_hint": True,
+            "quote_case": {
+                "id": case.id,
+                "case_no": case.case_no,
+                "status": case.status,
+                "order_id": case.order_id,
+            },
+            "quote_task": {
+                "id": task.id,
+                "status": task.status,
+                "trace_id": task.trace_id,
+            },
+        },
+    )
+
+
+def _is_duplicate_quote_confirmation_text(text: Any) -> bool:
+    return _quote_chat_polarity_exact(text) == QUOTE_CHAT_POLARITY_AFFIRM
 
 
 def _is_duplicate_quote_cancel_text(text: Any) -> bool:
-    compact = re.sub(r"\s+", "", _norm_text(text))
-    if not compact:
-        return False
-    return bool(
-        compact in {
-            "中止",
-            "取消",
-            "放弃",
-            "停止",
-            "不继续",
-            "不用继续",
-            "中止报价",
-            "取消报价",
-            "放弃报价",
-            "停止报价",
-            "中止重复报价",
-            "取消重复报价",
-            "放弃重复报价",
-            "中止重复投保",
-            "取消重复投保",
-            "放弃重复投保",
-        }
-        or re.fullmatch(r"(不|不用|不要)?(继续|确认)?(中止|取消|放弃|停止)(重复)?(报价|投保)?", compact)
-    )
+    return _quote_chat_polarity_exact(text) == QUOTE_CHAT_POLARITY_NEGATE
 
 
 def looks_like_duplicate_quote_confirmation(text: Any) -> bool:
@@ -6003,6 +6433,13 @@ def _quote_platform_dialog_response(
     )
     data["silent"] = not visible_to_chat
     data["ui_visible"] = visible_to_chat
+    if visible_to_chat:
+        _attach_quote_failure(
+            data,
+            code=_failure_code_for_platform_dialog_subtype(subtype),
+            reason=error_detail or message,
+            next_action=_quote_failure_next_action(_failure_code_for_platform_dialog_subtype(subtype)),
+        )
     return (
         message if visible_to_chat else "",
         {
@@ -6071,6 +6508,16 @@ def _quote_platform_text_notice_response(
     )
     data["silent"] = False
     data["ui_visible"] = True
+    notice_failure_code = (
+        FAILURE_CODE_DUPLICATE_QUOTE
+        if _to_str(notice_type).strip().lower() in {"duplicate_quote_notice", "duplicate_quote"}
+        else FAILURE_CODE_PLATFORM
+    )
+    _attach_quote_failure(
+        data,
+        code=notice_failure_code,
+        reason=safe_message,
+    )
     return (
         safe_message,
         {
@@ -9266,6 +9713,268 @@ def _missing_item_text(item: Dict[str, Any]) -> str:
     return f"{label}（{detail}）" if detail else label
 
 
+def _quote_preflight_item(
+    *,
+    code: str,
+    category: str,
+    label: str,
+    detail: str = "",
+    failure_code: str = "",
+) -> Dict[str, str]:
+    return {
+        "code": _to_str(code).strip(),
+        "category": _to_str(category).strip(),
+        "label": _to_str(label).strip() or "未命名项",
+        "detail": _to_str(detail).strip(),
+        "failure_code": _to_str(failure_code).strip(),
+    }
+
+
+def _material_preflight_items(missing: Iterable[Mapping[str, Any]]) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for raw in missing or []:
+        item = dict(raw or {})
+        item_type = _to_str(item.get("type")).strip() or "field"
+        if item_type == "image":
+            category = "material_image"
+        elif item_type == "data_conflict":
+            category = "material_conflict"
+        else:
+            category = "material_field"
+        items.append(
+            _quote_preflight_item(
+                code=_to_str(item.get("key") or item_type).strip() or category,
+                category=category,
+                label=_missing_item_text(item),
+                detail=_format_missing_detail(item.get("detail")),
+                failure_code=FAILURE_CODE_MATERIAL_MISSING,
+            )
+        )
+    return items
+
+
+def _primary_preflight_failure_code(items: Iterable[Mapping[str, Any]]) -> str:
+    codes = {_to_str(item.get("failure_code")).strip() for item in (items or []) if _to_str(item.get("failure_code")).strip()}
+    for preferred in (
+        FAILURE_CODE_MATERIAL_MISSING,
+        FAILURE_CODE_ACCOUNT_MISSING,
+        FAILURE_CODE_ACCOUNT_LOGIN,
+        FAILURE_CODE_DEFAULT_CONFIG_MISSING,
+    ):
+        if preferred in codes:
+            return preferred
+    return FAILURE_CODE_PREFLIGHT if codes else FAILURE_CODE_PREFLIGHT
+
+
+def _format_quote_preflight_reply(
+    *,
+    platform_name: str,
+    items: Iterable[Mapping[str, Any]],
+    override_summary: str = "",
+    attached_images: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    safe_items = [dict(item or {}) for item in (items or []) if _to_str((item or {}).get("label")).strip()]
+    platform_label = _to_str(platform_name).strip() or "平台"
+    lines = [f"{platform_label}报价前检查未通过，请先处理以下事项："]
+    if _to_str(override_summary).strip():
+        lines.append(f"已记录本次调整：{_to_str(override_summary).strip()}")
+
+    field_labels = [_to_str(x.get("label")).strip() for x in safe_items if x.get("category") == "material_field"]
+    image_labels = [_to_str(x.get("label")).strip() for x in safe_items if x.get("category") == "material_image"]
+    conflict_labels = [_to_str(x.get("label")).strip() for x in safe_items if x.get("category") == "material_conflict"]
+    account_labels = [_to_str(x.get("label")).strip() for x in safe_items if x.get("category") == "account"]
+    config_labels = [_to_str(x.get("label")).strip() for x in safe_items if x.get("category") == "default_config"]
+
+    step = 1
+    if field_labels:
+        lines.append(f"{step}. 缺少字段：" + "、".join(field_labels[:12]))
+        step += 1
+    if image_labels:
+        lines.append(f"{step}. 缺少图片：" + "、".join(image_labels[:12]))
+        step += 1
+    if conflict_labels:
+        lines.append(f"{step}. 资料冲突：" + "、".join(conflict_labels[:8]))
+        step += 1
+    for label in account_labels:
+        lines.append(f"{step}. 账号：{label}")
+        step += 1
+    for label in config_labels:
+        lines.append(f"{step}. 默认参数：{label}")
+        step += 1
+
+    if attached_images:
+        moved = [
+            f"{slot_label(x.get('provided_slot_key') or '')}->{slot_label(x.get('confirmed_slot_key') or '')}"
+            for x in attached_images
+            if x.get("provided_slot_key") != x.get("confirmed_slot_key")
+        ]
+        if moved:
+            lines.append("已自动识别并归位图片：" + "、".join(moved[:5]))
+        review_count = sum(1 for x in attached_images if x.get("needs_manual_review"))
+        if review_count:
+            lines.append(
+                f"{review_count} 张图片特征不够明确，已先放入相关图片，不会覆盖关键材料；"
+                "如需修正，请补一句图片说明后重新拖入。"
+            )
+    lines.append(f"下一步：{_quote_failure_next_action(_primary_preflight_failure_code(safe_items))}")
+    return "\n".join(lines)
+
+
+async def _collect_quote_command_preflight_items(
+    db: AsyncSession,
+    *,
+    missing: Iterable[Mapping[str, Any]],
+    platform_account: Optional[QuotePlatformAccountProfile],
+    platform_has_enabled_account: bool,
+    platform_code: str,
+    platform_name: str,
+    selected_account_type_name: Optional[str],
+    operator_role_name: Any = "",
+) -> List[Dict[str, str]]:
+    """Gather material + account + default-config blockers for one quote command."""
+    material_items = _material_preflight_items(missing)
+    items: List[Dict[str, str]] = list(material_items)
+    type_name = _normalize_account_type_name(selected_account_type_name)
+    type_hint = f"（类型：{type_name}）" if type_name else ""
+    name = _to_str(platform_name).strip() or _platform_display_name(platform_code) or "平台"
+
+    if platform_account is None:
+        if platform_has_enabled_account:
+            items.append(
+                _quote_preflight_item(
+                    code="account_login",
+                    category="account",
+                    label=_quote_account_action_text(
+                        operator_role_name,
+                        f"{name}{type_hint}没有已登录可用账号（请确认已登录、未等待验证码且额度未满）",
+                        f"{name}{type_hint}没有已登录可用账号，请联系管理员处理",
+                    ),
+                    failure_code=FAILURE_CODE_ACCOUNT_LOGIN,
+                )
+            )
+        else:
+            items.append(
+                _quote_preflight_item(
+                    code="account_missing",
+                    category="account",
+                    label=_quote_account_action_text(
+                        operator_role_name,
+                        f"{name}{type_hint}还没有可用平台账号，请先新增、启用并登录",
+                        f"{name}{type_hint}还没有可用平台账号，请联系管理员新增、启用或登录",
+                    ),
+                    failure_code=FAILURE_CODE_ACCOUNT_MISSING,
+                )
+            )
+
+    # Default-config depends on account type; only check after materials are complete
+    # so incomplete OCR/vehicle type does not raise a misleading config blocker.
+    if type_name and not material_items:
+        resolved = await resolve_platform_default_config(
+            db,
+            platform_code=platform_code,
+            account_type_name=type_name,
+        )
+        matched = _to_str(resolved.get("matched")).strip()
+        if matched != "account_type":
+            items.append(
+                _quote_preflight_item(
+                    code="default_config_missing",
+                    category="default_config",
+                    label=_quote_account_action_text(
+                        operator_role_name,
+                        f"{name}（{type_name}）尚未启用默认参数配置，请先在“默认参数配置”中新增并启用",
+                        f"{name}（{type_name}）尚未启用默认参数配置，请联系管理员处理",
+                    ),
+                    failure_code=FAILURE_CODE_DEFAULT_CONFIG_MISSING,
+                )
+            )
+    return items
+
+
+def _quote_preflight_actions(
+    *,
+    items: Iterable[Mapping[str, Any]],
+    platform_code: str,
+    platform_name: str,
+    selected_account_type_name: Optional[str],
+    operator_role_name: Any = "",
+) -> List[Dict[str, Any]]:
+    codes = {_to_str(item.get("failure_code")).strip() for item in (items or [])}
+    actions: List[Dict[str, Any]] = []
+    if codes & {FAILURE_CODE_ACCOUNT_MISSING, FAILURE_CODE_ACCOUNT_LOGIN}:
+        actions.extend(
+            _quote_platform_account_manage_actions(
+                operator_role_name,
+                platform_code=platform_code,
+                platform_name=platform_name,
+            )
+        )
+    if FAILURE_CODE_DEFAULT_CONFIG_MISSING in codes and not _quote_account_needs_admin_contact(operator_role_name):
+        actions.append(
+            _mk_action(
+                "默认参数配置",
+                "open_default_config_manager",
+                "quote_platform_default_configs",
+                platform_code=platform_code,
+                platform_name=platform_name,
+                account_type_name=_normalize_account_type_name(selected_account_type_name),
+            )
+        )
+    actions.append(_mk_action("查看当前材料状态"))
+    if not (
+        codes & {FAILURE_CODE_ACCOUNT_MISSING, FAILURE_CODE_ACCOUNT_LOGIN}
+        and _quote_account_needs_admin_contact(operator_role_name)
+    ):
+        actions.append(_mk_action(f"{_to_str(platform_name).strip() or '平台'}报价"))
+    return actions
+
+
+def _build_quote_preflight_blocked_response(
+    *,
+    case: QuoteCase,
+    platform_code: str,
+    platform_name: str,
+    selected_account_type_name: Optional[str],
+    items: Iterable[Mapping[str, Any]],
+    merged_entities: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    override_summary: str = "",
+    attached_images: Optional[List[Dict[str, Any]]] = None,
+    operator_role_name: Any = "",
+    trace_id: str = "",
+) -> Tuple[str, Dict[str, Any]]:
+    safe_items = [dict(item or {}) for item in (items or [])]
+    failure_code = _primary_preflight_failure_code(safe_items)
+    reply = _format_quote_preflight_reply(
+        platform_name=platform_name,
+        items=safe_items,
+        override_summary=override_summary,
+        attached_images=attached_images,
+    )
+    data_payload = dict(payload or {})
+    data_payload["preflight_checklist"] = safe_items
+    data_payload["preflight_blocked"] = True
+    return _build_quote_user_failure_response(
+        reply=reply,
+        case=case,
+        task=None,
+        trace_id=trace_id or _new_trace_id(),
+        failure_code=failure_code,
+        failure_reason="报价前检查未通过",
+        result_status=RESULT_NEED_MORE,
+        response_status="success",
+        actions=_quote_preflight_actions(
+            items=safe_items,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            selected_account_type_name=selected_account_type_name,
+            operator_role_name=operator_role_name,
+        ),
+        payload=data_payload,
+        entities={**(merged_entities or {}), "quote_case_id": case.id, "order_id": case.order_id},
+    )
+
+
 def _quote_material_form_command_mode(text: Any) -> str:
     compact = re.sub(r"[\s,，。.;；:：]+", "", _norm_text(text))
     if not compact:
@@ -9570,11 +10279,23 @@ async def handle_quote_material_form_message(
         platform_code=platform_code,
         account_type_name=selected_account_type_name,
     )
-    case.normalized_data = normalized_data
-    case.draft_order_data = normalized_data
-    case.missing_requirements = missing
-    if case.status not in {CASE_STATUS_QUOTED, CASE_STATUS_WAITING_SMS, CASE_STATUS_WAITING_DUPLICATE_CONFIRM}:
-        case.status = CASE_STATUS_READY if not missing else CASE_STATUS_COLLECTING
+    # Opening the form while a wait is active must not rewrite case data: the
+    # waiting task is bound to submitted_snapshot fingerprint. Persist only when
+    # the case is not waiting for SMS / legacy duplicate confirm.
+    if case.status in {CASE_STATUS_WAITING_SMS, CASE_STATUS_WAITING_DUPLICATE_CONFIRM}:
+        normalized_data = _json_obj(case.normalized_data) or _json_obj(case.draft_order_data) or normalized_data
+        missing = _json_list(case.missing_requirements) or missing
+        selected_account_type_name = _normalize_account_type_name(
+            merged_entities.get("account_type_name")
+            or normalized_data.get("account_type_name")
+            or selected_account_type_name
+        )
+    else:
+        case.normalized_data = normalized_data
+        case.draft_order_data = normalized_data
+        case.missing_requirements = missing
+        if case.status not in {CASE_STATUS_QUOTED}:
+            case.status = CASE_STATUS_READY if not missing else CASE_STATUS_COLLECTING
     case.updated_at = _now()
 
     form_payload = _quote_material_form_payload(
@@ -9904,6 +10625,69 @@ async def _find_waiting_duplicate_quote_confirm_task(
     return (row[0], row[1]) if row else None
 
 
+async def _cancel_orphaned_waiting_duplicate_confirm_tasks(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    session_id: Optional[str],
+    for_update: bool = False,
+) -> int:
+    """Cancel legacy duplicate-confirm tasks whose Case is no longer waiting.
+
+    New quotes no longer create waiting_duplicate_confirm. Older rows can drift
+    when Case status was rewritten without cancelling the Task; the paired
+    finder then never recovers them.
+    """
+
+    if owner_user_id <= 0:
+        return 0
+    stmt = (
+        select(QuoteCase, QuoteTask)
+        .join(QuoteTask, QuoteTask.quote_case_id == QuoteCase.id)
+        .where(
+            QuoteCase.owner_user_id == owner_user_id,
+            QuoteTask.status == TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+            QuoteCase.status != CASE_STATUS_WAITING_DUPLICATE_CONFIRM,
+        )
+        .order_by(desc(QuoteTask.id))
+    )
+    if session_id:
+        stmt = stmt.where(QuoteCase.session_id == session_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    rows = (await db.execute(stmt)).all()
+    cancelled = 0
+    ts = _now()
+    for case, task in rows:
+        await _mark_quote_task_cancelled(
+            db,
+            task=task,
+            reason="遗留重复投保确认已失效",
+            now=ts,
+            response_extra={"orphaned_duplicate_confirm_cancelled": True},
+        )
+        if case.current_task_id == task.id:
+            case.current_task_id = None
+            case.updated_at = ts
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": TASK_STATUS_CANCELLED,
+                "orphaned_duplicate_confirm_cancelled": True,
+                "case_status": case.status,
+            },
+        )
+        cancelled += 1
+    if cancelled:
+        await db.flush()
+    return cancelled
+
+
 def _is_sms_task_expired(task: QuoteTask) -> bool:
     base = getattr(task, "started_at", None) or getattr(task, "created_at", None)
     if not isinstance(base, datetime):
@@ -9947,9 +10731,14 @@ async def _refresh_quote_case_material_state(
 
 
 def _quote_task_stale_base_time(task: QuoteTask) -> Optional[datetime]:
+    """Clock for stale running cleanup.
+
+    Prefer started_at (then created_at). Do not use updated_at: long platform
+    calls may keep bumping updated_at and indefinitely delay expiry.
+    """
+
     for value in (
         getattr(task, "started_at", None),
-        getattr(task, "updated_at", None),
         getattr(task, "created_at", None),
     ):
         if isinstance(value, datetime):
@@ -10003,12 +10792,16 @@ async def _expire_stale_running_quote_tasks_for_owner_session(
         if not _quote_task_is_stale(task, now=now):
             continue
         task.status = TASK_STATUS_FAILED
-        task.error_detail = "报价任务超时，已自动清理"
+        task.error_detail = QUOTE_STALE_TIMEOUT_MESSAGE
         task.response_payload = {
             **_json_obj(task.response_payload),
             "stale_running_task_cleaned": True,
             "stale_seconds": QUOTE_RUNNING_TASK_STALE_SECONDS,
             "quota_not_adjusted": True,
+            **_quote_failure_fields(
+                code=FAILURE_CODE_STALE_TIMEOUT,
+                reason=QUOTE_STALE_TIMEOUT_MESSAGE,
+            ),
         }
         task.finished_at = now
         task.updated_at = now
@@ -10026,7 +10819,24 @@ async def _expire_stale_running_quote_tasks_for_owner_session(
                 "status": TASK_STATUS_FAILED,
                 "reason": task.error_detail,
                 "stale_running_task_cleaned": True,
+                "failure_code": FAILURE_CODE_STALE_TIMEOUT,
             },
+        )
+        platform_label = task.platform_name or case.platform_name or case.platform_code or "平台"
+        notice = (
+            f"{platform_label}报价超时已中止，请重新发起报价；"
+            "若反复超时请检查账号会话。"
+        )
+        await _persist_platform_text_notice_if_recently_absent(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            message=notice,
+            trace_id=task.trace_id or _new_trace_id(),
+            task_id=task.id,
+            platform_code=task.platform_code or case.platform_code or "",
+            platform_name=platform_label,
+            notice_type="stale_timeout_notice",
         )
         expired += 1
     if expired:
@@ -10058,7 +10868,7 @@ async def _expire_waiting_sms_task(
     case: QuoteCase,
     task: QuoteTask,
     owner_user_id: int,
-    reason: str = "短信验证码已过期",
+    reason: str = QUOTE_SMS_EXPIRED_MESSAGE,
     now: Optional[datetime] = None,
 ) -> None:
     ts = now or _now()
@@ -10122,8 +10932,23 @@ async def _expire_stale_waiting_sms_tasks_for_owner_session(
             case=case,
             task=task,
             owner_user_id=owner_user_id,
-            reason="短信验证码已过期",
+            reason=QUOTE_SMS_EXPIRED_MESSAGE,
             now=ts,
+        )
+        platform_label = task.platform_name or case.platform_name or case.platform_code or "平台"
+        await _persist_platform_text_notice_if_recently_absent(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            message=(
+                f"{platform_label}验证码已过期，旧验证码已作废。"
+                f"请重新发送“{platform_label}报价”获取新验证码。"
+            ),
+            trace_id=task.trace_id or _new_trace_id(),
+            task_id=task.id,
+            platform_code=task.platform_code or case.platform_code or "",
+            platform_name=platform_label,
+            notice_type="sms_expired_notice",
         )
         expired += 1
     if expired:
@@ -10155,6 +10980,7 @@ async def _find_recent_invalid_sms_task(
             QuoteTask.login_state == "failed",
             QuoteTask.error_detail.in_(
                 (
+                    QUOTE_SMS_EXPIRED_MESSAGE,
                     "短信验证码已过期",
                     "cancelled_by_material_change",
                     "cancelled_by_image_recall",
@@ -10291,20 +11117,17 @@ async def _stop_quote_for_material_change(
         platform_account=platform_account,
     )
     payload["material_changed"] = True
-    return (
-        f"{platform_label}报价材料已更新，我已停止本次报价；请确认材料后重新发起报价。",
-        {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": trace_id,
-            "data": _mk_data(
-                result_status=RESULT_NOT_READY,
-                message=QUOTE_MATERIAL_CHANGED_MESSAGE,
-                entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
-                payload=payload,
-            ),
-            "actions": [_mk_action(f"{platform_label}报价"), _mk_action("查看当前材料状态")],
-        },
+    return _build_quote_user_failure_response(
+        reply=f"{platform_label}报价材料已更新，我已停止本次报价；请确认材料后重新发起报价。",
+        case=case,
+        task=task,
+        trace_id=trace_id,
+        failure_code=FAILURE_CODE_MATERIAL_CHANGED,
+        failure_reason=QUOTE_MATERIAL_CHANGED_MESSAGE,
+        result_status=RESULT_NOT_READY,
+        response_status="success",
+        actions=[_mk_action(f"{platform_label}报价"), _mk_action("查看当前材料状态")],
+        payload=payload,
     )
 
 
@@ -10372,24 +11195,20 @@ async def _stop_quote_for_default_config_change(
         platform_account=platform_account,
     )
     payload["default_config_changed"] = True
-    return (
-        "",
-        {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": trace_id,
-            "silent": True,
-            "ui_visible": False,
-            "data": _mk_data(
-                result_status=RESULT_NOT_READY,
-                message=QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE,
-                entities={"quote_case_id": case.id, "quote_task_id": task.id if task is not None else None, "order_id": case.order_id},
-                payload=payload,
-            ),
-            "silent": True,
-            "ui_visible": False,
-            "actions": [_mk_action(f"{platform_label}报价"), _mk_action("查看当前材料状态")],
-        },
+    return _build_quote_user_failure_response(
+        reply=(
+            f"{platform_label}默认参数已更新，我已停止本次报价；"
+            f"{QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE}。"
+        ),
+        case=case,
+        task=task,
+        trace_id=trace_id,
+        failure_code=FAILURE_CODE_DEFAULT_CONFIG_CHANGED,
+        failure_reason=QUOTE_DEFAULT_CONFIG_CHANGED_MESSAGE,
+        result_status=RESULT_NOT_READY,
+        response_status="success",
+        actions=[_mk_action(f"{platform_label}报价"), _mk_action("查看当前材料状态")],
+        payload=payload,
     )
 
 
@@ -10494,7 +11313,24 @@ def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, acco
     display_name = result_platform_name or platform_name or "平台"
     if result_platform_code == "PICC" or display_name in {"人保", "中国人保", "PICC"}:
         display_name = "人保"
-    return f"{display_name}风险水平：{risk_score or '-'} 分"
+    proposal = _json_obj(card.get("proposal_info"))
+    vehicle_model = _to_str(
+        proposal.get("vehicle_model")
+        or result.get("vehicle_model")
+        or card.get("vehicle_model")
+    ).strip()
+    parts = [f"{display_name}风险水平：{risk_score or '-'} 分"]
+    if vehicle_model and vehicle_model != "-":
+        parts.append(f"选定车型：{vehicle_model}")
+    match_method = _to_str(
+        proposal.get("model_match_method")
+        or proposal.get("modelQueryMatchLabel")
+        or result.get("model_match_method")
+        or card.get("model_match_method")
+    ).strip()
+    if match_method and match_method != "-":
+        parts.append(f"匹配方式：{match_method}")
+    return "；".join(parts)
 
 
 def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> Dict[str, str]:
@@ -11036,6 +11872,19 @@ async def _persist_platform_text_notice_if_recently_absent(
         ),
         "actions": [],
     }
+    notice_key = _to_str(notice_type).strip().lower()
+    notice_failure_code = FAILURE_CODE_PLATFORM
+    if notice_key in {"stale_timeout_notice", "stale_timeout"}:
+        notice_failure_code = FAILURE_CODE_STALE_TIMEOUT
+    elif notice_key in {"sms_expired_notice", "sms_expired"}:
+        notice_failure_code = FAILURE_CODE_SMS_EXPIRED
+    elif notice_key in {"duplicate_quote_notice", "duplicate_quote"}:
+        notice_failure_code = FAILURE_CODE_DUPLICATE_QUOTE
+    _attach_quote_failure(
+        metadata["data"],
+        code=notice_failure_code,
+        reason=safe_message,
+    )
     try:
         async with db.begin_nested():
             await db_append_message(
@@ -11841,22 +12690,18 @@ async def _fail_quote_after_result_materialization(
     }
     if fallback_task is not None:
         payload["source_task_id"] = fallback_task.id
-    return reply, {
-        "status": "failed",
-        "intent": "quote",
-        "trace_id": trace_id,
-        "data": _mk_data(
-            result_status=RESULT_FAILED,
-            message=reply,
-            entities={
-                "quote_case_id": case.id,
-                "quote_task_id": task.id,
-                "order_id": case.order_id,
-            },
-            payload=payload,
-        ),
-        "actions": [_mk_action(f"{platform_name or case.platform_name or '平台'}报价")],
-    }
+    return _build_quote_user_failure_response(
+        reply=reply,
+        case=case,
+        task=task,
+        trace_id=trace_id,
+        failure_code=FAILURE_CODE_RESULT_MATERIALIZATION,
+        failure_reason=detail,
+        result_status=RESULT_FAILED,
+        response_status="failed",
+        actions=[_mk_action(f"{platform_name or case.platform_name or '平台'}报价")],
+        payload=payload,
+    )
 
 
 def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
@@ -11877,7 +12722,7 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
         "意外",
     )
     alias_group = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
-    remove_words = ("去掉", "不要", "取消", "不买", "不投", "不保", "去除", "删除", "关闭", "不需要")
+    remove_words = QUOTE_CHAT_NEGATE_OBJECT_WORDS
     remove_group = "|".join(re.escape(word) for word in remove_words)
     remove_pattern = rf"^(?:请)?(?:(?:{remove_group})(?:{alias_group})(?:保费|金额|保额|险|保险)?|(?:{alias_group})(?:保费|金额|保额|险|保险)?(?:{remove_group}))$"
     if re.fullmatch(remove_pattern, compact, flags=re.IGNORECASE):
@@ -12739,6 +13584,63 @@ def _already_quoted_response(
     }
 
 
+def _quote_task_is_sms_wait(task: QuoteTask) -> bool:
+    return task.status == TASK_STATUS_WAITING_SMS or task.login_state == "sms_required"
+
+
+def _align_case_status_with_running_quote_task(case: QuoteCase) -> None:
+    """Keep Case/Task paired while a quote attempt is running.
+
+    waiting_sms is only valid when Task is also waiting for a code. Once Task
+    moves to running (SMS submitted or reuse-authenticated quote), Case must
+    leave waiting_sms so wait finders and active-case logic stay consistent.
+    """
+
+    case.status = CASE_STATUS_READY
+
+
+async def _mark_quote_task_cancelled(
+    db: AsyncSession,
+    *,
+    task: QuoteTask,
+    reason: str,
+    now: datetime,
+    response_extra: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Mark one task cancelled. Returns whether it was an SMS wait task."""
+
+    was_sms_task = _quote_task_is_sms_wait(task)
+    task.status = TASK_STATUS_CANCELLED
+    task.login_state = "failed" if was_sms_task else "authenticated"
+    task.error_detail = reason
+    if response_extra:
+        task.response_payload = {**_json_obj(task.response_payload), **response_extra}
+    task.finished_at = now
+    task.updated_at = now
+    return was_sms_task
+
+
+async def _expire_account_after_sms_task_cancel(
+    db: AsyncSession,
+    *,
+    task: QuoteTask,
+    owner_user_id: int,
+    reason: str,
+    now: datetime,
+) -> None:
+    if owner_user_id <= 0:
+        return
+    account_id = _quote_task_platform_account_id(task)
+    if account_id <= 0:
+        return
+    account = await _get_platform_account_profile_by_id(db, account_id=account_id)
+    if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
+        account.login_status = ACCOUNT_LOGIN_EXPIRED
+        account.last_error = reason
+        account.last_check_at = now
+        account.updated_at = now
+
+
 async def _cancel_waiting_tasks_for_case(
     db: AsyncSession,
     *,
@@ -12760,20 +13662,15 @@ async def _cancel_waiting_tasks_for_case(
 
     cancelled = 0
     for task in active_waiting_tasks:
-        was_sms_task = task.status == TASK_STATUS_WAITING_SMS or task.login_state == "sms_required"
-        task.status = TASK_STATUS_CANCELLED
-        task.login_state = "failed" if was_sms_task else "authenticated"
-        task.error_detail = reason
-        task.finished_at = ts
-        task.updated_at = ts
-        account_id = _quote_task_platform_account_id(task)
-        if was_sms_task and owner_user_id > 0 and account_id > 0:
-            account = await _get_platform_account_profile_by_id(db, account_id=account_id)
-            if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
-                account.login_status = ACCOUNT_LOGIN_EXPIRED
-                account.last_error = "材料已更新，请重新发起报价"
-                account.last_check_at = ts
-                account.updated_at = ts
+        was_sms_task = await _mark_quote_task_cancelled(db, task=task, reason=reason, now=ts)
+        if was_sms_task:
+            await _expire_account_after_sms_task_cancel(
+                db,
+                task=task,
+                owner_user_id=owner_user_id,
+                reason=QUOTE_MATERIAL_CHANGED_MESSAGE,
+                now=ts,
+            )
         cancelled += 1
 
     if cancelled:
@@ -12814,25 +13711,24 @@ async def _cancel_active_quote_tasks_for_case(
         task_id = _safe_int(getattr(task, "id", 0), 0)
         if exclude_task_id and task_id == exclude_task_id:
             continue
-        was_sms_task = task.status == TASK_STATUS_WAITING_SMS or task.login_state == "sms_required"
-        task.status = TASK_STATUS_CANCELLED
-        task.login_state = "failed" if was_sms_task else "authenticated"
-        task.error_detail = reason
-        task.response_payload = {
-            **_json_obj(task.response_payload),
-            "cancelled_by_new_quote_state": True,
-            "cancel_reason": reason,
-        }
-        task.finished_at = ts
-        task.updated_at = ts
-        account_id = _quote_task_platform_account_id(task)
-        if was_sms_task and owner_user_id > 0 and account_id > 0:
-            account = await _get_platform_account_profile_by_id(db, account_id=account_id)
-            if account and account.login_status in {ACCOUNT_LOGIN_LOGGING_IN, ACCOUNT_LOGIN_NEEDS_CODE}:
-                account.login_status = ACCOUNT_LOGIN_EXPIRED
-                account.last_error = reason
-                account.last_check_at = ts
-                account.updated_at = ts
+        was_sms_task = await _mark_quote_task_cancelled(
+            db,
+            task=task,
+            reason=reason,
+            now=ts,
+            response_extra={
+                "cancelled_by_new_quote_state": True,
+                "cancel_reason": reason,
+            },
+        )
+        if was_sms_task:
+            await _expire_account_after_sms_task_cancel(
+                db,
+                task=task,
+                owner_user_id=owner_user_id,
+                reason=reason,
+                now=ts,
+            )
         cancelled += 1
 
     if cancelled:
@@ -12990,10 +13886,6 @@ async def has_recent_invalid_sms_task(db: AsyncSession, ctx: Dict[str, Any]) -> 
     ) is not None
 
 
-async def has_quote_case_waiting_for_login_phone(db: AsyncSession, ctx: Dict[str, Any]) -> bool:
-    return False
-
-
 async def _start_sms_task(
     db: AsyncSession,
     *,
@@ -13028,7 +13920,7 @@ async def _start_sms_task(
                 case=case,
                 task=waiting,
                 owner_user_id=owner_user_id,
-                reason="短信验证码已过期",
+                reason=QUOTE_SMS_EXPIRED_MESSAGE,
             )
             await db.flush()
         elif waiting_operation == normalized_operation:
@@ -13143,19 +14035,17 @@ async def _complete_waiting_duplicate_quote_task(
         case.current_task_id = task.id
         case.updated_at = _now()
         await db.flush()
-        return (
-            f"{platform_name}报价失败：平台账号不存在，请重新发起报价。",
-            {
-                "status": "failed",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_FAILED,
-                    message="平台账号不存在",
-                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                    payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
-                ),
-            },
+        return _build_quote_user_failure_response(
+            reply=f"{platform_name}报价失败：平台账号不存在，请重新发起报价。",
+            case=case,
+            task=task,
+            trace_id=trace_id,
+            failure_code=FAILURE_CODE_ACCOUNT_MISSING,
+            failure_reason="平台账号不存在",
+            result_status=RESULT_FAILED,
+            response_status="failed",
+            actions=[_mk_action(f"{platform_name}报价")],
+            payload={"quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id}},
         )
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         return await _stop_quote_for_material_change(
@@ -13552,38 +14442,33 @@ async def _continue_quote_with_platform_account(
             "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
             "请联系管理员在“默认参数配置”中新增并启用该账号类型配置后，再重新发起报价。",
         )
-        return (
-            f"{reply_prefix}{platform_name}（类型：{selected_type_name}）还没有启用的默认参数配置，暂不提交报价。\n"
-            f"{config_action_text}",
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_NOT_READY,
-                    message="等待配置对应账号类型的默认参数",
-                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                    payload=payload,
-                ),
-                "actions": [
-                    *(
-                        []
-                        if _quote_account_needs_admin_contact(operator_role_name)
-                        else [
-                            _mk_action(
-                                "默认参数配置",
-                                "open_default_config_manager",
-                                "quote_platform_default_configs",
-                                platform_code=platform_code,
-                                platform_name=platform_name,
-                                account_type_name=selected_type_name,
-                            ),
-                        ]
-                    ),
-                    _mk_action(f"{platform_name}报价"),
-                ],
-            },
+        preflight_items = [
+            _quote_preflight_item(
+                code="default_config_missing",
+                category="default_config",
+                label=f"{platform_name}（{selected_type_name}）尚未启用默认参数配置",
+                detail=config_action_text,
+                failure_code=FAILURE_CODE_DEFAULT_CONFIG_MISSING,
+            )
+        ]
+        reply, body = _build_quote_preflight_blocked_response(
+            case=case,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            selected_account_type_name=selected_type_name,
+            items=preflight_items,
+            merged_entities=merged_entities,
+            payload=payload,
+            attached_images=attached_images or [],
+            operator_role_name=operator_role_name,
+            trace_id=trace_id,
         )
+        if reply_prefix:
+            reply = f"{reply_prefix}{reply}"
+            data = body.get("data")
+            if isinstance(data, dict):
+                data["message"] = reply
+        return reply, body
 
     if platform_account.login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED} and await _account_has_usable_session_snapshot(platform_account):
         reply, meta = await _complete_quote_without_sms(
@@ -13820,19 +14705,47 @@ def _should_auto_probe_renewal_before_normal_quote(
 
 
 def _is_silent_auto_renewal_not_found_response(response: Mapping[str, Any]) -> bool:
+    """Whether an auto renewal probe should fall through to the normal quote path.
+
+    Only the explicit auto_probe_fallthrough marker counts. Soft exits (not found,
+    runtime failure, no session) must return _auto_renewal_probe_fallthrough_response.
+    """
+
     payload = _json_obj(_json_obj(_json_obj(response).get("data")).get("payload"))
     lookup = _json_obj(payload.get("renewal_lookup"))
-    if lookup.get("found") is False:
-        return True
-    status = _to_str(_json_obj(response).get("status")).strip().lower()
-    result_status = _to_str(_json_obj(_json_obj(response).get("data")).get("result_status")).strip().lower()
-    message = _to_str(_json_obj(_json_obj(response).get("data")).get("message")).strip()
-    compact = re.sub(r"\s+", "", message)
-    return status == "success" and result_status in {RESULT_NOT_READY.lower(), "not_ready"} and bool(
-        re.search(
-            r"(没有此车辆信息|不是可续保车辆|不可续保|无续保信息|未查询到续保|没有续保信息)",
-            compact,
-        )
+    return lookup.get("auto_probe_fallthrough") is True
+
+
+def _auto_renewal_probe_fallthrough_response(
+    *,
+    case: QuoteCase,
+    trace_id: str,
+    reason: str = "auto_renewal_probe_fallthrough",
+) -> Tuple[str, Dict[str, Any]]:
+    return (
+        "",
+        {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": trace_id,
+            "silent": True,
+            "ui_visible": False,
+            "data": _mk_data(
+                result_status=RESULT_NOT_READY,
+                message=reason,
+                entities={"quote_case_id": case.id, "order_id": case.order_id},
+                payload={
+                    "renewal_lookup": {
+                        "found": False,
+                        "auto_probe_fallthrough": True,
+                        "reason": reason,
+                    },
+                    "silent": True,
+                    "ui_visible": False,
+                },
+            ),
+            "actions": [],
+        },
     )
 
 
@@ -13847,6 +14760,7 @@ async def _complete_renewal_lookup_without_sms(
     login_mode: str,
     task: Optional[QuoteTask] = None,
     operator_role_name: Any = "",
+    auto_probe: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "PICC"
     platform_name = case.platform_name or platform_account.platform_name or "人保"
@@ -13919,7 +14833,8 @@ async def _complete_renewal_lookup_without_sms(
         ),
     )
     started = time.perf_counter()
-    runtime_result = await quote_platform_runtime.query_renewal(platform_ctx, snapshot, db=db)
+    async with release_chat_session_lock_for_platform_io():
+        runtime_result = await quote_platform_runtime.query_renewal(platform_ctx, snapshot, db=db)
     perf = {"login_mode": login_mode, "renewal_lookup_ms": _elapsed_ms(started)}
     runtime_status = _runtime_status(runtime_result)
     runtime_data = _json_obj(getattr(runtime_result, "data", None))
@@ -13962,25 +14877,34 @@ async def _complete_renewal_lookup_without_sms(
             },
         )
         await db.flush()
+        if auto_probe:
+            return _auto_renewal_probe_fallthrough_response(
+                case=case,
+                trace_id=trace_id,
+                reason=detail or "auto_renewal_probe_runtime_failed",
+            )
         if _is_runtime_session_expired_result(runtime_result) and _quote_account_needs_admin_contact(operator_role_name):
             detail = f"{platform_name}账号登录已过期，请联系管理员处理。"
-        return (
-            f"{platform_name}续保查询失败：{detail}",
-            {
-                "status": "failed",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_FAILED,
-                    message=detail,
-                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                    payload={
-                        "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
-                        "platform_account": _credential_public_payload(platform_account),
-                        "renewal_lookup": _runtime_result_payload(runtime_result),
-                    },
-                ),
-                "actions": [],
+        failure_code = (
+            FAILURE_CODE_SESSION_EXPIRED
+            if _is_runtime_session_expired_result(runtime_result)
+            else FAILURE_CODE_PLATFORM
+        )
+        return _build_quote_user_failure_response(
+            reply=f"{platform_name}续保查询失败：{detail}",
+            case=case,
+            task=task,
+            trace_id=trace_id,
+            failure_code=failure_code,
+            failure_reason=detail,
+            result_status=RESULT_FAILED,
+            response_status="failed",
+            actions=[],
+            payload={
+                "quote_task": {"id": task.id, "status": task.status, "trace_id": trace_id},
+                "platform_account": _credential_public_payload(platform_account),
+                "renewal_lookup": _runtime_result_payload(runtime_result),
+                "operation": RENEWAL_LOOKUP_OPERATION,
             },
         )
 
@@ -14024,6 +14948,12 @@ async def _complete_renewal_lookup_without_sms(
             },
         )
         await db.flush()
+        if auto_probe:
+            return _auto_renewal_probe_fallthrough_response(
+                case=case,
+                trace_id=trace_id,
+                reason=detail or "auto_renewal_probe_not_found",
+            )
         return (
             detail,
             {
@@ -14170,6 +15100,7 @@ async def _continue_renewal_lookup_with_platform_account(
     trace_id: str,
     platform_account: QuotePlatformAccountProfile,
     operator_role_name: Any = "",
+    auto_probe: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "PICC"
     platform_name = case.platform_name or platform_account.platform_name or "人保"
@@ -14183,6 +15114,14 @@ async def _continue_renewal_lookup_with_platform_account(
             platform_account=platform_account,
             login_mode="reuse_authenticated",
             operator_role_name=operator_role_name,
+            auto_probe=auto_probe,
+        )
+
+    if auto_probe:
+        return _auto_renewal_probe_fallthrough_response(
+            case=case,
+            trace_id=trace_id,
+            reason="auto_renewal_probe_no_usable_session",
         )
 
     message = _quote_account_action_text(
@@ -14376,6 +15315,285 @@ def _quote_result_from_runtime(
     return {}
 
 
+async def _finalize_quote_runtime_failure(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+    platform_account: Optional[QuotePlatformAccountProfile],
+    quote_runtime_result: PlatformRuntimeResult,
+    response_payload: Dict[str, Any],
+    trace_id: str,
+    platform_code: str,
+    platform_name: str,
+    event_extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Persist Task/Case/account failure state shared by SMS and no-SMS paths."""
+
+    _apply_platform_account_runtime_status(
+        platform_account,
+        quote_runtime_result,
+        default_error="平台报价失败",
+    )
+    error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
+    now = _now()
+    task.status = TASK_STATUS_FAILED
+    task.login_state = "authenticated"
+    task.error_detail = error_detail
+    task.response_payload = response_payload
+    task.result_payload = {}
+    task.finished_at = now
+    task.updated_at = now
+    case.status = CASE_STATUS_READY
+    case.current_task_id = task.id
+    case.updated_at = now
+    if platform_account:
+        platform_account.last_error = error_detail
+        platform_account.last_check_at = now
+        platform_account.updated_at = now
+        if _is_runtime_quota_full_result(quote_runtime_result):
+            platform_account.quota_status = ACCOUNT_QUOTA_FULL
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_FAILED,
+            "trace_id": trace_id,
+            "reason": error_detail,
+            **_json_obj(event_extra),
+        },
+    )
+    await db.flush()
+    await _persist_runtime_auto_notices(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        runtime_result=quote_runtime_result,
+        trace_id=trace_id,
+        task_id=task.id,
+        platform_code=platform_code,
+        platform_name=platform_name,
+    )
+    await db.flush()
+    return error_detail
+
+
+def _session_expired_quote_failure_response(
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    platform_account: Optional[QuotePlatformAccountProfile],
+    quote_runtime_result: PlatformRuntimeResult,
+    snapshot: Dict[str, Any],
+    platform_code: str,
+    platform_name: str,
+    trace_id: str,
+    operator_role_name: Any = "",
+) -> Tuple[str, Dict[str, Any]]:
+    runtime_payload = _runtime_result_payload(quote_runtime_result)
+    runtime_data = _json_obj(runtime_payload.get("data"))
+    request_body_draft = _json_obj(
+        runtime_data.get("request_body")
+        or runtime_data.get("request_body_draft")
+        or _json_obj(snapshot.get("request_body"))
+    )
+    account_label = ""
+    if platform_account:
+        account_label = f"（账号：{platform_account.account_username or platform_account.id}）"
+    preflight = _json_obj(request_body_draft.get("preflight"))
+    missing_default_config = [
+        _to_str(item).strip()
+        for item in (preflight.get("missingDefaultConfig") if isinstance(preflight.get("missingDefaultConfig"), list) else [])
+        if _to_str(item).strip()
+    ]
+    draft_account_type = (
+        _to_str(request_body_draft.get("accountTypeName")).strip()
+        or _to_str(_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")).strip()
+        or _to_str(platform_account.account_type_name if platform_account else "").strip()
+        or "当前账号类型"
+    )
+    reply_lines = [
+        f"{platform_name}{account_label}登录已过期，本次没有继续提交报价。",
+        f"已完成资料解析和{draft_account_type}请求体草稿组装，重新登录该平台账号后可直接重新发起报价。",
+    ]
+    if _quote_account_needs_admin_contact(operator_role_name):
+        reply_lines = [
+            f"{platform_name}账号登录已过期，本次没有继续提交报价。",
+            "请联系管理员重新登录平台账号后再发起报价。",
+        ]
+    if missing_default_config:
+        reply_lines.append(
+            "重新报价前还需要在右上角“默认参数配置”补齐："
+            + "、".join(missing_default_config[:8])
+            + "。"
+        )
+    return _quote_platform_dialog_response(
+        case=case,
+        task=task,
+        platform_account=platform_account,
+        runtime_result=quote_runtime_result,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        trace_id=trace_id,
+        error_detail="\n".join(reply_lines),
+        result_status=RESULT_NOT_READY,
+        response_status="success",
+        title=f"{platform_name}登录已过期",
+        subtype="session_expired",
+        severity="warning",
+        actions=[
+            *_quote_platform_account_manage_actions(
+                operator_role_name,
+                platform_code=platform_code,
+                platform_name=platform_name,
+            ),
+            *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
+        ],
+        extra_payload={"request_body": request_body_draft},
+        operator_role_name=operator_role_name,
+    )
+
+
+async def _respond_after_quote_runtime_failure(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+    platform_account: Optional[QuotePlatformAccountProfile],
+    quote_runtime_result: PlatformRuntimeResult,
+    snapshot: Dict[str, Any],
+    trace_id: str,
+    platform_code: str,
+    platform_name: str,
+    config_type_name: Optional[str],
+    attempted_account_ids: Optional[Iterable[int]],
+    operator_role_name: Any = "",
+    extra_payload: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """Shared post-failure branch: duplicate auto-retry, session/quota switch, dialog."""
+
+    error_detail = _to_str(task.error_detail).strip() or _runtime_detail(quote_runtime_result, "平台报价失败")
+    if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+        warning = _duplicate_quote_warning_from_runtime(quote_runtime_result)
+        task.request_payload = {**_json_obj(task.request_payload), "duplicate_quote_warning": warning}
+        retry_duplicate = await _auto_retry_duplicate_quote_once(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_account=platform_account,
+            platform_name=platform_name,
+            config_type_name=config_type_name or platform_account.account_type_name,
+            operator_role_name=operator_role_name,
+        )
+        if retry_duplicate is not None:
+            return retry_duplicate
+        if await _quote_auto_notice_already_persisted(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=case.session_id,
+            dedupe_key="",
+            message=warning,
+            trace_id=trace_id,
+        ):
+            return _quote_notice_already_visible_silent_response(
+                case=case,
+                task=task,
+                trace_id=trace_id,
+                message=warning,
+            )
+        return _quote_platform_text_notice_response(
+            case=case,
+            task=task,
+            runtime_result=quote_runtime_result,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            message=warning,
+            result_status=RESULT_NOT_READY,
+            response_status="success",
+            notice_type="duplicate_quote_notice",
+        )
+    if _is_runtime_session_expired_result(quote_runtime_result):
+        retry = await _retry_quote_with_next_platform_account(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            current_account=platform_account,
+            config_type_name=config_type_name
+            or (platform_account.account_type_name if platform_account else None),
+            attempted_account_ids=attempted_account_ids,
+            reason_text="登录已过期",
+            operator_role_name=operator_role_name,
+        )
+        if retry is not None:
+            return retry
+        return _session_expired_quote_failure_response(
+            case=case,
+            task=task,
+            platform_account=platform_account,
+            quote_runtime_result=quote_runtime_result,
+            snapshot=snapshot,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            operator_role_name=operator_role_name,
+        )
+    if _is_runtime_quota_full_result(quote_runtime_result):
+        retry = await _retry_quote_with_next_platform_account(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            current_account=platform_account,
+            config_type_name=config_type_name
+            or (platform_account.account_type_name if platform_account else None),
+            attempted_account_ids=attempted_account_ids,
+            reason_text="平台提示查询额度已用完",
+            operator_role_name=operator_role_name,
+        )
+        if retry is not None:
+            return retry
+    if await _quote_auto_notice_already_persisted(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=case.session_id,
+        dedupe_key="",
+        message=error_detail,
+        trace_id=trace_id,
+    ):
+        return _quote_notice_already_visible_silent_response(
+            case=case,
+            task=task,
+            trace_id=trace_id,
+            message=error_detail,
+        )
+    return _quote_platform_dialog_response(
+        case=case,
+        task=task,
+        platform_account=platform_account,
+        runtime_result=quote_runtime_result,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        trace_id=trace_id,
+        error_detail=error_detail,
+        actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+        extra_payload=extra_payload,
+        operator_role_name=operator_role_name,
+    )
+
+
 async def _complete_waiting_task(
     db: AsyncSession,
     *,
@@ -14434,6 +15652,10 @@ async def _complete_waiting_task(
     task.error_detail = None
     task.response_payload = {"perf": perf}
     task.updated_at = _now()
+    # Leave waiting_sms only while Task is actually waiting for a code.
+    # After commit the challenge/quote window uses Task=running; Case must not
+    # stay waiting_sms or concurrent wait lookups / active-case logic diverge.
+    _align_case_status_with_running_quote_task(case)
     case.current_task_id = task.id
     case.updated_at = _now()
     await _add_event(
@@ -14448,7 +15670,8 @@ async def _complete_waiting_task(
     await db.commit()
 
     challenge_started = time.perf_counter()
-    challenge_result = await quote_platform_runtime.submit_challenge(platform_ctx, sms_code, db=db)
+    async with release_chat_session_lock_for_platform_io():
+        challenge_result = await quote_platform_runtime.submit_challenge(platform_ctx, sms_code, db=db)
     perf["challenge_ms"] = _elapsed_ms(challenge_started)
     if await _quote_task_was_cancelled(db, task=task):
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
@@ -14723,7 +15946,8 @@ async def _complete_waiting_task(
         platform_code=platform_code,
         platform_name=platform_name,
     )
-    quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
+    async with release_chat_session_lock_for_platform_io():
+        quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     quote_runtime_result = _quote_runtime_result_or_failure(quote_runtime_result)
     if await _quote_task_was_cancelled(db, task=task):
@@ -14732,210 +15956,37 @@ async def _complete_waiting_task(
     quote_status = _runtime_status(quote_runtime_result)
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
-        task.status = TASK_STATUS_FAILED
-        task.login_state = "authenticated"
-        task.error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
-        task.response_payload = {
-            "sms_code_length": len(sms_code),
-            "challenge": _runtime_result_payload(challenge_result),
-            "quote": _runtime_result_payload(quote_runtime_result),
-            "perf": {**perf, "total_ms": _elapsed_ms(perf_started)},
-        }
-        task.result_payload = {}
-        task.finished_at = _now()
-        task.updated_at = _now()
-        case.status = CASE_STATUS_READY
-        case.current_task_id = task.id
-        case.updated_at = _now()
-        if platform_account:
-            platform_account.last_error = task.error_detail
-            platform_account.last_check_at = _now()
-            platform_account.updated_at = _now()
-            if _is_runtime_quota_full_result(quote_runtime_result):
-                platform_account.quota_status = ACCOUNT_QUOTA_FULL
-        await _add_event(
+        await _finalize_quote_runtime_failure(
             db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="task",
-            role="system",
-            payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": task.error_detail},
-        )
-        await db.flush()
-        await _persist_runtime_auto_notices(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            runtime_result=quote_runtime_result,
-            trace_id=trace_id,
-            task_id=task.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-        )
-        await db.flush()
-        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
-            warning = _duplicate_quote_warning_from_runtime(quote_runtime_result)
-            task.request_payload = {**_json_obj(task.request_payload), "duplicate_quote_warning": warning}
-            retry_duplicate = await _auto_retry_duplicate_quote_once(
-                db,
-                case=case,
-                task=task,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                platform_account=platform_account,
-                platform_name=platform_name,
-                config_type_name=_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
-                or (platform_account.account_type_name if platform_account else None),
-                operator_role_name=operator_role_name,
-            )
-            if retry_duplicate is not None:
-                return retry_duplicate
-            if await _quote_auto_notice_already_persisted(
-                db,
-                owner_user_id=owner_user_id,
-                session_id=case.session_id,
-                dedupe_key="",
-                message=warning,
-                trace_id=trace_id,
-            ):
-                return _quote_notice_already_visible_silent_response(
-                    case=case,
-                    task=task,
-                    trace_id=trace_id,
-                    message=warning,
-                )
-            return _quote_platform_text_notice_response(
-                case=case,
-                task=task,
-                runtime_result=quote_runtime_result,
-                platform_code=platform_code,
-                platform_name=platform_name,
-                trace_id=trace_id,
-                message=warning,
-                result_status=RESULT_NOT_READY,
-                response_status="success",
-                notice_type="duplicate_quote_notice",
-            )
-        if _is_runtime_session_expired_result(quote_runtime_result):
-            retry = await _retry_quote_with_next_platform_account(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                current_account=platform_account,
-                config_type_name=_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
-                or (platform_account.account_type_name if platform_account else None),
-                attempted_account_ids={account_id} if account_id else None,
-                reason_text="登录已过期",
-                operator_role_name=operator_role_name,
-            )
-            if retry is not None:
-                return retry
-            runtime_payload = _runtime_result_payload(quote_runtime_result)
-            runtime_data = _json_obj(runtime_payload.get("data"))
-            request_body_draft = _json_obj(
-                runtime_data.get("request_body")
-                or runtime_data.get("request_body_draft")
-                or _json_obj(snapshot.get("request_body"))
-            )
-            account_label = ""
-            if platform_account:
-                account_label = f"（账号：{platform_account.account_username or platform_account.id}）"
-            preflight = _json_obj(request_body_draft.get("preflight"))
-            missing_default_config = [
-                _to_str(item).strip()
-                for item in (preflight.get("missingDefaultConfig") if isinstance(preflight.get("missingDefaultConfig"), list) else [])
-                if _to_str(item).strip()
-            ]
-            draft_account_type = (
-                _to_str(request_body_draft.get("accountTypeName")).strip()
-                or _to_str(_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")).strip()
-                or _to_str(platform_account.account_type_name if platform_account else "").strip()
-                or "当前账号类型"
-            )
-            reply_lines = [
-                f"{platform_name}{account_label}登录已过期，本次没有继续提交报价。",
-                f"已完成资料解析和{draft_account_type}请求体草稿组装，重新登录该平台账号后可直接重新发起报价。",
-            ]
-            if _quote_account_needs_admin_contact(operator_role_name):
-                reply_lines = [
-                    f"{platform_name}账号登录已过期，本次没有继续提交报价。",
-                    "请联系管理员重新登录平台账号后再发起报价。",
-                ]
-            if missing_default_config:
-                reply_lines.append(
-                    "重新报价前还需要在右上角“默认参数配置”补齐："
-                    + "、".join(missing_default_config[:8])
-                    + "。"
-                )
-            return _quote_platform_dialog_response(
-                case=case,
-                task=task,
-                platform_account=platform_account,
-                runtime_result=quote_runtime_result,
-                platform_code=platform_code,
-                platform_name=platform_name,
-                trace_id=trace_id,
-                error_detail="\n".join(reply_lines),
-                result_status=RESULT_NOT_READY,
-                response_status="success",
-                title=f"{platform_name}登录已过期",
-                subtype="session_expired",
-                severity="warning",
-                actions=[
-                    *_quote_platform_account_manage_actions(
-                        operator_role_name,
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                    ),
-                    *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
-                ],
-                extra_payload={"request_body": request_body_draft},
-                operator_role_name=operator_role_name,
-            )
-        if _is_runtime_quota_full_result(quote_runtime_result):
-            retry = await _retry_quote_with_next_platform_account(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                current_account=platform_account,
-                config_type_name=_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
-                or (platform_account.account_type_name if platform_account else None),
-                attempted_account_ids={account_id} if account_id else None,
-                reason_text="平台提示查询额度已用完",
-                operator_role_name=operator_role_name,
-            )
-            if retry is not None:
-                return retry
-        if await _quote_auto_notice_already_persisted(
-            db,
-            owner_user_id=owner_user_id,
-            session_id=case.session_id,
-            dedupe_key="",
-            message=task.error_detail,
-            trace_id=trace_id,
-        ):
-            return _quote_notice_already_visible_silent_response(
-                case=case,
-                task=task,
-                trace_id=trace_id,
-                message=task.error_detail,
-            )
-        return _quote_platform_dialog_response(
             case=case,
             task=task,
+            owner_user_id=owner_user_id,
             platform_account=platform_account,
-            runtime_result=quote_runtime_result,
+            quote_runtime_result=quote_runtime_result,
+            response_payload={
+                "sms_code_length": len(sms_code),
+                "challenge": _runtime_result_payload(challenge_result),
+                "quote": _runtime_result_payload(quote_runtime_result),
+                "perf": {**perf, "total_ms": _elapsed_ms(perf_started)},
+            },
+            trace_id=trace_id,
             platform_code=platform_code,
             platform_name=platform_name,
+        )
+        return await _respond_after_quote_runtime_failure(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            platform_account=platform_account,
+            quote_runtime_result=quote_runtime_result,
+            snapshot=snapshot,
             trace_id=trace_id,
-            error_detail=task.error_detail,
-            actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
+            platform_code=platform_code,
+            platform_name=platform_name,
+            config_type_name=_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")
+            or (platform_account.account_type_name if platform_account else None),
+            attempted_account_ids={account_id} if account_id else None,
             operator_role_name=operator_role_name,
         )
     result = _quote_result_from_runtime(
@@ -15273,7 +16324,8 @@ async def _complete_quote_without_sms(
         platform_code=platform_code,
         platform_name=platform_name,
     )
-    quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
+    async with release_chat_session_lock_for_platform_io():
+        quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
     quote_runtime_result = _quote_runtime_result_or_failure(quote_runtime_result)
     if await _quote_task_was_cancelled(db, task=task):
@@ -15301,229 +16353,56 @@ async def _complete_quote_without_sms(
     quote_status = _runtime_status(quote_runtime_result)
     if not _is_runtime_quote_success(quote_status):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
-        _apply_platform_account_runtime_status(platform_account, quote_runtime_result, default_error="平台报价失败")
-        error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
         perf["total_ms"] = _elapsed_ms(perf_started)
-        task.status = TASK_STATUS_FAILED
-        task.login_state = "authenticated"
-        task.error_detail = error_detail
-        task.response_payload = {
-            "login": login_mode,
-            "quote": _runtime_result_payload(quote_runtime_result),
-            "perf": perf,
-        }
-        task.result_payload = {}
-        task.finished_at = _now()
-        task.updated_at = _now()
-        await db.flush()
-
-        case.status = CASE_STATUS_READY
-        case.current_task_id = task.id
-        case.updated_at = _now()
-        platform_account.last_error = error_detail
-        platform_account.last_check_at = _now()
-        platform_account.updated_at = _now()
-        if _is_runtime_quota_full_result(quote_runtime_result):
-            platform_account.quota_status = ACCOUNT_QUOTA_FULL
-        await _add_event(
+        error_detail = await _finalize_quote_runtime_failure(
             db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="task",
-            role="system",
-            payload={"task_id": task.id, "status": TASK_STATUS_FAILED, "trace_id": trace_id, "reason": error_detail, "login_mode": login_mode},
-        )
-        await db.flush()
-        await _persist_runtime_auto_notices(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            runtime_result=quote_runtime_result,
-            trace_id=trace_id,
-            task_id=task.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-        )
-        await db.flush()
-        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
-            warning = _duplicate_quote_warning_from_runtime(quote_runtime_result)
-            task.request_payload = {**_json_obj(task.request_payload), "duplicate_quote_warning": warning}
-            retry_duplicate = await _auto_retry_duplicate_quote_once(
-                db,
-                case=case,
-                task=task,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                platform_account=platform_account,
-                platform_name=platform_name,
-                config_type_name=account_type_name or platform_account.account_type_name,
-                operator_role_name=operator_role_name,
-            )
-            if retry_duplicate is not None:
-                return retry_duplicate
-            if await _quote_auto_notice_already_persisted(
-                db,
-                owner_user_id=owner_user_id,
-                session_id=case.session_id,
-                dedupe_key="",
-                message=warning,
-                trace_id=trace_id,
-            ):
-                return _quote_notice_already_visible_silent_response(
-                    case=case,
-                    task=task,
-                    trace_id=trace_id,
-                    message=warning,
-                )
-            return _quote_platform_text_notice_response(
-                case=case,
-                task=task,
-                runtime_result=quote_runtime_result,
-                platform_code=platform_code,
-                platform_name=platform_name,
-                trace_id=trace_id,
-                message=warning,
-                result_status=RESULT_NOT_READY,
-                response_status="success",
-                notice_type="duplicate_quote_notice",
-            )
-        if _is_runtime_session_expired_result(quote_runtime_result):
-            retry = await _retry_quote_with_next_platform_account(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                current_account=platform_account,
-                config_type_name=account_type_name or platform_account.account_type_name,
-                attempted_account_ids=attempted,
-                reason_text="登录已过期",
-                operator_role_name=operator_role_name,
-            )
-            if retry is not None:
-                return retry
-
-            runtime_payload = _runtime_result_payload(quote_runtime_result)
-            runtime_data = _json_obj(runtime_payload.get("data"))
-            request_body_draft = _json_obj(
-                runtime_data.get("request_body")
-                or runtime_data.get("request_body_draft")
-                or _json_obj(snapshot.get("request_body"))
-            )
-            preflight = _json_obj(request_body_draft.get("preflight"))
-            missing_default_config = [
-                _to_str(item).strip()
-                for item in (preflight.get("missingDefaultConfig") if isinstance(preflight.get("missingDefaultConfig"), list) else [])
-                if _to_str(item).strip()
-            ]
-            draft_account_type = (
-                _to_str(request_body_draft.get("accountTypeName")).strip()
-                or _to_str(_json_obj(snapshot.get("platform_default_config")).get("resolved_type_name")).strip()
-                or _to_str(platform_account.account_type_name).strip()
-                or "当前账号类型"
-            )
-            reply_lines = [
-                f"{platform_name}（账号：{platform_account.account_username or platform_account.id}）登录已过期，本次没有继续提交报价。",
-                f"已完成资料解析和{draft_account_type}请求体草稿组装，重新登录该平台账号后可直接重新发起报价。",
-            ]
-            if _quote_account_needs_admin_contact(operator_role_name):
-                reply_lines = [
-                    f"{platform_name}账号登录已过期，本次没有继续提交报价。",
-                    "请联系管理员重新登录平台账号后再发起报价。",
-                ]
-            if missing_default_config:
-                reply_lines.append(
-                    "重新报价前还需要在右上角“默认参数配置”补齐："
-                    + "、".join(missing_default_config[:8])
-                    + "。"
-                )
-            return _quote_platform_dialog_response(
-                case=case,
-                task=task,
-                platform_account=platform_account,
-                runtime_result=quote_runtime_result,
-                platform_code=platform_code,
-                platform_name=platform_name,
-                trace_id=trace_id,
-                error_detail="\n".join(reply_lines),
-                result_status=RESULT_NOT_READY,
-                response_status="success",
-                title=f"{platform_name}登录已过期",
-                subtype="session_expired",
-                severity="warning",
-                actions=[
-                    *_quote_platform_account_manage_actions(
-                        operator_role_name,
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                    ),
-                    *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
-                ],
-                extra_payload={"request_body": request_body_draft},
-                operator_role_name=operator_role_name,
-            )
-        if _is_runtime_quota_full_result(quote_runtime_result):
-            retry = await _retry_quote_with_next_platform_account(
-                db,
-                case=case,
-                owner_user_id=owner_user_id,
-                snapshot=snapshot,
-                trace_id=trace_id,
-                current_account=platform_account,
-                config_type_name=account_type_name or platform_account.account_type_name,
-                attempted_account_ids=attempted,
-                reason_text="平台提示查询额度已用完",
-                operator_role_name=operator_role_name,
-            )
-            if retry is not None:
-                return retry
-
-        payload = {
-            "quote_case": {
-                "id": case.id,
-                "case_no": case.case_no,
-                "status": case.status,
-                "order_id": case.order_id,
-                "source_type": case.source_type,
-            },
-            "quote_task": {
-                "id": task.id,
-                "status": task.status,
-                "login_state": task.login_state,
-                "trace_id": trace_id,
-                "error_detail": error_detail,
-            },
-            "platform_account": _credential_public_payload(platform_account),
-        }
-        if await _quote_auto_notice_already_persisted(
-            db,
-            owner_user_id=owner_user_id,
-            session_id=case.session_id,
-            dedupe_key="",
-            message=error_detail,
-            trace_id=trace_id,
-        ):
-            return _quote_notice_already_visible_silent_response(
-                case=case,
-                task=task,
-                trace_id=trace_id,
-                message=error_detail,
-            )
-        return _quote_platform_dialog_response(
             case=case,
             task=task,
+            owner_user_id=owner_user_id,
             platform_account=platform_account,
-            runtime_result=quote_runtime_result,
+            quote_runtime_result=quote_runtime_result,
+            response_payload={
+                "login": login_mode,
+                "quote": _runtime_result_payload(quote_runtime_result),
+                "perf": perf,
+            },
+            trace_id=trace_id,
             platform_code=platform_code,
             platform_name=platform_name,
-            trace_id=trace_id,
-            error_detail=error_detail,
-            actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
-            extra_payload=payload,
-            operator_role_name=operator_role_name,
+            event_extra={"login_mode": login_mode},
         )
-
+        return await _respond_after_quote_runtime_failure(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            platform_account=platform_account,
+            quote_runtime_result=quote_runtime_result,
+            snapshot=snapshot,
+            trace_id=trace_id,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            config_type_name=account_type_name or platform_account.account_type_name,
+            attempted_account_ids=attempted,
+            operator_role_name=operator_role_name,
+            extra_payload={
+                "quote_case": {
+                    "id": case.id,
+                    "case_no": case.case_no,
+                    "status": case.status,
+                    "order_id": case.order_id,
+                    "source_type": case.source_type,
+                },
+                "quote_task": {
+                    "id": task.id,
+                    "status": task.status,
+                    "login_state": task.login_state,
+                    "trace_id": trace_id,
+                    "error_detail": error_detail,
+                },
+                "platform_account": _credential_public_payload(platform_account),
+            },
+        )
     result = _quote_result_from_runtime(
         quote_runtime_result,
         platform_code=platform_code,
@@ -15715,6 +16594,12 @@ async def handle_quote_images_message(
     _ensure_quote_flow_access(ctx)
 
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    await _expire_stale_waiting_sms_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     await _expire_stale_running_quote_tasks_for_owner_session(
         db,
         owner_user_id=owner_user_id,
@@ -16107,6 +16992,18 @@ async def handle_quote_text_material_message(
         return None
     extracted = extract_quote_fields(text)
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    await _expire_stale_waiting_sms_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    await _expire_stale_running_quote_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     form_values = _quote_material_form_values_from_context(ctx or {})
     form_session_id = _to_str((ctx or {}).get("quote_material_form_session_id")).strip()
     form_case_id = _safe_int((ctx or {}).get("quote_material_form_case_id"), 0)
@@ -16465,7 +17362,19 @@ async def handle_quote_message(
     operator_role_name = _ctx_role_name(ctx)
 
     session_id = _to_str((ctx or {}).get("session_id")).strip() or None
+    await _expire_stale_waiting_sms_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     await _expire_stale_running_quote_tasks_for_owner_session(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
+    await _cancel_orphaned_waiting_duplicate_confirm_tasks(
         db,
         owner_user_id=owner_user_id,
         session_id=session_id,
@@ -16612,23 +17521,24 @@ async def handle_quote_message(
                 case=case,
                 task=task,
                 owner_user_id=owner_user_id,
-                reason="短信验证码已过期",
+                reason=QUOTE_SMS_EXPIRED_MESSAGE,
             )
             await db.flush()
-            return (
-                f"{case.platform_name or case.platform_code or '平台'}验证码已过期，我没有继续提交旧验证码。\n请重新发送“{case.platform_name or case.platform_code or '平台'}报价”触发新的短信验证码。",
-                {
-                    "status": "success",
-                    "intent": "quote",
-                    "trace_id": task.trace_id or _new_trace_id(),
-                    "data": _mk_data(
-                        result_status=RESULT_NOT_READY,
-                        message="短信验证码已过期，请重新触发报价",
-                        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-                        payload={"quote_case": {"id": case.id, "case_no": case.case_no, "status": case.status}},
-                    ),
-                    "actions": [_mk_action(f"{case.platform_name or '太平洋'}报价")],
-                },
+            platform_label = case.platform_name or case.platform_code or "平台"
+            return _build_quote_user_failure_response(
+                reply=(
+                    f"{platform_label}验证码已过期，我没有继续提交旧验证码。\n"
+                    f"请重新发送“{platform_label}报价”触发新的短信验证码。"
+                ),
+                case=case,
+                task=task,
+                trace_id=task.trace_id or _new_trace_id(),
+                failure_code=FAILURE_CODE_SMS_EXPIRED,
+                failure_reason=QUOTE_SMS_EXPIRED_MESSAGE,
+                result_status=RESULT_NOT_READY,
+                response_status="success",
+                actions=[_mk_action(f"{platform_label}报价")],
+                payload={"quote_case": {"id": case.id, "case_no": case.case_no, "status": case.status}},
             )
         invalid_pair = await _find_recent_invalid_sms_task(
             db,
@@ -16747,15 +17657,17 @@ async def handle_quote_message(
         session_id=session_id,
         for_update=True,
     )
-    duplicate_auto_confirm_result: Optional[Tuple[str, Dict[str, Any]]] = None
+    # Joint-sales image adjustment only rewrites a prior success result image.
+    # Do not start a full duplicate-confirm requote and then discard that reply
+    # (same cancel-then-adjust pattern as image/text material intake).
     if joint_sales_image_adjustment and duplicate_confirm_pair:
-        case, task = duplicate_confirm_pair
-        duplicate_auto_confirm_result = await _complete_waiting_duplicate_quote_task(
+        waiting_case, waiting_task = duplicate_confirm_pair
+        await _cancel_waiting_duplicate_quote_task(
             db,
-            case=case,
-            task=task,
+            case=waiting_case,
+            task=waiting_task,
             owner_user_id=owner_user_id,
-            operator_role_name=_ctx_role_name(ctx),
+            reason="已调整非车金额，自动中止上一笔重复投保确认",
         )
         duplicate_confirm_pair = None
     if joint_sales_image_adjustment:
@@ -16776,8 +17688,6 @@ async def handle_quote_message(
                 adjustment=joint_sales_image_adjustment,
                 source_pair=source_pair,
             )
-        if duplicate_auto_confirm_result is not None:
-            return duplicate_auto_confirm_result
     if duplicate_confirm_pair:
         _, duplicate_task = duplicate_confirm_pair
         duplicate_product_state_changed = _quote_product_state_changes_current(
@@ -16911,6 +17821,28 @@ async def handle_quote_message(
             task=task,
             owner_user_id=owner_user_id,
             operator_role_name=_ctx_role_name(ctx),
+        )
+    # Waiting for an explicit yes/no: do not guess unclear short polarity attempts.
+    if (
+        duplicate_confirm_pair
+        and not quote_state_changed
+        and not sms_code
+        and _looks_like_unclear_chat_polarity_attempt(text)
+    ):
+        case, task = duplicate_confirm_pair
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="chat",
+            role="user",
+            content=text,
+            payload={"duplicate_quote_confirm_unclear": True},
+        )
+        return _duplicate_quote_unclear_command_response(
+            case=case,
+            task=task,
+            trace_id=task.trace_id or _new_trace_id(),
         )
 
     platform_code = _to_str(merged_entities.get("platform_code")).strip().upper()
@@ -17244,11 +18176,21 @@ async def handle_quote_message(
         quote_flow_type=quote_flow_type,
     )
     case.missing_requirements = missing
-    missing_account = platform_account is None
-    account_pool_unavailable = bool(missing_account and platform_has_enabled_account)
-
-    if missing:
-        case.status = CASE_STATUS_COLLECTING
+    preflight_items = await _collect_quote_command_preflight_items(
+        db,
+        missing=missing,
+        platform_account=platform_account,
+        platform_has_enabled_account=platform_has_enabled_account,
+        platform_code=platform_code,
+        platform_name=platform_name,
+        selected_account_type_name=selected_account_type_name or account_type_name,
+        operator_role_name=operator_role_name,
+    )
+    if preflight_items:
+        has_material_blocker = any(
+            _to_str(item.get("failure_code")).strip() == FAILURE_CODE_MATERIAL_MISSING for item in preflight_items
+        )
+        case.status = CASE_STATUS_COLLECTING if has_material_blocker else CASE_STATUS_READY
         case.updated_at = _now()
         await _add_event(
             db,
@@ -17256,53 +18198,20 @@ async def handle_quote_message(
             owner_user_id=owner_user_id,
             event_type="status",
             role="assistant",
-            payload={"status": "collecting", "missing": missing},
+            payload={
+                "status": case.status,
+                "missing": missing,
+                "preflight_checklist": preflight_items,
+                "need_platform_account": platform_account is None,
+                "need_platform_default_config": any(
+                    _to_str(item.get("failure_code")).strip() == FAILURE_CODE_DEFAULT_CONFIG_MISSING
+                    for item in preflight_items
+                ),
+                "platform_code": platform_code,
+                "account_type_name": selected_account_type_name or account_type_name,
+            },
         )
         await db.flush()
-
-        missing_fields = [_missing_item_text(item) for item in missing if item.get("type") == "field"]
-        missing_images = [_missing_item_text(item) for item in missing if item.get("type") == "image"]
-        missing_conflicts = [_missing_item_text(item) for item in missing if item.get("type") == "data_conflict"]
-        lines = [
-            f"{platform_name}报价资料还不完整，已中断本次报价。",
-        ]
-        if override_summary:
-            lines.append(f"已记录本次调整：{override_summary}")
-        if missing_account and account_pool_unavailable:
-            lines.append(
-                _quote_account_action_text(
-                    operator_role_name,
-                    f"另外，{platform_name}同平台账号暂不可用，请确认账号已登录、未等待验证码且额度未用完。",
-                    f"另外，{platform_name}平台账号暂不可用，请联系管理员处理。",
-                )
-            )
-        if missing_account and not account_pool_unavailable:
-            type_hint = f"（类型：{selected_account_type_name or account_type_name}）" if (selected_account_type_name or account_type_name) else ""
-            lines.append(
-                _quote_account_action_text(
-                    operator_role_name,
-                    f"另外，{platform_name}{type_hint}还没有可用账号，请先在右上角“平台账号管理”新增或启用账号。",
-                    f"另外，{platform_name}{type_hint}还没有可用账号，请联系管理员新增、启用或登录账号。",
-                )
-            )
-        if missing_fields:
-            lines.append("缺少字段：" + "、".join(missing_fields))
-        if missing_images:
-            lines.append("缺少图片：" + "、".join(missing_images))
-        if missing_conflicts:
-            lines.append("资料冲突：" + "、".join(missing_conflicts))
-        if attached_images:
-            moved = [
-                f"{slot_label(x.get('provided_slot_key') or '')}->{slot_label(x.get('confirmed_slot_key') or '')}"
-                for x in attached_images
-                if x.get("provided_slot_key") != x.get("confirmed_slot_key")
-            ]
-            if moved:
-                lines.append("已自动识别并归位图片：" + "、".join(moved[:5]))
-            review_count = sum(1 for x in attached_images if x.get("needs_manual_review"))
-            if review_count:
-                lines.append(f"{review_count} 张图片特征不够明确，已先放入相关图片，不会覆盖关键材料；如需修正，请补一句图片说明后重新拖入。")
-
         payload = _case_payload(
             case=case,
             normalized_data=normalized_data,
@@ -17311,96 +18220,21 @@ async def handle_quote_message(
             attached_images=attached_images,
             platform_account=platform_account,
         )
-        return "\n".join(lines), {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": _new_trace_id(),
-            "data": _mk_data(
-                result_status=RESULT_NEED_MORE,
-                message="报价资料不足，已中断本次报价",
-                entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                payload=payload,
-            ),
-            "actions": [
-                *(
-                    _quote_platform_account_manage_actions(
-                        operator_role_name,
-                        platform_code=platform_code,
-                        platform_name=platform_name,
-                    )
-                    if missing_account
-                    else []
-                ),
-                _mk_action("查看当前材料状态"),
-                *([] if (missing_account and _quote_account_needs_admin_contact(operator_role_name)) else [_mk_action(f"{platform_name}报价")]),
-            ],
-        }
+        return _build_quote_preflight_blocked_response(
+            case=case,
+            platform_code=platform_code,
+            platform_name=platform_name,
+            selected_account_type_name=selected_account_type_name or account_type_name,
+            items=preflight_items,
+            merged_entities=merged_entities,
+            payload=payload,
+            override_summary=override_summary,
+            attached_images=attached_images,
+            operator_role_name=operator_role_name,
+        )
 
     case.status = CASE_STATUS_READY
     case.updated_at = _now()
-    if missing_account:
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="status",
-            role="assistant",
-            payload={
-                "status": "ready",
-                "need_platform_account": True,
-                "platform_code": platform_code,
-                "account_type_name": account_type_name,
-            },
-        )
-        await db.flush()
-        payload = _case_payload(
-            case=case,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            missing=[],
-            attached_images=attached_images,
-            platform_account=platform_account,
-        )
-        type_hint = f"（类型：{selected_account_type_name or account_type_name}）" if (selected_account_type_name or account_type_name) else ""
-        if account_pool_unavailable:
-            lines = [
-                f"{platform_name}{type_hint}报价资料已齐，但同平台账号暂不可用。",
-                _quote_account_action_text(
-                    operator_role_name,
-                    "请在右上角“平台账号管理”确认账号已登录、未等待验证码且额度未用完。",
-                    "请联系管理员确认账号已登录、未等待验证码且额度未用完。",
-                ),
-            ]
-        else:
-            lines = [
-                f"{platform_name}{type_hint}报价资料已齐，但当前没有可用平台账号。",
-                _quote_account_action_text(
-                    operator_role_name,
-                    "请先点击右上角“平台账号管理”，新增/启用账号，或确认账号额度没有满。",
-                    "请联系管理员新增、启用或登录平台账号，并确认账号额度没有满。",
-                ),
-            ]
-        if override_summary:
-            lines.insert(0, f"已记录本次调整：{override_summary}")
-        return "\n".join(lines), {
-            "status": "success",
-            "intent": "quote",
-            "trace_id": _new_trace_id(),
-            "data": _mk_data(
-                result_status=RESULT_NEED_MORE,
-                message="同平台账号暂不可用" if account_pool_unavailable else "报价资料已齐，等待配置可用平台账号",
-                entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                payload=payload,
-            ),
-            "actions": [
-                *_quote_platform_account_manage_actions(
-                    operator_role_name,
-                    platform_code=platform_code,
-                    platform_name=platform_name,
-                ),
-                *([] if _quote_account_needs_admin_contact(operator_role_name) else [_mk_action(f"{platform_name}报价")]),
-            ],
-        }
 
     snapshot = _snapshot_payload(case=case, normalized_data=normalized_data, images_by_slot=images_by_slot)
     trace_id = _new_trace_id()
@@ -17477,6 +18311,7 @@ async def handle_quote_message(
             trace_id=trace_id,
             platform_account=platform_account,
             operator_role_name=operator_role_name,
+            auto_probe=True,
         )
         if not _is_silent_auto_renewal_not_found_response(auto_renewal_response):
             return auto_renewal_reply, auto_renewal_response
@@ -17492,72 +18327,7 @@ async def handle_quote_message(
         account_type_name=platform_account.account_type_name,
         config_type_name=selected_account_type_name,
     )
-    platform_default_config = _json_obj(snapshot.get("platform_default_config"))
-    if selected_account_type_name and _to_str(platform_default_config.get("matched")).strip() != "account_type":
-        case.status = CASE_STATUS_READY
-        case.updated_at = _now()
-        await _add_event(
-            db,
-            case=case,
-            owner_user_id=owner_user_id,
-            event_type="status",
-            role="assistant",
-            payload={
-                "status": "ready",
-                "need_platform_default_config": True,
-                "platform_code": platform_code,
-                "account_type_name": selected_account_type_name,
-            },
-        )
-        await db.flush()
-        payload = _case_payload(
-            case=case,
-            normalized_data=normalized_data,
-            images_by_slot=images_by_slot,
-            missing=[],
-            attached_images=attached_images,
-            platform_account=platform_account,
-        )
-        payload["platform_default_config"] = platform_default_config
-        payload["default_config_json"] = _json_obj(snapshot.get("default_config_json"))
-        type_hint = f"（类型：{selected_account_type_name}）"
-        config_action_text = _quote_account_action_text(
-            operator_role_name,
-            "请先在右上角“默认参数配置”中新增并启用该账号类型配置，再重新发起报价。",
-            "请联系管理员在“默认参数配置”中新增并启用该账号类型配置后，再重新发起报价。",
-        )
-        return (
-            f"{override_reply_prefix}{platform_name}{type_hint}还没有启用的默认参数配置，暂不提交报价。\n"
-            f"{config_action_text}",
-            {
-                "status": "success",
-                "intent": "quote",
-                "trace_id": trace_id,
-                "data": _mk_data(
-                    result_status=RESULT_NOT_READY,
-                    message="等待配置对应账号类型的默认参数",
-                    entities={**merged_entities, "quote_case_id": case.id, "order_id": case.order_id},
-                    payload=payload,
-                ),
-                "actions": [
-                    *(
-                        []
-                        if _quote_account_needs_admin_contact(operator_role_name)
-                        else [
-                            _mk_action(
-                                "默认参数配置",
-                                "open_default_config_manager",
-                                "quote_platform_default_configs",
-                                platform_code=platform_code,
-                                platform_name=platform_name,
-                                account_type_name=selected_account_type_name,
-                            ),
-                        ]
-                    ),
-                    _mk_action(f"{platform_name}报价"),
-                ],
-            },
-        )
+    # Default-config blockers are already handled by preflight above; keep continue path as safety net.
     return await _continue_quote_with_platform_account(
         db,
         case=case,
@@ -17649,6 +18419,12 @@ async def handle_quote_material_status(
         session_id=session_id,
         for_update=True,
     )
+    await _cancel_orphaned_waiting_duplicate_confirm_tasks(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        for_update=True,
+    )
     case = await _latest_active_case(db, owner_user_id=owner_user_id, session_id=session_id)
     if not case:
         return None
@@ -17706,7 +18482,11 @@ async def handle_quote_material_status(
         case.normalized_data = normalized_data
         case.draft_order_data = normalized_data
         case.missing_requirements = missing
-        if case.status not in {CASE_STATUS_QUOTED, CASE_STATUS_WAITING_SMS}:
+        if case.status not in {
+            CASE_STATUS_QUOTED,
+            CASE_STATUS_WAITING_SMS,
+            CASE_STATUS_WAITING_DUPLICATE_CONFIRM,
+        }:
             case.status = CASE_STATUS_READY if not missing else CASE_STATUS_COLLECTING
         case.updated_at = _now()
         await db.flush()

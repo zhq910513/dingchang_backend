@@ -17,16 +17,69 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
+
 from app.services.quote_assistant_service import (
+    CASE_STATUS_READY,
+    CASE_STATUS_WAITING_SMS,
+    FAILURE_CODE_ACCOUNT_LOGIN,
+    FAILURE_CODE_ACCOUNT_MISSING,
+    FAILURE_CODE_DEFAULT_CONFIG_CHANGED,
+    FAILURE_CODE_DEFAULT_CONFIG_MISSING,
+    FAILURE_CODE_MATERIAL_CHANGED,
+    FAILURE_CODE_MATERIAL_MISSING,
+    FAILURE_CODE_PLATFORM,
+    FAILURE_CODE_RESULT_MATERIALIZATION,
+    FAILURE_CODE_SESSION_EXPIRED,
+    FAILURE_CODE_STALE_TIMEOUT,
+    QUOTE_CHAT_POLARITY_AFFIRM,
+    QUOTE_CHAT_POLARITY_NEGATE,
+    QUOTE_DUPLICATE_CONFIRM_HINT,
+    QUOTE_FLOW_NORMAL,
+    QUOTE_FLOW_RENEWAL,
+    QUOTE_RUNNING_TASK_STALE_SECONDS,
+    QUOTE_SMS_CODE_TTL_SECONDS,
+    RESULT_FAILED,
+    RESULT_NEED_MORE,
+    RESULT_NOT_READY,
+    TASK_STATUS_CANCELLED,
+    TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+    TASK_STATUS_WAITING_SMS,
+    _align_case_status_with_running_quote_task,
+    _attach_quote_failure,
+    _auto_renewal_probe_fallthrough_response,
+    _build_quote_preflight_blocked_response,
+    _build_quote_user_failure_response,
+    _cancel_orphaned_waiting_duplicate_confirm_tasks,
+    _extract_quote_product_exclusions,
+    _failure_code_for_platform_dialog_subtype,
+    _format_quote_preflight_reply,
+    _is_duplicate_quote_cancel_text,
+    _is_duplicate_quote_confirmation_text,
     _is_runtime_duplicate_quote_result,
+    _is_silent_auto_renewal_not_found_response,
+    _is_sms_task_expired,
+    _looks_like_unclear_chat_polarity_attempt,
+    _mark_quote_task_cancelled,
+    _material_preflight_items,
+    _mk_data,
+    _primary_preflight_failure_code,
+    _quote_chat_polarity_exact,
+    _quote_failure_fields,
+    _quote_task_is_sms_wait,
     _runtime_detail,
     _active_image_extracted_data,
     _quote_car_name_from_features,
     _quote_end_date_text,
     _quote_image_extracted_fields_from_features,
+    _quote_sales_model_hint_from_model_text,
+    _merge_quote_extracted_prefer,
+    _backfill_quote_sales_model_fields,
     _quote_auto_notice_message_id,
     _quote_snapshot_with_auto_adjusted_dates,
     _quote_result_insurance_date_auto_adjustments,
+    _quote_result_reply_text,
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
     _has_reusable_renewal_quote_context,
@@ -34,9 +87,11 @@ from app.services.quote_assistant_service import (
     _normalize_quote_case_data,
     _platform_default_values_with_legacy_fixes,
     _picc_result_coverage_items_for_display,
+    _quote_task_is_stale,
+    _quote_task_stale_base_time,
+    _should_auto_probe_renewal_before_normal_quote,
     quote_message_may_interrupt_running_task,
     _normalize_quote_product_exclusions,
-    _extract_quote_product_exclusions,
     extract_quote_config_overrides,
 )
 from app.services.quote_platforms.platforms.picc.presentation import (
@@ -68,8 +123,11 @@ from app.services.quote_platforms.platforms.picc.business import (
     _picc_encrypt_renewal_policy_no,
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
+    _vehicle_brand_prefix,
     _vehicle_candidate_score,
     _vehicle_model_hint_is_usable,
+    _vehicle_model_resolution_failure_message,
+    _vehicle_query_resource_codes,
     _vehicle_rows_correlated_to_vin,
     _used_fuel_model_query_terms,
 )
@@ -211,6 +269,202 @@ class RunningQuoteInterruptionTests(unittest.TestCase):
                 {"page_context": {"quote_material_form_submit": True}},
             )
         )
+
+
+class AutoRenewalProbeFallthroughTests(unittest.TestCase):
+    def test_auto_probe_only_for_picc_used_car_normal_flow(self) -> None:
+        data = {"plate_no": "赣A12345", "engine_no": "ENG001"}
+        self.assertTrue(
+            _should_auto_probe_renewal_before_normal_quote(
+                platform_code="PICC",
+                quote_flow_type=QUOTE_FLOW_NORMAL,
+                account_type_name="油车-旧",
+                normalized_data=data,
+            )
+        )
+        self.assertFalse(
+            _should_auto_probe_renewal_before_normal_quote(
+                platform_code="PICC",
+                quote_flow_type=QUOTE_FLOW_RENEWAL,
+                account_type_name="油车-旧",
+                normalized_data=data,
+            )
+        )
+        self.assertFalse(
+            _should_auto_probe_renewal_before_normal_quote(
+                platform_code="PICC",
+                quote_flow_type=QUOTE_FLOW_NORMAL,
+                account_type_name="油车-新",
+                normalized_data=data,
+            )
+        )
+
+    def test_fallthrough_marker_and_not_found_do_not_steal_normal_quote(self) -> None:
+        case = SimpleNamespace(id=11, order_id=None)
+        _, fallthrough = _auto_renewal_probe_fallthrough_response(
+            case=case,
+            trace_id="trace-fallthrough",
+            reason="auto_renewal_probe_runtime_failed",
+        )
+        self.assertTrue(_is_silent_auto_renewal_not_found_response(fallthrough))
+
+        # Without the explicit marker, responses must not trigger fallthrough.
+        not_found_without_marker = {
+            "status": "success",
+            "data": {
+                "result_status": RESULT_NOT_READY,
+                "message": "没有此车辆信息或不是可续保车辆",
+                "payload": {"renewal_lookup": {"found": False}},
+            },
+        }
+        self.assertFalse(_is_silent_auto_renewal_not_found_response(not_found_without_marker))
+
+        probe_failed_without_marker = {
+            "status": "failed",
+            "data": {
+                "result_status": RESULT_FAILED,
+                "message": "人保续保查询失败：网络异常",
+                "payload": {"renewal_lookup": {"status": "failed"}, "operation": "renewal_lookup"},
+            },
+        }
+        self.assertFalse(_is_silent_auto_renewal_not_found_response(probe_failed_without_marker))
+
+        real_quote_success = {
+            "status": "success",
+            "data": {
+                "result_status": "success",
+                "message": "报价成功",
+                "payload": {"quote_task": {"status": "success"}},
+            },
+        }
+        self.assertFalse(_is_silent_auto_renewal_not_found_response(real_quote_success))
+
+
+class StaleRunningTaskClockTests(unittest.TestCase):
+    def test_stale_clock_ignores_updated_at_bumps(self) -> None:
+        started = datetime(2026, 8, 20, 12, 0, 0)
+        updated = started + timedelta(seconds=QUOTE_RUNNING_TASK_STALE_SECONDS + 60)
+        task = SimpleNamespace(started_at=started, updated_at=updated, created_at=started)
+        self.assertEqual(_quote_task_stale_base_time(task), started)
+        self.assertTrue(
+            _quote_task_is_stale(
+                task,
+                now=started + timedelta(seconds=QUOTE_RUNNING_TASK_STALE_SECONDS + 1),
+            )
+        )
+
+
+class QuoteCaseTaskAlignmentTests(unittest.IsolatedAsyncioTestCase):
+    def test_sms_submit_leaves_waiting_sms_when_task_runs(self) -> None:
+        case = SimpleNamespace(status=CASE_STATUS_WAITING_SMS)
+        _align_case_status_with_running_quote_task(case)
+        self.assertEqual(case.status, CASE_STATUS_READY)
+
+    async def test_mark_cancelled_distinguishes_sms_wait_from_duplicate_wait(self) -> None:
+        now = datetime(2026, 8, 20, 12, 0, 0)
+        sms_task = SimpleNamespace(
+            status=TASK_STATUS_WAITING_SMS,
+            login_state="sms_required",
+            error_detail=None,
+            response_payload={},
+            finished_at=None,
+            updated_at=None,
+        )
+        dup_task = SimpleNamespace(
+            status=TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+            login_state="authenticated",
+            error_detail=None,
+            response_payload={"keep": 1},
+            finished_at=None,
+            updated_at=None,
+        )
+        self.assertTrue(_quote_task_is_sms_wait(sms_task))
+        self.assertFalse(_quote_task_is_sms_wait(dup_task))
+
+        self.assertTrue(
+            await _mark_quote_task_cancelled(
+                AsyncMock(),
+                task=sms_task,
+                reason="材料已更新，请重新发起报价",
+                now=now,
+            )
+        )
+        self.assertEqual(sms_task.status, TASK_STATUS_CANCELLED)
+        self.assertEqual(sms_task.login_state, "failed")
+
+        self.assertFalse(
+            await _mark_quote_task_cancelled(
+                AsyncMock(),
+                task=dup_task,
+                reason="遗留重复投保确认已失效",
+                now=now,
+                response_extra={"orphaned_duplicate_confirm_cancelled": True},
+            )
+        )
+        self.assertEqual(dup_task.status, TASK_STATUS_CANCELLED)
+        self.assertEqual(dup_task.login_state, "authenticated")
+        self.assertTrue(dup_task.response_payload.get("orphaned_duplicate_confirm_cancelled"))
+
+    def test_sms_task_expiry_uses_started_at(self) -> None:
+        started = datetime(2026, 8, 20, 12, 0, 0)
+        fresh = SimpleNamespace(started_at=started, created_at=started)
+        expired = SimpleNamespace(
+            started_at=started - timedelta(seconds=QUOTE_SMS_CODE_TTL_SECONDS + 5),
+            created_at=started,
+        )
+        with patch("app.services.quote_assistant_service._now", return_value=started):
+            self.assertFalse(_is_sms_task_expired(fresh))
+            self.assertTrue(_is_sms_task_expired(expired))
+
+
+class OrphanDuplicateConfirmCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancels_task_when_case_no_longer_waiting_duplicate(self) -> None:
+        case = SimpleNamespace(
+            id=9,
+            status=CASE_STATUS_READY,
+            current_task_id=77,
+            session_id="s1",
+            updated_at=None,
+        )
+        task = SimpleNamespace(
+            id=77,
+            status=TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
+            login_state="authenticated",
+            error_detail=None,
+            response_payload={},
+            finished_at=None,
+            updated_at=None,
+        )
+        result = MagicMock()
+        result.all.return_value = [(case, task)]
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=result)
+        db.flush = AsyncMock()
+
+        with patch("app.services.quote_assistant_service._add_event", new_callable=AsyncMock) as add_event:
+            cancelled = await _cancel_orphaned_waiting_duplicate_confirm_tasks(
+                db,
+                owner_user_id=1,
+                session_id="s1",
+                for_update=True,
+            )
+
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(task.status, TASK_STATUS_CANCELLED)
+        self.assertIsNone(case.current_task_id)
+        self.assertTrue(task.response_payload.get("orphaned_duplicate_confirm_cancelled"))
+        add_event.assert_awaited()
+        db.flush.assert_awaited()
+
+    async def test_skips_when_owner_invalid(self) -> None:
+        db = AsyncMock()
+        cancelled = await _cancel_orphaned_waiting_duplicate_confirm_tasks(
+            db,
+            owner_user_id=0,
+            session_id="s1",
+        )
+        self.assertEqual(cancelled, 0)
+        db.execute.assert_not_called()
 
 
 class _QuoteResponseClient:
@@ -396,6 +650,9 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(len(rows["result"]), 1)
         self.assertEqual(client.names[0].upper(), "CT200H*")
         self.assertEqual(vehicle["modelQueryMatched"].upper(), "CT200H")
+        self.assertEqual(vehicle["modelQueryMatchKind"], "sales_model")
+        self.assertEqual(vehicle["modelQueryMatchLabel"], "销售车型直查")
+        self.assertEqual(vehicle.get("vehicleQueryResourcesUsed"), "0524")
 
     def test_vin_prefix_only_query_returns_picc_fail_without_rows_and_continues(self) -> None:
         class _OnlyVinPrefixClient:
@@ -488,6 +745,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(len(rows["result"]), 1)
         self.assertIn("雷克萨斯*", client.names)
         self.assertIn("VIN前缀关联", vehicle["modelQueryMatched"])
+        self.assertEqual(vehicle["modelQueryMatchKind"], "vin_correlated")
+        self.assertEqual(vehicle["modelQueryMatchLabel"], "VIN前缀关联")
 
     def test_broad_brand_rows_without_vin_correlation_are_rejected(self) -> None:
         class _UnsafeBroadClient:
@@ -517,6 +776,172 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
         self.assertEqual(rows["result"], [])
+
+    def test_brand_query_without_vin_does_not_silently_drop_or_auto_pick(self) -> None:
+        class _BrandOnlyClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                self.names.append(str(kwargs["params"]["jyVehicleRequest.vehicleName"]))
+                return {
+                    "status": 0,
+                    "result": [
+                        {
+                            "vehicleName": "雷克萨斯LEXUS CT200h轿车",
+                            "vehicleFgwCode": "JTHKR5BH",
+                            "purchasePrice": "280000",
+                        },
+                        {
+                            "vehicleName": "雷克萨斯最便宜误选车型",
+                            "vehicleFgwCode": "OTHER",
+                            "purchasePrice": "100000",
+                        },
+                    ],
+                }
+
+        client = _BrandOnlyClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯",
+            "modelName": "雷克萨斯",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "",
+            "vin": "",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(rows["result"], [])
+        self.assertEqual(vehicle.get("modelQueryBlockReason"), "broad_brand_without_vin")
+        msg = _vehicle_model_resolution_failure_message(vehicle, ["雷克萨斯", "雷克萨斯轿车"])
+        self.assertIn("缺少车架号关联或销售车型", msg)
+
+    def test_brand_only_model_without_hint_is_not_auto_accepted(self) -> None:
+        class _CheapestLexusClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                return {
+                    "status": 0,
+                    "result": [
+                        {
+                            "vehicleName": "雷克萨斯最便宜误选车型",
+                            "purchasePrice": "100000",
+                        }
+                    ],
+                }
+
+        vehicle = {
+            "rawModelName": "雷克萨斯",
+            "modelName": "雷克萨斯",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "",
+            "vehicleNameHint": "",
+            "vin": "",
+        }
+        rows = _adapter()._query_vehicle_candidates(_CheapestLexusClient(), vehicle)
+        self.assertEqual(rows["result"], [])
+        self.assertEqual(vehicle.get("modelQueryBlockReason"), "brand_only_without_vin_or_sales_model")
+
+    def test_polluted_brand_suffix_is_stripped_from_query_terms(self) -> None:
+        self.assertEqual(_vehicle_brand_prefix("雷克萨斯轿车"), "雷克萨斯")
+        terms = _used_fuel_model_query_terms(
+            "雷克萨斯",
+            "小型轿车",
+            brand_name="雷克萨斯轿车",
+            vehicle_name="雷克萨斯",
+            vin="",
+        )
+        self.assertNotIn("雷克萨斯轿车雷克萨斯", terms)
+        self.assertIn("雷克萨斯", terms)
+        self.assertFalse(_vehicle_model_hint_is_usable({"vin": ""}, "纯电动轿车"))
+        self.assertFalse(_vehicle_model_hint_is_usable({"vin": ""}, "增程式混合动力"))
+
+    def test_quote_success_reply_includes_selected_vehicle_model(self) -> None:
+        reply = _quote_result_reply_text(
+            {
+                "platform_code": "PICC",
+                "risk_score": "42",
+                "result_card": {
+                    "proposal_info": {
+                        "vehicle_model": "雷克萨斯LEXUS CT200h轿车",
+                        "model_match_method": "销售车型直查",
+                    },
+                },
+            },
+            platform_name="人保",
+        )
+        self.assertIn("风险水平：42 分", reply)
+        self.assertIn("选定车型：雷克萨斯LEXUS CT200h轿车", reply)
+        self.assertIn("匹配方式：销售车型直查", reply)
+
+    def test_vehicle_query_resource_codes_prefer_defaults_then_profile(self) -> None:
+        self.assertEqual(
+            _vehicle_query_resource_codes(profile={"vehicle_query_resources": "0524"}),
+            ["0524"],
+        )
+        self.assertEqual(
+            _vehicle_query_resource_codes(
+                profile={"vehicle_query_resources": "0524"},
+                defaults={"车型查询资源码": "0999,0524"},
+            ),
+            ["0999", "0524"],
+        )
+        self.assertEqual(
+            _vehicle_query_resource_codes(
+                profile={"vehicle_query_resources": "0524"},
+                defaults={"车型查询资源码": "0999"},
+                vehicle={"vehicleQueryResources": ["1111", "0524"]},
+            ),
+            ["1111", "0524"],
+        )
+
+    def test_vehicle_query_falls_back_across_configured_resource_codes(self) -> None:
+        class _ResourceFallbackClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.calls: list[tuple[str, str]] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                params = kwargs["params"]
+                resource = str(params["jyVehicleRequest.resources"])
+                name = str(params["jyVehicleRequest.vehicleName"])
+                self.calls.append((resource, name))
+                if resource == "0524":
+                    return {"status": 0, "result": []}
+                if resource == "0999" and "CT200H" in name.upper():
+                    return {
+                        "status": 0,
+                        "result": [
+                            {
+                                "vehicleName": "雷克萨斯LEXUS CT200h轿车",
+                                "purchasePrice": "280000",
+                            }
+                        ],
+                    }
+                return {"status": 0, "result": []}
+
+        client = _ResourceFallbackClient()
+        vehicle = {
+            "rawModelName": "雷克萨斯",
+            "modelName": "雷克萨斯",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "CT200h",
+            "vin": "JTHKR5BH3J2327186",
+        }
+        rows = _adapter()._query_vehicle_candidates(
+            client,
+            vehicle,
+            defaults={"车型查询资源码": "0524,0999"},
+        )
+        self.assertEqual(len(rows["result"]), 1)
+        self.assertEqual(vehicle["vehicleQueryResourcesUsed"], "0999")
+        self.assertEqual(vehicle["vehicleQueryResourcesTried"], ["0524", "0999"])
+        self.assertEqual(client.calls[0][0], "0524")
+        self.assertEqual(client.calls[1][0], "0999")
+        self.assertEqual(vehicle["modelQueryMatchKind"], "sales_model")
 
     def test_brand_and_vin_prefix_rows_without_correlation_are_rejected(self) -> None:
         class _MergedHintClient:
@@ -557,6 +982,66 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             ),
             "CT200h",
         )
+
+    def test_sales_model_is_split_from_license_brand_model_text(self) -> None:
+        self.assertEqual(
+            _quote_sales_model_hint_from_model_text("雷克萨斯CT200h", vin="JTHKR5BH3J2327186"),
+            "CT200h",
+        )
+        self.assertEqual(
+            _quote_sales_model_hint_from_model_text("雷克萨斯LEXUS CT200h", vin=""),
+            "CT200h",
+        )
+        self.assertEqual(
+            _quote_sales_model_hint_from_model_text("雷克萨斯JTHKR5BH", vin="JTHKR5BH3J2327186"),
+            "",
+        )
+        filled = _backfill_quote_sales_model_fields(
+            {"vehicle_model": "雷克萨斯CT200h", "vin": "JTHKR5BH3J2327186"}
+        )
+        self.assertEqual(filled.get("car_name"), "CT200h")
+        self.assertEqual(filled.get("vehicle_brand_name"), "雷克萨斯")
+
+    def test_slot_merge_prefers_better_vin_and_model_over_later_weak_ocr(self) -> None:
+        merged = _merge_quote_extracted_prefer(
+            {
+                "vin": "JTHKR5BH3J2327186",
+                "vehicle_model": "雷克萨斯CT200h",
+                "engine_no": "2ZR1234567",
+            },
+            {
+                "vin": "JTHKR5BH",
+                "vehicle_model": "雷克萨斯",
+                "engine_no": "2ZR",
+            },
+        )
+        self.assertEqual(merged.get("vin"), "JTHKR5BH3J2327186")
+        self.assertEqual(merged.get("vehicle_model"), "雷克萨斯CT200h")
+        self.assertEqual(merged.get("engine_no"), "2ZR1234567")
+
+    def test_driving_license_slot_keeps_derived_car_name(self) -> None:
+        images_by_slot = {
+            "driving_license_main": [
+                {
+                    "extracted_fields": {
+                        "vin": "JTHKR5BH3J2327186",
+                        "vehicle_model": "雷克萨斯CT200h",
+                        "plate_no": "粤B12345",
+                    },
+                    "method": "order_slot",
+                    "text_features": {"quote_image_upload": True},
+                }
+            ]
+        }
+        active = _active_image_extracted_data(images_by_slot)
+        self.assertEqual(active.get("car_name"), "CT200h")
+        normalized = _normalize_quote_case_data(
+            base_data={},
+            order_data={},
+            text_data={},
+            images_by_slot=images_by_slot,
+        )
+        self.assertEqual(normalized.get("car_name"), "CT200h")
 
     def test_vehicle_certificate_car_name_is_backfilled_from_historical_ocr_text(self) -> None:
         base_fields = {
@@ -1972,6 +2457,230 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             if item["code"] == "051064"
         )
         self.assertEqual(road_rescue["amount_text"], "-")
+
+
+class QuoteFailureEnvelopeTests(unittest.TestCase):
+    def test_failure_fields_and_attach_force_visibility(self) -> None:
+        fields = _quote_failure_fields(
+            code=FAILURE_CODE_STALE_TIMEOUT,
+            reason="报价任务超时，已自动中止",
+        )
+        self.assertEqual(fields["failure_code"], FAILURE_CODE_STALE_TIMEOUT)
+        self.assertTrue(fields["failure_reason"])
+        self.assertTrue(fields["next_action"])
+
+        data = _mk_data(result_status=RESULT_FAILED, message="x", payload={"silent": True})
+        data["silent"] = True
+        data["ui_visible"] = False
+        _attach_quote_failure(
+            data,
+            code=FAILURE_CODE_PLATFORM,
+            reason="平台返回业务错误",
+        )
+        self.assertEqual(data["failure_code"], FAILURE_CODE_PLATFORM)
+        self.assertFalse(data["silent"])
+        self.assertTrue(data["ui_visible"])
+        self.assertEqual(data["payload"]["failure_code"], FAILURE_CODE_PLATFORM)
+
+    def test_dialog_subtype_maps_to_failure_code(self) -> None:
+        self.assertEqual(
+            _failure_code_for_platform_dialog_subtype("session_expired"),
+            FAILURE_CODE_SESSION_EXPIRED,
+        )
+        self.assertEqual(
+            _failure_code_for_platform_dialog_subtype("quota_full"),
+            "quota_full",
+        )
+        self.assertEqual(
+            _failure_code_for_platform_dialog_subtype("quote_business_error"),
+            FAILURE_CODE_PLATFORM,
+        )
+
+    def test_build_user_failure_response_is_visible(self) -> None:
+        case = SimpleNamespace(id=11, order_id=22, case_no="QA1", status=CASE_STATUS_READY)
+        task = SimpleNamespace(id=33, status="failed")
+        reply, body = _build_quote_user_failure_response(
+            reply="人保报价材料已更新，我已停止本次报价；请确认材料后重新发起报价。",
+            case=case,
+            task=task,
+            trace_id="t-1",
+            failure_code=FAILURE_CODE_MATERIAL_CHANGED,
+            failure_reason="材料已更新，请重新发起报价",
+            result_status=RESULT_NOT_READY,
+            response_status="success",
+        )
+        self.assertIn("材料已更新", reply)
+        self.assertFalse(body.get("silent"))
+        self.assertTrue(body.get("ui_visible"))
+        self.assertEqual(body["data"]["failure_code"], FAILURE_CODE_MATERIAL_CHANGED)
+        self.assertEqual(body["data"]["payload"]["failure_code"], FAILURE_CODE_MATERIAL_CHANGED)
+        self.assertTrue(body["data"]["next_action"])
+
+        reply2, body2 = _build_quote_user_failure_response(
+            reply="结果图失败",
+            case=case,
+            task=task,
+            trace_id="t-2",
+            failure_code=FAILURE_CODE_RESULT_MATERIALIZATION,
+            failure_reason="真实报价结果无法生成",
+        )
+        self.assertEqual(body2["data"]["failure_code"], FAILURE_CODE_RESULT_MATERIALIZATION)
+        self.assertEqual(body2["status"], "failed")
+
+        reply3, body3 = _build_quote_user_failure_response(
+            reply="默认参数已更新",
+            case=case,
+            task=task,
+            trace_id="t-3",
+            failure_code=FAILURE_CODE_DEFAULT_CONFIG_CHANGED,
+            result_status=RESULT_NOT_READY,
+            response_status="success",
+        )
+        self.assertEqual(body3["data"]["failure_code"], FAILURE_CODE_DEFAULT_CONFIG_CHANGED)
+        self.assertFalse(body3.get("silent"))
+
+
+class ChatSessionLockReleaseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_is_noop_without_bound_lock(self) -> None:
+        from app.services.chat_session_lock import release_chat_session_lock_for_platform_io
+
+        marker = []
+        async with release_chat_session_lock_for_platform_io():
+            marker.append(1)
+        self.assertEqual(marker, [1])
+
+    async def test_release_allows_other_waiter_during_io(self) -> None:
+        import asyncio
+        from app.services.chat_session_lock import (
+            bind_chat_session_lock,
+            release_chat_session_lock_for_platform_io,
+            reset_chat_session_lock,
+        )
+
+        lock = asyncio.Lock()
+        order: list[str] = []
+        io_started = asyncio.Event()
+        waiter_done = asyncio.Event()
+
+        async def holder() -> None:
+            async with lock:
+                token = bind_chat_session_lock(lock)
+                try:
+                    order.append("holder_start")
+                    async with release_chat_session_lock_for_platform_io():
+                        order.append("io_start")
+                        io_started.set()
+                        await waiter_done.wait()
+                        order.append("io_end")
+                    order.append("holder_end")
+                finally:
+                    reset_chat_session_lock(token)
+
+        async def waiter() -> None:
+            await io_started.wait()
+            async with lock:
+                order.append("waiter")
+            waiter_done.set()
+
+        await asyncio.gather(holder(), waiter())
+        self.assertEqual(order, ["holder_start", "io_start", "waiter", "io_end", "holder_end"])
+
+    async def test_nested_release_is_reentrant(self) -> None:
+        import asyncio
+        from app.services.chat_session_lock import (
+            bind_chat_session_lock,
+            release_chat_session_lock_for_platform_io,
+            reset_chat_session_lock,
+        )
+
+        lock = asyncio.Lock()
+        async with lock:
+            token = bind_chat_session_lock(lock)
+            try:
+                async with release_chat_session_lock_for_platform_io():
+                    self.assertFalse(lock.locked())
+                    async with release_chat_session_lock_for_platform_io():
+                        self.assertFalse(lock.locked())
+                    self.assertFalse(lock.locked())
+                self.assertTrue(lock.locked())
+            finally:
+                reset_chat_session_lock(token)
+
+
+class QuotePreflightChecklistTests(unittest.TestCase):
+    def test_material_and_account_combined_reply(self) -> None:
+        items = _material_preflight_items(
+            [
+                {"type": "field", "key": "plate_no", "label": "车牌号"},
+                {"type": "image", "key": "vehicle_cert", "label": "行驶证"},
+            ]
+        )
+        items.append(
+            {
+                "code": "account_login",
+                "category": "account",
+                "label": "人保没有已登录可用账号",
+                "detail": "",
+                "failure_code": FAILURE_CODE_ACCOUNT_LOGIN,
+            }
+        )
+        items.append(
+            {
+                "code": "default_config_missing",
+                "category": "default_config",
+                "label": "人保（新能源车-旧）尚未启用默认参数配置",
+                "detail": "",
+                "failure_code": FAILURE_CODE_DEFAULT_CONFIG_MISSING,
+            }
+        )
+        self.assertEqual(_primary_preflight_failure_code(items), FAILURE_CODE_MATERIAL_MISSING)
+        reply = _format_quote_preflight_reply(platform_name="人保", items=items, override_summary="商业险起保日")
+        self.assertIn("报价前检查未通过", reply)
+        self.assertIn("缺少字段", reply)
+        self.assertIn("缺少图片", reply)
+        self.assertIn("账号：", reply)
+        self.assertIn("默认参数：", reply)
+        self.assertIn("已记录本次调整：商业险起保日", reply)
+
+        no_material = [x for x in items if x["failure_code"] != FAILURE_CODE_MATERIAL_MISSING]
+        self.assertEqual(_primary_preflight_failure_code(no_material), FAILURE_CODE_ACCOUNT_LOGIN)
+
+        case = SimpleNamespace(id=7, order_id=8, case_no="QA7", status=CASE_STATUS_READY)
+        reply2, body = _build_quote_preflight_blocked_response(
+            case=case,
+            platform_code="PICC",
+            platform_name="人保",
+            selected_account_type_name="新能源车-旧",
+            items=no_material,
+        )
+        self.assertEqual(body["data"]["result_status"], RESULT_NEED_MORE)
+        self.assertEqual(body["data"]["failure_code"], FAILURE_CODE_ACCOUNT_LOGIN)
+        self.assertTrue(body["data"]["payload"]["preflight_blocked"])
+        self.assertEqual(len(body["data"]["payload"]["preflight_checklist"]), 2)
+        self.assertIn("账号：", reply2)
+
+
+class QuoteChatPolarityWhitelistTests(unittest.TestCase):
+    def test_exact_whitelist_only(self) -> None:
+        self.assertEqual(_quote_chat_polarity_exact("好的"), QUOTE_CHAT_POLARITY_AFFIRM)
+        self.assertEqual(_quote_chat_polarity_exact("继续报价"), QUOTE_CHAT_POLARITY_AFFIRM)
+        self.assertEqual(_quote_chat_polarity_exact("取消"), QUOTE_CHAT_POLARITY_NEGATE)
+        self.assertEqual(_quote_chat_polarity_exact("不要继续"), QUOTE_CHAT_POLARITY_NEGATE)
+        self.assertIsNone(_quote_chat_polarity_exact("看着办"))
+        self.assertIsNone(_quote_chat_polarity_exact("先这样吧"))
+        self.assertIsNone(_quote_chat_polarity_exact("嗯嗯可以吧"))
+
+    def test_duplicate_confirm_helpers_and_unclear_attempt(self) -> None:
+        self.assertTrue(_is_duplicate_quote_confirmation_text("可以"))
+        self.assertTrue(_is_duplicate_quote_cancel_text("算了"))
+        self.assertFalse(_is_duplicate_quote_confirmation_text("看着办"))
+        self.assertTrue(_looks_like_unclear_chat_polarity_attempt("看着办"))
+        self.assertTrue(_looks_like_unclear_chat_polarity_attempt("嗯嗯"))
+        self.assertFalse(_looks_like_unclear_chat_polarity_attempt("继续报价"))
+        self.assertFalse(_looks_like_unclear_chat_polarity_attempt("查订单"))
+        self.assertIn("继续报价", QUOTE_DUPLICATE_CONFIRM_HINT)
+        exclusions = _extract_quote_product_exclusions("不要车损")
+        self.assertTrue(any("损失" in item or "车损" in item for item in exclusions))
 
 
 if __name__ == "__main__":

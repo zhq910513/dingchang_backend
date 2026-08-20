@@ -32,6 +32,7 @@ from app.core.access_control import (
     require_quote_platform_account_manage_access,
 )
 from app.core.db import get_db
+from app.services.chat_session_lock import bind_chat_session_lock, reset_chat_session_lock
 from app.schemas.ai_assistant import (
     AiChatIn,
     AiChatOut,
@@ -105,33 +106,59 @@ QUOTE_IMAGE_EXT_CONTENT_TYPES = {
     ".heif": "image/heif",
 }
 _CHAT_SESSION_LOCKS: Dict[str, asyncio.Lock] = {}
+_CHAT_SESSION_INTERRUPT_LOCKS: Dict[str, asyncio.Lock] = {}
 _CHAT_SESSION_LOCK_TOUCHED: Dict[str, float] = {}
+_CHAT_SESSION_INTERRUPT_LOCK_TOUCHED: Dict[str, float] = {}
 _CHAT_SESSION_LOCK_GUARD = asyncio.Lock()
 _CHAT_SESSION_LOCK_TTL_SECONDS = 15 * 60
 
 
-async def _get_chat_session_lock(owner_user_id: int, session_id: Any) -> asyncio.Lock | None:
+async def _get_named_chat_session_lock(
+    store: Dict[str, asyncio.Lock],
+    touched: Dict[str, float],
+    owner_user_id: int,
+    session_id: Any,
+) -> asyncio.Lock | None:
     sid = str(session_id or "").strip()
     if owner_user_id <= 0 or not sid:
         return None
     key = f"{owner_user_id}:{sid}"
     now = time.monotonic()
     async with _CHAT_SESSION_LOCK_GUARD:
-        if len(_CHAT_SESSION_LOCKS) > 500:
+        if len(store) > 500:
             stale_keys = [
-                k for k, touched in _CHAT_SESSION_LOCK_TOUCHED.items()
-                if now - float(touched or 0) > _CHAT_SESSION_LOCK_TTL_SECONDS
-                and not _CHAT_SESSION_LOCKS.get(k, asyncio.Lock()).locked()
+                k for k, touched_at in touched.items()
+                if now - float(touched_at or 0) > _CHAT_SESSION_LOCK_TTL_SECONDS
+                and not store.get(k, asyncio.Lock()).locked()
             ]
             for stale_key in stale_keys[:200]:
-                _CHAT_SESSION_LOCKS.pop(stale_key, None)
-                _CHAT_SESSION_LOCK_TOUCHED.pop(stale_key, None)
-        lock = _CHAT_SESSION_LOCKS.get(key)
+                store.pop(stale_key, None)
+                touched.pop(stale_key, None)
+        lock = store.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            _CHAT_SESSION_LOCKS[key] = lock
-        _CHAT_SESSION_LOCK_TOUCHED[key] = now
+            store[key] = lock
+        touched[key] = now
         return lock
+
+
+async def _get_chat_session_lock(owner_user_id: int, session_id: Any) -> asyncio.Lock | None:
+    return await _get_named_chat_session_lock(
+        _CHAT_SESSION_LOCKS,
+        _CHAT_SESSION_LOCK_TOUCHED,
+        owner_user_id,
+        session_id,
+    )
+
+
+async def _get_chat_session_interrupt_lock(owner_user_id: int, session_id: Any) -> asyncio.Lock | None:
+    """Serialize concurrent interrupt writers without waiting on the long-held chat lock."""
+    return await _get_named_chat_session_lock(
+        _CHAT_SESSION_INTERRUPT_LOCKS,
+        _CHAT_SESSION_INTERRUPT_LOCK_TOUCHED,
+        owner_user_id,
+        session_id,
+    )
 
 
 def _quote_api_error_detail(error: Exception) -> str:
@@ -1172,7 +1199,17 @@ async def ai_chat(
             # can invalidate a quote that committed just before this request.
             await db.rollback()
         running_quote = interrupt_running_quote and await _has_running_quote_task(db, chat_context)
-        chat_lock = None if running_quote else await _get_chat_session_lock(owner_user_id, body.session_id)
+        # Running quotes hold the session chat lock across local prep. Platform
+        # IO releases that lock via chat_session_lock helpers so interrupts and
+        # other messages are not blocked for the full PICC round-trip.
+        # Interrupt messages must not wait on the long chat lock; they take a
+        # dedicated interrupt lock so concurrent interrupt writers stay serialized.
+        bind_io_lock = False
+        if running_quote:
+            chat_lock = await _get_chat_session_interrupt_lock(owner_user_id, body.session_id)
+        else:
+            chat_lock = await _get_chat_session_lock(owner_user_id, body.session_id)
+            bind_io_lock = chat_lock is not None
 
         async def _run_chat_once() -> Dict[str, Any]:
             # Auth dependencies may have opened a MySQL repeatable-read snapshot
@@ -1198,7 +1235,12 @@ async def ai_chat(
 
         if chat_lock is not None:
             async with chat_lock:
-                result = await _run_chat_once()
+                bind_token = bind_chat_session_lock(chat_lock) if bind_io_lock else None
+                try:
+                    result = await _run_chat_once()
+                finally:
+                    if bind_token is not None:
+                        reset_chat_session_lock(bind_token)
         else:
             result = await _run_chat_once()
     except ValueError as e:

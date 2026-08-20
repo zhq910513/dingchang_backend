@@ -415,20 +415,22 @@ def _proposal_info_rows(card: Mapping[str, Any]) -> List[Tuple[str, str, str, st
             ("被保险人姓名", _to_str(info.get("insured_name") or "-"), "车牌号码", _to_str(info.get("plate_no") or "-")),
             ("发动机号", _to_str(info.get("engine_no") or "-"), "车架号", _to_str(info.get("vin") or "-")),
             ("车辆类型", _to_str(info.get("vehicle_type") or "-"), "车辆性质", _to_str(info.get("vehicle_usage") or "-")),
-            ("车辆型号", _to_str(info.get("vehicle_model") or "-"), "初登日期", _to_str(info.get("enroll_date") or "-")),
-            ("核定载质量", _to_str(info.get("ton_count") or "-"), "核定载客量(包括司机)", _to_str(info.get("seat_count") or "-")),
-            ("新车购置价", _to_str(info.get("purchase_price") or "-"), "承保年数、出险次数", _to_str(info.get("claim_summary") or "-")),
-            ("商业险起保日期", _to_str(info.get("bi_start_date") or "-"), "交强险起保日期", _to_str(info.get("ci_start_date") or "-")),
+            ("车辆型号", _to_str(info.get("vehicle_model") or "-"), "匹配方式", _to_str(info.get("model_match_method") or "-")),
+            ("初登日期", _to_str(info.get("enroll_date") or "-"), "核定载质量", _to_str(info.get("ton_count") or "-")),
+            ("核定载客量(包括司机)", _to_str(info.get("seat_count") or "-"), "新车购置价", _to_str(info.get("purchase_price") or "-")),
+            ("承保年数、出险次数", _to_str(info.get("claim_summary") or "-"), "商业险起保日期", _to_str(info.get("bi_start_date") or "-")),
+            ("交强险起保日期", _to_str(info.get("ci_start_date") or "-"), "", ""),
         ]
     return [
         ("被保险人姓名", _to_str(card.get("owner_name") or "-"), "车牌号码", _to_str(card.get("plate_no") or "-")),
         ("发动机号", _to_str(card.get("engine_no") or "-"), "车架号", _to_str(card.get("vin") or "-")),
         ("车辆类型", _to_str(card.get("vehicle_type") or "-"), "车辆性质", _to_str(card.get("vehicle_usage") or "-")),
-        ("车辆型号", _to_str(card.get("vehicle_model") or "-"), "初登日期", _to_str(card.get("enroll_date") or "-")),
-        ("核定载质量", _to_str(card.get("ton_count") or "-"), "核定载客量(包括司机)", _to_str(card.get("seat_count") or "-")),
-        ("新车购置价", _to_str(card.get("purchase_price") or "-"), "承保年数、出险次数", _to_str(card.get("claim_summary") or "-")),
-        ("商业险起保日期", _to_str(card.get("bi_start_date") or "-"), "交强险起保日期", _to_str(card.get("ci_start_date") or "-")),
-    ]
+            ("车辆型号", _to_str(card.get("vehicle_model") or "-"), "匹配方式", _to_str(card.get("model_match_method") or "-")),
+            ("初登日期", _to_str(card.get("enroll_date") or "-"), "核定载质量", _to_str(card.get("ton_count") or "-")),
+            ("核定载客量(包括司机)", _to_str(card.get("seat_count") or "-"), "新车购置价", _to_str(card.get("purchase_price") or "-")),
+            ("承保年数、出险次数", _to_str(card.get("claim_summary") or "-"), "商业险起保日期", _to_str(card.get("bi_start_date") or "-")),
+            ("交强险起保日期", _to_str(card.get("ci_start_date") or "-"), "", ""),
+        ]
 
 
 def _proposal_coverage_rows(card: Mapping[str, Any]) -> List[Dict[str, Any]]:

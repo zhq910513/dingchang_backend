@@ -52,7 +52,6 @@ from app.services.quote_assistant_service import (
     handle_quote_message,
     handle_quote_text_material_message,
     has_expired_waiting_sms_task,
-    has_quote_case_waiting_for_login_phone,
     has_recent_invalid_sms_task,
     has_waiting_duplicate_quote_confirm_task,
     has_waiting_sms_task,
@@ -3294,9 +3293,6 @@ async def _dispatch_rule_with_db(
     if intent != "quote" and sms_code_like and await has_recent_invalid_sms_task(db, ctx):
         intent = "quote"
         confidence = max(float(confidence or 0.0), 0.9)
-    if intent != "quote" and re.fullmatch(r"\d{11}", _norm_text(text)) and await has_quote_case_waiting_for_login_phone(db, ctx):
-        intent = "quote_credential"
-        confidence = max(float(confidence or 0.0), 0.91)
     if intent != "quote_credential" and looks_like_quote_material_form_command(text):
         form_result = await handle_quote_material_form_message(db, ctx=ctx, entities=entities, text=text)
         if form_result:
