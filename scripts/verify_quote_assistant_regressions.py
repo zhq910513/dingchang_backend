@@ -30,16 +30,24 @@ from app.services.quote_assistant_service import (
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
     _has_reusable_renewal_quote_context,
+    _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
     _platform_default_values_with_legacy_fixes,
+    _picc_result_coverage_items_for_display,
+    quote_message_may_interrupt_running_task,
     _normalize_quote_product_exclusions,
     _extract_quote_product_exclusions,
     extract_quote_config_overrides,
+)
+from app.services.quote_platforms.platforms.picc.presentation import (
+    picc_result_amount_text,
+    picc_result_kind_name,
 )
 from app.services.ai_assistant_service import (
     _message_preview_text,
     _session_preview_needs_recompute,
 )
+from app.api.v1.ai_assistant import _chat_context
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
 from app.services.quote_platforms.base import PlatformRuntimeResult
 from app.services.quote_platforms.platforms.picc.business import (
@@ -70,6 +78,139 @@ from app.services.quote_platforms.platforms.picc.business import (
 def _adapter() -> PiccBusinessAdapter:
     # The tested method only touches the client when a selected vehicle exists.
     return object.__new__(PiccBusinessAdapter)
+
+
+class PiccDynamicResultPresentationTests(unittest.TestCase):
+    def test_platform_energy_names_are_preserved_and_missing_names_use_energy_fallback(self) -> None:
+        self.assertEqual(
+            picc_result_kind_name(
+                "051050",
+                platform_name="新能源汽车损失保险",
+                is_new_energy=True,
+            ),
+            "新能源汽车损失保险",
+        )
+        self.assertEqual(
+            picc_result_kind_name("051063", is_new_energy=True),
+            "附加医保外医疗费用责任险（新能源汽车第三者责任保险）",
+        )
+        self.assertEqual(
+            picc_result_kind_name("051051", is_new_energy=False),
+            "机动车第三者责任保险",
+        )
+
+    def test_unknown_dynamic_kind_is_not_replaced_by_a_fixed_motor_label(self) -> None:
+        self.assertEqual(
+            picc_result_kind_name(
+                "099999",
+                platform_name="电池专项增值服务",
+                is_new_energy=True,
+            ),
+            "电池专项增值服务",
+        )
+
+    def test_road_rescue_quantity_is_rendered_as_service_times(self) -> None:
+        self.assertEqual(
+            picc_result_amount_text(
+                {
+                    "code": "051064",
+                    "name": "附加机动车增值服务特约条款（道路救援服务）",
+                    "quantity": "7",
+                    "amount_text": "-",
+                }
+            ),
+            "7次",
+        )
+
+    def test_display_rows_keep_platform_order_dynamic_names_and_quantity(self) -> None:
+        rows = _picc_result_coverage_items_for_display(
+            {
+                "vehicle_energy_type": "new_energy",
+                "coverage_items": [
+                    {
+                        "code": "051050",
+                        "name": "机动车损失保险",
+                        "amount": "219800",
+                        "premium": "3098.85",
+                    },
+                    {
+                        "code": "051064",
+                        "platform_name": "道路救援服务",
+                        "quantity": "5",
+                        "premium": "0",
+                    },
+                ],
+            },
+            seat_count="5",
+        )
+        self.assertEqual([row["name"] for row in rows], ["新能源汽车损失保险", "道路救援服务"])
+        self.assertEqual(rows[1]["amount_text"], "5次")
+        self.assertEqual(rows[1]["quantity"], "5")
+
+    def test_picc_result_builder_wires_energy_names_and_road_rescue_quantity(self) -> None:
+        result = _adapter()._build_motor_quote_result_from_response(
+            ctx=None,
+            quote_payload={},
+            request_body={
+                "accountTypeName": "新能源车-新",
+                "vehicleForm": {"seatCount": "5"},
+                "ownerForm": {},
+                "quoteForm": {},
+                "preflight": {},
+            },
+            quote_response={
+                "status": 0,
+                "data": {"biPremium": "100.00", "ciPremium": "0.00", "sumPayTax": "0.00"},
+                "itemKindTempList": [
+                    {"kindCode": "051050", "kindName": "", "amount": "219800", "premium": "100.00"},
+                    {
+                        "kindCode": "051064",
+                        "kindName": "附加机动车增值服务特约条款（道路救援服务）",
+                        "quantity": "7",
+                        "premium": "0.00",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(result["vehicle_energy_type"], "new_energy")
+        rows = result["result_card"]["proposal_coverage_items"]
+        self.assertEqual(rows[0]["name"], "新能源汽车损失保险")
+        self.assertEqual(rows[1]["amount_text"], "7次")
+
+
+class RunningQuoteInterruptionTests(unittest.TestCase):
+    def test_chat_context_uses_the_request_session_id(self) -> None:
+        context = _chat_context(
+            SimpleNamespace(
+                user=SimpleNamespace(id=7),
+                primary_role="super_admin",
+                team_names=(),
+            ),
+            SimpleNamespace(
+                context={"session_id": "forged-session"},
+                images=[],
+                order_id=None,
+                session_id="real-session",
+            ),
+        )
+        self.assertEqual(context["session_id"], "real-session")
+        self.assertEqual(context["current_user_id"], 7)
+
+    def test_only_snapshot_changing_messages_bypass_running_quote_serialization(self) -> None:
+        self.assertFalse(quote_message_may_interrupt_running_task("今天天气怎么样", {}))
+        self.assertTrue(quote_message_may_interrupt_running_task("人保报价", {}))
+        self.assertTrue(quote_message_may_interrupt_running_task("三者改成500万", {}))
+        self.assertTrue(quote_message_may_interrupt_running_task("过户车", {}))
+
+    def test_uploaded_images_and_material_form_submission_interrupt_running_quote(self) -> None:
+        image = {"storage_key": "related/example.jpg", "md5": "a" * 32}
+        self.assertTrue(quote_message_may_interrupt_running_task("图片已提交", {"images": [image]}))
+        self.assertTrue(
+            quote_message_may_interrupt_running_task(
+                "已提交补充资料",
+                {"page_context": {"quote_material_form_submit": True}},
+            )
+        )
 
 
 class _QuoteResponseClient:
@@ -141,6 +282,44 @@ def _har_response_json(har: dict, entry_index: int) -> dict:
 def _har_form_params(har: dict, entry_index: int) -> dict:
     text = har["log"]["entries"][entry_index]["request"].get("postData", {}).get("text") or ""
     return dict(urllib.parse.parse_qsl(text, keep_blank_values=True))
+
+
+class QuoteFlowMaterialRequirementRegressionTests(unittest.TestCase):
+    def test_renewal_case_uses_lookup_requirements_across_status_entry_points(self) -> None:
+        data = {
+            "quote_flow_type": "renewal_motor_quote",
+            "plate_no": "赣A12345",
+            "vin": "LSJEM4092TK037865",
+        }
+
+        missing = _missing_requirements_for_quote_flow(
+            data,
+            {},
+            platform_code="PICC",
+            account_type_name="油车-旧",
+        )
+
+        self.assertEqual(missing, [])
+
+    def test_normal_case_keeps_full_material_requirements(self) -> None:
+        data = {
+            "quote_flow_type": "normal_motor_quote",
+            "plate_no": "赣A12345",
+            "vin": "LSJEM4092TK037865",
+        }
+
+        missing = _missing_requirements_for_quote_flow(
+            data,
+            {},
+            platform_code="PICC",
+            account_type_name="油车-旧",
+        )
+        missing_keys = {str(item.get("key") or "") for item in missing}
+
+        self.assertIn("engine_no", missing_keys)
+        self.assertIn("first_register_date", missing_keys)
+        self.assertIn("vehicle_model", missing_keys)
+        self.assertIn("owner_name", missing_keys)
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
@@ -1458,7 +1637,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "preflight": {},
         }
         ctx = SimpleNamespace(account_type_name="油车-旧")
-        result = adapter._build_used_fuel_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
+        result = adapter._build_motor_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
         self.assertEqual(result["risk_score"], 45)
         self.assertEqual(str(result["premium_total"]), "2896.79")
         self.assertEqual(result["result_card"]["commercial_premium"], "1741.79")
@@ -1607,7 +1786,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
 
         final_response = _har_response_json(har, 66)
         self.assertEqual(final_response["data"]["sumYelPremium"], 0)
-        result = _adapter()._build_used_fuel_quote_result_from_response(ctx, {}, body, final_response)
+        result = _adapter()._build_motor_quote_result_from_response(ctx, {}, body, final_response)
         self.assertEqual(result["risk_score"], 44)
         self.assertEqual(str(result["premium_total"]), "2921.46")
         self.assertEqual(result["result_card"]["commercial_premium"], "1766.46")
@@ -1781,7 +1960,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "preflight": {},
         }
         ctx = SimpleNamespace(account_type_name="新能源车-旧")
-        result = _adapter()._build_used_fuel_quote_result_from_response(
+        result = _adapter()._build_motor_quote_result_from_response(
             ctx,
             {},
             request_body,

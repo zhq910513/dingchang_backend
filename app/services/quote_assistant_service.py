@@ -58,6 +58,11 @@ from app.services.quote_platforms import runtime as quote_platform_runtime
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
 from app.services.quote_platforms.browser_manager import account_profile_dir
 from app.services.quote_platforms.platforms.picc.business import picc_motor_builtin_default_values
+from app.services.quote_platforms.platforms.picc.presentation import (
+    picc_is_new_energy_vehicle,
+    picc_result_amount_text,
+    picc_result_kind_name,
+)
 from app.services.quote_platforms.session_manager import (
     SESSION_STATUS_AUTHENTICATED,
     SESSION_STATUS_DEGRADED,
@@ -5786,20 +5791,6 @@ def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) 
     return bool(re.search(r"(?:重复|已报价|已经报价|不能重复).{0,12}(?:报价|投保)?", raw))
 
 
-def _is_runtime_duplicate_quote_confirm_required_result(result: Optional[PlatformRuntimeResult]) -> bool:
-    if result is None:
-        return False
-    status = _runtime_status(result)
-    business_status = _runtime_business_status(result)
-    if status == "duplicate_quote_confirm_required" or business_status == "duplicate_quote_confirm_required":
-        return True
-    data = _json_obj(result.data)
-    for key in ("error_code", "code", "reason", "business_status"):
-        if _to_str(data.get(key)).strip().lower() == "duplicate_quote_confirm_required":
-            return True
-    return False
-
-
 def _duplicate_quote_warning_from_runtime(result: Optional[PlatformRuntimeResult]) -> str:
     runtime_payload = _runtime_result_payload(result)
     data = _json_obj(runtime_payload.get("data"))
@@ -8145,6 +8136,34 @@ def _collect_context_images(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     return images
 
 
+def quote_message_may_interrupt_running_task(text: Any, ctx: Optional[Mapping[str, Any]] = None) -> bool:
+    """Whether a new chat request can invalidate an already-running quote.
+
+    Ordinary chat remains serialized.  Only commands/material submissions that
+    can change the quote snapshot are allowed to pass the process-local chat
+    lock while a platform request is running; database task status and snapshot
+    fingerprints remain the cross-process source of truth.
+    """
+
+    safe_ctx = dict(ctx) if isinstance(ctx, Mapping) else {}
+    page_ctx = _json_obj(safe_ctx.get("page_context"))
+    if _collect_context_images(safe_ctx) or page_ctx.get("quote_material_form_submit") is True:
+        return True
+
+    value = _to_str(text).strip()
+    if not value:
+        return False
+    if detect_quote_signal(value).get("is_quote"):
+        return True
+    if _json_obj(detect_quote_config_override_signal(value).get("overrides")):
+        return True
+    if _json_obj(detect_quote_data_override_signal(value).get("overrides")):
+        return True
+    if _extract_transfer_vehicle_command(value) or _extract_quote_product_exclusions(value):
+        return True
+    return bool(extract_quote_fields(value))
+
+
 def _image_url_for_ocr(image: Dict[str, Any], storage_key: str) -> str:
     if not storage_key:
         return ""
@@ -9214,6 +9233,33 @@ def _renewal_lookup_missing_requirements(normalized_data: Dict[str, Any]) -> Lis
     return missing
 
 
+def _missing_requirements_for_quote_flow(
+    normalized_data: Dict[str, Any],
+    images_by_slot: Dict[str, List[Dict[str, Any]]],
+    *,
+    platform_code: str,
+    account_type_name: Optional[str],
+    quote_flow_type: Any = "",
+) -> List[Dict[str, Any]]:
+    """Resolve material requirements from the case's effective quote flow.
+
+    Renewal lookup deliberately starts with only the plate number and either
+    engine number or VIN. All material/status entry points must use that same
+    rule; otherwise a renewal case can oscillate between ready and collecting
+    depending on whether it was inspected, supplemented, or recalled.
+    """
+
+    flow_type = _to_str(quote_flow_type).strip() or _quote_flow_type_from_case_data(normalized_data)
+    if flow_type == QUOTE_FLOW_RENEWAL:
+        return _renewal_lookup_missing_requirements(normalized_data)
+    return _missing_requirements(
+        normalized_data,
+        images_by_slot,
+        platform_code=platform_code,
+        account_type_name=account_type_name,
+    )
+
+
 def _missing_item_text(item: Dict[str, Any]) -> str:
     label = _to_str(item.get("label") or item.get("key")).strip() or "未知项目"
     detail = _format_missing_detail(item.get("detail"))
@@ -9518,7 +9564,7 @@ async def handle_quote_material_form_message(
         or normalized_data.get("account_type_name")
         or vehicle_type_detect.get("config_type_name")
     )
-    missing = _missing_requirements(
+    missing = _missing_requirements_for_quote_flow(
         normalized_data,
         images_by_slot,
         platform_code=platform_code,
@@ -9858,92 +9904,6 @@ async def _find_waiting_duplicate_quote_confirm_task(
     return (row[0], row[1]) if row else None
 
 
-async def get_pending_duplicate_quote_confirm_payload(
-    db: AsyncSession,
-    *,
-    owner_user_id: int,
-    session_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """Return recoverable duplicate-quote state for UI modal, without exposing a chat bubble."""
-    owner = _safe_int(owner_user_id, 0)
-    sid = _to_str(session_id).strip() or None
-    if owner <= 0 or not sid:
-        return None
-    pair = await _find_waiting_duplicate_quote_confirm_task(
-        db,
-        owner_user_id=owner,
-        session_id=sid,
-        for_update=False,
-    )
-    if not pair:
-        return None
-    case, task = pair
-    request_payload = _json_obj(getattr(task, "request_payload", None))
-    response_payload = _json_obj(getattr(task, "response_payload", None))
-    runtime_payload = _json_obj(response_payload.get("quote"))
-    warning = _sanitize_duplicate_quote_warning(
-        request_payload.get("duplicate_quote_warning")
-        or _duplicate_quote_warning_from_runtime(
-            PlatformRuntimeResult(
-                status="duplicate_quote_confirm_required",
-                message=_to_str(getattr(task, "error_detail", "")).strip(),
-                data=runtime_payload,
-            )
-        )
-        or getattr(task, "error_detail", ""),
-        f"{case.platform_name or case.platform_code or '平台'}提示该车辆可能重复投保，请核实后再继续报价。",
-    )
-    trace_id = _to_str(getattr(task, "trace_id", "")).strip() or _new_trace_id()
-    platform_code = case.platform_code or task.platform_code or ""
-    platform_name = case.platform_name or task.platform_name or platform_code
-    dialog = _duplicate_quote_platform_dialog(
-        warning=warning,
-        platform_code=platform_code,
-        platform_name=platform_name,
-        trace_id=trace_id,
-        task_id=task.id,
-        case_id=case.id,
-    )
-    payload = {
-        "quote_case": {
-            "id": case.id,
-            "case_no": case.case_no,
-            "status": case.status,
-            "order_id": case.order_id,
-            "source_type": case.source_type,
-        },
-        "quote_task": {
-            "id": task.id,
-            "status": task.status,
-            "login_state": task.login_state,
-            "trace_id": trace_id,
-        },
-        "duplicate_quote_confirm_required": True,
-        "duplicate_quote_warning": warning,
-        "platform_dialog": dialog,
-        "ui_visible": False,
-    }
-    data = _mk_data(
-        result_status=RESULT_NOT_READY,
-        message="平台提示可能重复投保，等待确认",
-        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-        payload=payload,
-    )
-    data["silent"] = True
-    data["ui_visible"] = False
-    return {
-        "duplicate_quote_confirm_required": True,
-        "silent": True,
-        "ui_visible": False,
-        "reply": _duplicate_quote_confirm_reply_text(
-            warning,
-            platform_name=case.platform_name or case.platform_code or "",
-        ),
-        "trace_id": trace_id,
-        "data": data,
-    }
-
-
 def _is_sms_task_expired(task: QuoteTask) -> bool:
     base = getattr(task, "started_at", None) or getattr(task, "created_at", None)
     if not isinstance(base, datetime):
@@ -9971,7 +9931,7 @@ async def _refresh_quote_case_material_state(
         images_by_slot=images_by_slot,
     )
     vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
-    missing = _missing_requirements(
+    missing = _missing_requirements_for_quote_flow(
         normalized_data,
         images_by_slot,
         platform_code=case.platform_code or "",
@@ -10072,6 +10032,24 @@ async def _expire_stale_running_quote_tasks_for_owner_session(
     if expired:
         await db.flush()
     return expired
+
+
+async def has_running_quote_task(db: AsyncSession, ctx: Mapping[str, Any]) -> bool:
+    owner_user_id = _ctx_current_user_id(dict(ctx or {}))
+    session_id = _to_str((ctx or {}).get("session_id")).strip()
+    if owner_user_id <= 0 or not session_id:
+        return False
+    stmt = (
+        select(QuoteTask.id)
+        .join(QuoteCase, QuoteTask.quote_case_id == QuoteCase.id)
+        .where(
+            QuoteCase.owner_user_id == owner_user_id,
+            QuoteCase.session_id == session_id,
+            QuoteTask.status.in_(("pending", TASK_STATUS_RUNNING)),
+        )
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def _expire_waiting_sms_task(
@@ -11374,46 +11352,6 @@ def _quote_compact_money_text_or_empty(value: Any) -> str:
     return _quote_compact_money_text(value)
 
 
-def _picc_proposal_display_name(name: Any) -> str:
-    text = _to_str(name).strip()
-    mapping = {
-        "第三者责任险": "机动车第三者责任保险",
-        "车上人员责任险（司机）": "机动车车上人员责任保险（司机）",
-        "车上人员责任险(司机)": "机动车车上人员责任保险（司机）",
-        "车上人员责任险（乘客）": "机动车车上人员责任保险（乘客）",
-        "车上人员责任险(乘客)": "机动车车上人员责任保险（乘客）",
-        "医保外医疗费用责任险（第三者责任险）": "附加医保外医疗费用责任险（机动车第三者责任保险）",
-        "医保外医疗费用责任险(第三者责任险)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
-        "医保外医疗费用责任险(三者)": "附加医保外医疗费用责任险（机动车第三者责任保险）",
-        "道路救援": "附加机动车增值服务特约条款（道路救援服务）",
-        "道路救援服务": "附加机动车增值服务特约条款（道路救援服务）",
-        "机动车增值服务特约条款（道路救援服务）": "附加机动车增值服务特约条款（道路救援服务）",
-    }
-    return mapping.get(text, text)
-
-
-def _picc_proposal_amount_text(name: Any, amount: Any, *, seat_count: Any = "") -> str:
-    text = _to_str(name).strip()
-    if amount in (None, ""):
-        return "-"
-    raw = _to_str(amount).strip()
-    if re.search(r"元|万|共享|座|\*", raw):
-        return raw
-    value = _quote_money_decimal(amount)
-    if value <= 0:
-        return "-"
-    if "乘客" in text:
-        if not _quote_has_text(seat_count):
-            return f"{_quote_money_text(value)}元"
-        seats = max(1, _safe_int(seat_count, 0))
-        quantity = max(1, seats - 1)
-        per_seat = (value / Decimal(quantity)).quantize(Decimal("0.01")) if quantity else value
-        return f"{_quote_compact_money_text(per_seat / Decimal('10000'))}万元/座*{quantity}"
-    if "第三者" in text or "医保外" in text or "司机" in text:
-        return f"{_quote_compact_money_text(value / Decimal('10000'))}万元"
-    return f"{_quote_money_text(value)}元"
-
-
 def _picc_start_datetime_from_request(quote_form: Mapping[str, Any], vehicle: Mapping[str, Any], *, kind: str) -> str:
     if kind == "ci":
         date_value = _to_str(
@@ -11464,22 +11402,37 @@ def _picc_result_coverage_items_for_display(
     result: Mapping[str, Any],
     *,
     seat_count: Any = "",
+    vehicle_energy_type: Any = "",
 ) -> list[Dict[str, Any]]:
     rows = _json_list(result.get("coverage_items"))
+    is_new_energy = picc_is_new_energy_vehicle(
+        energy_type=vehicle_energy_type or result.get("vehicle_energy_type"),
+        account_type_name=result.get("account_type_name"),
+    )
     output: list[Dict[str, Any]] = []
     for item in rows:
         row = _json_obj(item)
-        name = _picc_proposal_display_name(row.get("name"))
+        name = picc_result_kind_name(
+            row.get("code"),
+            platform_name=row.get("platform_name"),
+            fallback_name=row.get("name"),
+            is_new_energy=is_new_energy,
+        )
         if not name:
             continue
-        output.append(
+        display_row = {
+            key: row.get(key)
+            for key in ("code", "platform_name", "amount", "unit_amount", "quantity", "shared_amount_flag")
+            if row.get(key) not in (None, "")
+        }
+        display_row.update(
             {
                 "name": name,
-                "amount_text": _to_str(row.get("amount_text")).strip()
-                or _picc_proposal_amount_text(name, row.get("amount"), seat_count=seat_count),
+                "amount_text": picc_result_amount_text(row, seat_count=seat_count),
                 "premium": _quote_money_text_or_empty(row.get("premium")),
             }
         )
+        output.append(display_row)
     return output
 
 
@@ -11533,7 +11486,17 @@ def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], ca
         for key, value in _json_obj(result.get("vehicle_tax_detail")).items()
         if _quote_has_text(value)
     }
-    coverage_items = _picc_result_coverage_items_for_display(result, seat_count=seat_count)
+    vehicle_energy_type = _quote_first_text(
+        result.get("vehicle_energy_type"),
+        safe_card.get("vehicle_energy_type"),
+    )
+    coverage_items = _picc_result_coverage_items_for_display(
+        result,
+        seat_count=seat_count,
+        vehicle_energy_type=vehicle_energy_type,
+    )
+    if vehicle_energy_type:
+        safe_card["vehicle_energy_type"] = vehicle_energy_type
     safe_card["proposal_coverage_items"] = coverage_items
 
     bi_start = _quote_first_text(
@@ -11594,6 +11557,7 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
     proposal_coverage_items = _picc_result_coverage_items_for_display(
         result,
         seat_count=seat_count,
+        vehicle_energy_type=result.get("vehicle_energy_type"),
     )
 
     commercial = _quote_money_text_or_empty(
@@ -11657,6 +11621,7 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         "claim_business_count": _quote_first_text(result.get("claim_business_count"), claim_bi),
         "claim_compulsory_count": _quote_first_text(result.get("claim_compulsory_count"), claim_ci),
         "risk_score": _to_str(result.get("risk_score") or "-").strip() or "-",
+        "vehicle_energy_type": _quote_first_text(result.get("vehicle_energy_type"), safe_card.get("vehicle_energy_type")),
         "proposal_info": {
             "insured_name": _quote_first_text(owner.get("ownerName"), result.get("owner_name"), safe_card.get("owner_name")),
             "plate_no": _quote_cert_display_text("plate_no", result.get("plate_no"), vehicle.get("licenseNo"), safe_card.get("plate_no")),
@@ -13145,149 +13110,6 @@ def _duplicate_quote_confirm_reply_text(warning: str, *, platform_name: str = ""
         f"{platform_name or '平台'}提示该车辆可能重复投保，请核实后再继续报价。",
     )
     return safe_warning
-
-
-async def _start_duplicate_quote_confirm_task(
-    db: AsyncSession,
-    *,
-    case: QuoteCase,
-    owner_user_id: int,
-    snapshot: Dict[str, Any],
-    trace_id: str,
-    platform_account: QuotePlatformAccountProfile,
-    runtime_result: PlatformRuntimeResult,
-    login_mode: str,
-    existing_task: Optional[QuoteTask] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    platform_code = case.platform_code or platform_account.platform_code or "STUB"
-    platform_name = case.platform_name or platform_account.platform_name or platform_code
-    runtime_payload = _runtime_result_payload(runtime_result)
-    runtime_data = _json_obj(runtime_payload.get("data"))
-    request_body = _json_obj(
-        runtime_data.get("request_body")
-        or runtime_data.get("request_body_draft")
-        or _json_obj(snapshot.get("request_body"))
-    )
-    warning = _duplicate_quote_warning_from_runtime(runtime_result)
-    pending_snapshot = dict(_json_obj(snapshot))
-    if request_body:
-        pending_snapshot["request_body"] = request_body
-    pending_snapshot["duplicate_quote_warning"] = warning
-    pending_snapshot["duplicate_quote_pending"] = True
-    pending_snapshot = _snapshot_with_quote_fingerprint(pending_snapshot)
-    request_payload = {
-        "mode": "pending_duplicate_confirmation",
-        "login": login_mode,
-        "owner_user_id": owner_user_id,
-        "platform_account": _credential_public_payload(platform_account),
-        "platform_default_config": _json_obj(pending_snapshot.get("platform_default_config")),
-        "default_config_json": _json_obj(pending_snapshot.get("default_config_json")),
-        "vehicle_type_detect": _json_obj(pending_snapshot.get("vehicle_type_detect")),
-        "request_body": request_body,
-        "duplicate_quote_warning": warning,
-    }
-    response_payload = {
-        "quote": runtime_payload,
-        "duplicate_quote_confirm_required": True,
-    }
-    now = _now()
-    task = existing_task
-    if task is None:
-        task = QuoteTask(
-            quote_case_id=case.id,
-            platform_code=platform_code,
-            platform_name=platform_name,
-            status=TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
-            login_state="authenticated",
-            sms_phone_mask=platform_account.login_phone_mask,
-            trace_id=trace_id,
-            request_payload=request_payload,
-            response_payload=response_payload,
-            result_payload={},
-            submitted_snapshot=pending_snapshot,
-            error_detail=warning[:1800] if warning else None,
-            started_at=now,
-        )
-        db.add(task)
-        await db.flush()
-    else:
-        task.status = TASK_STATUS_WAITING_DUPLICATE_CONFIRM
-        task.login_state = "authenticated"
-        task.sms_phone_mask = platform_account.login_phone_mask
-        task.request_payload = {**_json_obj(task.request_payload), **request_payload}
-        task.response_payload = {**_json_obj(task.response_payload), **response_payload}
-        task.result_payload = {}
-        task.submitted_snapshot = pending_snapshot
-        task.error_detail = warning[:1800] if warning else None
-        task.finished_at = None
-        task.updated_at = now
-
-    case.status = CASE_STATUS_WAITING_DUPLICATE_CONFIRM
-    case.current_task_id = task.id
-    case.updated_at = now
-    platform_account.last_check_at = now
-    platform_account.updated_at = now
-    await _add_event(
-        db,
-        case=case,
-        owner_user_id=owner_user_id,
-        event_type="task",
-        role="system",
-        payload={
-            "task_id": task.id,
-            "status": TASK_STATUS_WAITING_DUPLICATE_CONFIRM,
-            "trace_id": trace_id,
-            "duplicate_quote_confirm_required": True,
-            "warning": warning,
-        },
-    )
-    await db.flush()
-    dialog = _duplicate_quote_platform_dialog(
-        warning=warning,
-        platform_code=platform_code,
-        platform_name=platform_name,
-        trace_id=trace_id,
-        task_id=task.id,
-        case_id=case.id,
-    )
-    payload = {
-        "quote_case": {
-            "id": case.id,
-            "case_no": case.case_no,
-            "status": case.status,
-            "order_id": case.order_id,
-            "source_type": case.source_type,
-        },
-        "quote_task": {
-            "id": task.id,
-            "status": task.status,
-            "login_state": task.login_state,
-            "trace_id": trace_id,
-        },
-        "platform_account": _credential_public_payload(platform_account),
-        "duplicate_quote_confirm_required": True,
-        "duplicate_quote_warning": warning,
-        "platform_dialog": dialog,
-        "quote_runtime": runtime_payload,
-        "ui_visible": False,
-    }
-    data = _mk_data(
-        result_status=RESULT_NOT_READY,
-        message="平台提示可能重复投保，等待确认",
-        entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
-        payload=payload,
-    )
-    data["silent"] = True
-    data["ui_visible"] = False
-    return _duplicate_quote_confirm_reply_text(warning, platform_name=platform_name), {
-        "status": "success",
-        "intent": "quote",
-        "trace_id": trace_id,
-        "silent": True,
-        "ui_visible": False,
-        "data": data,
-        "actions": [],
-    }
 
 
 async def _complete_waiting_duplicate_quote_task(
@@ -16055,7 +15877,7 @@ async def handle_quote_images_message(
         )
     material_conflicts = _quote_material_issues(normalized_data, images_by_slot)
     missing = (
-        _missing_requirements(
+        _missing_requirements_for_quote_flow(
             normalized_data,
             images_by_slot,
             platform_code=auto_platform_code,
@@ -16232,7 +16054,7 @@ async def recall_quote_case_images(
             images_by_slot=images_by_slot,
         )
         vehicle_type_detect = detect_quote_vehicle_type(normalized_data, images_by_slot)
-        missing = _missing_requirements(
+        missing = _missing_requirements_for_quote_flow(
             normalized_data,
             images_by_slot,
             platform_code=case.platform_code or "",
@@ -16464,7 +16286,7 @@ async def handle_quote_text_material_message(
         or vehicle_type_detect.get("config_type_name")
     )
     missing = (
-        _missing_requirements(
+        _missing_requirements_for_quote_flow(
             normalized_data,
             images_by_slot,
             platform_code=platform_code,
@@ -17414,15 +17236,13 @@ async def handle_quote_message(
             platform_code=platform_code,
             account_type_name=None,
         )
-    if quote_flow_type == QUOTE_FLOW_RENEWAL:
-        missing = _renewal_lookup_missing_requirements(normalized_data)
-    else:
-        missing = _missing_requirements(
-            normalized_data,
-            images_by_slot,
-            platform_code=platform_code,
-            account_type_name=selected_account_type_name,
-        )
+    missing = _missing_requirements_for_quote_flow(
+        normalized_data,
+        images_by_slot,
+        platform_code=platform_code,
+        account_type_name=selected_account_type_name,
+        quote_flow_type=quote_flow_type,
+    )
     case.missing_requirements = missing
     missing_account = platform_account is None
     account_pool_unavailable = bool(missing_account and platform_has_enabled_account)
@@ -17876,7 +17696,7 @@ async def handle_quote_material_status(
     selected_account_type_name = _normalize_account_type_name(
         _json_obj(entities).get("account_type_name") or vehicle_type_detect.get("config_type_name")
     )
-    missing = _missing_requirements(
+    missing = _missing_requirements_for_quote_flow(
         normalized_data,
         images_by_slot,
         platform_code=case.platform_code or "",

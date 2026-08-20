@@ -25,6 +25,11 @@ from app.services.quote_platforms.platforms.picc.base import (
     snapshot_from_context,
     success_data,
 )
+from app.services.quote_platforms.platforms.picc.presentation import (
+    picc_is_new_energy_vehicle,
+    picc_result_amount_text,
+    picc_result_kind_name,
+)
 from app.services.ocr_cleaner import correct_vehicle_cert_field
 
 NEW_FUEL_ACCOUNT_TYPE = "油车-新"
@@ -2348,17 +2353,6 @@ def _pick_best_vehicle_candidate(
     return best_rows[0][1]
 
 
-PICC_PROPOSAL_KIND_NAME_BY_CODE = {
-    "051050": "机动车损失保险",
-    "051051": "机动车第三者责任保险",
-    "051052": "机动车车上人员责任保险（司机）",
-    "051053": "机动车车上人员责任保险（乘客）",
-    "051063": "附加医保外医疗费用责任险（机动车第三者责任保险）",
-    "051064": "附加机动车增值服务特约条款（道路救援服务）",
-    "051074": "交强险",
-    "051085": "附加外部电网故障损失险",
-}
-
 PICC_CAR_KIND_LABELS = {
     "A01": "客车",
     "A02": "货车",
@@ -2397,14 +2391,6 @@ def _proposal_money_yuan(value: Any, *, keep_decimal: bool = True, default: str 
     if keep_decimal:
         return f"{_money_text(amount)}元"
     return f"{_clean_money_text(amount)}元"
-
-
-def _proposal_wan_text(value: Any, default: str = "-") -> str:
-    amount = _money(value)
-    if amount <= 0:
-        return default
-    wan = amount / Decimal("10000")
-    return f"{_clean_money_text(wan)}万元"
 
 
 def _proposal_start_datetime(date_value: Any, hour_value: Any = "", minute_value: Any = "") -> str:
@@ -2489,31 +2475,6 @@ def _proposal_claim_summary(data: Mapping[str, Any], claim_bi: Any, claim_ci: An
     if _has_text(claim_ci):
         parts.append(f"交强险{_to_str(claim_ci).strip()}次")
     return "，".join(parts)
-
-
-def _proposal_kind_amount_text(row: Mapping[str, Any], *, seat_count: Any = "", shared_main_limit: Optional[bool] = None) -> str:
-    code = _to_str(row.get("kindCode")).strip()
-    amount = _money(row.get("amount"))
-    unit_amount = _money(row.get("unitAmount"))
-    seats = _safe_int_local(seat_count, 0) if _has_text(seat_count) else 0
-    if code == "051063" and shared_main_limit is True:
-        return "共享主险限额"
-    if code == "051064":
-        quantity = _safe_int_local(row.get("quantity"), 0)
-        return f"{quantity}次" if quantity > 0 else "-"
-    if amount <= 0:
-        return "-"
-    if code == "051050":
-        return _proposal_money_yuan(amount, keep_decimal=True)
-    if code == "051053":
-        per_seat = unit_amount if unit_amount > 0 else amount / Decimal(max(seats - 1, 1))
-        if unit_amount <= 0 and seats <= 1:
-            return _proposal_money_yuan(amount, keep_decimal=True)
-        quantity = max(1, int((amount / per_seat).quantize(Decimal("1"), rounding=ROUND_HALF_UP))) if per_seat else max(seats - 1, 1)
-        return f"{_proposal_wan_text(per_seat).replace('万元', '')}万元/座*{quantity}"
-    if code in {"051051", "051052", "051063", "051074", "051085"}:
-        return _proposal_wan_text(amount)
-    return _proposal_money_yuan(amount, keep_decimal=True)
 
 
 def _quote_form_kind_index(form: Mapping[str, Any], kind_code: str) -> Optional[int]:
@@ -4772,7 +4733,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     auto_notice_callback=auto_notice_callback,
                 )
                 runtime_stage = "build_quote_result"
-                quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
+                quote_result = self._build_motor_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 if not _picc_quote_result_has_real_premium(quote_result):
                     data_payload: Dict[str, Any] = {
                         "error_code": "quote_result_missing_premium",
@@ -6998,19 +6959,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             rows = [row for row in rows if _canonical_product_name(row.get("name")) not in exclusions]
         return rows
 
-    def _display_kind_name(self, kind_name: Any) -> str:
-        text = _to_str(kind_name).strip()
-        replacements = {
-            "机动车第三者责任保险": "第三者责任险",
-            "机动车车上人员责任保险（司机）": PRODUCT_DRIVER,
-            "机动车车上人员责任保险（乘客）": PRODUCT_PASSENGER,
-            "附加医保外医疗费用责任险（机动车第三者责任保险）": PRODUCT_MEDICAL_THIRD,
-            "附加机动车增值服务特约条款（道路救援服务）": PRODUCT_ROAD_RESCUE,
-            "交强险": "交强险",
-        }
-        return replacements.get(text, text)
-
-    def _build_used_fuel_quote_result_from_response(
+    def _build_motor_quote_result_from_response(
         self,
         ctx: PlatformAccountContext,
         quote_payload: Dict[str, Any],
@@ -7024,6 +6973,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             or USED_FUEL_ACCOUNT_TYPE
         )
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
+        is_new_energy_vehicle = picc_is_new_energy_vehicle(
+            account_type_name=account_type_name,
+            is_energy_car=_profile_text(profile, "is_energy_car"),
+        )
         data = _clean_vehicle_cert_fields(_json_obj(_json_obj(quote_response).get("data")))
         vehicle = _clean_vehicle_cert_fields(_json_obj(request_body.get("vehicleForm")))
         owner = _clean_vehicle_cert_fields(_json_obj(request_body.get("ownerForm")))
@@ -7073,7 +7026,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         for row_index, row_any in enumerate(item_rows):
             row = _json_obj(row_any)
             kind_code = _to_str(row.get("kindCode")).strip()
-            name = self._display_kind_name(row.get("kindName"))
+            platform_kind_name = _to_str(row.get("kindName")).strip()
+            name = picc_result_kind_name(
+                kind_code,
+                platform_name=platform_kind_name,
+                is_new_energy=is_new_energy_vehicle,
+            )
             premium_present = _has_text(row.get("premium"))
             premium = _money(row.get("premium")) if premium_present else Decimal("0")
             if kind_code == "051074" or name == "交强险":
@@ -7105,12 +7063,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 {
                     "code": kind_code,
                     "name": name,
+                    "platform_name": platform_kind_name,
                     "amount": _clean_money_text_or_empty(row.get("amount")),
-                    "amount_text": _proposal_kind_amount_text(
+                    "amount_text": picc_result_amount_text(
                         row,
                         seat_count=_first_text(vehicle.get("seatCount"), form.get("prpCitemCar.seatCount")),
                         shared_main_limit=shared_main_limit,
                     ),
+                    "unit_amount": _clean_money_text_or_empty(row.get("unitAmount")),
+                    "quantity": _to_str(row.get("quantity")).strip(),
+                    "shared_amount_flag": _to_str(row.get("sharedAmountFlag")).strip(),
                     "premium": _money_text_or_empty(row.get("premium")),
                     "premium_text": _proposal_money_yuan(row.get("premium")),
                 }
@@ -7330,15 +7292,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "claim_business_count": claim_bi,
             "claim_compulsory_count": claim_ci,
             "risk_score": risk_score,
+            "vehicle_energy_type": "new_energy" if is_new_energy_vehicle else "fuel",
             "coverage_items": coverage_items,
             "proposal_info": proposal_info,
-            "proposal_coverage_items": [
-                {
-                    **item,
-                    "name": PICC_PROPOSAL_KIND_NAME_BY_CODE.get(_to_str(item.get("code")).strip()) or _to_str(item.get("name")).strip(),
-                }
-                for item in coverage_items
-            ],
+            "proposal_coverage_items": [dict(item) for item in coverage_items],
             "transfer_available": True,
         }
         price_items = []
@@ -7401,6 +7358,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "normalized_amounts": normalized_amounts,
             },
             "account_type_name": account_type_name,
+            "vehicle_energy_type": "new_energy" if is_new_energy_vehicle else "fuel",
             "quotation_no": data.get("quotationNo"),
             "quotation_id": data.get("quotationId"),
             "plate_no": _first_text(data.get("licenseNo"), vehicle.get("licenseNo")),

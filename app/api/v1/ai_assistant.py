@@ -61,11 +61,13 @@ from app.services.quote_assistant_service import (
     delete_platform_default_config as _delete_platform_default_config,
     get_platform_account_profile as _get_platform_account_profile,
     get_quote_platform_account_health as _get_quote_platform_account_health,
+    has_running_quote_task as _has_running_quote_task,
     list_platform_default_configs as _list_platform_default_configs,
     list_platform_account_profiles as _list_platform_account_profiles,
     list_platform_account_types as _list_platform_account_types,
     list_quote_platforms as _list_quote_platforms,
     recall_quote_case_images as _recall_quote_case_images,
+    quote_message_may_interrupt_running_task,
     resolve_platform_default_config as _resolve_platform_default_config,
     save_platform_default_config as _save_platform_default_config,
     save_platform_account_type as _save_platform_account_type,
@@ -482,6 +484,7 @@ def _chat_context(ctx: CurrentUserContext, body: AiChatIn) -> Dict[str, Any]:
     body_order_id = body.order_id
     merged.update({
         "images": body.images,
+        "session_id": str(body.session_id or "").strip(),
         "current_user_id": int(getattr(ctx.user, "id", 0) or 0),
         "role_name": str(ctx.primary_role or ""),
         "team_names": list(ctx.team_names or ()),
@@ -723,7 +726,6 @@ async def get_ai_history(
         "items": items,
         "next_cursor": page.get("next_cursor") if isinstance(page, dict) else None,
         "has_more": bool(page.get("has_more")) if isinstance(page, dict) else False,
-        "pending_duplicate_confirm": None,
     }
 
 
@@ -1163,7 +1165,14 @@ async def ai_chat(
     chat_context = _chat_context(ctx, body)
 
     try:
-        chat_lock = await _get_chat_session_lock(owner_user_id, body.session_id)
+        interrupt_running_quote = quote_message_may_interrupt_running_task(body.message, chat_context)
+        if interrupt_running_quote:
+            # Authentication queries may have opened a repeatable-read snapshot.
+            # Detect the in-flight task from a fresh transaction so an adjustment
+            # can invalidate a quote that committed just before this request.
+            await db.rollback()
+        running_quote = interrupt_running_quote and await _has_running_quote_task(db, chat_context)
+        chat_lock = None if running_quote else await _get_chat_session_lock(owner_user_id, body.session_id)
 
         async def _run_chat_once() -> Dict[str, Any]:
             # Auth dependencies may have opened a MySQL repeatable-read snapshot

@@ -115,7 +115,7 @@ def main() -> None:
             ],
         ),
     )
-    addon_only_from_picc_parser = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+    addon_only_from_picc_parser = PiccBusinessAdapter()._build_motor_quote_result_from_response(
         ctx=None,  # The result builder reads account type from the request body first.
         quote_payload={},
         request_body={
@@ -239,7 +239,7 @@ def main() -> None:
         ),
     )
 
-    failed_joint_query_result = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+    failed_joint_query_result = PiccBusinessAdapter()._build_motor_quote_result_from_response(
         ctx=SimpleNamespace(account_type_name="油车-旧"),
         quote_payload={},
         request_body={
@@ -305,7 +305,7 @@ def main() -> None:
     else:
         raise AssertionError("display enrichment accepted an untrusted result")
 
-    missing_tax_result = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+    missing_tax_result = PiccBusinessAdapter()._build_motor_quote_result_from_response(
         ctx=SimpleNamespace(account_type_name="油车-旧"),
         quote_payload={},
         request_body={
