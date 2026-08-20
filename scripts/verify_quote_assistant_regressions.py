@@ -685,6 +685,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertIn("雷克萨斯LEXUS CT200h轿车", terms)
         self.assertIn("CT200h", terms)
         self.assertNotIn("JTHKR5BH", terms)
+        self.assertFalse(any("CT200HCT200H" in term.upper() for term in terms))
 
         _apply_vehicle_model_seed_hints(vehicle, seed)
         self.assertEqual(vehicle["rawModelName"], "雷克萨斯LEXUS CT200h轿车")

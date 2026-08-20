@@ -3692,7 +3692,8 @@ def _vehicle_model_seed_terms(vehicle: Mapping[str, Any], *seeds: Mapping[str, A
         seed = _json_obj(raw_seed)
         if not seed or not _vehicle_seed_identifier_matches_current(vehicle, seed):
             continue
-        seed_brand = _first_text(seed.get("brandNameHint"), seed.get("brandName"), vehicle.get("brandNameHint"))
+        seed_brand_raw = _first_text(seed.get("brandName"), seed.get("brandNameHint"), vehicle.get("brandNameHint"))
+        seed_brand = _vehicle_leading_brand_from_model(seed_brand_raw) or _vehicle_brand_prefix(seed_brand_raw)
         raw_values: List[Any] = [
             seed.get("selectedModelName"),
             seed.get("rawModelName"),
