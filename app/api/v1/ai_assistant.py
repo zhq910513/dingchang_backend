@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from copy import deepcopy
+from decimal import Decimal
 from typing import Any, Dict, List, Tuple
 
 import anyio
@@ -52,6 +53,7 @@ from app.services.ai_assistant_service import (
     db_list_messages as _get_session_messages,
     db_list_sessions as _list_sessions,
     db_recall_session_images as _recall_session_images,
+    schedule_async_quote_result_image_completion as _schedule_quote_result_image_completion,
     send_message as _send_message,  # async
 )
 from app.services.quote_assistant_service import (
@@ -408,6 +410,115 @@ def _normalize_quote_result_image_ref(image: Any, *, result: Any = None) -> Any:
     return image
 
 
+_LEGACY_MISSING_PROVENANCE_ERROR = "平台返回成功状态但缺少报价响应溯源"
+_LEGACY_UNTRUSTED_QUOTE_MARKERS = (
+    "fake",
+    "stub",
+    "mock",
+    "simulat",
+    "synthetic",
+    "placeholder",
+    "假报价",
+    "模拟报价",
+    "占位报价",
+)
+_LEGACY_CORE_PREMIUM_HINTS = (
+    "商业",
+    "交强",
+    "机动车损失保险",
+    "新能源汽车损失保险",
+    "车辆损失险",
+    "车损险",
+    "机动车第三者责任保险",
+    "新能源汽车第三者责任保险",
+    "第三者责任险",
+    "机动车车上人员责任保险",
+    "新能源汽车车上人员责任保险",
+    "车上人员责任险",
+)
+_LEGACY_NON_CORE_HINTS = ("附加", "医保外", "道路救援", "增值服务", "外部电网", "途家", "途顺", "车船")
+
+
+def _quote_result_image_url(image: Any) -> str:
+    if isinstance(image, str):
+        return image.strip()
+    if isinstance(image, dict):
+        return str(image.get("preview_url") or image.get("url") or image.get("image_url") or "").strip()
+    return ""
+
+
+def _positive_quote_amount(value: Any) -> bool:
+    if value in (None, "") or isinstance(value, bool):
+        return False
+    try:
+        number = Decimal(str(value).replace(",", "").replace("元", "").strip())
+    except Exception:
+        return False
+    return number.is_finite() and number > 0
+
+
+def _legacy_quote_result_has_untrusted_marker(result: Dict[str, Any]) -> bool:
+    if result.get("stub") is True or result.get("fake") is True or result.get("mock") is True:
+        return True
+    direct_markers = (
+        result.get("mode"),
+        result.get("status"),
+        result.get("message"),
+        result.get("remark"),
+    )
+    return any(
+        marker in str(value).lower()
+        for value in direct_markers
+        if value not in (None, "")
+        for marker in _LEGACY_UNTRUSTED_QUOTE_MARKERS
+    )
+
+
+def _legacy_quote_result_has_core_premium(result: Dict[str, Any]) -> bool:
+    card = result.get("result_card") or result.get("resultCard")
+    card = card if isinstance(card, dict) else {}
+    for source in (result, card):
+        if _positive_quote_amount(source.get("commercial_premium")) or _positive_quote_amount(source.get("compulsory_premium")):
+            return True
+    for row in result.get("price_items") or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        if any(hint in name for hint in _LEGACY_CORE_PREMIUM_HINTS) and not any(hint in name for hint in _LEGACY_NON_CORE_HINTS):
+            if _positive_quote_amount(row.get("premium")) or _positive_quote_amount(row.get("amount")):
+                return True
+    for rows in (result.get("coverage_items"), card.get("coverage_items"), card.get("proposal_coverage_items")):
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or row.get("platform_name") or "").strip()
+            if not name:
+                continue
+            if any(hint in name for hint in _LEGACY_CORE_PREMIUM_HINTS) and not any(hint in name for hint in _LEGACY_NON_CORE_HINTS):
+                if _positive_quote_amount(row.get("premium")):
+                    return True
+    return False
+
+
+def _allow_legacy_quote_result_image_display(result: Dict[str, Any], validation_error: str) -> bool:
+    """Keep old successful archived quote images viewable without relaxing runtime quote guards."""
+    if _LEGACY_MISSING_PROVENANCE_ERROR not in str(validation_error or ""):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status not in {"success", "ok", "quoted"}:
+        return False
+    image = result.get("result_image") if "result_image" in result else result.get("resultImage")
+    if not _quote_result_image_url(image):
+        return False
+    if _legacy_quote_result_has_untrusted_marker(result):
+        return False
+    return _legacy_quote_result_has_core_premium(result)
+
+
 def _quote_result_validation_error_in_metadata(metadata: Any) -> str:
     """Find the first fail-closed quote-result marker in normalized metadata."""
     if not isinstance(metadata, dict):
@@ -454,7 +565,7 @@ def _invalidate_quote_result_for_display(result: Dict[str, Any], error: str) -> 
     }
 
 
-def _normalize_quote_result_payload(payload: Any) -> Any:
+def _normalize_quote_result_payload(payload: Any, *, allow_legacy_success_image: bool = False) -> Any:
     if not isinstance(payload, dict):
         return payload
     normalized = deepcopy(payload)
@@ -463,7 +574,10 @@ def _normalize_quote_result_payload(payload: Any) -> Any:
         if not isinstance(result, dict):
             continue
         validation_error = quote_result_real_data_error(result)
-        if validation_error:
+        if validation_error and not (
+            allow_legacy_success_image
+            and _allow_legacy_quote_result_image_display(result, validation_error)
+        ):
             normalized[key] = _invalidate_quote_result_for_display(result, validation_error)
             continue
         result_copy = deepcopy(result)
@@ -477,22 +591,37 @@ def _normalize_quote_result_payload(payload: Any) -> Any:
     return normalized
 
 
-def _normalize_quote_result_metadata(metadata: Any) -> Any:
+def _normalize_quote_result_metadata(metadata: Any, *, allow_legacy_success_image: bool = False) -> Any:
     if not isinstance(metadata, dict):
         return metadata
     normalized = deepcopy(metadata)
     if isinstance(normalized.get("data"), dict):
         data = deepcopy(normalized["data"])
         if isinstance(data.get("payload"), dict):
-            data["payload"] = _normalize_quote_result_payload(data["payload"])
-        data = _normalize_quote_result_payload(data)
+            data["payload"] = _normalize_quote_result_payload(
+                data["payload"],
+                allow_legacy_success_image=allow_legacy_success_image,
+            )
+        data = _normalize_quote_result_payload(
+            data,
+            allow_legacy_success_image=allow_legacy_success_image,
+        )
         normalized["data"] = data
     if isinstance(normalized.get("payload"), dict):
-        normalized["payload"] = _normalize_quote_result_payload(normalized["payload"])
+        normalized["payload"] = _normalize_quote_result_payload(
+            normalized["payload"],
+            allow_legacy_success_image=allow_legacy_success_image,
+        )
     if isinstance(normalized.get("quote_result"), dict):
-        normalized["quote_result"] = _normalize_quote_result_payload({"quote_result": normalized["quote_result"]}).get("quote_result")
+        normalized["quote_result"] = _normalize_quote_result_payload(
+            {"quote_result": normalized["quote_result"]},
+            allow_legacy_success_image=allow_legacy_success_image,
+        ).get("quote_result")
     if isinstance(normalized.get("quoteResult"), dict):
-        normalized["quoteResult"] = _normalize_quote_result_payload({"quoteResult": normalized["quoteResult"]}).get("quoteResult")
+        normalized["quoteResult"] = _normalize_quote_result_payload(
+            {"quoteResult": normalized["quoteResult"]},
+            allow_legacy_success_image=allow_legacy_success_image,
+        ).get("quoteResult")
     validation_error = _quote_result_validation_error_in_metadata(normalized)
     if validation_error:
         normalized["quote_result_validation_error"] = validation_error
@@ -728,7 +857,8 @@ async def get_ai_history(
                 can_quote_use=can_quote_use,
                 can_platform_account_manage=can_account_manage,
                 can_default_config_manage=can_default_config_manage,
-            )
+            ),
+            allow_legacy_success_image=True,
         )
         raw_content = sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", "")
         history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
@@ -1231,6 +1361,7 @@ async def ai_chat(
                 db=db,
             )
             await db.commit()
+            _schedule_quote_result_image_completion(owner_user_id=owner_user_id, response=result_inner)
             return result_inner
 
         if chat_lock is not None:

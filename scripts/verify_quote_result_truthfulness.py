@@ -353,6 +353,35 @@ def main() -> None:
     valid_history_result = valid_history["data"]["payload"]["quote_result"]
     assert valid_history_result["result_image"]["image_url"].endswith("real-quote.png"), valid_history
 
+    legacy_history = _normalize_quote_result_metadata(
+        {
+            "data": {
+                "result_status": "success",
+                "payload": {
+                    "quote_result": {
+                        **_result(quote_provenance={}),
+                        "result_image": "https://oss.example/legacy-real-quote.png",
+                    }
+                },
+            }
+        },
+        allow_legacy_success_image=True,
+    )
+    legacy_history_result = legacy_history["data"]["payload"]["quote_result"]
+    assert legacy_history_result["result_image"]["image_url"].endswith("legacy-real-quote.png"), legacy_history
+    assert "quote_result_unavailable" not in legacy_history_result, legacy_history
+
+    legacy_without_image = _normalize_quote_result_metadata(
+        {
+            "data": {
+                "result_status": "success",
+                "payload": {"quote_result": {**_result(quote_provenance={})}},
+            }
+        },
+        allow_legacy_success_image=True,
+    )
+    assert legacy_without_image["data"]["payload"]["quote_result"]["quote_result_unavailable"] is True, legacy_without_image
+
     invalid_history = _normalize_quote_result_metadata(
         {
             "data": {

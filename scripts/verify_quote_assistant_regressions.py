@@ -86,6 +86,7 @@ from app.services.quote_assistant_service import (
     _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
     _platform_default_values_with_legacy_fixes,
+    _picc_existing_proposal_table_card_for_display,
     _picc_result_coverage_items_for_display,
     _quote_task_is_stale,
     _quote_task_stale_base_time,
@@ -98,9 +99,12 @@ from app.services.quote_platforms.platforms.picc.presentation import (
     picc_result_amount_text,
     picc_result_kind_name,
 )
+from app.services.quote_result_image import _proposal_info_rows
 from app.services.ai_assistant_service import (
     _message_preview_text,
     _session_preview_needs_recompute,
+    _quote_result_mark_async_image_failed,
+    _reschedule_pending_quote_result_images_from_page,
 )
 from app.api.v1.ai_assistant import _chat_context
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
@@ -206,6 +210,63 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in rows], ["新能源汽车损失保险", "道路救援服务"])
         self.assertEqual(rows[1]["amount_text"], "5次")
         self.assertEqual(rows[1]["quantity"], "5")
+
+    def test_existing_proposal_table_keeps_card_coverage_rows_when_result_top_level_is_empty(self) -> None:
+        card = {
+            "style": "picc_proposal_table",
+            "vehicle_energy_type": "fuel",
+            "coverage_items": [
+                {
+                    "code": "051050",
+                    "name": "机动车损失保险",
+                    "amount": "155900",
+                    "premium": "2477.15",
+                },
+                {
+                    "code": "051064",
+                    "name": "附加机动车增值服务特约条款（道路救援服务）",
+                    "quantity": "7",
+                    "premium": "0.00",
+                },
+            ],
+            "proposal_info": {"plate_no": "赣A12345", "vin": "LGXTEST0000000001"},
+        }
+        result = {
+            "vehicle_energy_type": "fuel",
+            "request_body": {"vehicleForm": {"seatCount": "5"}, "quoteForm": {}},
+            "quote_provenance": {"normalized_amounts": {}},
+        }
+        display_card = _picc_existing_proposal_table_card_for_display(result, card)
+        rows = display_card["proposal_coverage_items"]
+        self.assertEqual([row["name"] for row in rows], ["机动车损失保险", "附加机动车增值服务特约条款（道路救援服务）"])
+        self.assertEqual(rows[1]["amount_text"], "7次")
+
+    def test_proposal_info_rows_keep_legacy_field_order(self) -> None:
+        rows = _proposal_info_rows(
+            {
+                "proposal_info": {
+                    "insured_name": "杨响",
+                    "plate_no": "048407",
+                    "engine_no": "8A6048407",
+                    "vin": "LGXCH4CD6T0353958",
+                    "vehicle_type": "A01-客车",
+                    "vehicle_usage": "21-家庭自用汽车",
+                    "vehicle_model": "比亚迪BYD6480AMBE",
+                    "model_match_method": "目录关键词",
+                    "enroll_date": "2026-08-19",
+                    "ton_count": "0千克",
+                    "seat_count": "5人",
+                    "purchase_price": "144900元",
+                    "claim_summary": "商业险连续承保年数0年",
+                    "bi_start_date": "2026-08-20 00:00",
+                    "ci_start_date": "2026-08-20 00:00",
+                }
+            }
+        )
+        self.assertEqual(rows[3], ("车辆型号", "比亚迪BYD6480AMBE", "初登日期", "2026-08-19"))
+        self.assertEqual(rows[4], ("核定载质量", "0千克", "核定载客量(包括司机)", "5人"))
+        self.assertEqual(rows[5][0], "新车购置价")
+        self.assertEqual(rows[6][0], "商业险起保日期")
 
     def test_picc_result_builder_wires_energy_names_and_road_rescue_quantity(self) -> None:
         result = _adapter()._build_motor_quote_result_from_response(
@@ -2563,6 +2624,53 @@ class QuoteFailureEnvelopeTests(unittest.TestCase):
         self.assertFalse(data["silent"])
         self.assertTrue(data["ui_visible"])
         self.assertEqual(data["payload"]["failure_code"], FAILURE_CODE_PLATFORM)
+
+
+class AsyncQuoteImageFailureTests(unittest.TestCase):
+    def test_failed_async_image_generation_clears_pending_flag(self) -> None:
+        result = {
+            "result_image_pending": True,
+            "result_image_async": False,
+            "total_premium": "1234.56",
+        }
+        _quote_result_mark_async_image_failed(result)
+        self.assertFalse(result["result_image_pending"], result)
+        self.assertTrue(result["result_image_async_failed"], result)
+
+    def test_history_page_reschedules_pending_image(self) -> None:
+        scheduled = []
+
+        def fake_schedule(**kwargs):
+            scheduled.append(kwargs)
+            return True
+
+        page = [
+            {
+                "id": "m1",
+                "metadata": {
+                    "data": {
+                        "payload": {
+                            "quote_result": {
+                                "result_image_pending": True,
+                                "result_card": {"title": "报价结果"},
+                                "trace_id": "trace-1",
+                            },
+                            "quote_task": {"id": 8},
+                        }
+                    }
+                },
+            }
+        ]
+        with patch("app.services.ai_assistant_service._quote_result_needs_async_image", return_value=True), patch(
+            "app.services.ai_assistant_service._schedule_async_quote_result_image_completion_once",
+            side_effect=fake_schedule,
+        ):
+            import asyncio
+
+            asyncio.run(_reschedule_pending_quote_result_images_from_page(owner_user_id=1, session_id="sid", items=page))
+        self.assertEqual(len(scheduled), 1, scheduled)
+        self.assertEqual(scheduled[0]["assistant_message_id"], "m1")
+        self.assertEqual(scheduled[0]["quote_task_id"], 8)
 
     def test_dialog_subtype_maps_to_failure_code(self) -> None:
         self.assertEqual(

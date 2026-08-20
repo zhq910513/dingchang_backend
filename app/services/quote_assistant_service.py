@@ -114,6 +114,12 @@ def _log_quote_perf(
     except Exception:
         logger.debug("quote perf log failed", exc_info=True)
 
+
+def _quote_result_image_async_enabled() -> bool:
+    value = _to_str(os.getenv("QUOTE_RESULT_IMAGE_ASYNC_ENABLED", "1")).strip().lower()
+    return value not in {"0", "false", "no", "off", "否", "关闭"}
+
+
 RESULT_SUCCESS = "success"
 RESULT_NEED_MORE = "need_more_info"
 RESULT_NOT_READY = "not_ready"
@@ -12339,11 +12345,18 @@ def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], ca
         result.get("vehicle_energy_type"),
         safe_card.get("vehicle_energy_type"),
     )
+    coverage_source = result if _json_list(result.get("coverage_items")) else safe_card
     coverage_items = _picc_result_coverage_items_for_display(
-        result,
+        coverage_source,
         seat_count=seat_count,
         vehicle_energy_type=vehicle_energy_type,
     )
+    if not coverage_items:
+        coverage_items = [
+            dict(row)
+            for row in _json_list(safe_card.get("proposal_coverage_items"))
+            if isinstance(row, Mapping)
+        ]
     if vehicle_energy_type:
         safe_card["vehicle_energy_type"] = vehicle_energy_type
     safe_card["proposal_coverage_items"] = coverage_items
@@ -12547,6 +12560,7 @@ def _enrich_quote_result_for_display(
     *,
     platform_account: Optional[QuotePlatformAccountProfile] = None,
     platform_name: str = "",
+    generate_image: bool = True,
 ) -> Dict[str, Any]:
     """Attach truthful display metadata for the chat quote card without leaking secrets."""
     safe_result = dict(_json_obj(result))
@@ -12563,6 +12577,15 @@ def _enrich_quote_result_for_display(
     for key in ("watermark_account", "watermark_user", "watermark_name", "watermark_time", "watermark_text"):
         card.pop(key, None)
     safe_result["result_card"] = card
+    if not generate_image:
+        safe_result.pop("result_image", None)
+        safe_result.pop("resultImage", None)
+        safe_result["result_image_pending"] = True
+        if platform_account:
+            safe_result.setdefault("account_type_name", _normalize_account_type_name(_loaded_value(platform_account, "account_type_name")))
+            safe_result.setdefault("account_username", _to_str(_loaded_value(platform_account, "account_username")).strip())
+            safe_result.setdefault("account_owner_name", _to_str(_loaded_value(platform_account, "account_owner_name")).strip())
+        return safe_result
     image_started = time.perf_counter()
     try:
         image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
@@ -13381,6 +13404,7 @@ async def _handle_joint_sales_image_adjustment_message(
             adjusted_result,
             platform_account=platform_account,
             platform_name=platform_name,
+            generate_image=not _quote_result_image_async_enabled(),
         )
     except Exception as exc:
         return await _fail_quote_after_result_materialization(
@@ -13520,6 +13544,7 @@ def _already_quoted_response(
             result,
             platform_account=None,
             platform_name=platform_name,
+            generate_image=not _quote_result_image_async_enabled(),
         )
     except Exception as exc:
         detail = sanitize_quote_user_message(exc, "历史报价结果图生成失败")
@@ -16020,6 +16045,7 @@ async def _complete_waiting_task(
             result,
             platform_account=platform_account,
             platform_name=platform_name,
+            generate_image=not _quote_result_image_async_enabled(),
         )
     except Exception as exc:
         perf["result_display_ms"] = _elapsed_ms(display_started)
@@ -16439,6 +16465,7 @@ async def _complete_quote_without_sms(
             result,
             platform_account=platform_account,
             platform_name=platform_name,
+            generate_image=not _quote_result_image_async_enabled(),
         )
     except Exception as exc:
         perf["result_display_ms"] = _elapsed_ms(display_started)

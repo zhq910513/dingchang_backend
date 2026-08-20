@@ -14,7 +14,7 @@ from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sqlalchemy import and_, desc, false as sql_false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,11 +22,11 @@ from sqlalchemy.orm import lazyload, selectinload
 
 from app.core.access_control import normalize_team_names, user_team_match_expr
 from app.core.constants import ROLE_FINANCE, ROLE_MANAGER, ROLE_MARKET, ROLE_SALES, ROLE_SUPER_ADMIN
-from app.core.db import get_db
+from app.core.db import async_session_factory, get_db
 from app.models.ocr_task import OcrTask
 from app.models.order import Order, OrderImage
 from app.models.order_info import OrderInfo
-from app.models.quote_assistant import QuoteAssistantMessage, QuoteAssistantSession
+from app.models.quote_assistant import QuoteAssistantMessage, QuoteAssistantSession, QuoteTask
 from app.models.user import User
 from app.services.ai_platforms import get_adapter
 from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
@@ -65,6 +65,7 @@ from app.services.quote_assistant_service import (
     sanitize_quote_entities,
 )
 from app.services.quote_result_validation import quote_result_real_data_error
+from app.services.quote_result_image import save_quote_result_card_image
 from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
@@ -1230,6 +1231,13 @@ async def db_list_messages(
                 has_more = True
                 next_cursor = _history_before_cursor(today_start)
 
+    if items:
+        await _reschedule_pending_quote_result_images_from_page(
+            owner_user_id=owner,
+            session_id=row.session_id,
+            items=items,
+        )
+
     return {
         "items": items,
         "next_cursor": next_cursor,
@@ -1495,6 +1503,298 @@ async def db_recall_session_images(
         "updated_images": updated_images,
         "storage_keys": sorted(keys),
     }
+
+
+def _quote_result_from_chat_data(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    result = (
+        payload.get("quote_result")
+        or payload.get("quoteResult")
+        or data.get("quote_result")
+        or data.get("quoteResult")
+    )
+    return result if isinstance(result, dict) else {}
+
+
+def _set_quote_result_on_chat_data(data: Dict[str, Any], result: Dict[str, Any]) -> None:
+    if not isinstance(data, dict) or not isinstance(result, dict):
+        return
+    payload = data.get("payload")
+    if isinstance(payload, dict):
+        if isinstance(payload.get("quote_result"), dict):
+            payload["quote_result"] = deepcopy(result)
+        if isinstance(payload.get("quoteResult"), dict):
+            payload["quoteResult"] = deepcopy(result)
+    if isinstance(data.get("quote_result"), dict):
+        data["quote_result"] = deepcopy(result)
+    if isinstance(data.get("quoteResult"), dict):
+        data["quoteResult"] = deepcopy(result)
+
+
+def _quote_result_needs_async_image(result: Mapping[str, Any]) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("result_image_pending") is not True:
+        return False
+    if result.get("result_image") or result.get("resultImage"):
+        return False
+    return not quote_result_real_data_error(result)
+
+
+_ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS: set[Tuple[str, str]] = set()
+_ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK = threading.Lock()
+
+
+def _schedule_async_quote_result_image_completion_once(
+    *,
+    owner_user_id: int,
+    session_id: str,
+    assistant_message_id: str,
+    quote_task_id: int,
+    trace_id: str,
+) -> bool:
+    key = (_to_str(owner_user_id), f"{_to_str(session_id).strip()}:{_to_str(assistant_message_id).strip()}")
+    if not key[0].strip() or not key[1].strip():
+        return False
+    with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
+        if key in _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS:
+            return False
+        _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS.add(key)
+    try:
+        asyncio.create_task(
+            _complete_async_quote_result_image(
+                owner_user_id=int(owner_user_id),
+                session_id=_to_str(session_id).strip(),
+                assistant_message_id=_to_str(assistant_message_id).strip(),
+                quote_task_id=int(quote_task_id or 0),
+                trace_id=_to_str(trace_id).strip(),
+            )
+        )
+    except RuntimeError:
+        logger.debug(
+            "async quote result image scheduling skipped: no running loop owner=%s session=%s message=%s",
+            owner_user_id,
+            session_id,
+            assistant_message_id,
+        )
+        with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
+            _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS.discard(key)
+        return False
+    return True
+
+
+def _quote_result_mark_async_image_failed(result: Dict[str, Any]) -> None:
+    if not isinstance(result, dict):
+        return
+    result["result_image_pending"] = False
+    result["result_image_async_failed"] = True
+
+
+async def _clear_async_quote_result_image_pending(
+    *,
+    owner_user_id: int,
+    session_id: str,
+    assistant_message_id: str,
+    quote_task_id: int,
+) -> None:
+    async with async_session_factory() as db:
+        msg = await _db_get_message_by_public_id(
+            db,
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            message_id=assistant_message_id,
+        )
+        if msg is not None:
+            meta = deepcopy(msg.metadata_json or {})
+            if isinstance(meta, dict):
+                data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
+                result = _quote_result_from_chat_data(data)
+                if _quote_result_needs_async_image(result):
+                    result = deepcopy(result)
+                    _quote_result_mark_async_image_failed(result)
+                    _set_quote_result_on_chat_data(data, result)
+                    meta["data"] = data
+                    msg.metadata_json = _safe_metadata_for_history(meta)
+                    msg.updated_at = _now_db()
+
+        if quote_task_id > 0:
+            task = await db.get(QuoteTask, quote_task_id)
+            if task is not None:
+                task_result = deepcopy(task.result_payload or {})
+                if isinstance(task_result, dict) and _quote_result_needs_async_image(task_result):
+                    _quote_result_mark_async_image_failed(task_result)
+                    task.result_payload = task_result
+                response_payload = deepcopy(task.response_payload or {})
+                perf = response_payload.get("perf") if isinstance(response_payload.get("perf"), dict) else {}
+                perf["result_image_async_failed"] = True
+                response_payload["perf"] = perf
+                task.response_payload = response_payload
+                task.updated_at = _now_db()
+
+        await db.commit()
+
+
+async def _reschedule_pending_quote_result_images_from_page(
+    *,
+    owner_user_id: int,
+    session_id: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        data = metadata.get("data") if isinstance(metadata.get("data"), dict) else {}
+        result = _quote_result_from_chat_data(data)
+        if not _quote_result_needs_async_image(result):
+            continue
+        assistant_message_id = _to_str(item.get("id")).strip()
+        trace_id = _to_str(result.get("trace_id") or metadata.get("trace_id") or data.get("trace_id")).strip()
+        payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+        quote_task = payload.get("quote_task") if isinstance(payload.get("quote_task"), dict) else {}
+        quote_task_id = _safe_int(quote_task.get("id"), 0)
+        if assistant_message_id:
+            _schedule_async_quote_result_image_completion_once(
+                owner_user_id=owner_user_id,
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                quote_task_id=quote_task_id,
+                trace_id=trace_id,
+            )
+
+
+async def _complete_async_quote_result_image(
+    *,
+    owner_user_id: int,
+    session_id: str,
+    assistant_message_id: str,
+    quote_task_id: int,
+    trace_id: str,
+) -> None:
+    started = time.perf_counter()
+    cleanup_needed = False
+    try:
+        async with async_session_factory() as db:
+            msg = await _db_get_message_by_public_id(
+                db,
+                owner_user_id=owner_user_id,
+                session_id=session_id,
+                message_id=assistant_message_id,
+            )
+            if msg is None:
+                return
+            meta = deepcopy(msg.metadata_json or {})
+            if not isinstance(meta, dict):
+                return
+            data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
+            result = _quote_result_from_chat_data(data)
+            if not _quote_result_needs_async_image(result):
+                return
+            card = result.get("result_card") or result.get("resultCard")
+            if not isinstance(card, dict) or not card:
+                raise ValueError("async quote result image card missing")
+
+            image_payload = await asyncio.to_thread(
+                save_quote_result_card_image,
+                card,
+                trace_id=trace_id,
+            )
+            if not isinstance(image_payload, dict) or not (
+                image_payload.get("image_url") or image_payload.get("url") or image_payload.get("preview_url")
+            ):
+                raise ValueError("async quote result image payload missing")
+
+            result = deepcopy(result)
+            result["result_image"] = dict(image_payload)
+            result["result_image_pending"] = False
+            result["result_image_async"] = True
+            result["result_image_ms"] = int(round((time.perf_counter() - started) * 1000))
+            _set_quote_result_on_chat_data(data, result)
+            meta["data"] = data
+            msg.metadata_json = _safe_metadata_for_history(meta)
+            msg.updated_at = _now_db()
+
+            if quote_task_id > 0:
+                task = await db.get(QuoteTask, quote_task_id)
+                if task is not None:
+                    task_result = deepcopy(task.result_payload or {})
+                    if isinstance(task_result, dict) and _quote_result_needs_async_image(task_result):
+                        task_result.update(
+                            {
+                                "result_image": dict(image_payload),
+                                "result_image_pending": False,
+                                "result_image_async": True,
+                                "result_image_ms": result["result_image_ms"],
+                            }
+                        )
+                        task.result_payload = task_result
+                    response_payload = deepcopy(task.response_payload or {})
+                    perf = response_payload.get("perf") if isinstance(response_payload.get("perf"), dict) else {}
+                    perf["result_image_async_ms"] = result["result_image_ms"]
+                    response_payload["perf"] = perf
+                    task.response_payload = response_payload
+                    task.updated_at = _now_db()
+            await db.commit()
+    except Exception:
+        logger.warning(
+            "async quote result image completion failed: owner=%s session=%s message=%s task=%s",
+            owner_user_id,
+            session_id,
+            assistant_message_id,
+            quote_task_id,
+            exc_info=True,
+        )
+        try:
+            await _clear_async_quote_result_image_pending(
+                owner_user_id=owner_user_id,
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                quote_task_id=quote_task_id,
+            )
+        except Exception:
+            logger.warning(
+                "async quote result image failure cleanup failed: owner=%s session=%s message=%s task=%s",
+                owner_user_id,
+                session_id,
+                assistant_message_id,
+                quote_task_id,
+                exc_info=True,
+            )
+    finally:
+        key = (_to_str(owner_user_id), f"{_to_str(session_id).strip()}:{_to_str(assistant_message_id).strip()}")
+        with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
+            _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS.discard(key)
+
+
+def schedule_async_quote_result_image_completion(
+    *,
+    owner_user_id: int,
+    response: Dict[str, Any],
+) -> None:
+    if not isinstance(response, dict):
+        return
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    result = _quote_result_from_chat_data(data)
+    if not _quote_result_needs_async_image(result):
+        return
+    assistant_message = response.get("assistant_message") if isinstance(response.get("assistant_message"), dict) else {}
+    assistant_message_id = _to_str(assistant_message.get("id")).strip()
+    session_id = _to_str(response.get("session_id")).strip()
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    quote_task = payload.get("quote_task") if isinstance(payload.get("quote_task"), dict) else {}
+    quote_task_id = _safe_int(quote_task.get("id"), 0)
+    trace_id = _to_str(response.get("trace_id") or quote_task.get("trace_id") or result.get("trace_id")).strip()
+    if owner_user_id <= 0 or not session_id or not assistant_message_id:
+        return
+    _schedule_async_quote_result_image_completion_once(
+        owner_user_id=int(owner_user_id),
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+        quote_task_id=quote_task_id,
+        trace_id=trace_id,
+    )
 
 
 # =============================
@@ -3750,5 +4050,6 @@ __all__ = [
     "db_list_messages",
     "db_list_sessions",
     "db_recall_session_images",
+    "schedule_async_quote_result_image_completion",
     "send_message",
 ]
