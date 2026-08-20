@@ -11775,15 +11775,9 @@ async def _quote_auto_notice_already_persisted(
             return True
         metadata_obj = _json_obj(metadata)
         metadata_trace = _to_str(metadata_obj.get("trace_id")).strip()
+        same_trace = bool(trace_id and metadata_trace == trace_id)
         row_notice = _quote_auto_notice_payload_from_metadata(metadata_obj)
-        if row_notice:
-            row_message = _to_str(row_notice.get("message")).strip() or _to_str(content)
-            row_compact = _quote_auto_notice_compact_message(row_message)
-            if row_compact == compact_message:
-                return True
-            if _quote_auto_notice_message_overlaps(row_compact, compact_message):
-                return True
-        if trace_id and metadata_trace == trace_id:
+        if same_trace:
             row_message = _to_str(row_notice.get("message")).strip() or _to_str(content)
             row_compact = _quote_auto_notice_compact_message(row_message)
             if row_compact == compact_message:

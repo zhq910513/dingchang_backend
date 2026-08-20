@@ -80,6 +80,7 @@ from app.services.quote_assistant_service import (
     _quote_snapshot_with_auto_adjusted_dates,
     _quote_result_insurance_date_auto_adjustments,
     _quote_result_reply_text,
+    _quote_auto_notice_already_persisted,
     _quote_auto_notice_dedupe_key,
     _is_quote_auto_notice_duplicate_error,
     _has_reusable_renewal_quote_context,
@@ -1923,6 +1924,77 @@ class QuotePromptStateRegressionTests(unittest.TestCase):
         self.assertEqual(
             _quote_auto_notice_message_id(first),
             _quote_auto_notice_message_id(second),
+        )
+
+    def test_old_auto_notice_text_does_not_suppress_new_quote_task(self) -> None:
+        import asyncio
+
+        text = (
+            "重复投保提示\n\n"
+            "车辆VIN:LGXCH4CD6T0353958近期已在我司承保，请核实后进行报价，避免重复投保。"
+        )
+        old_key = _quote_auto_notice_dedupe_key(
+            trace_id="trace-old",
+            task_id=101,
+            notice_type="duplicate_quote_notice",
+            message=text,
+        )
+        new_key = _quote_auto_notice_dedupe_key(
+            trace_id="trace-new",
+            task_id=102,
+            notice_type="duplicate_quote_notice",
+            message=text,
+        )
+        old_metadata = {
+            "trace_id": "trace-old",
+            "data": {
+                "payload": {
+                    "platform_auto_notice": {
+                        "type": "duplicate_quote_notice",
+                        "message": text,
+                        "dedupe_key": old_key,
+                    },
+                },
+            },
+        }
+        result = MagicMock()
+        result.all.return_value = [(text, old_metadata)]
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=result)
+
+        self.assertFalse(
+            asyncio.run(_quote_auto_notice_already_persisted(
+                db,
+                owner_user_id=1,
+                session_id="session-1",
+                dedupe_key=new_key,
+                message=text,
+                trace_id="trace-new",
+            ))
+        )
+
+        same_trace_metadata = {
+            **old_metadata,
+            "trace_id": "trace-new",
+            "data": {
+                "payload": {
+                    "platform_auto_notice": {
+                        "type": "duplicate_quote_notice",
+                        "message": text,
+                    },
+                },
+            },
+        }
+        result.all.return_value = [(text, same_trace_metadata)]
+        self.assertTrue(
+            asyncio.run(_quote_auto_notice_already_persisted(
+                db,
+                owner_user_id=1,
+                session_id="session-1",
+                dedupe_key=new_key,
+                message=text,
+                trace_id="trace-new",
+            ))
         )
 
     def test_auto_notice_duplicate_key_errors_are_swallowed_only_for_message_id(self) -> None:
