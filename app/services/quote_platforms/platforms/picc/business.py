@@ -3657,6 +3657,89 @@ def _used_fuel_model_query_terms(
     )
 
 
+def _vehicle_seed_identifier_matches_current(vehicle: Mapping[str, Any], seed: Mapping[str, Any]) -> bool:
+    """Only trust cached/pre-filled vehicle model hints when they are for this car."""
+
+    current_vin = _clean_vehicle_cert_value(
+        "vin",
+        _first_text(vehicle.get("vin"), vehicle.get("vinNo"), vehicle.get("frameNo")),
+    )
+    seed_vin = _clean_vehicle_cert_value(
+        "vin",
+        _first_text(seed.get("vin"), seed.get("vinNo"), seed.get("frameNo")),
+    )
+    current_engine = _clean_vehicle_cert_value("engine_no", _first_text(vehicle.get("engineNo"), vehicle.get("engine_no")))
+    seed_engine = _clean_vehicle_cert_value("engine_no", _first_text(seed.get("engineNo"), seed.get("engine_no")))
+    current_plate = _clean_vehicle_cert_value("plate_no", _first_text(vehicle.get("licenseNo"), vehicle.get("plate_no")))
+    seed_plate = _clean_vehicle_cert_value("plate_no", _first_text(seed.get("licenseNo"), seed.get("plate_no")))
+
+    matched = False
+    for current, incoming in ((current_vin, seed_vin), (current_engine, seed_engine), (current_plate, seed_plate)):
+        current_text = _to_str(current).strip().upper()
+        incoming_text = _to_str(incoming).strip().upper()
+        if current_text and incoming_text:
+            if current_text != incoming_text:
+                return False
+            matched = True
+    return matched
+
+
+def _vehicle_model_seed_terms(vehicle: Mapping[str, Any], *seeds: Mapping[str, Any]) -> List[str]:
+    """Extract safe sales-model query terms from renewal/history request seeds."""
+
+    out: List[str] = []
+    for raw_seed in seeds:
+        seed = _json_obj(raw_seed)
+        if not seed or not _vehicle_seed_identifier_matches_current(vehicle, seed):
+            continue
+        seed_brand = _first_text(seed.get("brandNameHint"), seed.get("brandName"), vehicle.get("brandNameHint"))
+        raw_values: List[Any] = [
+            seed.get("selectedModelName"),
+            seed.get("rawModelName"),
+            seed.get("modelName"),
+            seed.get("modelQueryMatched"),
+            seed.get("vehicleFgwCode"),
+        ]
+        raw_values.extend(seed.get("modelQueryTerms") if isinstance(seed.get("modelQueryTerms"), list) else [])
+        for value in raw_values:
+            direct = _to_str(value).strip().strip("*")
+            candidates = _dedupe_model_terms(
+                [
+                    direct,
+                    *_used_fuel_model_query_terms(
+                        direct,
+                        vehicle.get("vehicleType"),
+                        vehicle.get("energyModelSuffix"),
+                        brand_name=seed_brand,
+                        vehicle_name="",
+                        vin=vehicle.get("vin"),
+                    ),
+                ]
+            )
+            for term in candidates:
+                if not _vehicle_model_hint_is_usable(vehicle, term):
+                    continue
+                if _vehicle_term_lacks_sales_specificity(term, {**_json_obj(vehicle), "brandNameHint": seed_brand}):
+                    continue
+                out.append(term)
+    return _dedupe_model_terms(out)
+
+
+def _apply_vehicle_model_seed_hints(vehicle: Dict[str, Any], *seeds: Mapping[str, Any]) -> None:
+    """Promote trusted renewal/history model hints without accepting stale broad terms."""
+
+    terms = _vehicle_model_seed_terms(vehicle, *seeds)
+    if not terms:
+        return
+    vehicle["trustedModelSeedTerms"] = terms
+    first_term = terms[0]
+    if not _vehicle_model_hint_is_usable(vehicle, vehicle.get("vehicleNameHint")):
+        vehicle["vehicleNameHint"] = first_term
+    if not _vehicle_model_hint_is_usable(vehicle, vehicle.get("rawModelName")):
+        vehicle["rawModelName"] = first_term
+        vehicle["modelName"] = first_term
+
+
 def _normalize_used_fuel_model_name(model_name: Any, vehicle_type: Any = "") -> str:
     terms = _used_fuel_model_query_terms(model_name, vehicle_type)
     return terms[0] if terms else _to_str(model_name).strip()
@@ -5353,6 +5436,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             _json_obj(incoming_body.get("vehicleForm")),
         )
         vehicle = _clean_vehicle_cert_fields(vehicle)
+        _apply_vehicle_model_seed_hints(
+            vehicle,
+            _json_obj(_json_obj(normalized_data.get("renewal_request_body_seed")).get("vehicleForm")),
+            _json_obj(incoming_body.get("vehicleForm")),
+        )
         owner = _deep_merge(
             self._used_fuel_owner(defaults, normalized_data),
             _json_obj(incoming_body.get("ownerForm")),
@@ -5479,7 +5567,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         defaults = _picc_business_defaults(payload.get("default_config_json"))
         normalized_data = _json_obj(payload.get("normalized_data"))
         explicit_loss_amount = _quote_loss_override_amount(payload, defaults)
+        incoming_body = _json_obj(payload.get("request_body"))
         vehicle = self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile)
+        _apply_vehicle_model_seed_hints(
+            vehicle,
+            _json_obj(_json_obj(normalized_data.get("renewal_request_body_seed")).get("vehicleForm")),
+            _json_obj(incoming_body.get("vehicleForm")),
+        )
         owner = self._used_fuel_owner(defaults, normalized_data)
 
         search_result = self._query_vehicle_candidates(client, vehicle, profile=profile, defaults=defaults)
@@ -6380,7 +6474,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             raise PiccRequestError("人保报价缺少车型名称，无法查询车型配置")
         # Always rebuild terms from current vehicle fields. Stale modelQueryTerms on
         # draft/retry bodies previously poisoned brand-only searches.
-        terms = _dedupe_model_terms(
+        seed_terms = [
+            term
+            for term in (
+                vehicle.get("trustedModelSeedTerms")
+                if isinstance(vehicle.get("trustedModelSeedTerms"), list)
+                else []
+            )
+            if _vehicle_model_hint_is_usable(vehicle, term)
+            and not _vehicle_term_lacks_sales_specificity(term, vehicle)
+        ]
+        rebuilt_terms = _dedupe_model_terms(
             _used_fuel_model_query_terms(
                 model_name,
                 vehicle.get("vehicleType"),
@@ -6390,6 +6494,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 vin=vehicle.get("vin"),
             )
         ) or [model_name]
+        current_model_is_specific = _vehicle_model_hint_is_usable(
+            vehicle,
+            model_name,
+        ) and not _vehicle_term_lacks_sales_specificity(model_name, vehicle)
+        terms = _dedupe_model_terms(
+            [*rebuilt_terms, *seed_terms]
+            if current_model_is_specific
+            else [*seed_terms, *rebuilt_terms]
+        )
         resource_codes = _vehicle_query_resource_codes(profile=profile, defaults=defaults, vehicle=vehicle)
         if isinstance(vehicle, dict):
             vehicle["modelQueryTerms"] = terms

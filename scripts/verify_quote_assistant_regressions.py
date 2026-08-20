@@ -125,7 +125,9 @@ from app.services.quote_platforms.platforms.picc.business import (
     _pick_renewal_policy_candidate,
     _vehicle_brand_prefix,
     _vehicle_candidate_score,
+    _apply_vehicle_model_seed_hints,
     _vehicle_model_hint_is_usable,
+    _vehicle_model_seed_terms,
     _vehicle_model_resolution_failure_message,
     _vehicle_query_resource_codes,
     _vehicle_rows_correlated_to_vin,
@@ -653,6 +655,85 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(vehicle["modelQueryMatchKind"], "sales_model")
         self.assertEqual(vehicle["modelQueryMatchLabel"], "销售车型直查")
         self.assertEqual(vehicle.get("vehicleQueryResourcesUsed"), "0524")
+
+    def test_history_vehicle_seed_restores_lexus_sales_model_without_guessing(self) -> None:
+        seed = {
+            "vin": "JTHKR5BH3J2327186",
+            "engineNo": "5ZR2A03174",
+            "licenseNo": "赣G73C52",
+            "selectedModelName": "雷克萨斯LEXUS CT200h轿车",
+            "rawModelName": "雷克萨斯LEXUS CT200h轿车",
+            "vehicleFgwCode": "CT200H",
+            "modelQueryTerms": [
+                "雷克萨斯LEXUS CT200h轿车",
+                "CT200h",
+                "JTHKR5BH",
+            ],
+        }
+        vehicle = {
+            "rawModelName": "雷克萨斯JTHKR5BH",
+            "modelName": "雷克萨斯JTHKR5BH",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vehicleNameHint": "",
+            "vin": "JTHKR5BH3J2327186",
+            "engineNo": "5ZR2A03174",
+            "licenseNo": "赣G73C52",
+        }
+
+        terms = _vehicle_model_seed_terms(vehicle, seed)
+        self.assertIn("雷克萨斯LEXUS CT200h轿车", terms)
+        self.assertIn("CT200h", terms)
+        self.assertNotIn("JTHKR5BH", terms)
+
+        _apply_vehicle_model_seed_hints(vehicle, seed)
+        self.assertEqual(vehicle["rawModelName"], "雷克萨斯LEXUS CT200h轿车")
+        self.assertEqual(vehicle["vehicleNameHint"], "雷克萨斯LEXUS CT200h轿车")
+
+        class _HistorySeedClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
+                self.names.append(name)
+                if "CT200H" in name.upper():
+                    return {
+                        "status": 0,
+                        "result": [
+                            {
+                                "vehicleName": "雷克萨斯LEXUS CT200h轿车",
+                                "vehicleFgwCode": "CT200H",
+                                "purchasePrice": "232000",
+                            }
+                        ],
+                    }
+                return {"status": 0, "result": []}
+
+        client = _HistorySeedClient()
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(len(rows["result"]), 1)
+        self.assertNotIn("JTHKR5BH*", client.names[:2])
+
+    def test_history_vehicle_seed_is_rejected_when_identifiers_differ(self) -> None:
+        vehicle = {
+            "rawModelName": "雷克萨斯JTHKR5BH",
+            "modelName": "雷克萨斯JTHKR5BH",
+            "vehicleType": "小型轿车",
+            "brandNameHint": "雷克萨斯",
+            "vin": "JTHKR5BH3J2327186",
+            "engineNo": "5ZR2A03174",
+        }
+        seed = {
+            "vin": "OTHER5BH3J2327186",
+            "engineNo": "5ZR2A03174",
+            "selectedModelName": "雷克萨斯LEXUS CT200h轿车",
+            "vehicleFgwCode": "CT200H",
+        }
+        _apply_vehicle_model_seed_hints(vehicle, seed)
+        self.assertNotIn("trustedModelSeedTerms", vehicle)
+        self.assertEqual(vehicle["rawModelName"], "雷克萨斯JTHKR5BH")
 
     def test_vin_prefix_only_query_returns_picc_fail_without_rows_and_continues(self) -> None:
         class _OnlyVinPrefixClient:
