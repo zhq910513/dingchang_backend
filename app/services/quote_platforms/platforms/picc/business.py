@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult, QuotePlatformAdapter
+from app.services.quote_result_validation import quote_result_has_real_data
 from app.services.quote_platforms.platforms.picc.base import (
     KEEPALIVE_PATH,
     KEEPALIVE_PARAMS,
@@ -125,18 +126,29 @@ PICC_KIND_NAME_BY_CODE = {
     "051085": "附加外部电网故障损失险",
 }
 
+PICC_CORE_MOTOR_KIND_CODES = frozenset({
+    "051050",
+    "051051",
+    "051052",
+    "051053",
+})
+
 PICC_REAL_QUOTE_ACCOUNT_TYPES = {
     NEW_FUEL_ACCOUNT_TYPE,
     USED_FUEL_ACCOUNT_TYPE,
     NEW_ENERGY_NEW_ACCOUNT_TYPE,
     NEW_ENERGY_USED_ACCOUNT_TYPE,
 }
+
+
+def _picc_quote_result_has_real_premium(result: Any) -> bool:
+    """Keep PICC on the shared, strict quote-result truthfulness rule."""
+    return quote_result_has_real_data(result)
 PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
     NEW_FUEL_ACCOUNT_TYPE: {
         "account_type_name": NEW_FUEL_ACCOUNT_TYPE,
         "request_id_prefix": "picc-new-fuel",
         "mode": "picc_new_fuel_real",
-        "stub_mode": "picc_new_fuel_preflight_stub",
         "display_name": "人保油车-新报价",
         "energy_type_plat": "0",
         "energy_type_name": "燃油",
@@ -167,7 +179,6 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "account_type_name": USED_FUEL_ACCOUNT_TYPE,
         "request_id_prefix": "picc-used-fuel",
         "mode": "picc_used_fuel_real",
-        "stub_mode": "picc_used_fuel_preflight_stub",
         "display_name": "人保油车-旧报价",
         "energy_type_plat": "0",
         "energy_type_name": "燃油",
@@ -198,7 +209,6 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "account_type_name": NEW_ENERGY_NEW_ACCOUNT_TYPE,
         "request_id_prefix": "picc-new-energy-new",
         "mode": "picc_new_energy_new_real",
-        "stub_mode": "picc_new_energy_new_preflight_stub",
         "display_name": "人保新能源车-新报价",
         "energy_type_plat": "1",
         "energy_type_name": "纯电动",
@@ -229,7 +239,6 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
         "account_type_name": NEW_ENERGY_USED_ACCOUNT_TYPE,
         "request_id_prefix": "picc-new-energy-used",
         "mode": "picc_new_energy_used_real",
-        "stub_mode": "picc_new_energy_used_preflight_stub",
         "display_name": "人保新能源车-旧报价",
         "energy_type_plat": "1",
         "energy_type_name": "纯电动",
@@ -4676,7 +4685,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             request_body_draft = (
                 self._assemble_used_fuel_offline_request_body(ctx, quote_payload, account_type_name=real_account_type)
                 if is_real_quote
-                else self._assemble_stub_request_body(ctx, quote_payload)
+                else self._assemble_untyped_request_draft(ctx, quote_payload)
             )
         except Exception as exc:
             draft_error = str(exc)[:500] or exc.__class__.__name__
@@ -4764,6 +4773,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 )
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
+                if not _picc_quote_result_has_real_premium(quote_result):
+                    data_payload: Dict[str, Any] = {
+                        "error_code": "quote_result_missing_premium",
+                        "error_stage": runtime_stage,
+                        "request_body": request_body,
+                        "platform_response": _platform_debug_payload(quote_response),
+                    }
+                    if prequote_auto_notices:
+                        data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
+                    return PlatformRuntimeResult(
+                        status="failed",
+                        message="人保报价接口返回成功状态，但没有返回真实保费明细，未生成报价结果",
+                        data=success_data(client, extra=data_payload),
+                    )
                 platform_auto_notices = [*prequote_auto_notices, *auto_period_notices]
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
                 duplicate_notice = _duplicate_quote_notice_from_success_dialog(
@@ -4805,7 +4828,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 data=success_data(
                     client,
                     extra={
-                        "mode": quote_result.get("mode") or "picc_protocol_stub",
+                        "mode": quote_result.get("mode") or "picc_motor_real",
                         "request_body": request_body,
                         "quote_result": quote_result,
                         "platform_dialog": quote_result.get("platform_dialog"),
@@ -5129,7 +5152,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "message": str(exc)[:300] or exc.__class__.__name__,
             }
 
-    def _assemble_stub_request_body(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _assemble_untyped_request_draft(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> Dict[str, Any]:
         payload = _json_obj(quote_payload)
         request_body = _json_obj(payload.get("request_body"))
         default_config = _json_obj(payload.get("default_config_json"))
@@ -7010,24 +7033,46 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         selected_vehicle = _json_obj(preflight.get("selectedVehicle"))
         precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
         item_rows = _json_obj(quote_response).get("itemKindTempList")
+        item_rows_source = "quote_response.itemKindTempList"
         if not isinstance(item_rows, list):
             item_rows = data.get("itemKindTempList")
+            item_rows_source = "quote_response.data.itemKindTempList"
         if not isinstance(item_rows, list):
             item_rows = []
 
         coverage_items: List[Dict[str, Any]] = []
+        core_premium_evidence: List[Dict[str, Any]] = []
+        joint_sales_evidence: List[Dict[str, Any]] = []
         commercial_premium_from_rows = Decimal("0")
         commercial_premium_rows_present = False
+        commercial_primary_rows_present = False
         compulsory_premium_value: Optional[Decimal] = _money(data.get("ciPremium")) if _has_text(data.get("ciPremium")) else None
-        for row_any in item_rows:
+        commercial_premium_source = ""
+        compulsory_premium_source = ""
+        vehicle_tax_source = ""
+        total_without_vehicle_tax_source = ""
+        total_with_vehicle_tax_source = ""
+        if _has_text(data.get("biPremium")):
+            commercial_premium_source = "quote_response.data.biPremium"
+            core_premium_evidence.append(
+                {
+                    "name": "commercial",
+                    "source": "quote_response.data.biPremium",
+                    "value": _clean_money_text(data.get("biPremium")),
+                }
+            )
+        if _has_text(data.get("ciPremium")):
+            compulsory_premium_source = "quote_response.data.ciPremium"
+            core_premium_evidence.append(
+                {
+                    "name": "compulsory",
+                    "source": "quote_response.data.ciPremium",
+                    "value": _clean_money_text(data.get("ciPremium")),
+                }
+            )
+        for row_index, row_any in enumerate(item_rows):
             row = _json_obj(row_any)
             kind_code = _to_str(row.get("kindCode")).strip()
-            if kind_code == "051064" and _safe_int_local(row.get("quantity"), 0) <= 0:
-                form_index = _quote_form_kind_index(form, "051064")
-                if form_index is not None:
-                    quantity = _to_str(form.get(f"prpCitemKindVos[{form_index}].quantity")).strip()
-                    if quantity:
-                        row["quantity"] = quantity
             name = self._display_kind_name(row.get("kindName"))
             premium_present = _has_text(row.get("premium"))
             premium = _money(row.get("premium")) if premium_present else Decimal("0")
@@ -7035,10 +7080,27 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if compulsory_premium_value is None and premium_present:
                     compulsory_premium = premium
                     compulsory_premium_value = premium
+                    compulsory_premium_source = f"{item_rows_source}[{row_index}].premium"
+                    core_premium_evidence.append(
+                        {
+                            "name": "compulsory",
+                            "source": f"{item_rows_source}[{row_index}].premium",
+                            "value": _clean_money_text(row.get("premium")),
+                        }
+                    )
                 continue
             if premium_present:
                 commercial_premium_from_rows += premium
                 commercial_premium_rows_present = True
+                if kind_code in PICC_CORE_MOTOR_KIND_CODES:
+                    commercial_primary_rows_present = True
+                    core_premium_evidence.append(
+                        {
+                            "name": "commercial",
+                            "source": f"{item_rows_source}[{row_index}].premium",
+                            "value": _clean_money_text(row.get("premium")),
+                        }
+                    )
             coverage_items.append(
                 {
                     "code": kind_code,
@@ -7057,17 +7119,35 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         commercial_premium_value: Optional[Decimal] = (
             _money(data.get("biPremium"))
             if _has_text(data.get("biPremium"))
-            else (commercial_premium_from_rows if commercial_premium_rows_present else None)
+            # The platform sometimes omits biPremium, in which case its
+            # motor rows are a valid real source. An add-on alone must not be
+            # promoted into a commercial quote.
+            else (
+                commercial_premium_from_rows
+                if commercial_premium_rows_present and commercial_primary_rows_present
+                else None
+            )
         )
+        if commercial_premium_value is not None and not commercial_premium_source:
+            commercial_premium_source = f"{item_rows_source}[*].premium.sum"
         vehicle_tax_raw = _first_text(data.get("sumPayTax"), data.get("thisPayTax"), data.get("carShipTaxes"))
         vehicle_tax_value: Optional[Decimal] = _money(vehicle_tax_raw) if _has_text(vehicle_tax_raw) else None
+        for tax_key in ("sumPayTax", "thisPayTax", "carShipTaxes"):
+            if _has_text(data.get(tax_key)):
+                vehicle_tax_source = f"quote_response.data.{tax_key}"
+                break
         if vehicle_tax_value is None and (_has_text(data.get("prePayTax")) or _has_text(data.get("delayPayTax"))):
             vehicle_tax_value = _money(data.get("prePayTax")) + _money(data.get("delayPayTax"))
+            vehicle_tax_source = "derived_from_quote_response.data.prePayTax+delayPayTax"
 
         risk_score: Any = ""
         picc_score = _to_str(data.get("piccScore")).strip()
         if picc_score:
-            risk_score = _safe_int_local(picc_score, 0)
+            try:
+                parsed_score = int(picc_score)
+            except (TypeError, ValueError):
+                parsed_score = None
+            risk_score = parsed_score if parsed_score is not None else ""
         warning_parts = []
         quote_warning = _strip_platform_error_code(data.get("errorMessage"))
         if quote_warning:
@@ -7096,31 +7176,94 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         platform_joint_sales_premium_raw_present = _has_text(data.get("sumYelPremium"))
         platform_joint_sales_premium = _money(data.get("sumYelPremium")) if platform_joint_sales_premium_raw_present else Decimal("0")
         platform_joint_sales_premium_present = platform_joint_sales_premium_raw_present and platform_joint_sales_premium > 0
+        if platform_joint_sales_premium_present:
+            joint_sales_evidence.append(
+                {
+                    "name": "joint_sales",
+                    "source": "quote_response.data.sumYelPremium",
+                    "value": _clean_money_text(data.get("sumYelPremium")),
+                }
+            )
         joint_sales_premium_present = platform_joint_sales_premium_present
         joint_sales_premium = platform_joint_sales_premium
         tujia_premium = _money(tujia_anshun.get("premium"))
         joint_sales_premium_from_plan = False
-        if tujia_premium > 0 and (not joint_sales_premium_present or joint_sales_premium <= 0):
-            joint_sales_premium = tujia_premium
+        selected_plan = _json_obj(tujia_anshun.get("selected_plan"))
+        selected_plan_premium = _money(selected_plan.get("planPremium"))
+        # A configured premium is only an input to the plan lookup. It is not
+        # a quote result unless that lookup actually returned a usable plan.
+        tujia_plan_success = tujia_anshun.get("success") is True
+        if (
+            tujia_plan_success
+            and selected_plan_premium > 0
+            and (not joint_sales_premium_present or joint_sales_premium <= 0)
+        ):
+            joint_sales_premium = selected_plan_premium
             joint_sales_premium_present = True
             joint_sales_premium_from_plan = True
-        joint_sales_amount = _money(tujia_anshun.get("amount")) if _has_text(tujia_anshun.get("amount")) else Decimal("0")
+            joint_sales_evidence.append(
+                {
+                    "name": "joint_sales",
+                    "source": "joint_sales_plan_response.selected_plan.planPremium",
+                    "value": _clean_money_text(selected_plan_premium),
+                }
+            )
+        elif tujia_plan_success and tujia_premium > 0 and selected_plan_premium <= 0:
+            warning_parts.append("途家安顺保额查询返回方案缺少真实保费，未填充配置保费")
+        joint_sales_amount = (
+            _money(
+                selected_plan.get("planAmount")
+                if _has_text(selected_plan.get("planAmount"))
+                else tujia_anshun.get("amount")
+            )
+            if tujia_plan_success
+            and (
+                _has_text(selected_plan.get("planAmount"))
+                or _has_text(tujia_anshun.get("amount"))
+            )
+            else Decimal("0")
+        )
         joint_sales_amount_present = joint_sales_premium > 0 and joint_sales_amount > 0
+        if not joint_sales_premium_present:
+            joint_sales_amount_present = False
+            joint_sales_amount = Decimal("0")
+        if platform_joint_sales_premium_present:
+            joint_sales_source = "platform_quote_response"
+        elif joint_sales_premium_from_plan:
+            joint_sales_source = "joint_sales_plan_response"
+        else:
+            joint_sales_source = "none"
         if _has_text(data.get("sumPremium")):
             total_without_vehicle_tax: Optional[Decimal] = _money(data.get("sumPremium"))
+            total_without_vehicle_tax_source = "quote_response.data.sumPremium"
             if joint_sales_premium_from_plan and platform_joint_sales_premium <= 0:
                 total_without_vehicle_tax += joint_sales_premium
+                total_without_vehicle_tax_source = (
+                    "derived_from_quote_response.data.sumPremium+"
+                    "joint_sales_plan_response.selected_plan.planPremium"
+                )
         elif commercial_premium_value is not None and compulsory_premium_value is not None:
             total_without_vehicle_tax = commercial_premium_value + compulsory_premium_value + (joint_sales_premium if joint_sales_premium_present else Decimal("0"))
+            total_without_vehicle_tax_source = "derived_from_quote_response_components"
+            if joint_sales_premium_from_plan:
+                total_without_vehicle_tax_source += "+joint_sales_plan_response.selected_plan.planPremium"
         else:
             total_without_vehicle_tax = None
 
         if _has_text(data.get("totalPremium") or data.get("premiumTotal")):
             total_with_vehicle_tax: Optional[Decimal] = _money(data.get("totalPremium") or data.get("premiumTotal"))
+            total_with_vehicle_tax_source = (
+                "quote_response.data.totalPremium"
+                if _has_text(data.get("totalPremium"))
+                else "quote_response.data.premiumTotal"
+            )
         elif total_without_vehicle_tax is not None and vehicle_tax_value is not None:
             total_with_vehicle_tax = total_without_vehicle_tax + vehicle_tax_value
+            total_with_vehicle_tax_source = "derived_from_quote_response_components"
         else:
-            total_with_vehicle_tax = total_without_vehicle_tax
+            # Never label an unknown tax-inclusive total with the pre-tax
+            # amount. A missing platform total/tax is unknown, not zero.
+            total_with_vehicle_tax = None
         # Keep the historical field as the final payable total while exposing both table totals explicitly.
         total = total_with_vehicle_tax
         vehicle_type_code = _first_text(data.get("carKindCode"), data.get("vehicleClassPicc"), form.get("prpCitemCar.carKindCode"), vehicle.get("carKindCode"))
@@ -7207,11 +7350,56 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             price_items.append({"name": "车船税", "amount": float(vehicle_tax_value)})
         if joint_sales_premium:
             price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
+        normalized_amounts: Dict[str, Dict[str, Any]] = {}
+        if commercial_premium_value is not None:
+            normalized_amounts["commercial"] = {
+                "value": _clean_money_text(commercial_premium_value),
+                "source": commercial_premium_source,
+            }
+        if compulsory_premium_value is not None:
+            normalized_amounts["compulsory"] = {
+                "value": _clean_money_text(compulsory_premium_value),
+                "source": compulsory_premium_source,
+            }
+        if vehicle_tax_value is not None:
+            normalized_amounts["vehicle_tax"] = {
+                "value": _clean_money_text(vehicle_tax_value),
+                "source": vehicle_tax_source,
+            }
+        if joint_sales_premium_present:
+            normalized_amounts["joint_sales"] = {
+                "value": _clean_money_text(joint_sales_premium),
+                "source": (
+                    "quote_response.data.sumYelPremium"
+                    if platform_joint_sales_premium_present
+                    else "joint_sales_plan_response.selected_plan.planPremium"
+                ),
+            }
+        if total_without_vehicle_tax is not None:
+            normalized_amounts["total_without_vehicle_tax"] = {
+                "value": _clean_money_text(total_without_vehicle_tax),
+                "source": total_without_vehicle_tax_source,
+            }
+        if total_with_vehicle_tax is not None:
+            normalized_amounts["total_with_vehicle_tax"] = {
+                "value": _clean_money_text(total_with_vehicle_tax),
+                "source": total_with_vehicle_tax_source,
+            }
         return {
             "mode": _profile_text(profile, "mode", "picc_motor_real"),
             "status": "quoted",
             "platform_code": "PICC",
             "platform_name": "人保",
+            "quote_provenance": {
+                "source": "platform_quote_response",
+                "platform_code": "PICC",
+                "response_status": _json_obj(quote_response).get("status"),
+                "quotation_no": data.get("quotationNo"),
+                "quotation_id": data.get("quotationId"),
+                "core_premium_evidence": core_premium_evidence,
+                "joint_sales_evidence": joint_sales_evidence,
+                "normalized_amounts": normalized_amounts,
+            },
             "account_type_name": account_type_name,
             "quotation_no": data.get("quotationNo"),
             "quotation_id": data.get("quotationId"),
@@ -7220,8 +7408,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "vehicle_model": vehicle.get("selectedModelName") or vehicle.get("modelName"),
             "vehicle_actual_value": _money_text_or_empty(vehicle.get("actualValue")),
             "joint_sales": tujia_anshun,
+            "joint_sales_source": joint_sales_source,
             "joint_sales_premium": _money_text(joint_sales_premium) if joint_sales_premium_present else "",
             "joint_sales_amount": _money_text(joint_sales_amount) if joint_sales_amount_present else "",
+            "driver_accident_premium": _money_text_or_empty(data.get("DDAPremium")),
+            "claim_business_count": claim_bi,
+            "claim_compulsory_count": claim_ci,
+            "vehicle_tax_detail": {
+                "current": _money_text_or_empty(data.get("thisPayTax")),
+                "back": _money_text_or_empty(data.get("prePayTax")),
+                "late_fee": _money_text_or_empty(data.get("delayPayTax")),
+            },
             "bi_start_date": proposal_info.get("bi_start_date"),
             "ci_start_date": proposal_info.get("ci_start_date"),
             "commercial_start_date": proposal_info.get("bi_start_date"),

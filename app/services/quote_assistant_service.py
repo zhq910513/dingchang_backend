@@ -67,6 +67,7 @@ from app.services.quote_platforms.session_manager import (
     session_manager as quote_platform_session_manager,
 )
 from app.services.quote_result_image import save_quote_result_card_image
+from app.services.quote_result_validation import quote_result_real_data_error
 from app.services.quote_secret_box import decrypt_text, encrypt_json, encrypt_text
 from app.services.storage import StorageService
 from app.core.config import settings
@@ -5593,22 +5594,45 @@ def _runtime_result_payload(result: Optional[PlatformRuntimeResult]) -> Dict[str
             or "口令" in text
         )
 
-    def scrub(value: Any, *, depth: int = 0) -> Any:
+    def scrub(value: Any, *, depth: int = 0, inside_failed_runtime: bool = False) -> Any:
         if depth > 8:
             return None
         if isinstance(value, dict):
             safe: Dict[str, Any] = {}
+            runtime_status = _to_str(value.get("status")).strip().lower()
+            failed_runtime = inside_failed_runtime or runtime_status not in {
+                "",
+                *RUNTIME_QUOTE_SUCCESS_STATUSES,
+            }
             for key, item in value.items():
                 if sensitive_key(key):
                     continue
-                safe[str(key)] = scrub(item, depth=depth + 1)
+                # A failed runtime may retain diagnostics from an adapter. Do
+                # not let a nested candidate quote escape through that
+                # diagnostic payload and become renderable by a future caller.
+                if failed_runtime and _to_str(key).strip().lower() in {
+                    "quote_result",
+                    "quoteresult",
+                }:
+                    continue
+                safe[str(key)] = scrub(
+                    item,
+                    depth=depth + 1,
+                    inside_failed_runtime=failed_runtime,
+                )
             return safe
         if isinstance(value, list):
-            return [scrub(item, depth=depth + 1) for item in value]
+            return [
+                scrub(item, depth=depth + 1, inside_failed_runtime=inside_failed_runtime)
+                for item in value
+            ]
         return value
 
     data = _json_obj(result.data)
-    safe_data = scrub(data)
+    safe_data = scrub(data, inside_failed_runtime=_runtime_status(result) not in {
+        "",
+        *RUNTIME_QUOTE_SUCCESS_STATUSES,
+    })
     return {
         "status": result.status,
         "message": sanitize_quote_user_message(result.message),
@@ -5655,6 +5679,37 @@ def _is_runtime_challenge(status: str) -> bool:
 
 def _is_runtime_quote_success(status: str) -> bool:
     return status in RUNTIME_QUOTE_SUCCESS_STATUSES
+
+
+def _quote_result_real_data_error(result: Any) -> str:
+    """Keep the historical private name while sharing one validation rule."""
+    return quote_result_real_data_error(result)
+
+
+def _quote_runtime_result_or_failure(result: Optional[PlatformRuntimeResult]) -> PlatformRuntimeResult:
+    """Downgrade a transport-success response that contains no real quote."""
+    if result is None or not _is_runtime_quote_success(_runtime_status(result)):
+        return result or PlatformRuntimeResult(status="failed", message="平台未返回报价结果")
+
+    payload = _json_obj(getattr(result, "data", None))
+    candidate = _json_obj(payload.get("quote_result"))
+    validation_error = _quote_result_real_data_error(candidate)
+    if not validation_error:
+        return result
+
+    # Do not expose an untrusted candidate as a quote result in the failure
+    # payload. Keep only the validation reason and the surrounding diagnostics.
+    safe_payload = dict(payload)
+    safe_payload.pop("quote_result", None)
+    safe_payload["quote_result_validation_error"] = validation_error
+    safe_payload["original_runtime_status"] = _runtime_status(result)
+    return PlatformRuntimeResult(
+        status="failed",
+        message=validation_error,
+        data=safe_payload,
+        challenge_type=result.challenge_type,
+        challenge_prompt=result.challenge_prompt,
+    )
 
 
 def _is_runtime_quota_full(status: str) -> bool:
@@ -10412,6 +10467,8 @@ async def _latest_quote_task_for_material(
         )
     ).scalars().all()
     for task in rows:
+        if not await _stored_quote_task_has_real_result(db, task):
+            continue
         task_quote_fingerprint = _task_quote_fingerprint(task)
         if quote_fingerprint and task_quote_fingerprint:
             if task_quote_fingerprint == quote_fingerprint:
@@ -11218,12 +11275,13 @@ def _quote_card_time_text(value: Optional[datetime] = None) -> str:
         return _to_str(ts)
 
 
-def _quote_result_price_amount(result: Mapping[str, Any], keyword: str) -> Any:
-    for item in _json_list(result.get("price_items")):
-        row = _json_obj(item)
-        if keyword in _to_str(row.get("name")):
-            return row.get("amount")
-    return ""
+def _quote_result_normalized_amount(result: Mapping[str, Any], name: str) -> Any:
+    provenance = _json_obj(result.get("quote_provenance"))
+    amounts = _json_obj(provenance.get("normalized_amounts"))
+    entry = _json_obj(amounts.get(name))
+    if "value" not in entry or entry.get("value") in (None, ""):
+        return ""
+    return entry.get("value")
 
 
 def _quote_money_decimal(value: Any, default: str = "0") -> Decimal:
@@ -11316,20 +11374,6 @@ def _quote_compact_money_text_or_empty(value: Any) -> str:
     return _quote_compact_money_text(value)
 
 
-def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, Any]:
-    if not (result.get("premium_total") or _json_list(result.get("price_items"))):
-        return {}
-    return {
-        "title": "报价结果",
-        "include_tax": True,
-        "total_premium": result.get("premium_total"),
-        "commercial_premium": _quote_result_price_amount(result, "商业"),
-        "compulsory_premium": _quote_result_price_amount(result, "交强"),
-        "vehicle_tax": _quote_result_price_amount(result, "车船"),
-        "coverage_items": [],
-    }
-
-
 def _picc_proposal_display_name(name: Any) -> str:
     text = _to_str(name).strip()
     mapping = {
@@ -11416,43 +11460,81 @@ def _quote_cert_display_text(field_name: str, *values: Any) -> str:
     return correct_vehicle_cert_field(field_name, raw) or raw
 
 
+def _picc_result_coverage_items_for_display(
+    result: Mapping[str, Any],
+    *,
+    seat_count: Any = "",
+) -> list[Dict[str, Any]]:
+    rows = _json_list(result.get("coverage_items"))
+    output: list[Dict[str, Any]] = []
+    for item in rows:
+        row = _json_obj(item)
+        name = _picc_proposal_display_name(row.get("name"))
+        if not name:
+            continue
+        output.append(
+            {
+                "name": name,
+                "amount_text": _to_str(row.get("amount_text")).strip()
+                or _picc_proposal_amount_text(name, row.get("amount"), seat_count=seat_count),
+                "premium": _quote_money_text_or_empty(row.get("premium")),
+            }
+        )
+    return output
+
+
 def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
     safe_card = dict(_json_obj(card))
     request_body = _json_obj(result.get("request_body"))
     vehicle = _json_obj(request_body.get("vehicleForm"))
     quote_form = _json_obj(request_body.get("quoteForm"))
     proposal_info = dict(_json_obj(safe_card.get("proposal_info")))
+    seat_count = _quote_first_text(vehicle.get("seatCount"), quote_form.get("prpCitemCar.seatCount"))
     joint_sales = _json_obj(result.get("joint_sales"))
-    joint_disabled = joint_sales and (
-        joint_sales.get("enabled") is False or _quote_value_is_false(joint_sales.get("enabled"))
+    joint_premium = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "joint_sales")
     )
-    original_joint_premium = _quote_money_decimal(safe_card.get("joint_sales_premium"))
-    if joint_disabled:
-        joint_premium = ""
-        joint_amount = ""
-    else:
-        joint_premium = _quote_first_positive_money_text(
-            result.get("joint_sales_premium"),
-            joint_sales.get("premium"),
-            safe_card.get("joint_sales_premium"),
-        )
-        joint_amount = _quote_first_positive_money_text(
-            result.get("joint_sales_amount"),
-            joint_sales.get("amount"),
-            safe_card.get("joint_sales_amount"),
-        )
-        if not joint_premium:
-            joint_amount = ""
-    next_joint_premium = _quote_money_decimal(joint_premium)
-    if next_joint_premium != original_joint_premium:
-        delta = next_joint_premium - original_joint_premium
-        for key in ("total_without_vehicle_tax", "total_with_vehicle_tax", "total_premium"):
-            if safe_card.get(key) not in (None, ""):
-                safe_card[key] = _quote_adjusted_money_text(safe_card.get(key), delta)
+    joint_amount = _quote_money_text_or_empty(
+        result.get("joint_sales_amount")
+    ) if joint_premium else ""
+    commercial = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "commercial")
+    )
+    compulsory = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "compulsory")
+    )
+    vehicle_tax = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "vehicle_tax")
+    )
+    total_without_tax = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "total_without_vehicle_tax")
+    )
+    total_with_tax = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "total_with_vehicle_tax")
+    )
     safe_card["joint_sales_label"] = "途家安顺"
     safe_card["joint_sales_display_label"] = "途顺家安组合保险"
     safe_card["joint_sales_premium"] = joint_premium
     safe_card["joint_sales_amount"] = joint_amount
+    safe_card["commercial_premium"] = commercial
+    safe_card["compulsory_premium"] = compulsory
+    safe_card["vehicle_tax"] = vehicle_tax
+    safe_card["total_without_vehicle_tax"] = total_without_tax
+    safe_card["total_with_vehicle_tax"] = total_with_tax
+    safe_card["total_premium"] = total_with_tax
+    safe_card["risk_score"] = _quote_first_text(result.get("risk_score"), "-")
+    safe_card["driver_accident_premium"] = _quote_money_text_or_empty(
+        result.get("driver_accident_premium")
+    )
+    safe_card["claim_business_count"] = result.get("claim_business_count", "")
+    safe_card["claim_compulsory_count"] = result.get("claim_compulsory_count", "")
+    safe_card["vehicle_tax_detail"] = {
+        key: _quote_money_text_or_empty(value)
+        for key, value in _json_obj(result.get("vehicle_tax_detail")).items()
+        if _quote_has_text(value)
+    }
+    coverage_items = _picc_result_coverage_items_for_display(result, seat_count=seat_count)
+    safe_card["proposal_coverage_items"] = coverage_items
 
     bi_start = _quote_first_text(
         result.get("bi_start_date"),
@@ -11508,67 +11590,51 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
     vehicle = _json_obj(request_body.get("vehicleForm"))
     owner = _json_obj(request_body.get("ownerForm"))
     quote_form = _json_obj(request_body.get("quoteForm"))
-    coverage_items = _json_list(safe_card.get("proposal_coverage_items") or safe_card.get("coverage_items"))
     seat_count = _quote_first_text(vehicle.get("seatCount"), quote_form.get("prpCitemCar.seatCount"))
-    proposal_coverage_items = []
-    for item in coverage_items:
-        row = _json_obj(item)
-        name = _picc_proposal_display_name(row.get("name"))
-        if not name:
-            continue
-        proposal_coverage_items.append(
-            {
-                "name": name,
-                "amount_text": _to_str(row.get("amount_text")).strip()
-                or _picc_proposal_amount_text(name, row.get("amount"), seat_count=seat_count),
-                "premium": _quote_money_text_or_empty(row.get("premium")),
-            }
-        )
+    proposal_coverage_items = _picc_result_coverage_items_for_display(
+        result,
+        seat_count=seat_count,
+    )
 
     commercial = _quote_money_text_or_empty(
-        _quote_first_text(safe_card.get("commercial_premium"), _quote_result_price_amount(result, "商业"))
+        _quote_result_normalized_amount(result, "commercial")
     )
     compulsory = _quote_money_text_or_empty(
-        _quote_first_text(safe_card.get("compulsory_premium"), _quote_result_price_amount(result, "交强"))
+        _quote_result_normalized_amount(result, "compulsory")
     )
     vehicle_tax = _quote_money_text_or_empty(
-        _quote_first_text(safe_card.get("vehicle_tax"), _quote_result_price_amount(result, "车船"))
+        _quote_result_normalized_amount(result, "vehicle_tax")
     )
     joint_sales = _json_obj(result.get("joint_sales"))
     joint_premium = _quote_money_text_or_empty(
-        _quote_first_text(result.get("joint_sales_premium"), joint_sales.get("premium"), safe_card.get("joint_sales_premium"))
+        _quote_result_normalized_amount(result, "joint_sales")
     )
     joint_amount = _quote_money_text_or_empty(
-        _quote_first_text(result.get("joint_sales_amount"), joint_sales.get("amount"), safe_card.get("joint_sales_amount"))
+        result.get("joint_sales_amount")
     )
     if _quote_money_decimal(joint_premium) <= 0:
         joint_premium = ""
         joint_amount = ""
-    total_without_tax = _quote_money_text_or_empty(safe_card.get("total_without_vehicle_tax"))
-    if not total_without_tax:
-        total_without_tax = _quote_sum_if_present(commercial, compulsory, joint_premium)
-    total_with_tax = _quote_money_text_or_empty(
-        _quote_first_text(safe_card.get("total_with_vehicle_tax"), safe_card.get("total_premium"), result.get("premium_total"))
+    total_without_tax = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "total_without_vehicle_tax")
     )
-    if not total_with_tax and total_without_tax and vehicle_tax:
-        total_with_tax = _quote_sum_if_present(total_without_tax, vehicle_tax)
+    total_with_tax = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(result, "total_with_vehicle_tax")
+    )
 
     car_kind_code = _quote_first_text(vehicle.get("carKindCode"), quote_form.get("prpCitemCar.carKindCode"))
     use_nature_code = _quote_first_text(vehicle.get("useNatureCode"), quote_form.get("prpCitemCar.useNatureCode"))
-    claim_bi = _quote_first_text(safe_card.get("claim_business_count"))
-    claim_ci = _quote_first_text(safe_card.get("claim_compulsory_count"))
+    claim_bi = _quote_first_text(result.get("claim_business_count"))
+    claim_ci = _quote_first_text(result.get("claim_compulsory_count"))
     claim_parts = []
-    if _quote_has_text(safe_card.get("claim_summary")):
-        claim_summary = _to_str(safe_card.get("claim_summary")).strip()
-    else:
-        if claim_bi:
-            claim_parts.append(f"连续承保期间出险次数{claim_bi}次")
-        if claim_ci:
-            claim_parts.append(f"交强险{claim_ci}次")
-        claim_summary = "，".join(claim_parts)
+    if claim_bi:
+        claim_parts.append(f"连续承保期间出险次数{claim_bi}次")
+    if claim_ci:
+        claim_parts.append(f"交强险{claim_ci}次")
+    claim_summary = "，".join(claim_parts)
     tax_detail = {
         key: _quote_money_text_or_empty(value)
-        for key, value in _json_obj(safe_card.get("vehicle_tax_detail")).items()
+        for key, value in _json_obj(result.get("vehicle_tax_detail")).items()
         if _quote_has_text(value)
     }
 
@@ -11587,10 +11653,10 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         "joint_sales_display_label": "途顺家安组合保险",
         "joint_sales_premium": joint_premium,
         "joint_sales_amount": joint_amount,
-        "driver_accident_premium": _quote_money_text_or_empty(safe_card.get("driver_accident_premium")),
-        "claim_business_count": claim_bi,
-        "claim_compulsory_count": claim_ci,
-        "risk_score": _to_str(result.get("risk_score") or safe_card.get("risk_score") or "-").strip() or "-",
+        "driver_accident_premium": _quote_money_text_or_empty(result.get("driver_accident_premium")),
+        "claim_business_count": _quote_first_text(result.get("claim_business_count"), claim_bi),
+        "claim_compulsory_count": _quote_first_text(result.get("claim_compulsory_count"), claim_ci),
+        "risk_score": _to_str(result.get("risk_score") or "-").strip() or "-",
         "proposal_info": {
             "insured_name": _quote_first_text(owner.get("ownerName"), result.get("owner_name"), safe_card.get("owner_name")),
             "plate_no": _quote_cert_display_text("plate_no", result.get("plate_no"), vehicle.get("licenseNo"), safe_card.get("plate_no")),
@@ -11651,13 +11717,6 @@ def _sync_quote_result_with_display_card(result: Dict[str, Any], card: Mapping[s
         result["joint_sales"] = joint_sales
         _update_joint_sales_price_items(result, premium_decimal)
 
-    total_text = _quote_first_text(
-        safe_card.get("total_premium"),
-        safe_card.get("total_with_vehicle_tax"),
-    )
-    if total_text:
-        result["premium_total"] = float(_quote_money_decimal(total_text))
-
     proposal_info = _json_obj(safe_card.get("proposal_info"))
     bi_start = _quote_first_text(proposal_info.get("bi_start_date"), safe_card.get("bi_start_date"))
     ci_start = _quote_first_text(proposal_info.get("ci_start_date"), safe_card.get("ci_start_date"))
@@ -11677,28 +11736,162 @@ def _enrich_quote_result_for_display(
 ) -> Dict[str, Any]:
     """Attach truthful display metadata for the chat quote card without leaking secrets."""
     safe_result = dict(_json_obj(result))
-    card = _json_obj(safe_result.get("result_card")) or _quote_result_card_from_price_items(safe_result)
-    if card:
-        card = _picc_result_card_for_display(safe_result, card)
-        _sync_quote_result_with_display_card(safe_result, card)
-        display_time = _quote_card_time_text()
-        card.setdefault("quote_time", display_time)
-        for key in ("watermark_account", "watermark_user", "watermark_name", "watermark_time", "watermark_text"):
-            card.pop(key, None)
-        safe_result["result_card"] = card
-        try:
-            image_started = time.perf_counter()
-            image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
-            safe_result["result_image_ms"] = _elapsed_ms(image_started)
-            if image_payload:
-                safe_result["result_image"] = image_payload
-        except Exception as exc:
-            safe_result["result_image_error"] = sanitize_quote_user_message(exc, "报价结果图片生成失败")
+    validation_error = _quote_result_real_data_error(safe_result)
+    if validation_error:
+        raise ValueError(f"报价结果未通过真实性校验，不能生成结果图：{validation_error}")
+    card = _json_obj(safe_result.get("result_card") or safe_result.get("resultCard"))
+    if not card:
+        raise ValueError("真实报价结果缺少结果卡片，不能生成结果图")
+    card = _picc_result_card_for_display(safe_result, card)
+    _sync_quote_result_with_display_card(safe_result, card)
+    display_time = _quote_card_time_text()
+    card.setdefault("quote_time", display_time)
+    for key in ("watermark_account", "watermark_user", "watermark_name", "watermark_time", "watermark_text"):
+        card.pop(key, None)
+    safe_result["result_card"] = card
+    image_started = time.perf_counter()
+    try:
+        image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
+    except Exception as exc:
+        raise ValueError(
+            sanitize_quote_user_message(exc, "报价结果图片生成失败")
+        ) from exc
+    safe_result["result_image_ms"] = _elapsed_ms(image_started)
+    if not isinstance(image_payload, Mapping):
+        raise ValueError("报价结果图片生成失败：OSS未返回有效图片信息")
+    image_url = _to_str(
+        image_payload.get("image_url")
+        or image_payload.get("url")
+        or image_payload.get("preview_url")
+    ).strip()
+    if not image_url:
+        raise ValueError("报价结果图片生成失败：OSS未返回图片地址")
+    try:
+        image_size = int(image_payload.get("size") or 0)
+        image_width = int(image_payload.get("width") or 0)
+        image_height = int(image_payload.get("height") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("报价结果图片生成失败：图片元数据无效")
+    if image_size <= 0 or image_width <= 0 or image_height <= 0:
+        raise ValueError("报价结果图片生成失败：图片内容或尺寸无效")
+    safe_result["result_image"] = dict(image_payload)
     if platform_account:
         safe_result.setdefault("account_type_name", _normalize_account_type_name(_loaded_value(platform_account, "account_type_name")))
         safe_result.setdefault("account_username", _to_str(_loaded_value(platform_account, "account_username")).strip())
         safe_result.setdefault("account_owner_name", _to_str(_loaded_value(platform_account, "account_owner_name")).strip())
     return safe_result
+
+
+async def _fail_quote_after_result_materialization(
+    db: AsyncSession,
+    *,
+    case: QuoteCase,
+    task: QuoteTask,
+    owner_user_id: int,
+    platform_name: str,
+    trace_id: str,
+    error: Any,
+    platform_account: Optional[QuotePlatformAccountProfile] = None,
+    quota_reservation: Optional[Dict[str, Any]] = None,
+    response_payload: Optional[Dict[str, Any]] = None,
+    preserve_existing_quote: bool = False,
+    fallback_task: Optional[QuoteTask] = None,
+    reply_prefix: str = "报价结果生成失败",
+) -> Tuple[str, Dict[str, Any]]:
+    """Close a quote attempt when a real result cannot be materialized.
+
+    A platform response is not a successful quote until both the trusted
+    result card and its OSS image have been created. This helper keeps that
+    boundary explicit: no result payload, success event, quote count, or
+    success reply may be persisted when materialization fails.
+    """
+    detail = sanitize_quote_user_message(error, "真实报价结果无法生成")
+    reply = f"{platform_name or case.platform_name or '平台'}{reply_prefix}：{detail}。未生成报价结果图，请重试。"
+    await _release_account_quota_reservation(
+        db,
+        account=platform_account,
+        reservation=quota_reservation or {},
+    )
+    task = await _lock_quote_task(db, task)
+    if await _quote_task_was_cancelled(db, task=task):
+        return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
+
+    now = _now()
+    task.status = TASK_STATUS_FAILED
+    task.error_detail = reply
+    task.response_payload = {
+        **_json_obj(task.response_payload),
+        **_json_obj(response_payload),
+        "result_materialization_failed": True,
+        "result_materialization_error": detail,
+        "result_image_not_created": True,
+    }
+    task.result_payload = {}
+    task.finished_at = now
+    task.updated_at = now
+
+    if preserve_existing_quote and fallback_task is not None:
+        case.status = CASE_STATUS_QUOTED
+        case.current_task_id = fallback_task.id
+    else:
+        case.status = CASE_STATUS_READY
+        case.current_task_id = task.id
+    case.updated_at = now
+    await _add_event(
+        db,
+        case=case,
+        owner_user_id=owner_user_id,
+        event_type="task",
+        role="system",
+        payload={
+            "task_id": task.id,
+            "status": TASK_STATUS_FAILED,
+            "trace_id": trace_id,
+            "reason": reply,
+            "result_materialization_failed": True,
+            "result_materialization_error": detail,
+            "source_task_id": fallback_task.id if fallback_task is not None else None,
+        },
+    )
+    await db.flush()
+
+    payload = {
+        "quote_case": {
+            "id": case.id,
+            "case_no": case.case_no,
+            "status": case.status,
+            "order_id": case.order_id,
+            "source_type": case.source_type,
+            "quote_count": _safe_int(case.quote_count, 0),
+            "current_task_id": case.current_task_id,
+        },
+        "quote_task": {
+            "id": task.id,
+            "status": task.status,
+            "trace_id": trace_id,
+            "error_detail": task.error_detail,
+        },
+        "result_materialization_failed": True,
+        "result_materialization_error": detail,
+    }
+    if fallback_task is not None:
+        payload["source_task_id"] = fallback_task.id
+    return reply, {
+        "status": "failed",
+        "intent": "quote",
+        "trace_id": trace_id,
+        "data": _mk_data(
+            result_status=RESULT_FAILED,
+            message=reply,
+            entities={
+                "quote_case_id": case.id,
+                "quote_task_id": task.id,
+                "order_id": case.order_id,
+            },
+            payload=payload,
+        ),
+        "actions": [_mk_action(f"{platform_name or case.platform_name or '平台'}报价")],
+    }
 
 
 def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
@@ -11736,9 +11929,54 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
 
 
 def _result_has_quote_card(result: Any) -> bool:
-    if not isinstance(result, dict):
+    if _quote_result_real_data_error(result):
         return False
     return bool(_json_obj(result.get("result_card") or result.get("resultCard")))
+
+
+async def _stored_quote_task_has_real_result(
+    db: AsyncSession,
+    task: Optional[QuoteTask],
+    *,
+    seen_task_ids: Optional[Set[int]] = None,
+) -> bool:
+    """Validate a stored success task before it can be reused or redrawn."""
+    if task is None or _to_str(getattr(task, "status", "")).strip().lower() != TASK_STATUS_SUCCESS:
+        return False
+
+    task_id = _safe_int(getattr(task, "id", 0), 0)
+    seen = set(seen_task_ids or set())
+    if task_id > 0:
+        if task_id in seen:
+            return False
+        seen.add(task_id)
+
+    result = _json_obj(getattr(task, "result_payload", None))
+    if _quote_result_real_data_error(result):
+        return False
+    if not _json_obj(result.get("result_card") or result.get("resultCard")):
+        return False
+
+    response_payload = _json_obj(getattr(task, "response_payload", None))
+    runtime_payload = _json_obj(response_payload.get("quote"))
+    runtime_data = _json_obj(runtime_payload.get("data"))
+    runtime_result = _json_obj(runtime_data.get("quote_result"))
+    if runtime_result and not _quote_result_real_data_error(runtime_result):
+        return True
+
+    # Image-only adjustments intentionally reuse a prior real quote. Follow
+    # the provenance chain instead of trusting the derived card by itself.
+    if response_payload.get("reused_quote_result") is True:
+        source_task_id = _safe_int(response_payload.get("source_task_id"), 0)
+        if source_task_id <= 0:
+            return False
+        source_task = await db.get(QuoteTask, source_task_id)
+        return await _stored_quote_task_has_real_result(
+            db,
+            source_task,
+            seen_task_ids=seen,
+        )
+    return False
 
 
 async def _latest_success_quote_task_for_session(
@@ -11768,7 +12006,7 @@ async def _latest_success_quote_task_for_session(
     for case, task in rows:
         if ctx is not None and not await _case_order_is_readable(db, ctx=ctx, case=case):
             continue
-        if _result_has_quote_card(_json_obj(task.result_payload)):
+        if await _stored_quote_task_has_real_result(db, task):
             return case, task
     return None
 
@@ -11952,13 +12190,18 @@ def _apply_joint_sales_image_adjustment(
     premium_value: Any,
     base_joint_sales_amount: Any = None,
 ) -> Dict[str, Any]:
+    source_validation_error = _quote_result_real_data_error(result)
+    if source_validation_error:
+        raise ValueError(f"历史报价结果不完整，不能重绘结果图：{source_validation_error}")
     adjusted = deepcopy(_json_obj(result))
     card = deepcopy(_json_obj(adjusted.get("result_card") or adjusted.get("resultCard")))
     if not card:
         raise ValueError("最近一次报价结果缺少图片数据，无法只重绘报价图")
 
     premium = _quote_money_decimal(premium_value)
-    old_premium = _quote_money_decimal(card.get("joint_sales_premium") or adjusted.get("joint_sales_premium"))
+    old_premium = _quote_money_decimal(
+        _quote_result_normalized_amount(adjusted, "joint_sales")
+    )
     delta = premium - old_premium
     premium_text = _quote_money_text(premium)
 
@@ -11994,26 +12237,58 @@ def _apply_joint_sales_image_adjustment(
         joint_sales["original_amount"] = original_amount_text
         adjusted["joint_sales"] = joint_sales
 
-    for key in ("total_without_vehicle_tax", "total_with_vehicle_tax", "total_premium"):
-        if card.get(key) not in (None, ""):
-            card[key] = _quote_adjusted_money_text(card.get(key), delta)
-    if not card.get("total_without_vehicle_tax"):
-        card["total_without_vehicle_tax"] = _quote_money_text(
-            _quote_money_decimal(card.get("commercial_premium"))
-            + _quote_money_decimal(card.get("compulsory_premium"))
-            + premium
-        )
-    if not card.get("total_with_vehicle_tax"):
-        card["total_with_vehicle_tax"] = _quote_money_text(
-            _quote_money_decimal(card.get("total_without_vehicle_tax"))
-            + _quote_money_decimal(card.get("vehicle_tax"))
-        )
-    card["total_premium"] = _quote_money_text(card.get("total_with_vehicle_tax") or card.get("total_premium"))
+    normalized_amounts = deepcopy(
+        _json_obj(_json_obj(adjusted.get("quote_provenance")).get("normalized_amounts"))
+    )
+    if premium > 0:
+        normalized_amounts["joint_sales"] = {
+            "value": premium_text,
+            "source": "joint_sales_plan_response.selected_plan.planPremium",
+        }
+    else:
+        normalized_amounts.pop("joint_sales", None)
+
+    for amount_name in ("total_without_vehicle_tax", "total_with_vehicle_tax"):
+        entry = _json_obj(normalized_amounts.get(amount_name))
+        if not entry or entry.get("value") in (None, ""):
+            continue
+        entry["value"] = _quote_adjusted_money_text(entry.get("value"), delta)
+        entry["source"] = "derived_from_real_quote"
+        normalized_amounts[amount_name] = entry
+
+    provenance = deepcopy(_json_obj(adjusted.get("quote_provenance")))
+    provenance["normalized_amounts"] = normalized_amounts
+    if premium > 0:
+        provenance["joint_sales_evidence"] = [
+            {
+                "name": "joint_sales",
+                "source": "joint_sales_plan_response.selected_plan.planPremium",
+                "value": premium_text,
+            }
+        ]
+    else:
+        provenance.pop("joint_sales_evidence", None)
+    adjusted["quote_provenance"] = provenance
+
+    card["commercial_premium"] = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(adjusted, "commercial")
+    )
+    card["compulsory_premium"] = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(adjusted, "compulsory")
+    )
+    card["vehicle_tax"] = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(adjusted, "vehicle_tax")
+    )
+    card["total_without_vehicle_tax"] = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(adjusted, "total_without_vehicle_tax")
+    )
+    card["total_with_vehicle_tax"] = _quote_money_text_or_empty(
+        _quote_result_normalized_amount(adjusted, "total_with_vehicle_tax")
+    )
+    card["total_premium"] = card["total_with_vehicle_tax"]
 
     if adjusted.get("premium_total") not in (None, ""):
         adjusted["premium_total"] = float(_quote_money_decimal(adjusted.get("premium_total")) + delta)
-    else:
-        adjusted["premium_total"] = float(_quote_money_decimal(card.get("total_premium")))
 
     _update_joint_sales_price_items(adjusted, premium)
     adjusted["result_card"] = card
@@ -12148,6 +12423,66 @@ async def _handle_joint_sales_image_adjustment_message(
     await db.flush()
     await db.commit()
 
+    source_result = _json_obj(source_task.result_payload)
+    source_validation_error = _quote_result_real_data_error(source_result)
+    if source_validation_error or not _json_obj(source_result.get("result_card") or source_result.get("resultCard")):
+        detail = source_validation_error or "历史报价结果缺少结果卡片"
+        reply = f"历史报价结果不完整，无法调整途家安顺并重绘结果图：{detail}。请重新发起报价。"
+        task = await _lock_quote_task(db, task)
+        task.status = TASK_STATUS_FAILED
+        task.error_detail = reply
+        task.response_payload = {
+            **_json_obj(task.response_payload),
+            "source_task_id": source_task.id,
+            "quote_result_validation_error": detail,
+        }
+        task.result_payload = {}
+        task.finished_at = _now()
+        task.updated_at = _now()
+        case.status = CASE_STATUS_READY
+        case.current_task_id = task.id
+        case.updated_at = _now()
+        await _add_event(
+            db,
+            case=case,
+            owner_user_id=owner_user_id,
+            event_type="task",
+            role="system",
+            payload={
+                "task_id": task.id,
+                "status": TASK_STATUS_FAILED,
+                "trace_id": trace_id,
+                "reason": detail,
+                "source_task_id": source_task.id,
+            },
+        )
+        await db.flush()
+        return (
+            reply,
+            {
+                "status": "success",
+                "intent": "quote",
+                "trace_id": trace_id,
+                "data": _mk_data(
+                    result_status=RESULT_FAILED,
+                    message=reply,
+                    entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                    payload={
+                        "quote_case": {
+                            "id": case.id,
+                            "case_no": case.case_no,
+                            "status": case.status,
+                            "order_id": case.order_id,
+                        },
+                        "quote_task": {"id": task.id, "status": task.status},
+                        "source_task_id": source_task.id,
+                        "quote_result_validation_error": detail,
+                    },
+                ),
+                "actions": [_mk_action(f"{case.platform_name or source_task.platform_name or '平台'}报价")],
+            },
+        )
+
     try:
         joint_sales_amount, joint_sales_amount_query, platform_account = await _query_joint_sales_amount_for_image_adjustment(
             db,
@@ -12216,20 +12551,45 @@ async def _handle_joint_sales_image_adjustment_message(
     task = await _lock_quote_task(db, task)
     if await _quote_task_was_cancelled(db, task=task):
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
-    adjusted_result = _apply_joint_sales_image_adjustment(
-        _json_obj(source_task.result_payload),
-        premium_value=premium_value,
-        base_joint_sales_amount=joint_sales_amount,
-    )
-    adjusted_result["trace_id"] = trace_id
-    adjusted_result["source_quote_task_id"] = source_task.id
-    adjusted_result["joint_sales_amount_query"] = joint_sales_amount_query
-    platform_name = _to_str(source_task.platform_name or case.platform_name or adjusted_result.get("platform_name")).strip()
-    display_result = _enrich_quote_result_for_display(
-        adjusted_result,
-        platform_account=platform_account,
-        platform_name=platform_name,
-    )
+    platform_name = _to_str(source_task.platform_name or case.platform_name or "平台").strip()
+    try:
+        adjusted_result = _apply_joint_sales_image_adjustment(
+            _json_obj(source_task.result_payload),
+            premium_value=premium_value,
+            base_joint_sales_amount=joint_sales_amount,
+        )
+        adjusted_result["trace_id"] = trace_id
+        adjusted_result["source_quote_task_id"] = source_task.id
+        adjusted_result["joint_sales_amount_query"] = joint_sales_amount_query
+        platform_name = _to_str(
+            source_task.platform_name
+            or case.platform_name
+            or adjusted_result.get("platform_name")
+            or "平台"
+        ).strip()
+        display_result = _enrich_quote_result_for_display(
+            adjusted_result,
+            platform_account=platform_account,
+            platform_name=platform_name,
+        )
+    except Exception as exc:
+        return await _fail_quote_after_result_materialization(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            error=exc,
+            platform_account=platform_account,
+            preserve_existing_quote=True,
+            fallback_task=source_task,
+            response_payload={
+                "source_task_id": source_task.id,
+                "joint_sales_amount_query": joint_sales_amount_query,
+            },
+            reply_prefix="报价结果图更新失败",
+        )
     task = await _lock_quote_task(db, task)
     if await _quote_task_was_cancelled(db, task=task):
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
@@ -12248,6 +12608,7 @@ async def _handle_joint_sales_image_adjustment_message(
     task.response_payload = {
         **_json_obj(task.response_payload),
         "reused_quote_result": True,
+        "derived_from_real_quote": True,
         "source_task_id": source_task.id,
         "joint_sales_amount_query": joint_sales_amount_query,
     }
@@ -12319,7 +12680,63 @@ def _already_quoted_response(
     quote_fingerprint: str = "",
 ) -> Tuple[str, Dict[str, Any]]:
     result = _json_obj(task.result_payload)
-    display_result = _enrich_quote_result_for_display(result, platform_account=None, platform_name=platform_name)
+    validation_error = _quote_result_real_data_error(result)
+    if validation_error:
+        reply = f"{platform_name or '平台'}历史报价结果不完整，本次没有复用结果图：{validation_error}。请重新发起报价。"
+        return reply, {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": task.trace_id or _new_trace_id(),
+            "data": _mk_data(
+                result_status=RESULT_FAILED,
+                message=reply,
+                entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                payload={
+                    "duplicate_quote_blocked": False,
+                    "quote_result_validation_error": validation_error,
+                    "quote_case": {
+                        "id": case.id,
+                        "case_no": case.case_no,
+                        "status": case.status,
+                        "order_id": case.order_id,
+                    },
+                    "quote_task": {"id": task.id, "status": task.status},
+                },
+            ),
+            "actions": [_mk_action(f"{platform_name or '平台'}报价")],
+        }
+    try:
+        display_result = _enrich_quote_result_for_display(
+            result,
+            platform_account=None,
+            platform_name=platform_name,
+        )
+    except Exception as exc:
+        detail = sanitize_quote_user_message(exc, "历史报价结果图生成失败")
+        reply = f"{platform_name or '平台'}历史报价结果图生成失败：{detail}。请重新发起报价。"
+        return reply, {
+            "status": "success",
+            "intent": "quote",
+            "trace_id": task.trace_id or _new_trace_id(),
+            "data": _mk_data(
+                result_status=RESULT_FAILED,
+                message=reply,
+                entities={"quote_case_id": case.id, "quote_task_id": task.id, "order_id": case.order_id},
+                payload={
+                    "duplicate_quote_blocked": False,
+                    "result_materialization_failed": True,
+                    "result_materialization_error": detail,
+                    "quote_case": {
+                        "id": case.id,
+                        "case_no": case.case_no,
+                        "status": case.status,
+                        "order_id": case.order_id,
+                    },
+                    "quote_task": {"id": task.id, "status": task.status},
+                },
+            ),
+            "actions": [_mk_action(f"{platform_name or '平台'}报价")],
+        }
     reply = _quote_result_reply_text(display_result, platform_name=platform_name)
     payload = {
         "duplicate_quote_blocked": True,
@@ -12681,7 +13098,7 @@ async def _start_sms_task(
         sms_phone_mask=phone_mask,
         trace_id=trace_id,
         request_payload={
-            "mode": "stub",
+            "mode": "pending_sms_challenge",
             "operation": normalized_operation,
             "login": "sms_required",
             "owner_user_id": owner_user_id,
@@ -12759,7 +13176,7 @@ async def _start_duplicate_quote_confirm_task(
     pending_snapshot["duplicate_quote_pending"] = True
     pending_snapshot = _snapshot_with_quote_fingerprint(pending_snapshot)
     request_payload = {
-        "mode": "stub",
+        "mode": "pending_duplicate_confirmation",
         "login": login_mode,
         "owner_user_id": owner_user_id,
         "platform_account": _credential_public_payload(platform_account),
@@ -14117,45 +14534,8 @@ async def _auto_retry_duplicate_quote_once(
     )
 
 
-def _fake_quote_result(snapshot: Dict[str, Any], *, platform_code: str, platform_name: str, trace_id: str) -> Dict[str, Any]:
-    data = snapshot.get("normalized_data") if isinstance(snapshot, dict) else {}
-    if not isinstance(data, dict):
-        data = {}
-    seed = "|".join(
-        [
-            _to_str(platform_code),
-            _to_str(data.get("plate_no")),
-            _to_str(data.get("vin")),
-            _to_str(data.get("engine_no")),
-        ]
-    )
-    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    base = int(digest[:8], 16)
-    commercial = Decimal(1800 + base % 2400) / Decimal("1.00")
-    compulsory = Decimal(760 + base % 260)
-    vehicle_tax = Decimal(300 + base % 720)
-    total = commercial + compulsory + vehicle_tax
-    return {
-        "mode": "stub",
-        "status": "quoted",
-        "platform_code": platform_code,
-        "platform_name": platform_name,
-        "trace_id": trace_id,
-        "plate_no": data.get("plate_no"),
-        "owner_name": data.get("owner_name"),
-        "price_items": [
-            {"name": "商业险", "amount": float(commercial)},
-            {"name": "交强险", "amount": float(compulsory)},
-            {"name": "车船税", "amount": float(vehicle_tax)},
-        ],
-        "premium_total": float(total),
-        "remark": "本地联调假报价结果，后续替换为真实平台适配器返回。",
-    }
-
-
-def _quote_result_from_runtime_or_fake(
+def _quote_result_from_runtime(
     result: Optional[PlatformRuntimeResult],
-    snapshot: Dict[str, Any],
     *,
     platform_code: str,
     platform_name: str,
@@ -14168,7 +14548,10 @@ def _quote_result_from_runtime_or_fake(
         runtime_quote_result.setdefault("platform_name", platform_name)
         runtime_quote_result.setdefault("trace_id", trace_id)
         return runtime_quote_result
-    return _fake_quote_result(snapshot, platform_code=platform_code, platform_name=platform_name, trace_id=trace_id)
+    # The caller must run _quote_runtime_result_or_failure first.  Returning
+    # an empty result here is deliberately not a success fallback; an empty
+    # result can never reach the result-card/image path.
+    return {}
 
 
 async def _complete_waiting_task(
@@ -14520,6 +14903,7 @@ async def _complete_waiting_task(
     )
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
+    quote_runtime_result = _quote_runtime_result_or_failure(quote_runtime_result)
     if await _quote_task_was_cancelled(db, task=task):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
@@ -14531,7 +14915,6 @@ async def _complete_waiting_task(
         task.login_state = "authenticated"
         task.error_detail = _runtime_detail(quote_runtime_result, "平台报价失败")
         task.response_payload = {
-            "stub": True,
             "sms_code_length": len(sms_code),
             "challenge": _runtime_result_payload(challenge_result),
             "quote": _runtime_result_payload(quote_runtime_result),
@@ -14733,22 +15116,12 @@ async def _complete_waiting_task(
             actions=[_mk_action("查看当前材料状态"), _mk_action(f"{platform_name}报价")],
             operator_role_name=operator_role_name,
         )
-    result = _quote_result_from_runtime_or_fake(
+    result = _quote_result_from_runtime(
         quote_runtime_result,
-        snapshot,
         platform_code=platform_code,
         platform_name=platform_name,
         trace_id=trace_id,
     )
-    display_started = time.perf_counter()
-    result = _enrich_quote_result_for_display(
-        result,
-        platform_account=platform_account,
-        platform_name=platform_name,
-    )
-    perf["result_display_ms"] = _elapsed_ms(display_started)
-    if result.get("result_image_ms") is not None:
-        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
     task = await _lock_quote_task(db, task)
     if await _quote_task_was_cancelled(db, task=task):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
@@ -14767,11 +15140,39 @@ async def _complete_waiting_task(
             response_payload={"quote": _runtime_result_payload(quote_runtime_result), "perf": perf},
         )
 
+    # Create/upload a result image only after this quote is still current.
+    display_started = time.perf_counter()
+    try:
+        result = _enrich_quote_result_for_display(
+            result,
+            platform_account=platform_account,
+            platform_name=platform_name,
+        )
+    except Exception as exc:
+        perf["result_display_ms"] = _elapsed_ms(display_started)
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        return await _fail_quote_after_result_materialization(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            error=exc,
+            platform_account=platform_account,
+            quota_reservation=quota_reservation,
+            response_payload={
+                "quote": _runtime_result_payload(quote_runtime_result),
+                "perf": perf,
+            },
+        )
+    perf["result_display_ms"] = _elapsed_ms(display_started)
+    if result.get("result_image_ms") is not None:
+        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
     perf["total_ms"] = _elapsed_ms(perf_started)
     task.status = TASK_STATUS_SUCCESS
     task.login_state = "authenticated"
     task.response_payload = {
-        "stub": True,
         "sms_code_length": len(sms_code),
         "challenge": _runtime_result_payload(challenge_result),
         "quote": _runtime_result_payload(quote_runtime_result),
@@ -14920,7 +15321,7 @@ async def _complete_quote_without_sms(
         return _quote_superseded_silent_response(case=case, task=None, trace_id=trace_id)
 
     request_payload = {
-        "mode": "stub",
+        "mode": "quote_attempt",
         "login": login_mode,
         "owner_user_id": owner_user_id,
         "platform_account": _credential_public_payload(platform_account),
@@ -15052,13 +15453,13 @@ async def _complete_quote_without_sms(
     )
     quote_runtime_result = await quote_platform_runtime.quote(platform_ctx, snapshot, db=db)
     perf["platform_quote_ms"] = _elapsed_ms(platform_quote_started)
+    quote_runtime_result = _quote_runtime_result_or_failure(quote_runtime_result)
     if await _quote_task_was_cancelled(db, task=task):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         perf["total_ms"] = _elapsed_ms(perf_started)
         task.response_payload = {
-            "stub": True,
             "login": login_mode,
             "quote": _runtime_result_payload(quote_runtime_result),
             "material_changed": True,
@@ -15085,7 +15486,6 @@ async def _complete_quote_without_sms(
         task.login_state = "authenticated"
         task.error_detail = error_detail
         task.response_payload = {
-            "stub": True,
             "login": login_mode,
             "quote": _runtime_result_payload(quote_runtime_result),
             "perf": perf,
@@ -15302,23 +15702,12 @@ async def _complete_quote_without_sms(
             operator_role_name=operator_role_name,
         )
 
-    result = _quote_result_from_runtime_or_fake(
+    result = _quote_result_from_runtime(
         quote_runtime_result,
-        snapshot,
         platform_code=platform_code,
         platform_name=platform_name,
         trace_id=trace_id,
     )
-    display_started = time.perf_counter()
-    result = _enrich_quote_result_for_display(
-        result,
-        platform_account=platform_account,
-        platform_name=platform_name,
-    )
-    perf["result_display_ms"] = _elapsed_ms(display_started)
-    if result.get("result_image_ms") is not None:
-        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
-    perf["total_ms"] = _elapsed_ms(perf_started)
     task = await _lock_quote_task(db, task)
     if await _quote_task_was_cancelled(db, task=task):
         await _release_account_quota_reservation(db, account=platform_account, reservation=quota_reservation)
@@ -15342,10 +15731,39 @@ async def _complete_quote_without_sms(
             quota_reservation=quota_reservation,
             response_payload={"quote": _runtime_result_payload(quote_runtime_result)},
         )
+    # Create/upload a result image only after this quote is still current.
+    display_started = time.perf_counter()
+    try:
+        result = _enrich_quote_result_for_display(
+            result,
+            platform_account=platform_account,
+            platform_name=platform_name,
+        )
+    except Exception as exc:
+        perf["result_display_ms"] = _elapsed_ms(display_started)
+        perf["total_ms"] = _elapsed_ms(perf_started)
+        return await _fail_quote_after_result_materialization(
+            db,
+            case=case,
+            task=task,
+            owner_user_id=owner_user_id,
+            platform_name=platform_name,
+            trace_id=trace_id,
+            error=exc,
+            platform_account=platform_account,
+            quota_reservation=quota_reservation,
+            response_payload={
+                "quote": _runtime_result_payload(quote_runtime_result),
+                "perf": perf,
+            },
+        )
+    perf["result_display_ms"] = _elapsed_ms(display_started)
+    if result.get("result_image_ms") is not None:
+        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
+    perf["total_ms"] = _elapsed_ms(perf_started)
     task.status = TASK_STATUS_SUCCESS
     task.login_state = "authenticated"
     task.response_payload = {
-        "stub": True,
         "login": login_mode,
         "quote": _runtime_result_payload(quote_runtime_result),
         "perf": perf,

@@ -110,8 +110,8 @@ class Settings(BaseSettings):
 
     # ✅ 平台开关（按平台 code 大写命名）
     # 例如：AI_PLATFORM_ENABLE_TP=true
-    # 当前先内置 STUB（用于公共入口跑通）
-    AI_PLATFORM_ENABLE_STUB: bool = Field(default=True)
+    # 未接入平台使用明确失败的通用适配器，不会产生报价结果。
+    AI_PLATFORM_ENABLE_STUB: bool = Field(default=False)
 
     # -----------------------------
     # PICC 协议报价助手

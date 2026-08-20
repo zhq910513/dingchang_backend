@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from app.core.config import settings
+from app.services.quote_result_validation import quote_result_real_data_error
 
 
 def _to_str(v: Any, default: str = "") -> str:
@@ -231,10 +232,15 @@ class AiPlatformAdapter(abc.ABC):
 
         if use_cache:
             cached = await get_cache_backend().get(cache_key)
-            if isinstance(cached, dict) and cached.get("ok") is True:
+            cached_result = cached.get("quote_result") if isinstance(cached, dict) else None
+            if (
+                isinstance(cached, dict)
+                and cached.get("ok") is True
+                and not quote_result_real_data_error(cached_result)
+            ):
                 return QuoteResult(
                     ok=True,
-                    quote_result=cached.get("quote_result"),
+                    quote_result=cached_result,
                     raw_request=cached.get("raw_request"),
                     raw_response=cached.get("raw_response"),
                     cached=True,
@@ -301,6 +307,18 @@ class AiPlatformAdapter(abc.ABC):
                 trace_id=trace_id,
             )
 
+        validation_error = quote_result_real_data_error(norm)
+        if validation_error:
+            return QuoteResult(
+                ok=False,
+                error_code="quote_result_invalid",
+                error_message=validation_error,
+                raw_request=req_payload if isinstance(req_payload, dict) else None,
+                raw_response=raw_resp,
+                cached=False,
+                trace_id=trace_id,
+            )
+
         res = QuoteResult(
             ok=True,
             quote_result=norm,
@@ -361,7 +379,7 @@ class AiPlatformAdapter(abc.ABC):
 
 class StubPlatformAdapter(AiPlatformAdapter):
     """
-    ✅ 默认占位适配器：平台未接入时返回 stub
+    默认未接入适配器：平台未接入时必须明确失败，不能伪造报价成功。
     """
     platform_code = "STUB"
 
@@ -379,13 +397,8 @@ class StubPlatformAdapter(AiPlatformAdapter):
         }
 
     async def do_quote(self, *, ctx: QuoteContext, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return {"stub": True, "message": "platform adapter not implemented"}
+        raise RuntimeError(f"平台未接入真实报价接口：{self.platform_code}")
 
     async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
                                      raw_response: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "status": "stub",
-            "message": "平台报价接口未接入",
-            "price_items": [],
-            "raw": raw_response,
-        }
+        raise RuntimeError(f"平台未接入真实报价接口：{self.platform_code}")

@@ -36,25 +36,29 @@ class QuotePlatformAdapter:
     keep_browser_alive = False
 
     async def validate_account(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="ok")
+        return self._not_implemented_result("账号校验")
 
     async def login(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="success")
+        return self._not_implemented_result("登录")
 
     async def submit_challenge(self, ctx: PlatformAccountContext, challenge: str) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="success", data={"challenge_length": len(challenge or "")})
+        return self._not_implemented_result("验证码校验")
 
     async def keepalive(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="success")
+        return self._not_implemented_result("保活")
 
     async def check_quota(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="available")
+        return self._not_implemented_result("额度检查")
 
     async def detect_account_type(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="unknown")
 
     async def quote(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="success", data={"mode": "stub"})
+        return PlatformRuntimeResult(
+            status="failed",
+            message=f"{self.platform_name or self.platform_code}报价流程尚未接入真实平台接口",
+            data={"error_code": "platform_quote_not_implemented"},
+        )
 
     async def query_renewal(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="failed", message="当前平台暂不支持续保查询")
@@ -64,3 +68,11 @@ class QuotePlatformAdapter:
 
     async def query_repair_codes(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="failed", message="当前平台暂不支持送修码查询")
+
+    def _not_implemented_result(self, operation: str) -> PlatformRuntimeResult:
+        platform = self.platform_name or self.platform_code or "当前平台"
+        return PlatformRuntimeResult(
+            status="failed",
+            message=f"{platform}{operation}流程尚未接入真实平台接口",
+            data={"error_code": "platform_not_implemented", "operation": operation},
+        )

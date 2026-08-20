@@ -1,0 +1,563 @@
+scripts\db_business_fingerprint.py:33:    "premium_total",
+scripts\verify_quote_result_truthfulness.py:16:    _enrich_quote_result_for_display,
+scripts\verify_quote_result_truthfulness.py:22:from app.services.quote_result_validation import quote_result_real_data_error
+scripts\verify_quote_result_truthfulness.py:23:from app.api.v1.ai_assistant import _normalize_quote_result_metadata
+scripts\verify_quote_result_truthfulness.py:43:        "premium_total": "1288.80",
+scripts\verify_quote_result_truthfulness.py:44:        "price_items": [{"name": "商业险", "amount": "1288.80"}],
+scripts\verify_quote_result_truthfulness.py:51:    error = quote_result_real_data_error(result)
+scripts\verify_quote_result_truthfulness.py:56:    assert not quote_result_real_data_error(_result())
+scripts\verify_quote_result_truthfulness.py:57:    assert not quote_result_real_data_error(
+scripts\verify_quote_result_truthfulness.py:59:            premium_total="",
+scripts\verify_quote_result_truthfulness.py:60:            price_items=[{"name": "机动车损失保险", "amount": "32000", "premium": "812.60"}],
+scripts\verify_quote_result_truthfulness.py:67:            premium_total="",
+scripts\verify_quote_result_truthfulness.py:68:            price_items=[{"name": "车船税", "amount": "420.00"}],
+scripts\verify_quote_result_truthfulness.py:69:            result_card={"vehicle_tax": "420.00"},
+scripts\verify_quote_result_truthfulness.py:75:            premium_total="",
+scripts\verify_quote_result_truthfulness.py:76:            price_items=[{"name": "机动车损失保险", "amount": "32000"}],
+scripts\verify_quote_result_truthfulness.py:77:            result_card={"coverage_items": [{"name": "机动车损失保险", "amount": "32000"}]},
+scripts\verify_quote_result_truthfulness.py:82:        _result(premium_total="", price_items=[], risk_score=36, result_card={"risk_score": 36}),
+scripts\verify_quote_result_truthfulness.py:87:            premium_total="398.00",
+scripts\verify_quote_result_truthfulness.py:88:            price_items=[{"name": "途家安顺", "amount": "398.00"}],
+scripts\verify_quote_result_truthfulness.py:89:            result_card={"joint_sales_premium": "398.00"},
+scripts\verify_quote_result_truthfulness.py:95:            premium_total="120.00",
+scripts\verify_quote_result_truthfulness.py:96:            price_items=[
+scripts\verify_quote_result_truthfulness.py:104:    addon_only_from_picc_parser = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+scripts\verify_quote_result_truthfulness.py:134:            premium_total="0.00",
+scripts\verify_quote_result_truthfulness.py:135:            price_items=[{"name": "商业险", "amount": "0.00"}, {"name": "车船税", "amount": "0.00"}],
+scripts\verify_quote_result_truthfulness.py:138:    _assert_rejected("stub-marker", _result(mode="stub"))
+scripts\verify_quote_result_truthfulness.py:139:    _assert_rejected("fake-marker", _result(fake=True))
+scripts\verify_quote_result_truthfulness.py:150:            price_items=[
+scripts\verify_quote_result_truthfulness.py:156:    assert not quote_result_real_data_error(
+scripts\verify_quote_result_truthfulness.py:177:            price_items=[
+scripts\verify_quote_result_truthfulness.py:184:    failed_joint_query_result = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+scripts\verify_quote_result_truthfulness.py:214:    assert all(item["name"] != "途家安顺" for item in failed_joint_query_result["price_items"])
+scripts\verify_quote_result_truthfulness.py:215:    assert failed_joint_query_result["premium_total"] == 2143.8
+scripts\verify_quote_result_truthfulness.py:221:            data={"quote_result": _result(mode="stub")},
+scripts\verify_quote_result_truthfulness.py:225:    assert "quote_result" not in (runtime.data or {}), runtime.data
+scripts\verify_quote_result_truthfulness.py:226:    assert "占位或模拟报价结果" in str(runtime.message), runtime
+scripts\verify_quote_result_truthfulness.py:234:                    "quote_result": _result(),
+scripts\verify_quote_result_truthfulness.py:240:    assert "quote_result" not in str(failed_payload), failed_payload
+scripts\verify_quote_result_truthfulness.py:244:        _enrich_quote_result_for_display(_result(mode="stub"))
+scripts\verify_quote_result_truthfulness.py:250:    missing_tax_result = PiccBusinessAdapter()._build_used_fuel_quote_result_from_response(
+scripts\verify_quote_result_truthfulness.py:269:    assert missing_tax_result["premium_total"] is None, missing_tax_result
+scripts\verify_quote_result_truthfulness.py:270:    assert missing_tax_result["result_card"]["total_with_vehicle_tax"] == "", missing_tax_result
+scripts\verify_quote_result_truthfulness.py:271:    assert not quote_result_real_data_error(missing_tax_result), missing_tax_result
+scripts\verify_quote_result_truthfulness.py:273:    valid_history = _normalize_quote_result_metadata(
+scripts\verify_quote_result_truthfulness.py:278:                    "quote_result": {
+scripts\verify_quote_result_truthfulness.py:286:    valid_history_result = valid_history["data"]["payload"]["quote_result"]
+scripts\verify_quote_result_truthfulness.py:289:    invalid_history = _normalize_quote_result_metadata(
+scripts\verify_quote_result_truthfulness.py:294:                    "quote_result": {
+scripts\verify_quote_result_truthfulness.py:295:                        **_result(mode="stub"),
+scripts\verify_quote_result_truthfulness.py:302:    invalid_history_result = invalid_history["data"]["payload"]["quote_result"]
+scripts\verify_quote_result_truthfulness.py:304:    assert invalid_history_result["quote_result_unavailable"] is True, invalid_history
+scripts\verify_quote_result_truthfulness.py:306:    assert "quote_result_validation_error" in invalid_history, invalid_history
+scripts\verify_quote_result_truthfulness.py:308:    invalid_direct_history = _normalize_quote_result_metadata(
+scripts\verify_quote_result_truthfulness.py:312:                "quote_result": {
+scripts\verify_quote_result_truthfulness.py:314:                    "premium_total": "1288.80",
+scripts\verify_quote_result_truthfulness.py:319:    direct_result = invalid_direct_history["data"]["quote_result"]
+scripts\verify_quote_result_truthfulness.py:320:    assert direct_result["quote_result_unavailable"] is True, invalid_direct_history
+scripts\verify_quote_result_truthfulness.py:326:        "and stub/fake/config-only results rejected; invalid historical results hidden"
+scripts\verify_invalid_command_flow.py:10:from unittest.mock import AsyncMock, patch
+scripts\verify_invalid_command_flow.py:36:    assert intent == "fallback", (intent, confidence, entities)
+scripts\verify_invalid_command_flow.py:41:            new=AsyncMock(return_value=False),
+scripts\verify_invalid_command_flow.py:45:            new=AsyncMock(side_effect=AssertionError("invalid text must not enter image handling")),
+scripts\verify_invalid_command_flow.py:49:            new=AsyncMock(side_effect=AssertionError("invalid text must not mutate quote materials")),
+scripts\verify_invalid_command_flow.py:60:        assert meta.get("intent") == "fallback", meta
+scripts\verify_invalid_command_flow.py:67:            new=AsyncMock(return_value=True),
+scripts\verify_invalid_command_flow.py:71:            new=AsyncMock(side_effect=AssertionError("ordinary text must not enter image handling")),
+scripts\verify_invalid_command_flow.py:75:            new=AsyncMock(side_effect=AssertionError("ordinary text must not mutate quote materials")),
+scripts\verify_invalid_command_flow.py:82:            intent="fallback",
+scripts\verify_invalid_command_flow.py:86:        assert meta.get("intent") == "fallback", meta
+scripts\verify_invalid_command_flow.py:94:            new=AsyncMock(return_value=False),
+scripts\verify_invalid_command_flow.py:98:            new=AsyncMock(
+scripts\verify_invalid_command_flow.py:114:            intent="fallback",
+scripts\verify_invalid_command_flow.py:118:        assert invalid_meta.get("intent") == "fallback", invalid_meta
+scripts\verify_invalid_command_flow.py:146:            new=AsyncMock(return_value=False),
+scripts\verify_invalid_command_flow.py:150:            new=AsyncMock(return_value=image_reply),
+scripts\verify_invalid_command_flow.py:160:            intent="fallback",
+scripts\verify_invalid_command_flow.py:171:            new=AsyncMock(return_value=True),
+scripts\verify_invalid_command_flow.py:175:            new=AsyncMock(
+scripts\verify_invalid_command_flow.py:191:            intent="fallback",
+scripts\verify_invalid_command_flow.py:199:async def _verify_persisted_fallback_message() -> None:
+scripts\verify_invalid_command_flow.py:220:            assert result.get("intent") == "fallback", result
+scripts\verify_invalid_command_flow.py:242:        await _verify_persisted_fallback_message()
+scripts\verify_invalid_command_flow.py:249:    print("PASS invalid command flow: visible fallback, persisted reply, no quote mutation, SMS code preserved")
+app\models\order_info.py:50:    premium_total = Column(
+scripts\verify_quote_assistant_local_blackbox.py:189:                            "quote_result": {
+app\core\config.py:114:    AI_PLATFORM_ENABLE_STUB: bool = Field(default=False)
+app\utils\order_image_urls.py:131:def _fallback_url_for_order_image(im: Any) -> str:
+app\utils\order_image_urls.py:158:            allow_fallback_public=False,
+app\utils\order_image_urls.py:189:    fallback_url = _fallback_url_for_order_image(im)
+app\utils\order_image_urls.py:190:    if fallback_url:
+app\utils\order_image_urls.py:192:            _set_cached_display_url(storage_key, fallback_url)
+app\utils\order_image_urls.py:193:        return fallback_url
+scripts\verify_quote_assistant_regressions.py:21:    _is_runtime_duplicate_quote_result,
+scripts\verify_quote_assistant_regressions.py:29:    _quote_result_insurance_date_auto_adjustments,
+scripts\verify_quote_assistant_regressions.py:185:        class _VehicleFallbackClient:
+scripts\verify_quote_assistant_regressions.py:207:        client = _VehicleFallbackClient()
+scripts\verify_quote_assistant_regressions.py:276:        class _VinFallbackClient:
+scripts\verify_quote_assistant_regressions.py:299:        client = _VinFallbackClient()
+scripts\verify_quote_assistant_regressions.py:389:        fallback_text = "CarModelDFL7000NAA2BEY\nCarBrand东风日产牌\nCarName纯电动轿车\nVehicleType轿车"
+scripts\verify_quote_assistant_regressions.py:392:        fields = _quote_image_extracted_fields_from_features(text_features, fallback_text)
+scripts\verify_quote_assistant_regressions.py:400:                    "ocr_text_sample": fallback_text,
+scripts\verify_quote_assistant_regressions.py:964:        adjustments = _quote_result_insurance_date_auto_adjustments(result)
+scripts\verify_quote_assistant_regressions.py:1043:        self.assertFalse(_is_runtime_duplicate_quote_result(result))
+scripts\verify_quote_assistant_regressions.py:1051:        self.assertTrue(_is_runtime_duplicate_quote_result(result))
+scripts\verify_quote_assistant_regressions.py:1225:        def fake_fetch(self, client, selected):
+scripts\verify_quote_assistant_regressions.py:1228:        def fake_prefill(self, prefill, selected):
+scripts\verify_quote_assistant_regressions.py:1241:        def fake_prepare(self, client, ctx, payload, account_type_name="油车-旧"):
+scripts\verify_quote_assistant_regressions.py:1251:        def fake_apply(self, body, renewal_data, prefill, selected):
+scripts\verify_quote_assistant_regressions.py:1254:        adapter._fetch_renewal_policy_prefill = MethodType(fake_fetch, adapter)
+scripts\verify_quote_assistant_regressions.py:1255:        adapter._renewal_prefill_vehicle_data = MethodType(fake_prefill, adapter)
+scripts\verify_quote_assistant_regressions.py:1256:        adapter._prepare_used_fuel_quote = MethodType(fake_prepare, adapter)
+scripts\verify_quote_assistant_regressions.py:1257:        adapter._apply_renewal_prefill_to_quote_body = MethodType(fake_apply, adapter)
+scripts\verify_quote_assistant_regressions.py:1461:        result = adapter._build_used_fuel_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
+scripts\verify_quote_assistant_regressions.py:1463:        self.assertEqual(str(result["premium_total"]), "3294.79")
+scripts\verify_quote_assistant_regressions.py:1464:        self.assertEqual(result["result_card"]["commercial_premium"], "1741.79")
+scripts\verify_quote_assistant_regressions.py:1465:        self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
+scripts\verify_quote_assistant_regressions.py:1466:        self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
+scripts\verify_quote_assistant_regressions.py:1467:        self.assertEqual(result["result_card"]["joint_sales_premium"], "398.00")
+scripts\verify_quote_assistant_regressions.py:1468:        self.assertEqual(result["result_card"]["proposal_info"]["plate_no"], "赣G872F6")
+scripts\verify_quote_assistant_regressions.py:1490:                                {"planName": "HAR fake", "planCode": "P1", "planPremium": "398", "planAmount": "200000"}
+scripts\verify_quote_assistant_regressions.py:1564:                                {"planName": "HAR fake", "planCode": "P1", "planPremium": "398", "planAmount": "200000"}
+scripts\verify_quote_assistant_regressions.py:1610:        result = _adapter()._build_used_fuel_quote_result_from_response(ctx, {}, body, final_response)
+scripts\verify_quote_assistant_regressions.py:1612:        self.assertEqual(str(result["premium_total"]), "2921.46")
+scripts\verify_quote_assistant_regressions.py:1613:        self.assertEqual(result["result_card"]["commercial_premium"], "1766.46")
+scripts\verify_quote_assistant_regressions.py:1614:        self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
+scripts\verify_quote_assistant_regressions.py:1615:        self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
+scripts\verify_quote_assistant_regressions.py:1616:        self.assertEqual(result["result_card"]["joint_sales_premium"], "")
+scripts\verify_quote_assistant_regressions.py:1617:        self.assertEqual(result["result_card"]["total_without_vehicle_tax"], "2621.46")
+scripts\verify_quote_assistant_regressions.py:1618:        self.assertEqual(result["result_card"]["total_with_vehicle_tax"], "2921.46")
+scripts\verify_quote_assistant_regressions.py:1784:        result = _adapter()._build_used_fuel_quote_result_from_response(
+scripts\verify_quote_assistant_regressions.py:1792:            for item in result["result_card"]["proposal_coverage_items"]
+scripts\verify_quote_assistant_full_local_chain.py:81:        self.quote_result_variant = "recorded_contract"
+scripts\verify_quote_assistant_full_local_chain.py:88:        async def fake_quote(ctx, quote_payload, db=None):
+scripts\verify_quote_assistant_full_local_chain.py:114:            premium_total = "2921.46" if renewal_seat_adjusted else ("2596.79" if is_renewal else "5760.19")
+scripts\verify_quote_assistant_full_local_chain.py:118:            quote_result = {
+scripts\verify_quote_assistant_full_local_chain.py:151:                "premium_total": premium_total,
+scripts\verify_quote_assistant_full_local_chain.py:152:                "price_items": [
+scripts\verify_quote_assistant_full_local_chain.py:157:                "result_card": {
+scripts\verify_quote_assistant_full_local_chain.py:160:                    "total_premium": premium_total,
+scripts\verify_quote_assistant_full_local_chain.py:180:                quote_result["quotation_no"] = "FDAA202636040008979424"
+scripts\verify_quote_assistant_full_local_chain.py:181:                quote_result["renewal"] = {
+scripts\verify_quote_assistant_full_local_chain.py:185:            if self.quote_result_variant == "untrusted_marker":
+scripts\verify_quote_assistant_full_local_chain.py:186:                quote_result["mode"] = "stub"
+scripts\verify_quote_assistant_full_local_chain.py:193:                    "quote_result": quote_result,
+scripts\verify_quote_assistant_full_local_chain.py:199:        async def fake_query_renewal(ctx, quote_payload, db=None):
+scripts\verify_quote_assistant_full_local_chain.py:235:        async def fake_joint_sales(ctx, quote_payload, db=None):
+scripts\verify_quote_assistant_full_local_chain.py:238:                message="本地模拟途家安顺保额查询成功",
+scripts\verify_quote_assistant_full_local_chain.py:255:        async def fake_repair_codes(ctx, quote_payload, db=None):
+scripts\verify_quote_assistant_full_local_chain.py:258:                message="本地模拟送修码查询成功",
+scripts\verify_quote_assistant_full_local_chain.py:272:        quote_platform_runtime.quote = fake_quote
+scripts\verify_quote_assistant_full_local_chain.py:273:        quote_platform_runtime.query_renewal = fake_query_renewal
+scripts\verify_quote_assistant_full_local_chain.py:274:        quote_platform_runtime.query_joint_sales_plan = fake_joint_sales
+scripts\verify_quote_assistant_full_local_chain.py:275:        quote_platform_runtime.query_repair_codes = fake_repair_codes
+scripts\verify_quote_assistant_full_local_chain.py:380:                    quote_result = await _send(db, session_id=session_id, message="人保报价")
+scripts\verify_quote_assistant_full_local_chain.py:381:                    reply = str(quote_result.get("reply") or "")
+scripts\verify_quote_assistant_full_local_chain.py:382:                    payload = _payload(quote_result)
+scripts\verify_quote_assistant_full_local_chain.py:383:                    quote_payload = payload.get("quote_result") if isinstance(payload.get("quote_result"), dict) else {}
+scripts\verify_quote_assistant_full_local_chain.py:384:                    assert quote_result.get("intent") == "quote", (account_type, quote_result)
+scripts\verify_quote_assistant_full_local_chain.py:385:                    assert _result_status(quote_result) == "success", (account_type, quote_result)
+scripts\verify_quote_assistant_full_local_chain.py:468:                joint_sales_payload = _payload(joint_sales_result).get("quote_result") or {}
+scripts\verify_quote_assistant_full_local_chain.py:469:                joint_sales_card = joint_sales_payload.get("result_card") or {}
+scripts\verify_quote_assistant_full_local_chain.py:503:                renewal_quote_payload = _payload(renewal_result).get("quote_result") or {}
+scripts\verify_quote_assistant_full_local_chain.py:504:                assert str(renewal_quote_payload.get("premium_total")) == "2596.79", renewal_quote_payload
+scripts\verify_quote_assistant_full_local_chain.py:519:                adjusted_payload = _payload(seat_adjustment).get("quote_result") or {}
+scripts\verify_quote_assistant_full_local_chain.py:520:                adjusted_card = adjusted_payload.get("result_card") or {}
+scripts\verify_quote_assistant_full_local_chain.py:525:                assert str(adjusted_payload.get("premium_total")) == "2921.46", adjusted_payload
+scripts\verify_quote_assistant_full_local_chain.py:578:                runtime_patch.quote_result_variant = "untrusted_marker"
+scripts\verify_quote_assistant_full_local_chain.py:598:                assert "占位或模拟报价结果" in str(rejected.get("reply") or ""), rejected
+scripts\verify_quote_assistant_full_local_chain.py:600:                assert not (rejected_payload.get("quote_result") or {}).get("result_image"), rejected_payload
+scripts\verify_quote_assistant_full_local_chain.py:625:                runtime_patch.quote_result_variant = "recorded_contract"
+app\schemas\order.py:60:    premium_total: Optional[float] = None
+app\schemas\order.py:86:    premium_total: Optional[float] = None
+app\services\image_slot_classifier.py:236:    provided slot as a low-risk fallback.
+app\services\image_slot_classifier.py:346:            method="provided_slot_fallback",
+app\services\image_slot_classifier.py:355:        method="unknown_fallback",
+app\services\ai_platforms\__init__.py:7:from app.services.ai_platforms.base import AiPlatformAdapter, StubPlatformAdapter
+app\services\ai_platforms\__init__.py:42:# 默认注册未接入适配器；它只能返回明确失败，不能伪造报价结果。
+app\services\ai_platforms\__init__.py:43:register_adapter(StubPlatformAdapter())
+app\api\v1\ai_assistant.py:78:from app.services.quote_result_validation import quote_result_real_data_error
+app\api\v1\ai_assistant.py:291:                "quote_result",
+app\api\v1\ai_assistant.py:344:def _is_legacy_quote_result_url(url: str) -> bool:
+app\api\v1\ai_assistant.py:346:    return "/quote_results/" in normalized or normalized.startswith("quote_results/")
+app\api\v1\ai_assistant.py:349:def _normalize_quote_result_image_ref(image: Any, *, result: Any = None) -> Any:
+app\api\v1\ai_assistant.py:355:            "kind": "quote_result",
+app\api\v1\ai_assistant.py:361:        if _is_legacy_quote_result_url(url):
+app\api\v1\ai_assistant.py:370:        normalized.setdefault("kind", "quote_result")
+app\api\v1\ai_assistant.py:375:        if _is_legacy_quote_result_url(url):
+app\api\v1\ai_assistant.py:382:def _quote_result_validation_error_in_metadata(metadata: Any) -> str:
+app\api\v1\ai_assistant.py:387:        metadata.get("quote_result"),
+app\api\v1\ai_assistant.py:394:                data.get("quote_result"),
+app\api\v1\ai_assistant.py:402:                    payload.get("quote_result"),
+app\api\v1\ai_assistant.py:410:                payload.get("quote_result"),
+app\api\v1\ai_assistant.py:415:        if isinstance(candidate, dict) and candidate.get("quote_result_unavailable") is True:
+app\api\v1\ai_assistant.py:416:            return str(candidate.get("quote_result_validation_error") or "报价结果未通过真实性校验").strip()
+app\api\v1\ai_assistant.py:420:def _invalidate_quote_result_for_display(result: Dict[str, Any], error: str) -> Dict[str, Any]:
+app\api\v1\ai_assistant.py:423:        "quote_result_unavailable": True,
+app\api\v1\ai_assistant.py:424:        "quote_result_validation_error": error or "报价结果未通过真实性校验",
+app\api\v1\ai_assistant.py:428:def _normalize_quote_result_payload(payload: Any) -> Any:
+app\api\v1\ai_assistant.py:432:    for key in ("quote_result", "quoteResult"):
+app\api\v1\ai_assistant.py:436:        validation_error = quote_result_real_data_error(result)
+app\api\v1\ai_assistant.py:438:            normalized[key] = _invalidate_quote_result_for_display(result, validation_error)
+app\api\v1\ai_assistant.py:443:            wrapped = _normalize_quote_result_image_ref(image, result=result_copy)
+app\api\v1\ai_assistant.py:451:def _normalize_quote_result_metadata(metadata: Any) -> Any:
+app\api\v1\ai_assistant.py:458:            data["payload"] = _normalize_quote_result_payload(data["payload"])
+app\api\v1\ai_assistant.py:459:        data = _normalize_quote_result_payload(data)
+app\api\v1\ai_assistant.py:462:        normalized["payload"] = _normalize_quote_result_payload(normalized["payload"])
+app\api\v1\ai_assistant.py:463:    if isinstance(normalized.get("quote_result"), dict):
+app\api\v1\ai_assistant.py:464:        normalized["quote_result"] = _normalize_quote_result_payload({"quote_result": normalized["quote_result"]}).get("quote_result")
+app\api\v1\ai_assistant.py:466:        normalized["quoteResult"] = _normalize_quote_result_payload({"quoteResult": normalized["quoteResult"]}).get("quoteResult")
+app\api\v1\ai_assistant.py:467:    validation_error = _quote_result_validation_error_in_metadata(normalized)
+app\api\v1\ai_assistant.py:469:        normalized["quote_result_validation_error"] = validation_error
+app\api\v1\ai_assistant.py:643:        quote_result = await _recall_quote_case_images(
+app\api\v1\ai_assistant.py:661:            "quote": quote_result,
+app\api\v1\ai_assistant.py:695:        filtered_metadata = _normalize_quote_result_metadata(
+app\api\v1\ai_assistant.py:704:        history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
+app\api\v1\ai_assistant.py:1027:            allow_fallback_public=False,
+app\api\v1\ai_assistant.py:1206:    filtered_response_metadata = _normalize_quote_result_metadata(
+app\api\v1\ai_assistant.py:1215:    response_validation_error = _quote_result_validation_error_in_metadata(filtered_response_metadata)
+app\services\ai_platforms\base.py:13:from app.services.quote_result_validation import quote_result_real_data_error
+app\services\ai_platforms\base.py:68:    quote_result: Optional[Dict[str, Any]] = None
+app\services\ai_platforms\base.py:178:    - normalize_quote_result: 把原始响应转成统一摘要
+app\services\ai_platforms\base.py:222:                quote_result=None,
+app\services\ai_platforms\base.py:235:            cached_result = cached.get("quote_result") if isinstance(cached, dict) else None
+app\services\ai_platforms\base.py:239:                and not quote_result_real_data_error(cached_result)
+app\services\ai_platforms\base.py:243:                    quote_result=cached_result,
+app\services\ai_platforms\base.py:298:            norm = await self.normalize_quote_result(ctx=ctx, payload=req_payload, raw_response=raw_resp or {})
+app\services\ai_platforms\base.py:310:        validation_error = quote_result_real_data_error(norm)
+app\services\ai_platforms\base.py:314:                error_code="quote_result_invalid",
+app\services\ai_platforms\base.py:324:            quote_result=norm,
+app\services\ai_platforms\base.py:337:                    "quote_result": res.quote_result,
+app\services\ai_platforms\base.py:372:    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+app\services\ai_platforms\base.py:375:        将 raw_response 转换为标准化摘要 quote_result（便于前端展示）
+app\services\ai_platforms\base.py:380:class StubPlatformAdapter(AiPlatformAdapter):
+app\services\ai_platforms\base.py:382:    默认未接入适配器：平台未接入时必须明确失败，不能伪造报价成功。
+app\services\ai_platforms\base.py:384:    platform_code = "STUB"
+app\services\ai_platforms\base.py:402:    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+app\services\ocr_worker.py:228:    """Split hard OCR failures from warnings after fallback composition.
+app\services\ocr_worker.py:753:    ✅ 兼容：storage.object_url_for_display 是否支持 allow_fallback_public 参数（不支持也不炸）
+app\services\ocr_worker.py:763:                    allow_fallback_public=False,
+app\services\ocr_worker.py:917:        related_fallback_images: list[OrderImage] = []
+app\services\ocr_worker.py:931:                related_fallback_images.append(image)
+app\services\ocr_worker.py:948:        if missing_core_slots and related_fallback_images:
+app\services\ocr_worker.py:952:                    related_fallback_images,
+app\services\ocr_worker.py:1060:                    ocr_raw_json[f"{slot_key}__fallback"] = {
+app\services\ocr_worker.py:1078:                    ocr_raw_json[f"{slot_key}__fallback"] = {
+app\services\ocr_worker.py:1090:                ocr_raw_json[f"{slot_key}__fallback"] = {
+app\services\quote_result_image.py:50:        value = int(float(os.getenv("QUOTE_RESULT_IMAGE_SCALE", "2") or "2"))
+app\services\quote_result_image.py:56:def _quote_result_target_size() -> Tuple[int, int]:
+app\services\quote_result_image.py:58:        width = int(float(os.getenv("QUOTE_RESULT_IMAGE_WIDTH", "1350") or "1350"))
+app\services\quote_result_image.py:62:        height = int(float(os.getenv("QUOTE_RESULT_IMAGE_HEIGHT", "650") or "650"))
+app\services\quote_result_image.py:92:def _fit_quote_result_image(image: Any, *, background: str = "#ffffff") -> Any:
+app\services\quote_result_image.py:95:    target_w, target_h = _quote_result_target_size()
+app\services\quote_result_image.py:118:    final_image = _fit_quote_result_image(image, background=background)
+app\services\quote_result_image.py:123:def _quote_result_rel_path(card: Mapping[str, Any], trace_id: str = "") -> Path:
+app\services\quote_result_image.py:124:    target_w, target_h = _quote_result_target_size()
+app\services\quote_result_image.py:578:def render_quote_result_card_png(card: Mapping[str, Any]) -> bytes:
+app\services\quote_result_image.py:585:def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "") -> Optional[Dict[str, Any]]:
+app\services\quote_result_image.py:589:    target_w, target_h = _quote_result_target_size()
+app\services\quote_result_image.py:590:    rel_path = _quote_result_rel_path(card, trace_id=trace_id)
+app\services\quote_result_image.py:592:    png_bytes = render_quote_result_card_png(card)
+app\services\quote_result_image.py:600:        "kind": "quote_result",
+app\services\quote_result_validation.py:15:    "fake",
+app\services\quote_result_validation.py:16:    "stub",
+app\services\quote_result_validation.py:17:    "mock",
+app\services\quote_result_validation.py:22:    "模拟报价",
+app\services\quote_result_validation.py:141:        for item in result.get("price_items") or []:
+app\services\quote_result_validation.py:174:def quote_result_real_data_error(result: Any) -> str:
+app\services\quote_result_validation.py:197:        result.get("stub") is True
+app\services\quote_result_validation.py:198:        or result.get("fake") is True
+app\services\quote_result_validation.py:199:        or result.get("mock") is True
+app\services\quote_result_validation.py:206:        return "平台返回的是占位或模拟报价结果，未生成真实报价"
+app\services\quote_result_validation.py:218:    card = _object(result.get("result_card") or result.get("resultCard"))
+app\services\quote_result_validation.py:221:    price_items = result.get("price_items")
+app\services\quote_result_validation.py:224:    if isinstance(price_items, list):
+app\services\quote_result_validation.py:225:        for item in price_items:
+app\services\quote_result_validation.py:292:def quote_result_has_real_data(result: Any) -> bool:
+app\services\quote_result_validation.py:293:    return not quote_result_real_data_error(result)
+app\services\storage.py:401:            allow_fallback_public: bool = False,
+app\services\storage.py:407:            * allow_fallback_public=True  -> 签名失败时降级直链（仅显式兼容历史场景）
+app\services\storage.py:408:            * allow_fallback_public=False -> 签名失败直接抛错，避免敏感图片回退公开直链
+app\services\storage.py:420:            if not allow_fallback_public:
+app\api\v1\orders.py:185:    "premium_total",
+app\api\v1\orders.py:399:    fallback = _group_display_name(g)
+app\api\v1\orders.py:400:    return str(fallback).strip() if fallback is not None and str(fallback).strip() else None
+app\api\v1\orders.py:687:    premium_total = commercial + compulsory + vehicle_tax + non_vehicle
+app\api\v1\orders.py:688:    info.premium_total = premium_total
+app\api\v1\orders.py:1092:    related_fallback_needed = (
+app\api\v1\orders.py:1097:    if trigger_ocr and (has_ocr_images or related_fallback_needed):
+app\api\v1\orders.py:1759:            allow_fallback_public=False,
+app\api\v1\orders.py:2065:    related_fallback_needed = (
+app\api\v1\orders.py:2070:    if has_ocr_images or related_fallback_needed:
+app\services\order_read_model.py:229:        premium_total=_to_float(getattr(info, "premium_total", None)),
+app\services\order_read_model.py:365:    fallback_images = images_by_order_id.get(order_id)
+app\services\order_read_model.py:366:    if isinstance(fallback_images, list):
+app\services\order_read_model.py:367:        return fallback_images
+app\services\order_read_model.py:368:    if fallback_images:
+app\services\order_read_model.py:369:        return list(fallback_images)
+app\services\quote_platforms\base.py:33:    platform_code = "STUB"
+app\services\quote_platforms\base.py:34:    platform_name = "Stub"
+app\services\quote_platforms\browser_manager.py:9:    code = str(platform_code or "stub").strip().lower() or "stub"
+app\services\ai_assistant_service.py:32:from app.services.ai_platforms.base import AiPlatformAdapter, QuoteContext, StubPlatformAdapter, QuoteResult
+app\services\ai_assistant_service.py:68:from app.services.quote_result_validation import quote_result_real_data_error
+app\services\ai_assistant_service.py:370:    if intent == "fallback" or result_status == RESULT_INVALID:
+app\services\ai_assistant_service.py:924:    # A fallback is not useful as a session-list preview, but it is a direct
+app\services\ai_assistant_service.py:926:    if intent == "fallback" or result_status == RESULT_INVALID:
+app\services\ai_assistant_service.py:1008:        fallback: str = "",
+app\services\ai_assistant_service.py:1010:    fallback_preview = _safe_chat_text_for_display(fallback).strip()[:120]
+app\services\ai_assistant_service.py:1011:    if fallback_preview and not _session_preview_needs_recompute(fallback_preview):
+app\services\ai_assistant_service.py:1012:        return fallback_preview
+app\services\ai_assistant_service.py:1016:        return fallback_preview
+app\services\ai_assistant_service.py:1019:        return "" if _session_preview_needs_recompute(fallback_preview) else fallback_preview
+app\services\ai_assistant_service.py:1026:    return "" if _session_preview_needs_recompute(fallback_preview) else fallback_preview
+app\services\ai_assistant_service.py:1083:            fallback=_to_str(getattr(row, "last_message_preview", "")),
+app\services\ai_assistant_service.py:1651:        ("premium_total", ("总保费", "保费", "金额")),
+app\services\ai_assistant_service.py:1680:    - fallback
+app\services\ai_assistant_service.py:1689:        entities["platform_code"] = PLATFORM_NAME_TO_CODE.get(platform_name, "STUB")
+app\services\ai_assistant_service.py:1770:    return "fallback", 0.40, entities
+app\services\ai_assistant_service.py:2014:            allow_fallback_public=False,
+app\services\ai_assistant_service.py:2137:            "premium_total": getattr(oi, "premium_total", None),
+app\services\ai_assistant_service.py:2234:class _DynamicStubAdapter(StubPlatformAdapter):
+app\services\ai_assistant_service.py:2237:        self.platform_code = (code or "STUB").strip().upper() or "STUB"
+app\services\ai_assistant_service.py:2241:    code = (platform_code or "").strip().upper() or "STUB"
+app\services\ai_assistant_service.py:2245:    # 未注册平台不能走成功占位，StubPlatformAdapter 会明确返回失败。
+app\services\ai_assistant_service.py:2246:    return _DynamicStubAdapter(code)
+app\services\ai_assistant_service.py:2587:        "保费金额": _fmt_money_text(oi.get("premium_total")),
+app\services\ai_assistant_service.py:2736:        elif key == "premium_total":
+app\services\ai_assistant_service.py:2737:            out.append(f"保费金额：{_fmt_money_text(oi.get('premium_total'))}")
+app\services\ai_assistant_service.py:2988:    platform_code = _to_str(entities.get("platform_code")).strip().upper() or "STUB"
+app\services\ai_assistant_service.py:3114:    result_validation_error = quote_result_real_data_error(res.quote_result) if res.ok else ""
+app\services\ai_assistant_service.py:3117:        error_code = res.error_code or "quote_result_invalid"
+app\services\ai_assistant_service.py:3136:                        "quote_result": {
+app\services\ai_assistant_service.py:3140:                            "quote_result": None,
+app\services\ai_assistant_service.py:3178:                    "quote_result": {
+app\services\ai_assistant_service.py:3182:                        "quote_result": res.quote_result,
+app\services\ai_assistant_service.py:3194:def _fallback_reply() -> Tuple[str, Dict[str, Any]]:
+app\services\ai_assistant_service.py:3198:        "intent": "fallback",
+app\services\ai_assistant_service.py:3227:    fallback_hint = "查看当前材料状态" if can_use_quote else "查订单 车牌号或车主姓名"
+app\services\ai_assistant_service.py:3232:        f"{first_line}\n请重试一次；如果还不行，先发“{fallback_hint}”。",
+app\services\ai_assistant_service.py:3308:    # Only actual uploads enter the quote material organizer. Plain fallback
+app\services\ai_assistant_service.py:3323:        and (intent != "fallback" or text_material_candidate)
+app\services\ai_assistant_service.py:3352:        reply, meta = _fallback_reply()
+app\services\ai_assistant_service.py:3467:    return _fallback_reply()
+app\services\quote_platforms\session_models.py:81:                data["platform_code"] = "STUB"
+app\services\quote_platforms\browser_runtime\manager.py:54:        platform_code = _safe_part(ctx.platform_code, "stub")
+app\services\quote_assistant_service.py:69:from app.services.quote_result_image import save_quote_result_card_image
+app\services\quote_assistant_service.py:70:from app.services.quote_result_validation import quote_result_real_data_error
+app\services\quote_assistant_service.py:439:    if not display_name and code and code != "STUB":
+app\services\quote_assistant_service.py:441:    if not display_name or display_name.upper() == "STUB":
+app\services\quote_assistant_service.py:1656:    if previous_value and previous_source not in {"fallback"}:
+app\services\quote_assistant_service.py:1663:    return _license_type_decision_payload(LICENSE_TYPE_FUEL, source="fallback", reason="未识别到新能源特征，默认小型汽车号牌")
+app\services\quote_assistant_service.py:1676:        if _to_str(decision.get("source")).strip() != "fallback":
+app\services\quote_assistant_service.py:1821:def _quote_feature_text(features: Any, fallback_text: Any = "") -> str:
+app\services\quote_assistant_service.py:1828:        or fallback_text
+app\services\quote_assistant_service.py:1851:def _quote_car_name_from_features(features: Any, fallback_text: Any = "") -> str:
+app\services\quote_assistant_service.py:1852:    text = _quote_feature_text(features, fallback_text)
+app\services\quote_assistant_service.py:1874:def _quote_image_extracted_fields_from_features(features: Any, fallback_text: Any = "") -> Dict[str, Any]:
+app\services\quote_assistant_service.py:1877:        car_name = _quote_car_name_from_features(features, fallback_text)
+app\services\quote_assistant_service.py:2992:    fallback_connectors = (
+app\services\quote_assistant_service.py:3004:    fallback_connector = "|".join(re.escape(item) for item in fallback_connectors)
+app\services\quote_assistant_service.py:3005:    fallback_separator = r"(?::|\uff1a|=|\+|\uff0c|,)?"
+app\services\quote_assistant_service.py:3006:    fallback_suffix = r"(?:\u4e3a|\u6210|\u5230|\u81f3)?"
+app\services\quote_assistant_service.py:3013:            pattern = rf"{re.escape(alias)}\s*{fallback_separator}\s*(?:{fallback_connector}){fallback_suffix}\s*{fallback_separator}\s*{value_pattern}"
+app\services\quote_assistant_service.py:3943:    return _json_obj(_json_obj(data.get("quote_result")).get("platform_usage"))
+app\services\quote_assistant_service.py:5512:        platform_code=_to_str(account.platform_code).strip().upper() or "STUB",
+app\services\quote_assistant_service.py:5518:        platform_code=_to_str(account.platform_code).strip().upper() or "STUB",
+app\services\quote_assistant_service.py:5519:        platform_name=_to_str(account.platform_name).strip() or _to_str(account.platform_code).strip().upper() or "STUB",
+app\services\quote_assistant_service.py:5614:                    "quote_result",
+app\services\quote_assistant_service.py:5684:def _quote_result_real_data_error(result: Any) -> str:
+app\services\quote_assistant_service.py:5686:    return quote_result_real_data_error(result)
+app\services\quote_assistant_service.py:5695:    candidate = _json_obj(payload.get("quote_result"))
+app\services\quote_assistant_service.py:5696:    validation_error = _quote_result_real_data_error(candidate)
+app\services\quote_assistant_service.py:5703:    safe_payload.pop("quote_result", None)
+app\services\quote_assistant_service.py:5704:    safe_payload["quote_result_validation_error"] = validation_error
+app\services\quote_assistant_service.py:5752:def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) -> bool:
+app\services\quote_assistant_service.py:6142:        platform_code=_to_str(safe.get("platform_code") or platform_code).strip().upper() or "STUB",
+app\services\quote_assistant_service.py:6143:        platform_name=_to_str(safe.get("platform_name") or platform_name).strip() or platform_code or "STUB",
+app\services\quote_assistant_service.py:7856:    fallback_case: Optional[QuoteCase] = None
+app\services\quote_assistant_service.py:7859:            if fallback_case is None:
+app\services\quote_assistant_service.py:7860:                fallback_case = case
+app\services\quote_assistant_service.py:7863:    return fallback_case
+app\services\quote_assistant_service.py:8033:def _db_safe_image_url(*, image: Optional[Dict[str, Any]] = None, storage_key: str = "", fallback: str = "") -> str:
+app\services\quote_assistant_service.py:8051:    raw = _to_str(img.get("image_url") or img.get("url") or img.get("preview_url") or fallback).strip()
+app\services\quote_assistant_service.py:8152:        return storage.object_url_for_display(storage_key, signed=True, expires_in=900, allow_fallback_public=True)
+app\services\quote_assistant_service.py:8905:            existing.image_url = _db_safe_image_url(image=image, storage_key=storage_key, fallback=existing.image_url)
+app\services\quote_assistant_service.py:9146:        image_url = _db_safe_image_url(storage_key=row.storage_key, fallback=row.image_url)
+app\services\quote_assistant_service.py:10482:def _quote_result_lines(result: Dict[str, Any]) -> List[str]:
+app\services\quote_assistant_service.py:10490:    for item in _json_list(result.get("price_items"))[:5]:
+app\services\quote_assistant_service.py:10501:    total = result.get("premium_total")
+app\services\quote_assistant_service.py:10511:def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, account_label: str = "") -> str:
+app\services\quote_assistant_service.py:10512:    card = _json_obj(result.get("result_card"))
+app\services\quote_assistant_service.py:10522:def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> Dict[str, str]:
+app\services\quote_assistant_service.py:10683:    adjustments = _quote_result_insurance_date_auto_adjustments(result)
+app\services\quote_assistant_service.py:10787:            "fallback_persisted": True,
+app\services\quote_assistant_service.py:10930:    """Check durable chat history before the fallback writes a duplicate notice."""
+app\services\quote_assistant_service.py:11105:    quote transaction retains the notice in the runtime result as a fallback.
+app\services\quote_assistant_service.py:11239:            # fallback persistence if this independent write ever fails.
+app\services\quote_assistant_service.py:11278:def _quote_result_price_amount(result: Mapping[str, Any], keyword: str) -> Any:
+app\services\quote_assistant_service.py:11279:    for item in _json_list(result.get("price_items")):
+app\services\quote_assistant_service.py:11376:def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, Any]:
+app\services\quote_assistant_service.py:11377:    if not (result.get("premium_total") or _json_list(result.get("price_items"))):
+app\services\quote_assistant_service.py:11382:        "total_premium": result.get("premium_total"),
+app\services\quote_assistant_service.py:11383:        "commercial_premium": _quote_result_price_amount(result, "商业"),
+app\services\quote_assistant_service.py:11384:        "compulsory_premium": _quote_result_price_amount(result, "交强"),
+app\services\quote_assistant_service.py:11385:        "vehicle_tax": _quote_result_price_amount(result, "车船"),
+app\services\quote_assistant_service.py:11554:def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
+app\services\quote_assistant_service.py:11586:        _quote_first_text(safe_card.get("commercial_premium"), _quote_result_price_amount(result, "商业"))
+app\services\quote_assistant_service.py:11589:        _quote_first_text(safe_card.get("compulsory_premium"), _quote_result_price_amount(result, "交强"))
+app\services\quote_assistant_service.py:11592:        _quote_first_text(safe_card.get("vehicle_tax"), _quote_result_price_amount(result, "车船"))
+app\services\quote_assistant_service.py:11608:        _quote_first_text(safe_card.get("total_with_vehicle_tax"), safe_card.get("total_premium"), result.get("premium_total"))
+app\services\quote_assistant_service.py:11689:def _sync_quote_result_with_display_card(result: Dict[str, Any], card: Mapping[str, Any]) -> None:
+app\services\quote_assistant_service.py:11709:        _update_joint_sales_price_items(result, premium_decimal)
+app\services\quote_assistant_service.py:11716:        result["premium_total"] = float(_quote_money_decimal(total_text))
+app\services\quote_assistant_service.py:11729:def _enrich_quote_result_for_display(
+app\services\quote_assistant_service.py:11737:    validation_error = _quote_result_real_data_error(safe_result)
+app\services\quote_assistant_service.py:11740:    card = _json_obj(safe_result.get("result_card")) or _quote_result_card_from_price_items(safe_result)
+app\services\quote_assistant_service.py:11742:        card = _picc_result_card_for_display(safe_result, card)
+app\services\quote_assistant_service.py:11743:        _sync_quote_result_with_display_card(safe_result, card)
+app\services\quote_assistant_service.py:11748:        safe_result["result_card"] = card
+app\services\quote_assistant_service.py:11751:            image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
+app\services\quote_assistant_service.py:11799:    if _quote_result_real_data_error(result):
+app\services\quote_assistant_service.py:11801:    return bool(_json_obj(result.get("result_card") or result.get("resultCard")))
+app\services\quote_assistant_service.py:11822:    if _quote_result_real_data_error(result):
+app\services\quote_assistant_service.py:11824:    if not _json_obj(result.get("result_card") or result.get("resultCard")):
+app\services\quote_assistant_service.py:11830:    runtime_result = _json_obj(runtime_data.get("quote_result"))
+app\services\quote_assistant_service.py:11831:    if runtime_result and not _quote_result_real_data_error(runtime_result):
+app\services\quote_assistant_service.py:11836:    if response_payload.get("reused_quote_result") is True:
+app\services\quote_assistant_service.py:11885:def _update_joint_sales_price_items(result: Dict[str, Any], premium: Decimal) -> None:
+app\services\quote_assistant_service.py:11888:    for item in _json_list(result.get("price_items")):
+app\services\quote_assistant_service.py:11900:    result["price_items"] = items
+app\services\quote_assistant_service.py:11904:    card = _json_obj(result.get("result_card") or result.get("resultCard"))
+app\services\quote_assistant_service.py:12060:    source_validation_error = _quote_result_real_data_error(result)
+app\services\quote_assistant_service.py:12064:    card = deepcopy(_json_obj(adjusted.get("result_card") or adjusted.get("resultCard")))
+app\services\quote_assistant_service.py:12121:    if adjusted.get("premium_total") not in (None, ""):
+app\services\quote_assistant_service.py:12122:        adjusted["premium_total"] = float(_quote_money_decimal(adjusted.get("premium_total")) + delta)
+app\services\quote_assistant_service.py:12124:        adjusted["premium_total"] = float(_quote_money_decimal(card.get("total_premium")))
+app\services\quote_assistant_service.py:12126:    _update_joint_sales_price_items(adjusted, premium)
+app\services\quote_assistant_service.py:12127:    adjusted["result_card"] = card
+app\services\quote_assistant_service.py:12260:    source_validation_error = _quote_result_real_data_error(source_result)
+app\services\quote_assistant_service.py:12261:    if source_validation_error or not _json_obj(source_result.get("result_card") or source_result.get("resultCard")):
+app\services\quote_assistant_service.py:12270:            "quote_result_validation_error": detail,
+app\services\quote_assistant_service.py:12312:                        "quote_result_validation_error": detail,
+app\services\quote_assistant_service.py:12396:    display_result = _enrich_quote_result_for_display(
+app\services\quote_assistant_service.py:12418:        "reused_quote_result": True,
+app\services\quote_assistant_service.py:12464:        "quote_result": display_result,
+app\services\quote_assistant_service.py:12468:    return _quote_result_reply_text(display_result, platform_name=platform_name), {
+app\services\quote_assistant_service.py:12491:    validation_error = _quote_result_real_data_error(result)
+app\services\quote_assistant_service.py:12504:                    "quote_result_validation_error": validation_error,
+app\services\quote_assistant_service.py:12516:    display_result = _enrich_quote_result_for_display(result, platform_account=None, platform_name=platform_name)
+app\services\quote_assistant_service.py:12517:    reply = _quote_result_reply_text(display_result, platform_name=platform_name)
+app\services\quote_assistant_service.py:12538:        "quote_result": display_result,
+app\services\quote_assistant_service.py:12827:                QuoteTask.platform_code == (case.platform_code or "STUB"),
+app\services\quote_assistant_service.py:12871:        platform_code=case.platform_code or "STUB",
+app\services\quote_assistant_service.py:12939:    platform_code = case.platform_code or platform_account.platform_code or "STUB"
+app\services\quote_assistant_service.py:13079:    platform_code = task.platform_code or case.platform_code or "STUB"
+app\services\quote_assistant_service.py:13464:    platform_code = case.platform_code or platform_account.platform_code or "STUB"
+app\services\quote_assistant_service.py:14314:def _quote_result_from_runtime(
+app\services\quote_assistant_service.py:14322:    runtime_quote_result = _json_obj(data.get("quote_result"))
+app\services\quote_assistant_service.py:14323:    if runtime_quote_result:
+app\services\quote_assistant_service.py:14324:        runtime_quote_result.setdefault("platform_code", platform_code)
+app\services\quote_assistant_service.py:14325:        runtime_quote_result.setdefault("platform_name", platform_name)
+app\services\quote_assistant_service.py:14326:        runtime_quote_result.setdefault("trace_id", trace_id)
+app\services\quote_assistant_service.py:14327:        return runtime_quote_result
+app\services\quote_assistant_service.py:14329:    # an empty result here is deliberately not a success fallback; an empty
+app\services\quote_assistant_service.py:14344:    platform_code = task.platform_code or case.platform_code or "STUB"
+app\services\quote_assistant_service.py:14732:        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+app\services\quote_assistant_service.py:14896:    result = _quote_result_from_runtime(
+app\services\quote_assistant_service.py:14922:    result = _enrich_quote_result_for_display(
+app\services\quote_assistant_service.py:15015:    reply = _quote_result_reply_text(result, platform_name=platform_name)
+app\services\quote_assistant_service.py:15030:        "quote_result": result,
+app\services\quote_assistant_service.py:15040:    response_data["quote_result"] = result
+app\services\quote_assistant_service.py:15063:    platform_code = case.platform_code or platform_account.platform_code or "STUB"
+app\services\quote_assistant_service.py:15284:        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+app\services\quote_assistant_service.py:15463:    result = _quote_result_from_runtime(
+app\services\quote_assistant_service.py:15494:    result = _enrich_quote_result_for_display(
+app\services\quote_assistant_service.py:15586:    reply = _quote_result_reply_text(result, platform_name=platform_name, account_label=account_label)
+app\services\quote_assistant_service.py:15602:        "quote_result": result,
+app\services\quote_assistant_service.py:15665:        platform_code = _platform_code_from_display_name(platform_name) or "STUB"
+app\services\quote_assistant_service.py:15672:            platform_code = _platform_code_from_display_name(platform_name) or platform_code or "STUB"
+app\services\quote_assistant_service.py:15673:            if platform_code != "STUB":
+app\services\quote_assistant_service.py:16836:        platform_code = _platform_code_from_display_name(platform_name) or "STUB"
+app\services\quote_assistant_service.py:17009:            platform_code = _platform_code_from_display_name(platform_name) or platform_code or "STUB"
+app\services\quote_assistant_service.py:17010:            if platform_code != "STUB":
+app\services\quote_assistant_service.py:17659:        "fallback_to_same_platform_account": bool(platform_account is not None and selected_account_type_name),
+app\services\quote_platforms\platforms\picc\business.py:17:from app.services.quote_result_validation import quote_result_has_real_data
+app\services\quote_platforms\platforms\picc\business.py:144:def _picc_quote_result_has_real_premium(result: Any) -> bool:
+app\services\quote_platforms\platforms\picc\business.py:146:    return quote_result_has_real_data(result)
+app\services\quote_platforms\platforms\picc\business.py:168:        "enroll_date_fallback": "today",
+app\services\quote_platforms\platforms\picc\business.py:198:        "enroll_date_fallback": "",
+app\services\quote_platforms\platforms\picc\business.py:228:        "enroll_date_fallback": "today",
+app\services\quote_platforms\platforms\picc\business.py:258:        "enroll_date_fallback": "",
+app\services\quote_platforms\platforms\picc\business.py:683:def _profile_text(profile: Mapping[str, Any], key: str, fallback: Any = "") -> str:
+app\services\quote_platforms\platforms\picc\business.py:684:    return _to_str(profile.get(key, fallback)).strip()
+app\services\quote_platforms\platforms\picc\business.py:697:    fallback: Any = "",
+app\services\quote_platforms\platforms\picc\business.py:700:    return _default_value(defaults, canonical_name, profile_defaults.get(canonical_name, fallback))
+app\services\quote_platforms\platforms\picc\business.py:947:def _default_value(defaults: Mapping[str, Any], canonical_name: str, fallback: Any = "") -> Any:
+app\services\quote_platforms\platforms\picc\business.py:953:    return fallback
+app\services\quote_platforms\platforms\picc\business.py:956:def _field_value(defaults: Mapping[str, Any], *names: str, fallback: Any = "") -> Any:
+app\services\quote_platforms\platforms\picc\business.py:960:    return fallback
+app\services\quote_platforms\platforms\picc\business.py:963:def _wan_or_amount_to_amount(value: Any, fallback_wan: str) -> str:
+app\services\quote_platforms\platforms\picc\business.py:964:    amount = _money(value, fallback_wan)
+app\services\quote_platforms\platforms\picc\business.py:970:def _wan_or_amount_to_wan_text(value: Any, fallback_wan: str) -> str:
+app\services\quote_platforms\platforms\picc\business.py:971:    amount = _money(value, fallback_wan)
+app\services\quote_platforms\platforms\picc\business.py:974:    return _clean_money_text(amount, fallback_wan)
+app\services\quote_platforms\platforms\picc\business.py:1832:        _field_value(defaults, "送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus", fallback="1"),
+app\services\quote_platforms\platforms\picc\business.py:2383:def _code_label(code: Any, labels: Mapping[str, str], fallback_label: str = "") -> str:
+app\services\quote_platforms\platforms\picc\business.py:2387:    label = labels.get(text, fallback_label)
+app\services\quote_platforms\platforms\picc\business.py:2773:def _actual_value_from_response(data: Any, fallback: Any = "") -> str:
+app\services\quote_platforms\platforms\picc\business.py:2804:    candidates.append(fallback)
+app\services\quote_platforms\platforms\picc\business.py:2920:        _field_value(defaults, "车辆燃料类型", "vehicleFuelType", fallback=_profile_text(prof, "vehicle_fuel_type", "D1")),
+app\services\quote_platforms\platforms\picc\business.py:2966:        "fuel_type": _to_str(_field_value(defaults, "燃料种类", "fuelType", fallback=_profile_text(prof, "fuel_type", "A"))),
+app\services\quote_platforms\platforms\picc\business.py:3009:    if _to_str(decision.get("source")).strip() == "fallback":
+app\services\quote_platforms\platforms\picc\business.py:3764:            for fallback_type in ("02", "52"):
+app\services\quote_platforms\platforms\picc\business.py:3765:                if fallback_type not in policy_license_types:
+app\services\quote_platforms\platforms\picc\business.py:3766:                    policy_license_types.append(fallback_type)
+app\services\quote_platforms\platforms\picc\business.py:3771:        for fallback_type in ("02", "52"):
+app\services\quote_platforms\platforms\picc\business.py:3772:            if fallback_type not in lookup_license_types:
+app\services\quote_platforms\platforms\picc\business.py:3773:                lookup_license_types.append(fallback_type)
+app\services\quote_platforms\platforms\picc\business.py:4741:            quote_result: Dict[str, Any] = {}
+app\services\quote_platforms\platforms\picc\business.py:4774:                runtime_stage = "build_quote_result"
+app\services\quote_platforms\platforms\picc\business.py:4775:                quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
+app\services\quote_platforms\platforms\picc\business.py:4776:                if not _picc_quote_result_has_real_premium(quote_result):
+app\services\quote_platforms\platforms\picc\business.py:4778:                        "error_code": "quote_result_missing_premium",
+app\services\quote_platforms\platforms\picc\business.py:4806:                    quote_result["platform_auto_notices"] = platform_auto_notices
+app\services\quote_platforms\platforms\picc\business.py:4811:                    quote_result["platform_dialog"] = platform_dialog
+app\services\quote_platforms\platforms\picc\business.py:4818:                quote_result["platform_post_quote"] = post_quote
+app\services\quote_platforms\platforms\picc\business.py:4819:                quote_result["platform_usage"] = usage
+app\services\quote_platforms\platforms\picc\business.py:4820:                quote_result["quote_cache_cleanup"] = cleanup
+app\services\quote_platforms\platforms\picc\business.py:4831:                        "mode": quote_result.get("mode") or "picc_motor_real",
+app\services\quote_platforms\platforms\picc\business.py:4833:                        "quote_result": quote_result,
+app\services\quote_platforms\platforms\picc\business.py:4834:                        "platform_dialog": quote_result.get("platform_dialog"),
+app\services\quote_platforms\platforms\picc\business.py:5864:            "businesNature": _to_str(_field_value(defaults, "业务性质代码", "businesNature", fallback="2")),
+app\services\quote_platforms\platforms\picc\business.py:5865:            "businesNatureName": _to_str(_field_value(defaults, "业务性质名称", "businesNatureName", fallback="专业代理业务")),
+app\services\quote_platforms\platforms\picc\business.py:5877:            "opVehicleTaxFlag": _to_str(_field_value(defaults, "是否代收车船税", "opVehicleTaxFlag", fallback="1")),
+app\services\quote_platforms\platforms\picc\business.py:5908:            "prpCitemCar.countryNature": _to_str(_field_value(defaults, "国产进口标识", "countryNature", fallback="01")),
+app\services\quote_platforms\platforms\picc\business.py:5912:            "prpCitemCar.runAreaCode": _to_str(_field_value(defaults, "行驶区域代码", "runAreaCode", fallback="11")),
+app\services\quote_platforms\platforms\picc\business.py:5916:            "prpCitemCar.carInsuredRelation": _to_str(_field_value(defaults, "车主与被保险人关系", "carInsuredRelation", fallback="所有")),
+app\services\quote_platforms\platforms\picc\business.py:5918:            "prpCitemCar.clauseType": _to_str(_field_value(defaults, "条款类型", "clauseType", fallback="F42")),
+app\services\quote_platforms\platforms\picc\business.py:5924:            "prpCitemCar.taxPayerType": _to_str(_field_value(defaults, "纳税人类型", "taxPayerType", fallback="01")),
+app\services\quote_platforms\platforms\picc\business.py:5928:            "prpCitemCar.colorCode": _to_str(_field_value(defaults, "车辆颜色代码", "colorCode", fallback="999")),
+app\services\quote_platforms\platforms\picc\business.py:5943:            "quoteCarOwner.insuredType": _to_str(_field_value(defaults, "车主类型", "quoteCarOwner.insuredType", fallback="1")),
+app\services\quote_platforms\platforms\picc\business.py:5944:            "quoteCarOwner.sex": _to_str(_field_value(defaults, "车主性别", "quoteCarOwner.sex", fallback="1")),
+app\services\quote_platforms\platforms\picc\business.py:5951:            "prpCcarShipTax.taxType": _to_str(_field_value(defaults, "车船税类型", "taxType", fallback=tax_fields["tax_type"])),
+app\services\quote_platforms\platforms\picc\business.py:5952:            "prpCcarShipTax.calculateMode": _to_str(_field_value(defaults, "车船税计算方式", "calculateMode", fallback=tax_fields["calculate_mode"])),
+app\services\quote_platforms\platforms\picc\business.py:5955:            "prpCcarShipTax.taxAbateType": _to_str(_field_value(defaults, "车船税减免类型", "taxAbateType", fallback=tax_fields["tax_abate_type"])),
+app\services\quote_platforms\platforms\picc\business.py:5956:            "prpCcarShipTax.taxAbateReason": _to_str(_field_value(defaults, "车船税减免原因", "taxAbateReason", fallback=tax_fields["tax_abate_reason"])),
+app\services\quote_platforms\platforms\picc\business.py:5957:            "prpCcarShipTax.dutyPaidProofNo": _to_str(_field_value(defaults, "完税证明号", "dutyPaidProofNo", fallback=tax_fields["duty_paid_proof_no"])),
+app\services\quote_platforms\platforms\picc\business.py:5958:            "prpCcarShipTax.payStartDate": _to_str(_field_value(defaults, "车船税起始日期", "payStartDate", fallback=tax_fields["pay_start_date"])),
+app\services\quote_platforms\platforms\picc\business.py:5959:            "prpCcarShipTax.payEndDate": _to_str(_field_value(defaults, "车船税终止日期", "payEndDate", fallback=tax_fields["pay_end_date"])),
+app\services\quote_platforms\platforms\picc\business.py:6185:        if not enroll_date and _profile_text(prof, "enroll_date_fallback") == "today":
+app\services\quote_platforms\platforms\picc\business.py:6416:            "clauseFlag": _field_value(defaults, "条款标识", fallback="1"),
+app\services\quote_platforms\platforms\picc\business.py:6446:            "clauseType": _field_value(defaults, "条款类型", fallback="F42"),
+app\services\quote_platforms\platforms\picc\business.py:6500:        # legacy `suggested_*` fields are only a compatibility fallback.
+app\services\quote_platforms\platforms\picc\business.py:7013:    def _build_used_fuel_quote_result_from_response(
+app\services\quote_platforms\platforms\picc\business.py:7270:        result_card = {
+app\services\quote_platforms\platforms\picc\business.py:7306:        price_items = []
+app\services\quote_platforms\platforms\picc\business.py:7308:            price_items.append({"name": "商业险", "amount": float(commercial_premium_value)})
+app\services\quote_platforms\platforms\picc\business.py:7310:            price_items.append({"name": "交强险", "amount": float(compulsory_premium_value)})
+app\services\quote_platforms\platforms\picc\business.py:7312:            price_items.append({"name": "车船税", "amount": float(vehicle_tax_value)})
+app\services\quote_platforms\platforms\picc\business.py:7314:            price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
+app\services\quote_platforms\platforms\picc\business.py:7344:            "price_items": price_items,
+app\services\quote_platforms\platforms\picc\business.py:7345:            "premium_total": float(total) if total is not None else None,
+app\services\quote_platforms\platforms\picc\business.py:7347:            "result_card": result_card,

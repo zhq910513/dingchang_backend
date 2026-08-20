@@ -130,7 +130,7 @@ class QuoteTask(Base):
     trace_id = Column(String(64), nullable=True, comment="Trace id")
 
     request_payload = Column(JSON, nullable=False, comment="Platform request payload")
-    response_payload = Column(JSON, nullable=False, comment="Platform raw/fake response")
+    response_payload = Column(JSON, nullable=False, comment="Safe platform response diagnostics")
     result_payload = Column(JSON, nullable=False, comment="Normalized quote result")
     submitted_snapshot = Column(JSON, nullable=False, comment="Immutable snapshot at submit time")
     error_detail = Column(String(2048), nullable=True, comment="Error detail")

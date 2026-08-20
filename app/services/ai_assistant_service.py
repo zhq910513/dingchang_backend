@@ -65,6 +65,7 @@ from app.services.quote_assistant_service import (
     sanitize_quote_user_message,
     sanitize_quote_entities,
 )
+from app.services.quote_result_validation import quote_result_real_data_error
 from app.services.storage import StorageService
 
 TZ_BJ = timezone(timedelta(hours=8))
@@ -285,6 +286,7 @@ def _safe_image_meta_for_history(item: Any) -> Any:
     out: Dict[str, Any] = {}
     for key in (
         "id",
+        "kind",
         "slot_key",
         "provided_slot_key",
         "predicted_slot_key",
@@ -294,6 +296,10 @@ def _safe_image_meta_for_history(item: Any) -> Any:
         "etag",
         "size",
         "content_type",
+        "provider",
+        "width",
+        "height",
+        "render_scale",
         "original_name",
         "context_hint",
         "upload_batch_id",
@@ -2228,7 +2234,7 @@ def _build_material_payload_for_platform(order: Order) -> Dict[str, Any]:
 
 
 # =============================
-# 平台 adapter 获取（无 adapter 时 fallback stub）
+# 平台 adapter 获取（无 adapter 时返回明确未接入错误）
 # =============================
 class _DynamicStubAdapter(StubPlatformAdapter):
     def __init__(self, code: str) -> None:
@@ -2241,7 +2247,7 @@ def _get_platform_adapter(platform_code: str) -> AiPlatformAdapter:
     a = get_adapter(code)
     if a:
         return a
-    # 没注册任何平台时，仍然可以跑通“公共入口占位”
+    # 未注册平台不能走成功占位，StubPlatformAdapter 会明确返回失败。
     return _DynamicStubAdapter(code)
 
 
@@ -3110,17 +3116,20 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
 
     res: QuoteResult = await adapter.quote(ctx=qc, material_payload=material_payload, use_cache=True)
 
-    if not res.ok:
+    result_validation_error = quote_result_real_data_error(res.quote_result) if res.ok else ""
+    if not res.ok or result_validation_error:
         # 不炸：人性化失败回显
+        error_code = res.error_code or "quote_result_invalid"
+        error_message = res.error_message or result_validation_error or "平台报价失败"
         return (
-            f"{platform_name}报价未成功：{res.error_message or '未知错误'}",
+            f"{platform_name}报价未成功：{error_message}",
             {
                 "status": "success",
                 "intent": "quote",
                 "trace_id": trace_id,
                 "data": _mk_data(
-                    result_status=RESULT_FAILED if res.error_code not in ("platform_disabled",) else RESULT_NOT_READY,
-                    message=res.error_message or "平台报价失败",
+                    result_status=RESULT_FAILED if error_code not in ("platform_disabled",) else RESULT_NOT_READY,
+                    message=error_message,
                     entities={**entities, "order_id": _safe_int(getattr(order, "id", 0), 0) or None},
                     payload={
                         "quote_request": {
@@ -3131,9 +3140,9 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
                         },
                         "quote_result": {
                             "ok": False,
-                            "error_code": res.error_code,
-                            "error_message": res.error_message,
-                            "quote_result": res.quote_result,
+                            "error_code": error_code,
+                            "error_message": error_message,
+                            "quote_result": None,
                             "raw_request": res.raw_request,
                             "raw_response": res.raw_response,
                             "cached": bool(res.cached),
@@ -3144,7 +3153,7 @@ async def _reply_quote(db: AsyncSession, ctx: Dict[str, Any], entities: Dict[str
             },
         )
 
-    # 成功（或 stub 成功）：统一回显
+    # 只有真实适配器返回成功时才统一回显
     brief = _order_brief_from_order(order)
     reply = (
         f"{platform_name}报价已返回（{'命中缓存' if res.cached else '实时计算'}）。\n"

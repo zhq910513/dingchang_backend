@@ -1,0 +1,235 @@
+app/api\v1\orders.py:185:    "premium_total",
+app/api\v1\orders.py:687:    premium_total = commercial + compulsory + vehicle_tax + non_vehicle
+app/api\v1\orders.py:688:    info.premium_total = premium_total
+app/models\order_info.py:50:    premium_total = Column(
+app/services\quote_result_validation.py:224:        for item in result.get("price_items") or []:
+app/services\quote_result_validation.py:257:def quote_result_real_data_error(result: Any) -> str:
+app/services\quote_result_validation.py:315:    card = _object(result.get("result_card") or result.get("resultCard"))
+app/services\quote_result_validation.py:318:    price_items = result.get("price_items")
+app/services\quote_result_validation.py:332:    for item in price_items if isinstance(price_items, list) else []:
+app/services\quote_result_validation.py:372:    if "premium_total" in result:
+app/services\quote_result_validation.py:374:            label="premium_total",
+app/services\quote_result_validation.py:375:            actual=result.get("premium_total"),
+app/services\quote_result_validation.py:385:    if isinstance(price_items, list):
+app/services\quote_result_validation.py:386:        for item in price_items:
+app/services\quote_result_validation.py:453:def quote_result_has_real_data(result: Any) -> bool:
+app/services\quote_result_validation.py:454:    return not quote_result_real_data_error(result)
+app/api\v1\ai_assistant.py:78:from app.services.quote_result_validation import quote_result_real_data_error
+app/api\v1\ai_assistant.py:291:                "quote_result",
+app/api\v1\ai_assistant.py:344:def _is_legacy_quote_result_url(url: str) -> bool:
+app/api\v1\ai_assistant.py:346:    return "/quote_results/" in normalized or normalized.startswith("quote_results/")
+app/api\v1\ai_assistant.py:349:def _normalize_quote_result_image_ref(image: Any, *, result: Any = None) -> Any:
+app/api\v1\ai_assistant.py:355:            "kind": "quote_result",
+app/api\v1\ai_assistant.py:361:        if _is_legacy_quote_result_url(url):
+app/api\v1\ai_assistant.py:370:        normalized.setdefault("kind", "quote_result")
+app/api\v1\ai_assistant.py:375:        if _is_legacy_quote_result_url(url):
+app/api\v1\ai_assistant.py:382:def _quote_result_validation_error_in_metadata(metadata: Any) -> str:
+app/api\v1\ai_assistant.py:387:        metadata.get("quote_result"),
+app/api\v1\ai_assistant.py:394:                data.get("quote_result"),
+app/api\v1\ai_assistant.py:402:                    payload.get("quote_result"),
+app/api\v1\ai_assistant.py:410:                payload.get("quote_result"),
+app/api\v1\ai_assistant.py:415:        if isinstance(candidate, dict) and candidate.get("quote_result_unavailable") is True:
+app/api\v1\ai_assistant.py:416:            return str(candidate.get("quote_result_validation_error") or "报价结果未通过真实性校验").strip()
+app/api\v1\ai_assistant.py:420:def _invalidate_quote_result_for_display(result: Dict[str, Any], error: str) -> Dict[str, Any]:
+app/api\v1\ai_assistant.py:423:        "quote_result_unavailable": True,
+app/api\v1\ai_assistant.py:424:        "quote_result_validation_error": error or "报价结果未通过真实性校验",
+app/api\v1\ai_assistant.py:428:def _normalize_quote_result_payload(payload: Any) -> Any:
+app/api\v1\ai_assistant.py:432:    for key in ("quote_result", "quoteResult"):
+app/api\v1\ai_assistant.py:436:        validation_error = quote_result_real_data_error(result)
+app/api\v1\ai_assistant.py:438:            normalized[key] = _invalidate_quote_result_for_display(result, validation_error)
+app/api\v1\ai_assistant.py:441:        image = result_copy.get("result_image") if "result_image" in result_copy else result_copy.get("resultImage")
+app/api\v1\ai_assistant.py:443:            wrapped = _normalize_quote_result_image_ref(image, result=result_copy)
+app/api\v1\ai_assistant.py:444:            result_copy["result_image"] = wrapped
+app/api\v1\ai_assistant.py:451:def _normalize_quote_result_metadata(metadata: Any) -> Any:
+app/api\v1\ai_assistant.py:458:            data["payload"] = _normalize_quote_result_payload(data["payload"])
+app/api\v1\ai_assistant.py:459:        data = _normalize_quote_result_payload(data)
+app/api\v1\ai_assistant.py:462:        normalized["payload"] = _normalize_quote_result_payload(normalized["payload"])
+app/api\v1\ai_assistant.py:463:    if isinstance(normalized.get("quote_result"), dict):
+app/api\v1\ai_assistant.py:464:        normalized["quote_result"] = _normalize_quote_result_payload({"quote_result": normalized["quote_result"]}).get("quote_result")
+app/api\v1\ai_assistant.py:466:        normalized["quoteResult"] = _normalize_quote_result_payload({"quoteResult": normalized["quoteResult"]}).get("quoteResult")
+app/api\v1\ai_assistant.py:467:    validation_error = _quote_result_validation_error_in_metadata(normalized)
+app/api\v1\ai_assistant.py:469:        normalized["quote_result_validation_error"] = validation_error
+app/api\v1\ai_assistant.py:643:        quote_result = await _recall_quote_case_images(
+app/api\v1\ai_assistant.py:661:            "quote": quote_result,
+app/api\v1\ai_assistant.py:695:        filtered_metadata = _normalize_quote_result_metadata(
+app/api\v1\ai_assistant.py:704:        history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
+app/api\v1\ai_assistant.py:1206:    filtered_response_metadata = _normalize_quote_result_metadata(
+app/api\v1\ai_assistant.py:1215:    response_validation_error = _quote_result_validation_error_in_metadata(filtered_response_metadata)
+app/services\quote_result_image.py:56:def _quote_result_target_size() -> Tuple[int, int]:
+app/services\quote_result_image.py:92:def _fit_quote_result_image(image: Any, *, background: str = "#ffffff") -> Any:
+app/services\quote_result_image.py:95:    target_w, target_h = _quote_result_target_size()
+app/services\quote_result_image.py:118:    final_image = _fit_quote_result_image(image, background=background)
+app/services\quote_result_image.py:123:def _quote_result_rel_path(card: Mapping[str, Any], trace_id: str = "") -> Path:
+app/services\quote_result_image.py:124:    target_w, target_h = _quote_result_target_size()
+app/services\quote_result_image.py:578:def render_quote_result_card_png(card: Mapping[str, Any]) -> bytes:
+app/services\quote_result_image.py:585:def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "") -> Optional[Dict[str, Any]]:
+app/services\quote_result_image.py:589:    target_w, target_h = _quote_result_target_size()
+app/services\quote_result_image.py:590:    rel_path = _quote_result_rel_path(card, trace_id=trace_id)
+app/services\quote_result_image.py:592:    png_bytes = render_quote_result_card_png(card)
+app/services\quote_result_image.py:600:        "kind": "quote_result",
+app/services\order_read_model.py:229:        premium_total=_to_float(getattr(info, "premium_total", None)),
+app/services\ai_platforms\base.py:13:from app.services.quote_result_validation import quote_result_real_data_error
+app/services\ai_platforms\base.py:68:    quote_result: Optional[Dict[str, Any]] = None
+app/services\ai_platforms\base.py:178:    - normalize_quote_result: 把原始响应转成统一摘要
+app/services\ai_platforms\base.py:222:                quote_result=None,
+app/services\ai_platforms\base.py:235:            cached_result = cached.get("quote_result") if isinstance(cached, dict) else None
+app/services\ai_platforms\base.py:239:                and not quote_result_real_data_error(cached_result)
+app/services\ai_platforms\base.py:243:                    quote_result=cached_result,
+app/services\ai_platforms\base.py:298:            norm = await self.normalize_quote_result(ctx=ctx, payload=req_payload, raw_response=raw_resp or {})
+app/services\ai_platforms\base.py:310:        validation_error = quote_result_real_data_error(norm)
+app/services\ai_platforms\base.py:314:                error_code="quote_result_invalid",
+app/services\ai_platforms\base.py:324:            quote_result=norm,
+app/services\ai_platforms\base.py:337:                    "quote_result": res.quote_result,
+app/services\ai_platforms\base.py:372:    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+app/services\ai_platforms\base.py:375:        将 raw_response 转换为标准化摘要 quote_result（便于前端展示）
+app/services\ai_platforms\base.py:402:    async def normalize_quote_result(self, *, ctx: QuoteContext, payload: Dict[str, Any],
+app/services\ai_assistant_service.py:68:from app.services.quote_result_validation import quote_result_real_data_error
+app/services\ai_assistant_service.py:1651:        ("premium_total", ("总保费", "保费", "金额")),
+app/services\ai_assistant_service.py:2137:            "premium_total": getattr(oi, "premium_total", None),
+app/services\ai_assistant_service.py:2587:        "保费金额": _fmt_money_text(oi.get("premium_total")),
+app/services\ai_assistant_service.py:2736:        elif key == "premium_total":
+app/services\ai_assistant_service.py:2737:            out.append(f"保费金额：{_fmt_money_text(oi.get('premium_total'))}")
+app/services\ai_assistant_service.py:3114:    result_validation_error = quote_result_real_data_error(res.quote_result) if res.ok else ""
+app/services\ai_assistant_service.py:3117:        error_code = res.error_code or "quote_result_invalid"
+app/services\ai_assistant_service.py:3136:                        "quote_result": {
+app/services\ai_assistant_service.py:3140:                            "quote_result": None,
+app/services\ai_assistant_service.py:3178:                    "quote_result": {
+app/services\ai_assistant_service.py:3182:                        "quote_result": res.quote_result,
+app/services\quote_platforms\platforms\picc\business.py:17:from app.services.quote_result_validation import quote_result_has_real_data
+app/services\quote_platforms\platforms\picc\business.py:144:def _picc_quote_result_has_real_premium(result: Any) -> bool:
+app/services\quote_platforms\platforms\picc\business.py:146:    return quote_result_has_real_data(result)
+app/services\quote_platforms\platforms\picc\business.py:4741:            quote_result: Dict[str, Any] = {}
+app/services\quote_platforms\platforms\picc\business.py:4774:                runtime_stage = "build_quote_result"
+app/services\quote_platforms\platforms\picc\business.py:4775:                quote_result = self._build_used_fuel_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
+app/services\quote_platforms\platforms\picc\business.py:4776:                if not _picc_quote_result_has_real_premium(quote_result):
+app/services\quote_platforms\platforms\picc\business.py:4778:                        "error_code": "quote_result_missing_premium",
+app/services\quote_platforms\platforms\picc\business.py:4806:                    quote_result["platform_auto_notices"] = platform_auto_notices
+app/services\quote_platforms\platforms\picc\business.py:4811:                    quote_result["platform_dialog"] = platform_dialog
+app/services\quote_platforms\platforms\picc\business.py:4818:                quote_result["platform_post_quote"] = post_quote
+app/services\quote_platforms\platforms\picc\business.py:4819:                quote_result["platform_usage"] = usage
+app/services\quote_platforms\platforms\picc\business.py:4820:                quote_result["quote_cache_cleanup"] = cleanup
+app/services\quote_platforms\platforms\picc\business.py:4831:                        "mode": quote_result.get("mode") or "picc_motor_real",
+app/services\quote_platforms\platforms\picc\business.py:4833:                        "quote_result": quote_result,
+app/services\quote_platforms\platforms\picc\business.py:4834:                        "platform_dialog": quote_result.get("platform_dialog"),
+app/services\quote_platforms\platforms\picc\business.py:7013:    def _build_used_fuel_quote_result_from_response(
+app/services\quote_platforms\platforms\picc\business.py:7304:        result_card = {
+app/services\quote_platforms\platforms\picc\business.py:7340:        price_items = []
+app/services\quote_platforms\platforms\picc\business.py:7342:            price_items.append({"name": "商业险", "amount": float(commercial_premium_value)})
+app/services\quote_platforms\platforms\picc\business.py:7344:            price_items.append({"name": "交强险", "amount": float(compulsory_premium_value)})
+app/services\quote_platforms\platforms\picc\business.py:7346:            price_items.append({"name": "车船税", "amount": float(vehicle_tax_value)})
+app/services\quote_platforms\platforms\picc\business.py:7348:            price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
+app/services\quote_platforms\platforms\picc\business.py:7422:            "price_items": price_items,
+app/services\quote_platforms\platforms\picc\business.py:7423:            "premium_total": float(total) if total is not None else None,
+app/services\quote_platforms\platforms\picc\business.py:7425:            "result_card": result_card,
+app/services\quote_assistant_service.py:69:from app.services.quote_result_image import save_quote_result_card_image
+app/services\quote_assistant_service.py:70:from app.services.quote_result_validation import quote_result_real_data_error
+app/services\quote_assistant_service.py:3943:    return _json_obj(_json_obj(data.get("quote_result")).get("platform_usage"))
+app/services\quote_assistant_service.py:5614:                    "quote_result",
+app/services\quote_assistant_service.py:5684:def _quote_result_real_data_error(result: Any) -> str:
+app/services\quote_assistant_service.py:5686:    return quote_result_real_data_error(result)
+app/services\quote_assistant_service.py:5695:    candidate = _json_obj(payload.get("quote_result"))
+app/services\quote_assistant_service.py:5696:    validation_error = _quote_result_real_data_error(candidate)
+app/services\quote_assistant_service.py:5703:    safe_payload.pop("quote_result", None)
+app/services\quote_assistant_service.py:5704:    safe_payload["quote_result_validation_error"] = validation_error
+app/services\quote_assistant_service.py:5752:def _is_runtime_duplicate_quote_result(result: Optional[PlatformRuntimeResult]) -> bool:
+app/services\quote_assistant_service.py:10482:def _quote_result_lines(result: Dict[str, Any]) -> List[str]:
+app/services\quote_assistant_service.py:10490:    for item in _json_list(result.get("price_items"))[:5]:
+app/services\quote_assistant_service.py:10501:    total = result.get("premium_total")
+app/services\quote_assistant_service.py:10511:def _quote_result_reply_text(result: Dict[str, Any], *, platform_name: str, account_label: str = "") -> str:
+app/services\quote_assistant_service.py:10512:    card = _json_obj(result.get("result_card"))
+app/services\quote_assistant_service.py:10522:def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> Dict[str, str]:
+app/services\quote_assistant_service.py:10683:    adjustments = _quote_result_insurance_date_auto_adjustments(result)
+app/services\quote_assistant_service.py:11278:def _quote_result_price_amount(result: Mapping[str, Any], keyword: str) -> Any:
+app/services\quote_assistant_service.py:11279:    for item in _json_list(result.get("price_items")):
+app/services\quote_assistant_service.py:11286:def _quote_result_normalized_amount(result: Mapping[str, Any], name: str) -> Any:
+app/services\quote_assistant_service.py:11385:def _quote_result_card_from_price_items(result: Mapping[str, Any]) -> Dict[str, Any]:
+app/services\quote_assistant_service.py:11386:    if not (result.get("premium_total") or _json_list(result.get("price_items"))):
+app/services\quote_assistant_service.py:11391:        "total_premium": result.get("premium_total"),
+app/services\quote_assistant_service.py:11392:        "commercial_premium": _quote_result_price_amount(result, "商业"),
+app/services\quote_assistant_service.py:11393:        "compulsory_premium": _quote_result_price_amount(result, "交强"),
+app/services\quote_assistant_service.py:11394:        "vehicle_tax": _quote_result_price_amount(result, "车船"),
+app/services\quote_assistant_service.py:11517:        _quote_result_normalized_amount(result, "joint_sales")
+app/services\quote_assistant_service.py:11523:        _quote_result_normalized_amount(result, "commercial")
+app/services\quote_assistant_service.py:11526:        _quote_result_normalized_amount(result, "compulsory")
+app/services\quote_assistant_service.py:11529:        _quote_result_normalized_amount(result, "vehicle_tax")
+app/services\quote_assistant_service.py:11532:        _quote_result_normalized_amount(result, "total_without_vehicle_tax")
+app/services\quote_assistant_service.py:11535:        _quote_result_normalized_amount(result, "total_with_vehicle_tax")
+app/services\quote_assistant_service.py:11601:def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
+app/services\quote_assistant_service.py:11622:        _quote_result_normalized_amount(result, "commercial")
+app/services\quote_assistant_service.py:11625:        _quote_result_normalized_amount(result, "compulsory")
+app/services\quote_assistant_service.py:11628:        _quote_result_normalized_amount(result, "vehicle_tax")
+app/services\quote_assistant_service.py:11632:        _quote_result_normalized_amount(result, "joint_sales")
+app/services\quote_assistant_service.py:11641:        _quote_result_normalized_amount(result, "total_without_vehicle_tax")
+app/services\quote_assistant_service.py:11644:        _quote_result_normalized_amount(result, "total_with_vehicle_tax")
+app/services\quote_assistant_service.py:11720:def _sync_quote_result_with_display_card(result: Dict[str, Any], card: Mapping[str, Any]) -> None:
+app/services\quote_assistant_service.py:11740:        _update_joint_sales_price_items(result, premium_decimal)
+app/services\quote_assistant_service.py:11753:def _enrich_quote_result_for_display(
+app/services\quote_assistant_service.py:11761:    validation_error = _quote_result_real_data_error(safe_result)
+app/services\quote_assistant_service.py:11764:    card = _json_obj(safe_result.get("result_card")) or _quote_result_card_from_price_items(safe_result)
+app/services\quote_assistant_service.py:11766:        card = _picc_result_card_for_display(safe_result, card)
+app/services\quote_assistant_service.py:11767:        _sync_quote_result_with_display_card(safe_result, card)
+app/services\quote_assistant_service.py:11772:        safe_result["result_card"] = card
+app/services\quote_assistant_service.py:11775:            image_payload = save_quote_result_card_image(card, trace_id=_to_str(safe_result.get("trace_id")).strip())
+app/services\quote_assistant_service.py:11776:            safe_result["result_image_ms"] = _elapsed_ms(image_started)
+app/services\quote_assistant_service.py:11778:                safe_result["result_image"] = image_payload
+app/services\quote_assistant_service.py:11780:            safe_result["result_image_error"] = sanitize_quote_user_message(exc, "报价结果图片生成失败")
+app/services\quote_assistant_service.py:11823:    if _quote_result_real_data_error(result):
+app/services\quote_assistant_service.py:11825:    return bool(_json_obj(result.get("result_card") or result.get("resultCard")))
+app/services\quote_assistant_service.py:11846:    if _quote_result_real_data_error(result):
+app/services\quote_assistant_service.py:11848:    if not _json_obj(result.get("result_card") or result.get("resultCard")):
+app/services\quote_assistant_service.py:11854:    runtime_result = _json_obj(runtime_data.get("quote_result"))
+app/services\quote_assistant_service.py:11855:    if runtime_result and not _quote_result_real_data_error(runtime_result):
+app/services\quote_assistant_service.py:11860:    if response_payload.get("reused_quote_result") is True:
+app/services\quote_assistant_service.py:11909:def _update_joint_sales_price_items(result: Dict[str, Any], premium: Decimal) -> None:
+app/services\quote_assistant_service.py:11912:    for item in _json_list(result.get("price_items")):
+app/services\quote_assistant_service.py:11924:    result["price_items"] = items
+app/services\quote_assistant_service.py:11928:    card = _json_obj(result.get("result_card") or result.get("resultCard"))
+app/services\quote_assistant_service.py:12084:    source_validation_error = _quote_result_real_data_error(result)
+app/services\quote_assistant_service.py:12088:    card = deepcopy(_json_obj(adjusted.get("result_card") or adjusted.get("resultCard")))
+app/services\quote_assistant_service.py:12094:        _quote_result_normalized_amount(adjusted, "joint_sales")
+app/services\quote_assistant_service.py:12165:        _quote_result_normalized_amount(adjusted, "commercial")
+app/services\quote_assistant_service.py:12168:        _quote_result_normalized_amount(adjusted, "compulsory")
+app/services\quote_assistant_service.py:12171:        _quote_result_normalized_amount(adjusted, "vehicle_tax")
+app/services\quote_assistant_service.py:12174:        _quote_result_normalized_amount(adjusted, "total_without_vehicle_tax")
+app/services\quote_assistant_service.py:12177:        _quote_result_normalized_amount(adjusted, "total_with_vehicle_tax")
+app/services\quote_assistant_service.py:12181:    if adjusted.get("premium_total") not in (None, ""):
+app/services\quote_assistant_service.py:12182:        adjusted["premium_total"] = float(_quote_money_decimal(adjusted.get("premium_total")) + delta)
+app/services\quote_assistant_service.py:12184:    _update_joint_sales_price_items(adjusted, premium)
+app/services\quote_assistant_service.py:12185:    adjusted["result_card"] = card
+app/services\quote_assistant_service.py:12186:    adjusted.pop("result_image", None)
+app/services\quote_assistant_service.py:12275:        "mode": "result_image_adjustment",
+app/services\quote_assistant_service.py:12318:    source_validation_error = _quote_result_real_data_error(source_result)
+app/services\quote_assistant_service.py:12319:    if source_validation_error or not _json_obj(source_result.get("result_card") or source_result.get("resultCard")):
+app/services\quote_assistant_service.py:12328:            "quote_result_validation_error": detail,
+app/services\quote_assistant_service.py:12370:                        "quote_result_validation_error": detail,
+app/services\quote_assistant_service.py:12454:    display_result = _enrich_quote_result_for_display(
+app/services\quote_assistant_service.py:12476:        "reused_quote_result": True,
+app/services\quote_assistant_service.py:12522:        "quote_result": display_result,
+app/services\quote_assistant_service.py:12526:    return _quote_result_reply_text(display_result, platform_name=platform_name), {
+app/services\quote_assistant_service.py:12549:    validation_error = _quote_result_real_data_error(result)
+app/services\quote_assistant_service.py:12562:                    "quote_result_validation_error": validation_error,
+app/services\quote_assistant_service.py:12574:    display_result = _enrich_quote_result_for_display(result, platform_account=None, platform_name=platform_name)
+app/services\quote_assistant_service.py:12575:    reply = _quote_result_reply_text(display_result, platform_name=platform_name)
+app/services\quote_assistant_service.py:12596:        "quote_result": display_result,
+app/services\quote_assistant_service.py:14372:def _quote_result_from_runtime(
+app/services\quote_assistant_service.py:14380:    runtime_quote_result = _json_obj(data.get("quote_result"))
+app/services\quote_assistant_service.py:14381:    if runtime_quote_result:
+app/services\quote_assistant_service.py:14382:        runtime_quote_result.setdefault("platform_code", platform_code)
+app/services\quote_assistant_service.py:14383:        runtime_quote_result.setdefault("platform_name", platform_name)
+app/services\quote_assistant_service.py:14384:        runtime_quote_result.setdefault("trace_id", trace_id)
+app/services\quote_assistant_service.py:14385:        return runtime_quote_result
+app/services\quote_assistant_service.py:14790:        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+app/services\quote_assistant_service.py:14954:    result = _quote_result_from_runtime(
+app/services\quote_assistant_service.py:14980:    result = _enrich_quote_result_for_display(
+app/services\quote_assistant_service.py:14986:    if result.get("result_image_ms") is not None:
+app/services\quote_assistant_service.py:14987:        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
+app/services\quote_assistant_service.py:15073:    reply = _quote_result_reply_text(result, platform_name=platform_name)
+app/services\quote_assistant_service.py:15088:        "quote_result": result,
+app/services\quote_assistant_service.py:15098:    response_data["quote_result"] = result
+app/services\quote_assistant_service.py:15342:        if platform_account and _is_runtime_duplicate_quote_result(quote_runtime_result):
+app/services\quote_assistant_service.py:15521:    result = _quote_result_from_runtime(
+app/services\quote_assistant_service.py:15552:    result = _enrich_quote_result_for_display(
+app/services\quote_assistant_service.py:15558:    if result.get("result_image_ms") is not None:
+app/services\quote_assistant_service.py:15559:        perf["result_image_ms"] = _safe_int(result.get("result_image_ms"), 0)
+app/services\quote_assistant_service.py:15644:    reply = _quote_result_reply_text(result, platform_name=platform_name, account_label=account_label)
+app/services\quote_assistant_service.py:15660:        "quote_result": result,

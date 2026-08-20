@@ -9,4 +9,8 @@ from app.services.quote_platforms.platforms.taipingyang.base import TaipingyangB
 
 class TaipingyangBusinessAdapter(TaipingyangBaseAdapter):
     async def quote(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
-        return PlatformRuntimeResult(status="success", message="模拟报价成功", data={"mode": "stub", "payload": quote_payload})
+        return PlatformRuntimeResult(
+            status="failed",
+            message="太平洋报价流程尚未接入真实平台接口",
+            data={"error_code": "platform_quote_not_implemented"},
+        )

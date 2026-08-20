@@ -22,7 +22,7 @@ if str(ROOT) not in sys.path:
 
 from app.core.constants import ROLE_SUPER_ADMIN
 from app.core.db import async_session_factory, engine
-from app.models.quote_assistant import QuoteCase, QuotePlatformAccountProfile
+from app.models.quote_assistant import QuoteCase, QuotePlatformAccountProfile, QuoteTask
 from app.services import ai_assistant_service
 from app.services.ai_assistant_service import db_create_session, db_delete_session, send_message
 from app.services.quote_platforms.base import PlatformRuntimeResult
@@ -78,6 +78,7 @@ class LocalRuntimePatch:
     def __init__(self) -> None:
         self.quote_calls: List[Dict[str, Any]] = []
         self.renewal_calls: List[Dict[str, Any]] = []
+        self.quote_result_variant = "recorded_contract"
         self._old_quote = quote_platform_runtime.quote
         self._old_query_renewal = quote_platform_runtime.query_renewal
         self._old_query_joint_sales_plan = quote_platform_runtime.query_joint_sales_plan
@@ -114,10 +115,64 @@ class LocalRuntimePatch:
             commercial_premium = "1766.46" if renewal_seat_adjusted else ("1741.79" if is_renewal else "4810.19")
             compulsory_premium = "855.00" if is_renewal else "950.00"
             vehicle_tax = "300.00" if renewal_seat_adjusted else "0.00"
+            total_without_vehicle_tax = "2621.46" if renewal_seat_adjusted else premium_total
             quote_result = {
-                "mode": "local_full_chain_fake",
+                # This is a de-identified, recorded-result contract fixture.
+                # It only exists inside this monkeypatched local test process.
+                "mode": "picc_used_fuel_real",
+                "status": "quoted",
                 "platform_code": "PICC",
                 "platform_name": "人保",
+                "quote_provenance": {
+                    "source": "platform_quote_response",
+                    "platform_code": "PICC",
+                    "response_status": 0,
+                    "core_premium_evidence": [
+                        {
+                            "name": "commercial",
+                            "source": "quote_response.data.biPremium",
+                            "value": commercial_premium,
+                        },
+                        {
+                            "name": "compulsory",
+                            "source": "quote_response.data.ciPremium",
+                            "value": compulsory_premium,
+                        },
+                    ],
+                    "joint_sales_evidence": [
+                        {
+                            "name": "joint_sales",
+                            "source": "quote_response.data.sumYelPremium",
+                            "value": "398.00",
+                        }
+                    ],
+                    "normalized_amounts": {
+                        "commercial": {
+                            "value": commercial_premium,
+                            "source": "quote_response.data.biPremium",
+                        },
+                        "compulsory": {
+                            "value": compulsory_premium,
+                            "source": "quote_response.data.ciPremium",
+                        },
+                        "vehicle_tax": {
+                            "value": vehicle_tax,
+                            "source": "quote_response.data.sumPayTax",
+                        },
+                        "joint_sales": {
+                            "value": "398.00",
+                            "source": "quote_response.data.sumYelPremium",
+                        },
+                        "total_without_vehicle_tax": {
+                            "value": total_without_vehicle_tax,
+                            "source": "quote_response.data.sumPremium",
+                        },
+                        "total_with_vehicle_tax": {
+                            "value": premium_total,
+                            "source": "quote_response.data.totalPremium",
+                        },
+                    },
+                },
                 "trace_id": f"local-{len(self.quote_calls)}",
                 "risk_score": risk_score,
                 "premium_total": premium_total,
@@ -145,6 +200,7 @@ class LocalRuntimePatch:
                         {"name": "机动车第三者责任保险", "amount": "300万"},
                     ],
                 },
+                "joint_sales_source": "platform_quote_response",
                 "request_body": request_body,
             }
             if is_renewal:
@@ -153,9 +209,12 @@ class LocalRuntimePatch:
                     "old_policy_no_bi": "PDAA202536040000208495",
                     "old_policy_no_ci": "PDZA202536040000299779",
                 }
+            if self.quote_result_variant == "untrusted_marker":
+                quote_result["mode"] = "stub"
+
             return PlatformRuntimeResult(
                 status="success",
-                message="本地模拟报价成功",
+                message="人保报价完成",
                 data={
                     "business_status": "quoted",
                     "quote_result": quote_result,
@@ -352,10 +411,12 @@ async def main() -> None:
                     assert quote_result.get("intent") == "quote", (account_type, quote_result)
                     assert _result_status(quote_result) == "success", (account_type, quote_result)
                     assert "人保风险水平：" in reply and "分" in reply, (account_type, reply)
-                    assert quote_payload.get("result_image") or quote_payload.get("result_image_error") is None, (
+                    assert isinstance(quote_payload.get("result_image"), dict), (
                         account_type,
-                        quote_payload.get("result_image_error"),
+                        quote_payload,
                     )
+                    assert quote_payload["result_image"].get("provider") == "bos", quote_payload
+                    assert quote_payload["result_image"].get("image_url"), quote_payload
 
                     call = runtime_patch.quote_calls[-1]
                     normalized = call["normalized"]
@@ -540,6 +601,57 @@ async def main() -> None:
 
                 unsupported = await _send(db, session_id=missing_session_id, message="太平洋报价")
                 assert "暂未增加" in str(unsupported.get("reply") or ""), unsupported
+
+                # An untrusted runtime payload must fail closed: no result card,
+                # no image, and no successful quote count may be persisted.
+                runtime_patch.quote_result_variant = "untrusted_marker"
+                session = await db_create_session(
+                    db,
+                    owner_user_id=OWNER_USER_ID,
+                    title="Codex 本地假结果拦截",
+                )
+                invalid_result_session_id = str(session["session_id"])
+                session_ids.append(invalid_result_session_id)
+                await db.commit()
+                await _send(
+                    db,
+                    session_id=invalid_result_session_id,
+                    message=TEST_MATERIALS["油车-旧"],
+                )
+                rejected = await _send(
+                    db,
+                    session_id=invalid_result_session_id,
+                    message="人保报价",
+                )
+                assert _result_status(rejected) == "failed", rejected
+                assert "占位或模拟报价结果" in str(rejected.get("reply") or ""), rejected
+                rejected_payload = _payload(rejected)
+                assert not (rejected_payload.get("quote_result") or {}).get("result_image"), rejected_payload
+                rejected_case = (
+                    await db.execute(
+                        select(QuoteCase)
+                        .where(
+                            QuoteCase.owner_user_id == OWNER_USER_ID,
+                            QuoteCase.session_id == invalid_result_session_id,
+                        )
+                        .order_by(QuoteCase.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                assert rejected_case is not None, rejected
+                assert int(rejected_case.quote_count or 0) == 0, rejected_case.quote_count
+                rejected_task = (
+                    await db.execute(
+                        select(QuoteTask)
+                        .where(QuoteTask.quote_case_id == rejected_case.id)
+                        .order_by(QuoteTask.id.desc())
+                        .limit(1)
+                    )
+                ).scalars().first()
+                assert rejected_task is not None, rejected
+                assert str(rejected_task.status) == "failed", rejected_task.status
+                assert rejected_task.result_payload == {}, rejected_task.result_payload
+                runtime_patch.quote_result_variant = "recorded_contract"
 
                 parser_checks = {
                     "人保报价": True,

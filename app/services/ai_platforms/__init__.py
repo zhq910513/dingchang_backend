@@ -39,7 +39,7 @@ def list_enabled_adapters() -> List[AiPlatformAdapter]:
     return out
 
 
-# ✅ 默认注册一个 STUB（用于公共入口先跑通）
+# 默认注册未接入适配器；它只能返回明确失败，不能伪造报价结果。
 register_adapter(StubPlatformAdapter())
 
 __all__ = [

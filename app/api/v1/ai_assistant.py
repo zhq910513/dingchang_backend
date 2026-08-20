@@ -75,6 +75,7 @@ from app.services.quote_assistant_service import (
     update_platform_account_profile as _update_platform_account_profile,
 )
 from app.services.image_slot_classifier import SLOT_KEYS
+from app.services.quote_result_validation import quote_result_real_data_error
 from app.services.storage import StorageService
 
 router = APIRouter(prefix="/ai-assistant", tags=["报价助手"])
@@ -378,6 +379,52 @@ def _normalize_quote_result_image_ref(image: Any, *, result: Any = None) -> Any:
     return image
 
 
+def _quote_result_validation_error_in_metadata(metadata: Any) -> str:
+    """Find the first fail-closed quote-result marker in normalized metadata."""
+    if not isinstance(metadata, dict):
+        return ""
+    candidates: List[Any] = [
+        metadata.get("quote_result"),
+        metadata.get("quoteResult"),
+    ]
+    data = metadata.get("data")
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("quote_result"),
+                data.get("quoteResult"),
+            ]
+        )
+        payload = data.get("payload")
+        if isinstance(payload, dict):
+            candidates.extend(
+                [
+                    payload.get("quote_result"),
+                    payload.get("quoteResult"),
+                ]
+            )
+    payload = metadata.get("payload")
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("quote_result"),
+                payload.get("quoteResult"),
+            ]
+        )
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("quote_result_unavailable") is True:
+            return str(candidate.get("quote_result_validation_error") or "报价结果未通过真实性校验").strip()
+    return ""
+
+
+def _invalidate_quote_result_for_display(result: Dict[str, Any], error: str) -> Dict[str, Any]:
+    """Replace an untrusted historical result with a non-renderable marker."""
+    return {
+        "quote_result_unavailable": True,
+        "quote_result_validation_error": error or "报价结果未通过真实性校验",
+    }
+
+
 def _normalize_quote_result_payload(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
@@ -385,6 +432,10 @@ def _normalize_quote_result_payload(payload: Any) -> Any:
     for key in ("quote_result", "quoteResult"):
         result = normalized.get(key)
         if not isinstance(result, dict):
+            continue
+        validation_error = quote_result_real_data_error(result)
+        if validation_error:
+            normalized[key] = _invalidate_quote_result_for_display(result, validation_error)
             continue
         result_copy = deepcopy(result)
         image = result_copy.get("result_image") if "result_image" in result_copy else result_copy.get("resultImage")
@@ -405,6 +456,7 @@ def _normalize_quote_result_metadata(metadata: Any) -> Any:
         data = deepcopy(normalized["data"])
         if isinstance(data.get("payload"), dict):
             data["payload"] = _normalize_quote_result_payload(data["payload"])
+        data = _normalize_quote_result_payload(data)
         normalized["data"] = data
     if isinstance(normalized.get("payload"), dict):
         normalized["payload"] = _normalize_quote_result_payload(normalized["payload"])
@@ -412,6 +464,14 @@ def _normalize_quote_result_metadata(metadata: Any) -> Any:
         normalized["quote_result"] = _normalize_quote_result_payload({"quote_result": normalized["quote_result"]}).get("quote_result")
     if isinstance(normalized.get("quoteResult"), dict):
         normalized["quoteResult"] = _normalize_quote_result_payload({"quoteResult": normalized["quoteResult"]}).get("quoteResult")
+    validation_error = _quote_result_validation_error_in_metadata(normalized)
+    if validation_error:
+        normalized["quote_result_validation_error"] = validation_error
+        data = normalized.get("data")
+        if isinstance(data, dict):
+            data["result_status"] = "failed"
+            data["message"] = f"报价结果未通过真实性校验：{validation_error}"
+            normalized["data"] = data
     return normalized
 
 
@@ -641,6 +701,12 @@ async def get_ai_history(
             )
         )
         raw_content = sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", "")
+        history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
+        if history_validation_error and str(_pick(m, "role", default="assistant") or "").lower() == "assistant":
+            raw_content = (
+                "历史报价结果未通过真实性校验，未展示报价结果图："
+                f"{history_validation_error}。请重新发起报价。"
+            )
         if not can_quote_use and _metadata_is_quote_material(raw_metadata):
             raw_content = QUOTE_HIDDEN_MESSAGE
         items.append(
@@ -1146,6 +1212,12 @@ async def ai_chat(
         )
     )
     reply = sanitize_quote_user_message(_pick(result, "reply", "content", "text", default="") or "", "")
+    response_validation_error = _quote_result_validation_error_in_metadata(filtered_response_metadata)
+    if response_validation_error:
+        reply = (
+            "报价结果未通过真实性校验，未生成报价结果图："
+            f"{response_validation_error}。请重新发起报价。"
+        )
     if not can_quote_use and _metadata_is_quote_material(raw_response_metadata):
         reply = QUOTE_HIDDEN_MESSAGE
     silent = bool(_pick(result, "silent", default=False))

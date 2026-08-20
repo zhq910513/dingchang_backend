@@ -1408,7 +1408,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         changed_license_type = dict(base, license_type="02")
         self.assertFalse(_has_reusable_renewal_quote_context(changed_license_type))
 
-    def test_0813_renewal_prefill_and_result_with_default_joint_sales(self) -> None:
+    def test_0813_renewal_result_does_not_use_configured_joint_sales_without_plan(self) -> None:
         har = _load_0813_renewal_har()
         renewal_rows = _har_response_json(har, 4)["data"]["list"]
         summaries = [_adapter()._renewal_candidate_summary(row) for row in renewal_rows]
@@ -1460,11 +1460,11 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         ctx = SimpleNamespace(account_type_name="油车-旧")
         result = adapter._build_used_fuel_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
         self.assertEqual(result["risk_score"], 45)
-        self.assertEqual(str(result["premium_total"]), "3294.79")
+        self.assertEqual(str(result["premium_total"]), "2896.79")
         self.assertEqual(result["result_card"]["commercial_premium"], "1741.79")
         self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
         self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
-        self.assertEqual(result["result_card"]["joint_sales_premium"], "398.00")
+        self.assertEqual(result["result_card"]["joint_sales_premium"], "")
         self.assertEqual(result["result_card"]["proposal_info"]["plate_no"], "赣G872F6")
 
     def test_0813_renewal_prepare_builds_quote_body_like_har(self) -> None:
@@ -1765,7 +1765,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCitemKindVos[6].kindCode"], "051064")
         self.assertEqual(form["prpCitemKindVos[6].quantity"], "7")
 
-    def test_0818_result_uses_request_road_rescue_quantity_when_response_returns_zero(self) -> None:
+    def test_0818_result_keeps_response_road_rescue_quantity_when_response_returns_zero(self) -> None:
         har = _load_0818_smooth_quote_har()
         request_body = {
             "accountTypeName": "新能源车-旧",
@@ -1792,7 +1792,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             for item in result["result_card"]["proposal_coverage_items"]
             if item["code"] == "051064"
         )
-        self.assertEqual(road_rescue["amount_text"], "7次")
+        self.assertEqual(road_rescue["amount_text"], "-")
 
 
 if __name__ == "__main__":

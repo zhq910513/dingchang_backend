@@ -395,9 +395,9 @@ def _render_legacy_quote_card_png(card: Mapping[str, Any]) -> bytes:
 
     _draw_text(draw, (left, y), "理赔信息", font=font14)
     _draw_badge(draw, left + 118, y, "商", "#4f92ff", font12)
-    _draw_text(draw, (left + 138, y), safe_card.get("claim_business_count", 0), font=font14)
+    _draw_text(draw, (left + 138, y), safe_card.get("claim_business_count", "-"), font=font14)
     _draw_badge(draw, left + 184, y, "交", "#caa86c", font12)
-    _draw_text(draw, (left + 204, y), safe_card.get("claim_compulsory_count", 0), font=font14)
+    _draw_text(draw, (left + 204, y), safe_card.get("claim_compulsory_count", "-"), font=font14)
     _draw_text(draw, (left + 270, y), "理赔查询", font=font14, fill="#005eff")
     y += 32
 
