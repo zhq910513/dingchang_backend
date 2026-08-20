@@ -105,6 +105,7 @@ from app.services.ai_assistant_service import (
     _session_preview_needs_recompute,
     _quote_result_mark_async_image_failed,
     _reschedule_pending_quote_result_images_from_page,
+    _schedule_async_quote_result_image_completion_once,
 )
 from app.api.v1.ai_assistant import _chat_context
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
@@ -2636,6 +2637,26 @@ class AsyncQuoteImageFailureTests(unittest.TestCase):
         _quote_result_mark_async_image_failed(result)
         self.assertFalse(result["result_image_pending"], result)
         self.assertTrue(result["result_image_async_failed"], result)
+
+    def test_pending_image_scheduler_uses_asyncio_create_task(self) -> None:
+        created = []
+
+        def fake_create_task(coro):
+            created.append(coro)
+            coro.close()
+            return object()
+
+        with patch("app.services.ai_assistant_service.asyncio.create_task", side_effect=fake_create_task):
+            scheduled = _schedule_async_quote_result_image_completion_once(
+                owner_user_id=1,
+                session_id="sid",
+                assistant_message_id="mid",
+                quote_task_id=8,
+                trace_id="trace-1",
+            )
+
+        self.assertTrue(scheduled)
+        self.assertEqual(len(created), 1)
 
     def test_history_page_reschedules_pending_image(self) -> None:
         scheduled = []
