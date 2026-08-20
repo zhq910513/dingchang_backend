@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -587,16 +588,21 @@ def render_quote_result_card_png(card: Mapping[str, Any]) -> bytes:
 def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(card, Mapping) or not card:
         return None
+    started = time.perf_counter()
     render_scale = _render_scale()
     target_w, target_h = _quote_result_target_size()
     rel_path = _quote_result_rel_path(card, trace_id=trace_id)
     storage_key = rel_path.as_posix()
+    render_started = time.perf_counter()
     png_bytes = render_quote_result_card_png(card)
+    render_ms = int(round((time.perf_counter() - render_started) * 1000))
+    upload_started = time.perf_counter()
     _storage.put_object(
         storage_key,
         data=png_bytes,
         content_type="image/png",
     )
+    upload_ms = int(round((time.perf_counter() - upload_started) * 1000))
     url = _storage.object_public_url(storage_key)
     return {
         "kind": "quote_result",
@@ -611,4 +617,7 @@ def save_quote_result_card_image(card: Mapping[str, Any], *, trace_id: str = "")
         "render_scale": render_scale,
         "width": target_w,
         "height": target_h,
+        "render_ms": render_ms,
+        "upload_ms": upload_ms,
+        "total_ms": int(round((time.perf_counter() - started) * 1000)),
     }

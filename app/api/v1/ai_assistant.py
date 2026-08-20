@@ -53,6 +53,7 @@ from app.services.ai_assistant_service import (
     db_list_messages as _get_session_messages,
     db_list_sessions as _list_sessions,
     db_recall_session_images as _recall_session_images,
+    _humanize_exception as _humanize_chat_exception,
     schedule_async_quote_result_image_completion as _schedule_quote_result_image_completion,
     send_message as _send_message,  # async
 )
@@ -1379,7 +1380,13 @@ async def ai_chat(
         raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "消息处理失败"))
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"消息处理失败：{sanitize_quote_user_message(str(e) or e.__class__.__name__, '服务器处理异常')}")
+        logger.exception(
+            "ai assistant chat failed: owner_user_id=%s session_id=%s client_msg_id=%s",
+            owner_user_id,
+            body.session_id,
+            (body.client_msg_id or "").strip() or None,
+        )
+        raise HTTPException(status_code=500, detail=f"消息处理失败：{_humanize_chat_exception(e)}")
     raw_response_metadata = {
         "intent": _pick(result, "intent", default=None),
         "actions": _pick(result, "actions", default=[]) or [],

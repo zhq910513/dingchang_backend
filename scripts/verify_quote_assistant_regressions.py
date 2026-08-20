@@ -99,9 +99,11 @@ from app.services.quote_platforms.platforms.picc.presentation import (
     picc_result_amount_text,
     picc_result_kind_name,
 )
-from app.services.quote_result_image import _proposal_info_rows
+from app.services.quote_result_image import _proposal_info_rows, save_quote_result_card_image
 from app.services.ai_assistant_service import (
+    _humanize_exception,
     _message_preview_text,
+    _quote_result_needs_async_image,
     _session_preview_needs_recompute,
     _quote_result_mark_async_image_failed,
     _reschedule_pending_quote_result_images_from_page,
@@ -2638,6 +2640,28 @@ class AsyncQuoteImageFailureTests(unittest.TestCase):
         self.assertFalse(result["result_image_pending"], result)
         self.assertTrue(result["result_image_async_failed"], result)
 
+    def test_pending_image_detection_accepts_string_true(self) -> None:
+        with patch("app.services.ai_assistant_service.quote_result_real_data_error", return_value=""):
+            self.assertTrue(_quote_result_needs_async_image({"result_image_pending": "true"}))
+
+    def test_garbled_chat_exception_detail_is_humanized(self) -> None:
+        self.assertEqual(_humanize_exception(Exception("'' is")), "处理失败，请稍后重试")
+
+    def test_quote_result_image_payload_includes_timing_breakdown(self) -> None:
+        with patch("app.services.quote_result_image.render_quote_result_card_png", return_value=b"png"), patch(
+            "app.services.quote_result_image._storage.put_object"
+        ) as put_object, patch(
+            "app.services.quote_result_image._storage.object_public_url",
+            return_value="https://storage.test/quote.png",
+        ):
+            payload = save_quote_result_card_image({"title": "报价结果"}, trace_id="trace-1")
+
+        self.assertEqual(payload["image_url"], "https://storage.test/quote.png")
+        self.assertIn("render_ms", payload)
+        self.assertIn("upload_ms", payload)
+        self.assertIn("total_ms", payload)
+        put_object.assert_called_once()
+
     def test_pending_image_scheduler_uses_asyncio_create_task(self) -> None:
         created = []
 
@@ -2657,6 +2681,28 @@ class AsyncQuoteImageFailureTests(unittest.TestCase):
 
         self.assertTrue(scheduled)
         self.assertEqual(len(created), 1)
+
+    def test_pending_image_scheduler_rejects_missing_identifiers(self) -> None:
+        with patch("app.services.ai_assistant_service.asyncio.create_task") as create_task:
+            self.assertFalse(
+                _schedule_async_quote_result_image_completion_once(
+                    owner_user_id=1,
+                    session_id="",
+                    assistant_message_id="mid",
+                    quote_task_id=8,
+                    trace_id="trace-1",
+                )
+            )
+            self.assertFalse(
+                _schedule_async_quote_result_image_completion_once(
+                    owner_user_id=0,
+                    session_id="sid",
+                    assistant_message_id="mid",
+                    quote_task_id=8,
+                    trace_id="trace-1",
+                )
+            )
+        create_task.assert_not_called()
 
     def test_history_page_reschedules_pending_image(self) -> None:
         scheduled = []

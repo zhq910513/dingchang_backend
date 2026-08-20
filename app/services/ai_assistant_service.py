@@ -1537,7 +1537,8 @@ def _set_quote_result_on_chat_data(data: Dict[str, Any], result: Dict[str, Any])
 def _quote_result_needs_async_image(result: Mapping[str, Any]) -> bool:
     if not isinstance(result, Mapping):
         return False
-    if result.get("result_image_pending") is not True:
+    pending = result.get("result_image_pending")
+    if pending is not True and _to_str(pending).strip().lower() not in {"true", "1", "yes"}:
         return False
     if result.get("result_image") or result.get("resultImage"):
         return False
@@ -1548,6 +1549,20 @@ _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS: set[Tuple[str, str]] = set()
 _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK = threading.Lock()
 
 
+def _async_quote_result_image_schedule_key(
+    *,
+    owner_user_id: Any,
+    session_id: Any,
+    assistant_message_id: Any,
+) -> Optional[Tuple[str, str]]:
+    owner = _safe_int(owner_user_id, 0)
+    session_text = _to_str(session_id).strip()
+    message_text = _to_str(assistant_message_id).strip()
+    if owner <= 0 or not session_text or not message_text:
+        return None
+    return _to_str(owner), f"{session_text}:{message_text}"
+
+
 def _schedule_async_quote_result_image_completion_once(
     *,
     owner_user_id: int,
@@ -1556,8 +1571,12 @@ def _schedule_async_quote_result_image_completion_once(
     quote_task_id: int,
     trace_id: str,
 ) -> bool:
-    key = (_to_str(owner_user_id), f"{_to_str(session_id).strip()}:{_to_str(assistant_message_id).strip()}")
-    if not key[0].strip() or not key[1].strip():
+    key = _async_quote_result_image_schedule_key(
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+    )
+    if key is None:
         return False
     with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
         if key in _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS:
@@ -1712,6 +1731,10 @@ async def _complete_async_quote_result_image(
             result["result_image_pending"] = False
             result["result_image_async"] = True
             result["result_image_ms"] = int(round((time.perf_counter() - started) * 1000))
+            if image_payload.get("render_ms") is not None:
+                result["result_image_render_ms"] = _safe_int(image_payload.get("render_ms"), 0)
+            if image_payload.get("upload_ms") is not None:
+                result["result_image_upload_ms"] = _safe_int(image_payload.get("upload_ms"), 0)
             _set_quote_result_on_chat_data(data, result)
             meta["data"] = data
             msg.metadata_json = _safe_metadata_for_history(meta)
@@ -1728,16 +1751,32 @@ async def _complete_async_quote_result_image(
                                 "result_image_pending": False,
                                 "result_image_async": True,
                                 "result_image_ms": result["result_image_ms"],
+                                "result_image_render_ms": result.get("result_image_render_ms"),
+                                "result_image_upload_ms": result.get("result_image_upload_ms"),
                             }
                         )
                         task.result_payload = task_result
                     response_payload = deepcopy(task.response_payload or {})
                     perf = response_payload.get("perf") if isinstance(response_payload.get("perf"), dict) else {}
                     perf["result_image_async_ms"] = result["result_image_ms"]
+                    if result.get("result_image_render_ms") is not None:
+                        perf["result_image_render_ms"] = result["result_image_render_ms"]
+                    if result.get("result_image_upload_ms") is not None:
+                        perf["result_image_upload_ms"] = result["result_image_upload_ms"]
                     response_payload["perf"] = perf
                     task.response_payload = response_payload
                     task.updated_at = _now_db()
             await db.commit()
+            logger.info(
+                "async quote result image completed owner=%s session=%s message=%s task=%s image_ms=%s render_ms=%s upload_ms=%s",
+                owner_user_id,
+                session_id,
+                assistant_message_id,
+                quote_task_id,
+                result.get("result_image_ms"),
+                result.get("result_image_render_ms"),
+                result.get("result_image_upload_ms"),
+            )
     except Exception:
         logger.warning(
             "async quote result image completion failed: owner=%s session=%s message=%s task=%s",
@@ -1764,9 +1803,14 @@ async def _complete_async_quote_result_image(
                 exc_info=True,
             )
     finally:
-        key = (_to_str(owner_user_id), f"{_to_str(session_id).strip()}:{_to_str(assistant_message_id).strip()}")
-        with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
-            _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS.discard(key)
+        key = _async_quote_result_image_schedule_key(
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            assistant_message_id=assistant_message_id,
+        )
+        if key is not None:
+            with _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK:
+                _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS.discard(key)
 
 
 def schedule_async_quote_result_image_completion(
