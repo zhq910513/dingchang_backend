@@ -125,6 +125,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _insurance_date_adjustment_needed,
     _insurance_date_adjustment_target_day,
     _proposal_start_datetime_from_quote_response,
+    _platform_notice_auto_notice_from_dialog,
     _quote_form_kind_index,
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
@@ -149,6 +150,19 @@ def _adapter() -> PiccBusinessAdapter:
 
 
 class PiccDynamicResultPresentationTests(unittest.TestCase):
+    def test_platform_dialog_notice_becomes_chat_auto_notice(self) -> None:
+        notice = _platform_notice_auto_notice_from_dialog(
+            {
+                "subtype": "quote_platform_notice",
+                "title": "报价提示",
+                "severity": "warning",
+                "message": "家用车新车业务，请确认本地使用和本地上牌。",
+            }
+        )
+        self.assertEqual(notice["type"], "platform_notice")
+        self.assertEqual(notice["subtype"], "quote_platform_notice")
+        self.assertIn("本地使用", notice["message"])
+
     def test_platform_energy_names_are_preserved_and_missing_names_use_energy_fallback(self) -> None:
         self.assertEqual(
             picc_result_kind_name(
@@ -1359,6 +1373,8 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(energy_form["prpCitemCar.licenseType"], "52")
         self.assertEqual(energy_form["prpCitemCar.licenseColorCode"], "52")
+        self.assertEqual(energy_form["prpCitemCar.localUse"], "1")
+        self.assertEqual(energy_form["prpCitemCar.localLicense"], "1")
         self.assertEqual(energy_form["prpCcarShipTax.taxType"], "2")
         self.assertEqual(energy_form["prpCcarShipTax.calculateMode"], "C1")
         self.assertEqual(energy_form["prpCcarShipTax.taxAbateType"], "1")

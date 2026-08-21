@@ -1643,6 +1643,21 @@ def _platform_response_requires_insurance_date_adjustment(data: Any) -> bool:
     return any(_to_str(kind).strip() in {"bi", "ci"} for kind in (kinds if isinstance(kinds, list) else []))
 
 
+def _platform_notice_auto_notice_from_dialog(dialog_any: Any) -> Dict[str, Any]:
+    dialog = _json_obj(dialog_any)
+    message = _to_str(dialog.get("message")).strip()
+    if not message:
+        return {}
+    return {
+        "type": "platform_notice",
+        "subtype": _to_str(dialog.get("subtype")).strip() or "quote_platform_notice",
+        "title": _first_text(dialog.get("title"), "报价提示"),
+        "severity": _first_text(dialog.get("severity"), "warning"),
+        "message": message,
+        "source": "platform_prompt",
+    }
+
+
 def _platform_business_error_dialog(data: Any) -> Dict[str, Any]:
     payload = _json_obj(data)
     body = _json_obj(payload.get("data"))
@@ -1842,6 +1857,10 @@ def _checked(value: Any, default: bool = True) -> bool:
     if text in {"1", "true", "yes", "y", "是", "选", "勾选", "开启", "打开"}:
         return True
     return default
+
+
+def _checked_flag_text(value: Any, default: bool = True) -> str:
+    return "1" if _checked(value, default=default) else "0"
 
 
 def _repair_code_enabled(defaults: Mapping[str, Any]) -> bool:
@@ -4992,8 +5011,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         "request_body": request_body,
                         "platform_response": _platform_debug_payload(quote_response),
                     }
-                    if prequote_auto_notices:
-                        data_payload["platform_auto_notices"] = [dict(item) for item in prequote_auto_notices]
+                    failure_auto_notices = [*prequote_auto_notices, *auto_period_notices]
+                    if failure_auto_notices:
+                        data_payload["platform_auto_notices"] = [dict(item) for item in failure_auto_notices]
                     return PlatformRuntimeResult(
                         status="failed",
                         message="人保报价接口返回成功状态，但没有返回真实保费明细，未生成报价结果",
@@ -5001,6 +5021,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     )
                 platform_auto_notices = [*prequote_auto_notices, *auto_period_notices]
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
+                platform_dialog_subtype = _to_str(platform_dialog.get("subtype")).strip().lower()
                 duplicate_notice = _duplicate_quote_notice_from_success_dialog(
                     platform_dialog,
                     has_period_auto_notice=bool(auto_period_notices),
@@ -5014,13 +5035,27 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     if emitted:
                         duplicate_notice["emitted_to_chat"] = True
                     platform_auto_notices.append(duplicate_notice)
+                if platform_dialog and platform_dialog_subtype != "insurance_date_adjust":
+                    platform_notice = _platform_notice_auto_notice_from_dialog(platform_dialog)
+                    if platform_notice:
+                        platform_notice_text = re.sub(r"\s+", "", _to_str(platform_notice.get("message")).strip())
+                        already_recorded = any(
+                            platform_notice_text
+                            and (
+                                platform_notice_text in re.sub(r"\s+", "", _to_str(item.get("message")).strip())
+                                or re.sub(r"\s+", "", _to_str(item.get("message")).strip()) in platform_notice_text
+                            )
+                            for item in platform_auto_notices
+                        )
+                        if not already_recorded:
+                            emitted = _emit_platform_auto_notice(auto_notice_callback, platform_notice)
+                            if emitted:
+                                platform_notice["emitted_to_chat"] = True
+                            platform_auto_notices.append(platform_notice)
                 if platform_auto_notices:
                     quote_result["platform_auto_notices"] = platform_auto_notices
-                # Insurance-period prompts are handled in the retry loop above:
-                # emit raw chat text only when a request is actually adjusted,
-                # never leave a stale dialog in an otherwise successful result.
-                if platform_dialog and _to_str(platform_dialog.get("subtype")).strip().lower() != "insurance_date_adjust":
-                    quote_result["platform_dialog"] = platform_dialog
+                # Platform prompts are emitted as chat notices so the assistant
+                # never waits on a frontend dialog for an automatic quote path.
                 runtime_stage = "postchecks"
                 post_quote = self._run_used_fuel_quote_postchecks(client, request_body, quote_response)
                 runtime_stage = "query_usage"
@@ -6042,6 +6077,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         tax_fields = _profile_tax_field_values(prof, energy_fields, defaults, start_date_ci)
         resolved_license_type = license_fields["license_type"]
         resolved_license_color_code = license_fields["license_color_code"]
+        local_use_flag = _checked_flag_text(
+            _field_value(defaults, "本地使用", "是否本地使用", "localUse", "prpCitemCar.localUse", fallback="1"),
+            default=True,
+        )
+        local_license_flag = _checked_flag_text(
+            _field_value(defaults, "本地上牌", "是否本地上牌", "localLicense", "prpCitemCar.localLicense", fallback="1"),
+            default=True,
+        )
 
         compulsory_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"), "20")
         loss_amount = _money_text(_first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value))
@@ -6151,6 +6194,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCitemCar.isEnergyCar": energy_fields["is_energy_car"],
             "prpCitemCar.isDangerousCar": "0",
             "prpCitemCar.IsCriterion": "1",
+            "prpCitemCar.localUse": local_use_flag,
+            "prpCitemCar.localLicense": local_license_flag,
             "prpCitemCar.taxPayerType": _to_str(_field_value(defaults, "纳税人类型", "taxPayerType", fallback="01")),
             "prpCitemCar.fuelType": energy_fields["fuel_type"],
             "prpCitemCar.vehicleFuelType": energy_fields["vehicle_fuel_type"],
@@ -7180,6 +7225,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         emitted_notice_signatures: set[tuple[str, str, str, str]] = set()
         emitted_notice_texts: List[str] = []
         body = _clean_used_fuel_request_body(request_body)
+        platform_notice_retry_count = 0
 
         def remember_notice(adjustment: Mapping[str, Any], notice: Mapping[str, Any]) -> None:
             item = dict(_json_obj(notice))
@@ -7200,6 +7246,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 emitted_notice_signatures.add(signature)
                 emitted_notice_texts.append(message_compact)
                 emitted = _emit_insurance_date_adjust_notice(auto_notice_callback, adjustment)
+            if emitted:
+                item["emitted_to_chat"] = True
+            notices.append(item)
+
+        def remember_platform_notice(notice: Mapping[str, Any]) -> None:
+            item = dict(_json_obj(notice))
+            message_text = _to_str(item.get("message")).strip()
+            message_compact = re.sub(r"\s+", "", message_text)
+            if not message_compact:
+                return
+            if any(message_compact in previous or previous in message_compact for previous in emitted_notice_texts):
+                item["emitted_to_chat"] = True
+                notices.append(item)
+                return
+            emitted_notice_texts.append(message_compact)
+            emitted = _emit_platform_auto_notice(auto_notice_callback, item)
             if emitted:
                 item["emitted_to_chat"] = True
             notices.append(item)
@@ -7233,6 +7295,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             adjustment = self._insurance_date_adjustment_from_platform_response(client, quote_response, request_body=body)
             adjusted_body, changed, notice = self._apply_insurance_date_adjustment_to_request_body(client, body, adjustment)
             if not changed:
+                if not _quote_response_has_display_result(quote_response):
+                    platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
+                    if platform_dialog and _to_str(platform_dialog.get("subtype")).strip().lower() != "insurance_date_adjust":
+                        platform_notice = _platform_notice_auto_notice_from_dialog(platform_dialog)
+                        if platform_notice:
+                            remember_platform_notice(platform_notice)
+                            if platform_notice_retry_count < 2:
+                                platform_notice_retry_count += 1
+                                continue
                 return body, quote_response, notices
             remember_notice(adjustment, notice)
             body = adjusted_body

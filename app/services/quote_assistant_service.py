@@ -11549,7 +11549,7 @@ async def _persist_unemitted_quote_auto_notices(
     for notice_any in _json_list(_json_obj(result).get("platform_auto_notices"))[:3]:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice", "platform_notice"}:
             continue
         message = _sanitize_duplicate_quote_warning(notice.get("message"), "")
         if not message:
@@ -11928,7 +11928,7 @@ def _attach_quote_auto_notice_callback(
     async def persist_notice(notice_any: Any) -> bool:
         notice = _json_obj(notice_any)
         notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
-        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice"}:
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice", "platform_notice"}:
             return False
         message = _sanitize_duplicate_quote_warning(notice.get("message"), "")
         if not message:
@@ -11971,7 +11971,7 @@ def _attach_quote_auto_notice_callback(
                             ],
                         }
                     )
-                else:
+                elif notice_type == "duplicate_quote_notice":
                     auto_notice_payload["duplicateVin"] = _json_obj(notice.get("duplicateVin"))
 
                 payload = {
