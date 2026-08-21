@@ -11798,6 +11798,41 @@ async def _persist_runtime_auto_notices(
     )
 
 
+def _runtime_platform_auto_notice_messages(result: Optional[PlatformRuntimeResult]) -> List[str]:
+    data = _json_obj(getattr(result, "data", None) if result is not None else None)
+    messages: List[str] = []
+    for notice_any in _json_list(data.get("platform_auto_notices"))[:3]:
+        notice = _json_obj(notice_any)
+        notice_type = _to_str(notice.get("type")).strip() or "platform_notice"
+        if notice_type not in {"insurance_date_adjust", "duplicate_quote_notice", "platform_notice"}:
+            continue
+        message = _sanitize_duplicate_quote_warning(notice.get("message"), "")
+        if message:
+            messages.append(message)
+    return messages
+
+
+def _runtime_platform_auto_notice_message_for_failure(
+    result: Optional[PlatformRuntimeResult],
+    error_detail: Any,
+) -> str:
+    detail_key = _quote_auto_notice_compact_message(error_detail)
+    messages = _runtime_platform_auto_notice_messages(result)
+    if not messages:
+        return ""
+    for message in messages:
+        message_key = _quote_auto_notice_compact_message(message)
+        if detail_key and _quote_auto_notice_message_overlaps(detail_key, message_key):
+            return message
+    if (
+        len(messages) == 1
+        and detail_key
+        and ("没有返回真实保费明细" in detail_key or "未生成报价结果" in detail_key)
+    ):
+        return messages[0]
+    return ""
+
+
 async def _persist_platform_text_notice_if_recently_absent(
     db: AsyncSession,
     *,
@@ -15567,6 +15602,24 @@ async def _respond_after_quote_runtime_failure(
         )
         if retry is not None:
             return retry
+    auto_notice_message = _runtime_platform_auto_notice_message_for_failure(
+        quote_runtime_result,
+        error_detail,
+    )
+    if auto_notice_message and await _quote_auto_notice_already_persisted(
+        db,
+        owner_user_id=owner_user_id,
+        session_id=case.session_id,
+        dedupe_key="",
+        message=auto_notice_message,
+        trace_id=trace_id,
+    ):
+        return _quote_notice_already_visible_silent_response(
+            case=case,
+            task=task,
+            trace_id=trace_id,
+            message=auto_notice_message,
+        )
     if await _quote_auto_notice_already_persisted(
         db,
         owner_user_id=owner_user_id,

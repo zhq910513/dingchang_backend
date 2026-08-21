@@ -1658,6 +1658,45 @@ def _platform_notice_auto_notice_from_dialog(dialog_any: Any) -> Dict[str, Any]:
     }
 
 
+def _platform_auto_notice_message_key(notice_any: Any) -> str:
+    return re.sub(r"\s+", "", _to_str(_json_obj(notice_any).get("message")).strip())
+
+
+def _append_unique_platform_auto_notice(
+    notices: List[Dict[str, Any]],
+    notice_any: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    item = dict(_json_obj(notice_any))
+    message_key = _platform_auto_notice_message_key(item)
+    if not message_key:
+        return None
+    for previous in notices:
+        previous_key = _platform_auto_notice_message_key(previous)
+        if previous_key and (message_key in previous_key or previous_key in message_key):
+            return None
+    notices.append(item)
+    return item
+
+
+def _remember_platform_notice_from_quote_response(
+    notices: List[Dict[str, Any]],
+    quote_response: Any,
+    *,
+    auto_notice_callback: Any = None,
+) -> bool:
+    platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
+    if not platform_dialog or _to_str(platform_dialog.get("subtype")).strip().lower() == "insurance_date_adjust":
+        return False
+    platform_notice = _platform_notice_auto_notice_from_dialog(platform_dialog)
+    item = _append_unique_platform_auto_notice(notices, platform_notice)
+    if item is None:
+        return False
+    emitted = _emit_platform_auto_notice(auto_notice_callback, item)
+    if emitted:
+        item["emitted_to_chat"] = True
+    return True
+
+
 def _platform_business_error_dialog(data: Any) -> Dict[str, Any]:
     payload = _json_obj(data)
     body = _json_obj(payload.get("data"))
@@ -5005,13 +5044,18 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_motor_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 if not _picc_quote_result_has_real_premium(quote_result):
+                    failure_auto_notices = [*prequote_auto_notices, *auto_period_notices]
+                    _remember_platform_notice_from_quote_response(
+                        failure_auto_notices,
+                        quote_response,
+                        auto_notice_callback=auto_notice_callback,
+                    )
                     data_payload: Dict[str, Any] = {
                         "error_code": "quote_result_missing_premium",
                         "error_stage": runtime_stage,
                         "request_body": request_body,
                         "platform_response": _platform_debug_payload(quote_response),
                     }
-                    failure_auto_notices = [*prequote_auto_notices, *auto_period_notices]
                     if failure_auto_notices:
                         data_payload["platform_auto_notices"] = [dict(item) for item in failure_auto_notices]
                     return PlatformRuntimeResult(
@@ -5036,22 +5080,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         duplicate_notice["emitted_to_chat"] = True
                     platform_auto_notices.append(duplicate_notice)
                 if platform_dialog and platform_dialog_subtype != "insurance_date_adjust":
-                    platform_notice = _platform_notice_auto_notice_from_dialog(platform_dialog)
-                    if platform_notice:
-                        platform_notice_text = re.sub(r"\s+", "", _to_str(platform_notice.get("message")).strip())
-                        already_recorded = any(
-                            platform_notice_text
-                            and (
-                                platform_notice_text in re.sub(r"\s+", "", _to_str(item.get("message")).strip())
-                                or re.sub(r"\s+", "", _to_str(item.get("message")).strip()) in platform_notice_text
-                            )
-                            for item in platform_auto_notices
-                        )
-                        if not already_recorded:
-                            emitted = _emit_platform_auto_notice(auto_notice_callback, platform_notice)
-                            if emitted:
-                                platform_notice["emitted_to_chat"] = True
-                            platform_auto_notices.append(platform_notice)
+                    _remember_platform_notice_from_quote_response(
+                        platform_auto_notices,
+                        quote_response,
+                        auto_notice_callback=auto_notice_callback,
+                    )
                 if platform_auto_notices:
                     quote_result["platform_auto_notices"] = platform_auto_notices
                 # Platform prompts are emitted as chat notices so the assistant
@@ -7225,7 +7258,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         emitted_notice_signatures: set[tuple[str, str, str, str]] = set()
         emitted_notice_texts: List[str] = []
         body = _clean_used_fuel_request_body(request_body)
-        platform_notice_retry_count = 0
 
         def remember_notice(adjustment: Mapping[str, Any], notice: Mapping[str, Any]) -> None:
             item = dict(_json_obj(notice))
@@ -7301,9 +7333,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         platform_notice = _platform_notice_auto_notice_from_dialog(platform_dialog)
                         if platform_notice:
                             remember_platform_notice(platform_notice)
-                            if platform_notice_retry_count < 2:
-                                platform_notice_retry_count += 1
-                                continue
+                            return body, quote_response, notices
                 return body, quote_response, notices
             remember_notice(adjustment, notice)
             body = adjusted_body

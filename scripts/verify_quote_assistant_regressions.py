@@ -110,6 +110,7 @@ from app.services.ai_assistant_service import (
     _reschedule_pending_quote_result_images_from_page,
     _schedule_async_quote_result_image_completion_once,
 )
+from app.services.quote_assistant_service import _runtime_platform_auto_notice_message_for_failure
 from app.api.v1.ai_assistant import _chat_context
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
 from app.services.quote_platforms.base import PlatformRuntimeResult
@@ -127,6 +128,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _proposal_start_datetime_from_quote_response,
     _platform_notice_auto_notice_from_dialog,
     _quote_form_kind_index,
+    _remember_platform_notice_from_quote_response,
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
@@ -162,6 +164,108 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual(notice["type"], "platform_notice")
         self.assertEqual(notice["subtype"], "quote_platform_notice")
         self.assertIn("本地使用", notice["message"])
+
+    def test_platform_notice_from_quote_response_is_deduped(self) -> None:
+        response = {
+            "status": 0,
+            "data": {
+                "errorMessage": "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+            },
+        }
+        emitted: list[dict] = []
+        notices: list[dict] = []
+
+        self.assertTrue(
+            _remember_platform_notice_from_quote_response(
+                notices,
+                response,
+                auto_notice_callback=lambda notice: emitted.append(dict(notice)) or True,
+            )
+        )
+        self.assertFalse(
+            _remember_platform_notice_from_quote_response(
+                notices,
+                response,
+                auto_notice_callback=lambda notice: emitted.append(dict(notice)) or True,
+            )
+        )
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(notices[0].get("emitted_to_chat"))
+        self.assertEqual(notices[0]["type"], "platform_notice")
+
+    def test_non_display_platform_notice_does_not_retry_same_quote(self) -> None:
+        adapter = _adapter()
+        response = {
+            "status": 0,
+            "data": {
+                "errorMessage": "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+            },
+        }
+        calls = 0
+        emitted: list[dict] = []
+
+        def submit_once(_client: object, body: dict) -> tuple[dict, dict]:
+            nonlocal calls
+            calls += 1
+            return body, response
+
+        adapter._submit_used_fuel_quote_with_vehicle_retry = submit_once  # type: ignore[method-assign]
+        _body, quote_response, notices = adapter._submit_used_fuel_quote_with_period_auto_adjust(
+            object(),
+            {"quoteForm": {"example": "1"}},
+            auto_notice_callback=lambda notice: emitted.append(dict(notice)) or True,
+        )
+
+        self.assertIs(quote_response, response)
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(len(emitted), 1)
+        self.assertIn("医保外用药", notices[0]["message"])
+
+    def test_runtime_platform_notice_matches_failure_detail(self) -> None:
+        result = PlatformRuntimeResult(
+            status="failed",
+            message="人保报价接口返回成功状态，但没有返回真实保费明细，未生成报价结果",
+            data={
+                "platform_auto_notices": [
+                    {
+                        "type": "platform_notice",
+                        "message": "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(
+            _runtime_platform_auto_notice_message_for_failure(
+                result,
+                "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+            ),
+            "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+        )
+
+    def test_runtime_platform_notice_does_not_hide_unrelated_failure(self) -> None:
+        result = PlatformRuntimeResult(
+            status="failed",
+            message="平台报价失败",
+            data={
+                "platform_auto_notices": [
+                    {
+                        "type": "platform_notice",
+                        "message": "平台提示需要确认医保外用药配置。",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(
+            _runtime_platform_auto_notice_message_for_failure(
+                result,
+                "平台账号登录已过期，请联系管理员处理。",
+            ),
+            "",
+        )
 
     def test_platform_energy_names_are_preserved_and_missing_names_use_energy_fallback(self) -> None:
         self.assertEqual(
