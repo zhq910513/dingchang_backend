@@ -281,6 +281,22 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
             "附加医保外医疗费用责任险（新能源汽车第三者责任保险）",
         )
         self.assertEqual(
+            picc_result_kind_name(
+                "051050",
+                platform_name="机动车损失保险",
+                is_new_energy=True,
+            ),
+            "新能源汽车损失保险",
+        )
+        self.assertEqual(
+            picc_result_kind_name(
+                "051063",
+                platform_name="附加医保外医疗费用责任险（机动车第三者责任保险）",
+                is_new_energy=True,
+            ),
+            "附加医保外医疗费用责任险（新能源汽车第三者责任保险）",
+        )
+        self.assertEqual(
             picc_result_kind_name("051051", is_new_energy=False),
             "机动车第三者责任保险",
         )
@@ -315,6 +331,7 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
                 "coverage_items": [
                     {
                         "code": "051050",
+                        "platform_name": "机动车损失保险",
                         "name": "机动车损失保险",
                         "amount": "219800",
                         "premium": "3098.85",
@@ -362,6 +379,39 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         rows = display_card["proposal_coverage_items"]
         self.assertEqual([row["name"] for row in rows], ["机动车损失保险", "附加机动车增值服务特约条款（道路救援服务）"])
         self.assertEqual(rows[1]["amount_text"], "7次")
+
+    def test_existing_proposal_table_normalizes_new_energy_known_aliases(self) -> None:
+        card = {
+            "style": "picc_proposal_table",
+            "vehicle_energy_type": "new_energy",
+            "coverage_items": [
+                {
+                    "code": "051050",
+                    "platform_name": "机动车损失保险",
+                    "name": "机动车损失保险",
+                    "amount": "142800",
+                    "premium": "2254.01",
+                },
+                {
+                    "code": "051063",
+                    "platform_name": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+                    "name": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+                    "amount": "3000000",
+                    "shared_amount_flag": "1",
+                    "premium": "99.03",
+                },
+            ],
+            "proposal_info": {"plate_no": "091913", "vin": "LGXTEST0000000002"},
+        }
+        result = {
+            "vehicle_energy_type": "new_energy",
+            "request_body": {"vehicleForm": {"seatCount": "5"}, "quoteForm": {}},
+            "quote_provenance": {"normalized_amounts": {}},
+        }
+        display_card = _picc_existing_proposal_table_card_for_display(result, card)
+        rows = display_card["proposal_coverage_items"]
+        self.assertEqual(rows[0]["name"], "新能源汽车损失保险")
+        self.assertEqual(rows[1]["name"], "附加医保外医疗费用责任险（新能源汽车第三者责任保险）")
 
     def test_proposal_info_rows_keep_legacy_field_order(self) -> None:
         rows = _proposal_info_rows(

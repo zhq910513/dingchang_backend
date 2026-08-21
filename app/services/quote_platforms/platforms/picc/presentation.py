@@ -113,22 +113,26 @@ def picc_result_kind_name(
     fallback_name: Any = "",
     is_new_energy: bool = False,
 ) -> str:
-    """Return the truthful result label, preferring the platform response.
+    """Return the truthful result label while preserving unknown platform rows.
 
     PICC uses the same kind codes for fuel and new-energy motor products.  The
-    platform-provided label is therefore authoritative.  The energy-aware code
-    map is used only when that label is absent or the stored label is one of the
-    known aliases produced by older normalization code.
+    platform may still return the generic fuel label for a new-energy quote.
+    Known aliases are therefore normalized with the resolved energy type, while
+    unknown platform-provided names remain authoritative.
     """
 
     code = _text(kind_code)
+    names = PICC_NEW_ENERGY_KIND_NAMES if is_new_energy else PICC_FUEL_KIND_NAMES
+    aliases = _KNOWN_KIND_ALIASES.get(code, set())
     raw_platform_name = _text(platform_name)
     if raw_platform_name and raw_platform_name != code:
+        fuel_name = PICC_FUEL_KIND_NAMES.get(code, "")
+        energy_name = PICC_NEW_ENERGY_KIND_NAMES.get(code, "")
+        if is_new_energy and code in names and fuel_name != energy_name and raw_platform_name in aliases:
+            return names[code]
         return raw_platform_name
 
     fallback = _text(fallback_name)
-    names = PICC_NEW_ENERGY_KIND_NAMES if is_new_energy else PICC_FUEL_KIND_NAMES
-    aliases = _KNOWN_KIND_ALIASES.get(code, set())
     if code in names and (not fallback or fallback == code or fallback in aliases):
         return names[code]
     return fallback or names.get(code, "") or code
