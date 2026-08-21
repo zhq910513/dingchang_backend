@@ -963,6 +963,13 @@ def _default_value(defaults: Mapping[str, Any], canonical_name: str, fallback: A
     return fallback
 
 
+def _has_configured_product_default(defaults: Mapping[str, Any], canonical_name: str) -> bool:
+    for key in PRODUCT_FIELD_ALIASES.get(canonical_name, (canonical_name,)):
+        if key in defaults and _to_str(defaults.get(key)).strip() != "":
+            return True
+    return canonical_name in defaults and _to_str(defaults.get(canonical_name)).strip() != ""
+
+
 def _field_value(defaults: Mapping[str, Any], *names: str, fallback: Any = "") -> Any:
     for name in names:
         if name in defaults and _to_str(defaults.get(name)).strip() != "":
@@ -4524,15 +4531,29 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             merged_normalized["license_type_decision"] = _json_obj(renewal_data.get("license_type_decision"))
         renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
         user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
-        default_config = _picc_business_defaults(payload.get("default_config_json"))
+        configured_defaults = _json_obj(payload.get("default_config_json"))
+        default_config = _picc_business_defaults(configured_defaults)
         merged_defaults = dict(default_config)
+        accepted_renewal_defaults: Dict[str, Any] = {}
+        ignored_configured_renewal_defaults: Dict[str, Any] = {}
+        ignored_invalid_renewal_defaults: Dict[str, Any] = {}
+        ignored_user_override_renewal_defaults: Dict[str, Any] = {}
         for key, value in renewal_defaults.items():
-            if key not in user_overrides and (
+            if _has_configured_product_default(user_overrides, key):
+                ignored_user_override_renewal_defaults[key] = value
+                continue
+            if _has_configured_product_default(configured_defaults, key):
+                ignored_configured_renewal_defaults[key] = value
+                continue
+            if (
                 key == PRODUCT_SHARED_LIMIT
                 or key == PRODUCT_ROAD_RESCUE
                 or _is_positive_amount(value)
             ):
                 merged_defaults[key] = value
+                accepted_renewal_defaults[key] = value
+            else:
+                ignored_invalid_renewal_defaults[key] = value
         merged_defaults.update(user_overrides)
         renewal_payload = dict(payload)
         renewal_payload["normalized_data"] = merged_normalized
@@ -4549,21 +4570,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         }
         if renewal_defaults:
             preflight["renewalQuoteFieldDefaults"] = renewal_defaults
-            preflight["renewalQuoteFieldPriority"] = "会话明确调参值 > 有效续保接口返回值 > 默认参数配置 > profile内置默认值"
+            preflight["renewalQuoteFieldPriority"] = "会话明确调参值 > 默认参数配置 > 有效续保接口返回值 > profile内置默认值"
             preflight["renewalMergeTrace"] = {
                 "effectiveAccountTypeName": effective_account_type_name,
-                "acceptedRenewalDefaults": {
-                    key: value
-                    for key, value in renewal_defaults.items()
-                    if key in merged_defaults and merged_defaults.get(key) == value
-                },
-                "ignoredRenewalDefaults": {
-                    key: value
-                    for key, value in renewal_defaults.items()
-                    if key not in user_overrides
-                    and key not in {PRODUCT_SHARED_LIMIT, PRODUCT_ROAD_RESCUE}
-                    and not _is_positive_amount(value)
-                },
+                "acceptedRenewalDefaults": accepted_renewal_defaults,
+                "ignoredRenewalDefaults": ignored_invalid_renewal_defaults,
+                "ignoredConfiguredRenewalDefaults": ignored_configured_renewal_defaults,
+                "ignoredUserOverrideRenewalDefaults": ignored_user_override_renewal_defaults,
                 "userOverrideKeys": list(user_overrides.keys()),
             }
         body["preflight"] = preflight

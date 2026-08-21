@@ -2101,7 +2101,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(positive_defaults["共享主险限额"], True)
         self.assertEqual(positive_defaults["机动车增值服务特约条款（道路救援服务）"], "7")
 
-    def test_renewal_prepare_merge_keeps_default_when_renewal_default_is_zero(self) -> None:
+    def test_renewal_prepare_merge_keeps_configured_defaults_over_renewal_defaults(self) -> None:
         adapter = _adapter()
         captured: dict[str, object] = {}
 
@@ -2114,9 +2114,9 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
                 "license_type": "02",
                 "license_color_code": "01",
                 "renewal_quote_field_defaults": {
-                    "车上人员责任险（司机）": "0",
-                    "车上人员责任险（乘客）": "",
-                    "第三者责任险": "300",
+                    "车上人员责任险（司机）": "30000",
+                    "车上人员责任险（乘客）": "10000",
+                    "第三者责任险": "200",
                     "共享主险限额": True,
                 },
             }
@@ -2159,9 +2159,10 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
                     },
                 },
                 "default_config_json": {
-                    "车上人员责任险（司机）": "30000",
-                    "车上人员责任险（乘客）": "30000",
-                    "第三者责任险": "200",
+                    "车上人员责任险（司机）": "3",
+                    "车上人员责任险（乘客）": "3",
+                    "第三者责任险": "300",
+                    "共享主险限额": True,
                 },
                 "platform_default_config": {"resolved_type_name": "油车-旧"},
             },
@@ -2169,11 +2170,20 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         )
 
         merged_defaults = captured["default_config_json"]
-        self.assertEqual(merged_defaults["车上人员责任险（司机）"], "30000")
-        self.assertEqual(merged_defaults["车上人员责任险（乘客）"], "30000")
+        self.assertEqual(merged_defaults["车上人员责任险（司机）"], "3")
+        self.assertEqual(merged_defaults["车上人员责任险（乘客）"], "3")
         self.assertEqual(merged_defaults["第三者责任险"], "300")
         self.assertEqual(merged_defaults["共享主险限额"], True)
-        self.assertEqual(body["preflight"]["renewalQuoteFieldPriority"], "会话明确调参值 > 有效续保接口返回值 > 默认参数配置 > profile内置默认值")
+        self.assertEqual(
+            body["preflight"]["renewalMergeTrace"]["ignoredConfiguredRenewalDefaults"],
+            {
+                "车上人员责任险（司机）": "30000",
+                "车上人员责任险（乘客）": "10000",
+                "第三者责任险": "200",
+                "共享主险限额": True,
+            },
+        )
+        self.assertEqual(body["preflight"]["renewalQuoteFieldPriority"], "会话明确调参值 > 默认参数配置 > 有效续保接口返回值 > profile内置默认值")
 
     def test_quote_form_pre_submit_blocks_selected_zero_amounts(self) -> None:
         form = {
