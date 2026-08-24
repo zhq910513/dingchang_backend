@@ -146,6 +146,11 @@ PICC_CORE_MOTOR_KIND_CODES = frozenset({
     "051053",
 })
 
+PICC_OPTIONAL_RENEWAL_DEFAULTS_REQUIRE_CONFIG = frozenset({
+    PRODUCT_ROAD_RESCUE,
+    PRODUCT_EXTERNAL_GRID,
+})
+
 PICC_REAL_QUOTE_ACCOUNT_TYPES = {
     NEW_FUEL_ACCOUNT_TYPE,
     USED_FUEL_ACCOUNT_TYPE,
@@ -347,7 +352,7 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
         PRODUCT_PASSENGER: product_defaults.get(PRODUCT_PASSENGER, "2"),
         PRODUCT_SHARED_LIMIT: product_defaults.get(PRODUCT_SHARED_LIMIT, True),
         PRODUCT_MEDICAL_THIRD: product_defaults.get(PRODUCT_MEDICAL_THIRD, "300"),
-        PRODUCT_EXTERNAL_GRID: product_defaults.get(PRODUCT_EXTERNAL_GRID, ""),
+        PRODUCT_EXTERNAL_GRID: "",
     }
 
 
@@ -1000,8 +1005,8 @@ def _wan_or_amount_to_wan_text(value: Any, fallback_wan: str) -> str:
     return _clean_money_text(amount, fallback_wan)
 
 
-def _external_grid_amount(defaults: Mapping[str, Any], profile: Mapping[str, Any], actual_value: Any) -> str:
-    raw = _profile_product_default(defaults, profile, PRODUCT_EXTERNAL_GRID, "")
+def _external_grid_amount(defaults: Mapping[str, Any], actual_value: Any) -> str:
+    raw = _default_value(defaults, PRODUCT_EXTERNAL_GRID, "")
     text = _to_str(raw).strip()
     if not text:
         return ""
@@ -2914,14 +2919,15 @@ def _normalize_platform_adjusted_quote_products(
         _canonical_product_name(PRODUCT_ROAD_RESCUE) not in exclusions
         and _reinsure_items_include_kind(adjustment.get("reinsure_items"), "051064", "道路救援")
     ):
-        quantity = _safe_int_local(_profile_product_default(defaults, profile, PRODUCT_ROAD_RESCUE, ""), 0) or 7
-        changed = _set_quote_form_kind_row(
-            form,
-            kind_code="051064",
-            kind_name=PRODUCT_ROAD_RESCUE,
-            amount="",
-            quantity=str(quantity),
-        ) or changed
+        quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
+        if quantity > 0:
+            changed = _set_quote_form_kind_row(
+                form,
+                kind_code="051064",
+                kind_name=PRODUCT_ROAD_RESCUE,
+                amount="",
+                quantity=str(quantity),
+            ) or changed
     changed = _reorder_quote_form_kind_rows(form) or changed
     return changed
 
@@ -4623,6 +4629,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         ignored_configured_renewal_defaults: Dict[str, Any] = {}
         ignored_invalid_renewal_defaults: Dict[str, Any] = {}
         ignored_user_override_renewal_defaults: Dict[str, Any] = {}
+        ignored_unconfigured_optional_renewal_defaults: Dict[str, Any] = {}
         for key, value in renewal_defaults.items():
             if _has_configured_product_default(user_overrides, key):
                 ignored_user_override_renewal_defaults[key] = value
@@ -4630,9 +4637,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if _has_configured_product_default(configured_defaults, key):
                 ignored_configured_renewal_defaults[key] = value
                 continue
+            if _canonical_product_name(key) in PICC_OPTIONAL_RENEWAL_DEFAULTS_REQUIRE_CONFIG:
+                ignored_unconfigured_optional_renewal_defaults[key] = value
+                continue
             if (
                 key == PRODUCT_SHARED_LIMIT
-                or key == PRODUCT_ROAD_RESCUE
                 or _is_positive_amount(value)
             ):
                 merged_defaults[key] = value
@@ -4662,6 +4671,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "ignoredRenewalDefaults": ignored_invalid_renewal_defaults,
                 "ignoredConfiguredRenewalDefaults": ignored_configured_renewal_defaults,
                 "ignoredUserOverrideRenewalDefaults": ignored_user_override_renewal_defaults,
+                "ignoredUnconfiguredOptionalRenewalDefaults": ignored_unconfigured_optional_renewal_defaults,
                 "userOverrideKeys": list(user_overrides.keys()),
             }
         body["preflight"] = preflight
@@ -6159,7 +6169,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if shared_main_limit:
             medical_third_amount = _wan_or_amount_to_amount(third_party_amount, third_party_amount or "300")
-        road_rescue_quantity = _safe_int_local(_profile_product_default(defaults, prof, PRODUCT_ROAD_RESCUE, ""), 0)
+        road_rescue_quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
 
         missing_config = []
         if not main_com_code:
@@ -6329,7 +6339,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             form.pop("prpCitemCar.familyId", None)
         if _profile_text(prof, "is_energy_car") == "1" and _money(form.get("prpCitemCar.exhaustScale")) == 0:
             form.pop("prpCitemCar.exhaustScale", None)
-        external_grid_amount = _external_grid_amount(defaults, prof, actual_value)
+        external_grid_amount = _external_grid_amount(defaults, actual_value)
         product_specs: List[Dict[str, Any]] = [
             {"amount": compulsory_amount, "kind_code": "051074", "kind_name": PRODUCT_COMPULSORY},
             {"amount": loss_amount, "kind_code": "051050", "kind_name": PRODUCT_LOSS},
@@ -7407,8 +7417,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         )
         if shared_main_limit:
             medical_third_amount = third_party_amount
-        road_rescue_quantity = _safe_int_local(_profile_product_default(defaults, prof, PRODUCT_ROAD_RESCUE, ""), 0)
-        external_grid_amount = _external_grid_amount(defaults, prof, actual_value)
+        road_rescue_quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
+        external_grid_amount = _external_grid_amount(defaults, actual_value)
         rows = [
             {"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))},
             {"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)},

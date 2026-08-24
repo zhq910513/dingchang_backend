@@ -2446,6 +2446,82 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         )
         self.assertEqual(body["preflight"]["renewalQuoteFieldPriority"], "会话明确调参值 > 默认参数配置 > 有效续保接口返回值 > profile内置默认值")
 
+    def test_renewal_prepare_merge_ignores_unconfigured_optional_defaults(self) -> None:
+        adapter = _adapter()
+        captured: dict[str, object] = {}
+
+        def fake_fetch(self, client, selected):
+            return {"data": "prefill"}
+
+        def fake_prefill(self, prefill, selected):
+            return {
+                "account_type_name": "新能源车-旧",
+                "license_type": "52",
+                "license_color_code": "52",
+                "renewal_quote_field_defaults": {
+                    "机动车增值服务特约条款（道路救援服务）": "7",
+                    "附加外部电网故障损失险": "99957.18",
+                },
+            }
+
+        def fake_prepare(self, client, ctx, payload, account_type_name="新能源车-旧"):
+            captured["default_config_json"] = dict(payload["default_config_json"])
+            return {
+                "quoteForm": {},
+                "preflight": {},
+                "accountTypeName": account_type_name,
+            }
+
+        def fake_apply(self, body, renewal_data, prefill, selected):
+            return dict(body)
+
+        adapter._fetch_renewal_policy_prefill = MethodType(fake_fetch, adapter)
+        adapter._renewal_prefill_vehicle_data = MethodType(fake_prefill, adapter)
+        adapter._prepare_used_fuel_quote = MethodType(fake_prepare, adapter)
+        adapter._apply_renewal_prefill_to_quote_body = MethodType(fake_apply, adapter)
+
+        body = adapter._prepare_renewal_used_fuel_quote(
+            SimpleNamespace(),
+            SimpleNamespace(account_type_name="新能源车-旧"),
+            {
+                "quote_flow_type": "renewal_motor_quote",
+                "normalized_data": {
+                    "account_type_name": "新能源车-旧",
+                    "plate_no": "赣G12345",
+                    "engine_no": "E1234",
+                    "vin": "LHGCY1628T8046465",
+                    "renewal_lookup": {
+                        "found": True,
+                        "selected": {
+                            "policy_no": "P1",
+                            "policy_no_encode": "ENC1",
+                            "license_type": "52",
+                        },
+                    },
+                },
+                "default_config_json": {
+                    "第三者责任险": "300",
+                    "车上人员责任险（司机）": "3",
+                    "车上人员责任险（乘客）": "3",
+                    "医保外医疗费用责任险（第三者责任险）": "300",
+                    "共享主险限额": True,
+                },
+                "platform_default_config": {"resolved_type_name": "新能源车-旧"},
+            },
+            account_type_name="新能源车-旧",
+        )
+
+        merged_defaults = captured["default_config_json"]
+        self.assertNotIn("机动车增值服务特约条款（道路救援服务）", merged_defaults)
+        self.assertNotIn("附加外部电网故障损失险", merged_defaults)
+        self.assertEqual(
+            body["preflight"]["renewalMergeTrace"]["ignoredUnconfiguredOptionalRenewalDefaults"],
+            {
+                "机动车增值服务特约条款（道路救援服务）": "7",
+                "附加外部电网故障损失险": "99957.18",
+            },
+        )
+
     def test_quote_form_pre_submit_blocks_selected_zero_amounts(self) -> None:
         form = {
             "prpCitemCar.licenseType": "02",
@@ -2819,7 +2895,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(adjusted_form["prpCmain.endhourci"], expected_form["prpCmain.endhourci"])
         self.assertEqual(notice["compulsory_start_hour"], "14")
 
-    def test_0818_sync_period_keeps_configured_coverages_and_adds_road_rescue(self) -> None:
+    def test_0818_sync_period_keeps_configured_coverages_without_unconfigured_road_rescue(self) -> None:
         har = _load_0818_smooth_quote_har()
         source_form = _har_form_params(har, 72)
         expected_form = _har_form_params(har, 142)
@@ -2866,10 +2942,24 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(adjusted_form["prpCitemKindVos[4].amount"], expected_form["prpCitemKindVos[4].amount"])
         self.assertEqual(adjusted_form["prpCitemKindVos[5].amount"], expected_form["prpCitemKindVos[5].amount"])
         self.assertEqual(adjusted_form["prpCitemKindVos[5].sharedAmountFlag"], expected_form["prpCitemKindVos[5].sharedAmountFlag"])
-        road_rescue_index = _quote_form_kind_index(adjusted_form, "051064")
-        self.assertIsNotNone(road_rescue_index)
-        self.assertEqual(adjusted_form[f"prpCitemKindVos[{road_rescue_index}].quantity"], "7")
+        self.assertIsNone(_quote_form_kind_index(adjusted_form, "051064"))
         self.assertEqual(notice["commercial_start_date"], "2026-10-01")
+
+        configured_body = {
+            **request_body,
+            "quoteForm": dict(source_form),
+            "defaultFields": {"机动车增值服务特约条款（道路救援服务）": "2"},
+        }
+        configured_body, configured_changed, _notice = adapter._apply_insurance_date_adjustment_to_request_body(
+            client,
+            configured_body,
+            adjustment,
+        )
+        self.assertTrue(configured_changed)
+        configured_form = configured_body["quoteForm"]
+        road_rescue_index = _quote_form_kind_index(configured_form, "051064")
+        self.assertIsNotNone(road_rescue_index)
+        self.assertEqual(configured_form[f"prpCitemKindVos[{road_rescue_index}].quantity"], "2")
 
     def test_0818_sync_period_restores_missing_passenger_before_medical(self) -> None:
         har = _load_0818_original_quote_har()
@@ -2916,8 +3006,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCitemKindVos[5].kindCode"], "051063")
         self.assertEqual(form["prpCitemKindVos[5].amount"], "3000000")
         self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
-        self.assertEqual(form["prpCitemKindVos[6].kindCode"], "051064")
-        self.assertEqual(form["prpCitemKindVos[6].quantity"], "7")
+        self.assertIsNone(_quote_form_kind_index(form, "051064"))
 
     def test_0818_result_keeps_response_road_rescue_quantity_when_response_returns_zero(self) -> None:
         har = _load_0818_smooth_quote_har()
