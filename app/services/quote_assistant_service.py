@@ -1139,6 +1139,7 @@ QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("车上人员责任险（司机）", ("车上人员责任险（司机）", "车上人员责任险(司机)", "司机责任险", "司机险", "司机")),
     ("车上人员责任险（乘客）", ("车上人员责任险（乘客）", "车上人员责任险(乘客)", "乘客责任险", "乘客险", "乘客")),
     ("机动车增值服务特约条款（道路救援服务）", ("机动车增值服务特约条款（道路救援服务）", "附加机动车增值服务特约条款（道路救援服务）", "道路救援服务", "道路救援", "救援")),
+    ("附加外部电网故障损失险", ("附加外部电网故障损失险", "外部电网故障损失险", "外部电网", "电网故障损失险", "电网故障")),
     ("交强", ("交强险", "交强", "交强主险")),
     ("共享主险限额", ("共享主险限额", "主险限额共享")),
 )
@@ -1150,6 +1151,7 @@ QUOTE_LOSS_LABEL = "机动车损失保险"
 QUOTE_DRIVER_LABEL = "车上人员责任险（司机）"
 QUOTE_PASSENGER_LABEL = "车上人员责任险（乘客）"
 QUOTE_ROAD_RESCUE_LABEL = "机动车增值服务特约条款（道路救援服务）"
+QUOTE_EXTERNAL_GRID_LABEL = "附加外部电网故障损失险"
 QUOTE_COMPULSORY_LABEL = "交强"
 QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
@@ -2976,6 +2978,7 @@ def _normalize_quote_product_exclusions(value: Any) -> List[str]:
         QUOTE_PASSENGER_LABEL,
         QUOTE_MEDICAL_THIRD_LABEL,
         QUOTE_ROAD_RESCUE_LABEL,
+        QUOTE_EXTERNAL_GRID_LABEL,
     }
     for item in items:
         label = _canonical_quote_config_override_label(item)
@@ -3000,6 +3003,7 @@ def _extract_quote_product_exclusions(text: Any) -> List[str]:
         QUOTE_PASSENGER_LABEL,
         QUOTE_MEDICAL_THIRD_LABEL,
         QUOTE_ROAD_RESCUE_LABEL,
+        QUOTE_EXTERNAL_GRID_LABEL,
     }
     exclusions: List[str] = []
     for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:

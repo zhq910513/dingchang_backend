@@ -1576,6 +1576,87 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCmain.endDateCI"], "2027-09-30")
         self.assertEqual(form["prpCmain.endhourci"], "14")
 
+    def test_external_grid_default_adds_or_excludes_quote_form_kind(self) -> None:
+        from app.services.quote_platforms.platforms.picc.business import (
+            NEW_ENERGY_USED_ACCOUNT_TYPE,
+            _motor_quote_profile,
+            _picc_business_defaults,
+        )
+
+        adapter = _adapter()
+        vehicle = {
+            "licenseNo": "赣GF78199",
+            "engineNo": "CDSJC0660",
+            "vin": "LNNBBDEE2SH202251",
+            "enrollDate": "2025-10-09",
+            "startDateBI": "2026-10-08",
+            "startDateCI": "2026-10-07",
+            "startHourCI": "17",
+            "startMinuteCI": "30",
+            "modelName": "捷途SQR6480CHEVT1N插电式混合动力多用途乘用车",
+            "actualValue": "99957.18",
+            "purchasePrice": "107400",
+            "seatCount": "5",
+        }
+        selected = {"vehicleId": "JTVALD0004", "vehicleModelCode": "PLAT001", "purchasePrice": "107400"}
+        owner = {"ownerName": "测试", "ownerIdNo": "360402199001011234", "ownerPhone": "13900000000"}
+        profile = _motor_quote_profile(NEW_ENERGY_USED_ACCOUNT_TYPE)
+
+        form = adapter._build_used_fuel_quote_form(
+            _picc_business_defaults({"外部电网": "跟随车损"}),
+            vehicle,
+            owner,
+            selected,
+            {},
+            [],
+            profile=profile,
+        )
+        external_index = next(
+            int(key.split("[", 1)[1].split("]", 1)[0])
+            for key, value in form.items()
+            if key.endswith(".kindCode") and value == "051085"
+        )
+        self.assertEqual(form[f"prpCitemKindVos[{external_index}].amount"], "99957.18")
+        self.assertEqual(form[f"prpCitemKindVos[{external_index}].kindName"], "附加外部电网故障损失险")
+
+        ten_wan_form = adapter._build_used_fuel_quote_form(
+            _picc_business_defaults({"外部电网": "10"}),
+            vehicle,
+            owner,
+            selected,
+            {},
+            [],
+            profile=profile,
+        )
+        ten_wan_index = next(
+            int(key.split("[", 1)[1].split("]", 1)[0])
+            for key, value in ten_wan_form.items()
+            if key.endswith(".kindCode") and value == "051085"
+        )
+        self.assertEqual(ten_wan_form[f"prpCitemKindVos[{ten_wan_index}].amount"], "100000")
+
+        excluded_form = adapter._build_used_fuel_quote_form(
+            _picc_business_defaults({"外部电网": "跟随车损", "quote_product_exclusions": ["外部电网"]}),
+            vehicle,
+            owner,
+            selected,
+            {},
+            [],
+            profile=profile,
+        )
+        self.assertNotIn("051085", [value for key, value in excluded_form.items() if key.endswith(".kindCode")])
+
+        invalid_form = adapter._build_used_fuel_quote_form(
+            _picc_business_defaults({"外部电网": "abc"}),
+            vehicle,
+            owner,
+            selected,
+            {},
+            [],
+            profile=profile,
+        )
+        self.assertNotIn("051085", [value for key, value in invalid_form.items() if key.endswith(".kindCode")])
+
     def test_invalid_default_license_is_ignored_but_tax_fields_can_override_profile(self) -> None:
         from app.services.quote_platforms.platforms.picc.business import (
             NEW_ENERGY_USED_ACCOUNT_TYPE,
@@ -1965,6 +2046,16 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertIn(
             "机动车增值服务特约条款（道路救援服务）",
             _normalize_quote_product_exclusions(["道路救援"]),
+        )
+
+    def test_external_grid_command_can_adjust_or_remove_product(self) -> None:
+        overrides = extract_quote_config_overrides("外部电网 10")
+        self.assertEqual(overrides["附加外部电网故障损失险"], "10")
+        exclusions = _extract_quote_product_exclusions("不要外部电网")
+        self.assertIn("附加外部电网故障损失险", exclusions)
+        self.assertIn(
+            "附加外部电网故障损失险",
+            _normalize_quote_product_exclusions(["电网故障"]),
         )
 
     def test_duplicate_insurance_with_explicit_period_change_enters_retry_path(self) -> None:

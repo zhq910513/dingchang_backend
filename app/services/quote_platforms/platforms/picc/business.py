@@ -95,6 +95,7 @@ PRODUCT_PASSENGER = "车上人员责任险（乘客）"
 PRODUCT_SHARED_LIMIT = "共享主险限额"
 PRODUCT_MEDICAL_THIRD = "医保外医疗费用责任险（第三者责任险）"
 PRODUCT_ROAD_RESCUE = "机动车增值服务特约条款（道路救援服务）"
+PRODUCT_EXTERNAL_GRID = "附加外部电网故障损失险"
 PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
 PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
@@ -112,6 +113,13 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
         "道路救援服务",
         "道路救援",
         "救援",
+    ),
+    PRODUCT_EXTERNAL_GRID: (
+        "附加外部电网故障损失险",
+        "外部电网故障损失险",
+        "外部电网",
+        "电网故障损失险",
+        "电网故障",
     ),
     PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途家安顺保费", "途家安顺", "途家安顺非车保费"),
 }
@@ -339,6 +347,7 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
         PRODUCT_PASSENGER: product_defaults.get(PRODUCT_PASSENGER, "2"),
         PRODUCT_SHARED_LIMIT: product_defaults.get(PRODUCT_SHARED_LIMIT, True),
         PRODUCT_MEDICAL_THIRD: product_defaults.get(PRODUCT_MEDICAL_THIRD, "300"),
+        PRODUCT_EXTERNAL_GRID: product_defaults.get(PRODUCT_EXTERNAL_GRID, ""),
     }
 
 
@@ -989,6 +998,24 @@ def _wan_or_amount_to_wan_text(value: Any, fallback_wan: str) -> str:
     if amount >= Decimal("10000"):
         amount = (amount / Decimal("10000")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return _clean_money_text(amount, fallback_wan)
+
+
+def _external_grid_amount(defaults: Mapping[str, Any], profile: Mapping[str, Any], actual_value: Any) -> str:
+    raw = _profile_product_default(defaults, profile, PRODUCT_EXTERNAL_GRID, "")
+    text = _to_str(raw).strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if low in {"0", "false", "no", "n", "否", "不", "不选", "不勾选", "取消", "关闭", "去掉"}:
+        return ""
+    if low in {"1", "true", "yes", "y", "是", "选", "勾选", "开启", "打开", "跟随车损", "实际价值", "车损"}:
+        return _clean_money_text(actual_value)
+    amount = _money(raw, "0")
+    if amount <= 0:
+        return ""
+    if amount < Decimal("10000"):
+        amount *= Decimal("10000")
+    return _clean_money_text(amount)
 
 
 def _strip_platform_error_code(message: Any) -> str:
@@ -6302,6 +6329,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             form.pop("prpCitemCar.familyId", None)
         if _profile_text(prof, "is_energy_car") == "1" and _money(form.get("prpCitemCar.exhaustScale")) == 0:
             form.pop("prpCitemCar.exhaustScale", None)
+        external_grid_amount = _external_grid_amount(defaults, prof, actual_value)
         product_specs: List[Dict[str, Any]] = [
             {"amount": compulsory_amount, "kind_code": "051074", "kind_name": PRODUCT_COMPULSORY},
             {"amount": loss_amount, "kind_code": "051050", "kind_name": PRODUCT_LOSS},
@@ -6317,6 +6345,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "kind_code": "051064",
                     "kind_name": PRODUCT_ROAD_RESCUE,
                     "quantity": str(road_rescue_quantity),
+                }
+            )
+        if _is_positive_amount(external_grid_amount):
+            product_specs.append(
+                {
+                    "amount": external_grid_amount,
+                    "kind_code": "051085",
+                    "kind_name": PRODUCT_EXTERNAL_GRID,
                 }
             )
         excluded_products = _product_exclusions(defaults)
@@ -7372,6 +7408,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if shared_main_limit:
             medical_third_amount = third_party_amount
         road_rescue_quantity = _safe_int_local(_profile_product_default(defaults, prof, PRODUCT_ROAD_RESCUE, ""), 0)
+        external_grid_amount = _external_grid_amount(defaults, prof, actual_value)
         rows = [
             {"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))},
             {"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)},
@@ -7383,6 +7420,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         ]
         if road_rescue_quantity > 0:
             rows.append({"code": "BI_ROAD_RESCUE", "name": PRODUCT_ROAD_RESCUE, "required": False, "quantity": road_rescue_quantity})
+        if _is_positive_amount(external_grid_amount):
+            rows.append({"code": "BI_EXTERNAL_GRID", "name": PRODUCT_EXTERNAL_GRID, "required": False, "insuredAmount": external_grid_amount})
         exclusions = _product_exclusions(defaults)
         if exclusions:
             rows = [row for row in rows if _canonical_product_name(row.get("name")) not in exclusions]
