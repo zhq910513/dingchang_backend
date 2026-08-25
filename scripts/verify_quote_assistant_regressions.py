@@ -350,11 +350,30 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual(rows[1]["amount_text"], "5次")
         self.assertEqual(rows[1]["quantity"], "5")
 
+    def test_display_rows_fall_back_to_proposal_coverage_items(self) -> None:
+        rows = _picc_result_coverage_items_for_display(
+            {
+                "vehicle_energy_type": "fuel",
+                "proposal_coverage_items": [
+                    {
+                        "code": "051064",
+                        "platform_name": "道路救援服务",
+                        "name": "附加机动车增值服务特约条款（道路救援服务）",
+                        "quantity": "2",
+                        "premium": "0.00",
+                    }
+                ],
+            },
+            seat_count="5",
+        )
+        self.assertEqual([row["name"] for row in rows], ["道路救援服务"])
+        self.assertEqual(rows[0]["amount_text"], "2次")
+
     def test_existing_proposal_table_keeps_card_coverage_rows_when_result_top_level_is_empty(self) -> None:
         card = {
             "style": "picc_proposal_table",
             "vehicle_energy_type": "fuel",
-            "coverage_items": [
+            "proposal_coverage_items": [
                 {
                     "code": "051050",
                     "name": "机动车损失保险",
@@ -376,6 +395,7 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
             "quote_provenance": {"normalized_amounts": {}},
         }
         display_card = _picc_existing_proposal_table_card_for_display(result, card)
+        self.assertIn("coverage_items", display_card)
         rows = display_card["proposal_coverage_items"]
         self.assertEqual([row["name"] for row in rows], ["机动车损失保险", "附加机动车增值服务特约条款（道路救援服务）"])
         self.assertEqual(rows[1]["amount_text"], "7次")

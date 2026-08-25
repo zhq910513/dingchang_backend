@@ -284,6 +284,9 @@ def _draw_badge(draw: Any, x: int, y: int, label: str, color: str, font: Any) ->
 
 def _coverage_items(card: Mapping[str, Any]) -> Iterable[Dict[str, Any]]:
     rows = card.get("coverage_items")
+    if isinstance(rows, list) and rows:
+        return rows
+    rows = card.get("proposal_coverage_items")
     return rows if isinstance(rows, list) else []
 
 

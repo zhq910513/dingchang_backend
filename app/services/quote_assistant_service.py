@@ -12276,6 +12276,8 @@ def _picc_result_coverage_items_for_display(
     vehicle_energy_type: Any = "",
 ) -> list[Dict[str, Any]]:
     rows = _json_list(result.get("coverage_items"))
+    if not rows:
+        rows = _json_list(result.get("proposal_coverage_items"))
     is_new_energy = picc_is_new_energy_vehicle(
         energy_type=vehicle_energy_type or result.get("vehicle_energy_type"),
         account_type_name=result.get("account_type_name"),
@@ -12375,6 +12377,8 @@ def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], ca
         ]
     if vehicle_energy_type:
         safe_card["vehicle_energy_type"] = vehicle_energy_type
+    if not _json_list(safe_card.get("coverage_items")):
+        safe_card["coverage_items"] = coverage_items
     safe_card["proposal_coverage_items"] = coverage_items
 
     bi_start = _quote_first_text(
@@ -12535,6 +12539,8 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         },
         "proposal_coverage_items": proposal_coverage_items,
     }
+    if not _json_list(upgraded.get("coverage_items")):
+        upgraded["coverage_items"] = proposal_coverage_items
     return upgraded
 
 
