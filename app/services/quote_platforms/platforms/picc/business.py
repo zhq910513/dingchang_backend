@@ -146,11 +146,6 @@ PICC_CORE_MOTOR_KIND_CODES = frozenset({
     "051053",
 })
 
-PICC_OPTIONAL_RENEWAL_DEFAULTS_REQUIRE_CONFIG = frozenset({
-    PRODUCT_ROAD_RESCUE,
-    PRODUCT_EXTERNAL_GRID,
-})
-
 PICC_REAL_QUOTE_ACCOUNT_TYPES = {
     NEW_FUEL_ACCOUNT_TYPE,
     USED_FUEL_ACCOUNT_TYPE,
@@ -4478,6 +4473,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 quantity = _safe_int_local(row.get("quantity"), 0)
                 if quantity > 0:
                     defaults.setdefault(PRODUCT_ROAD_RESCUE, str(quantity))
+            elif kind_code == "051085" and _is_positive_amount(amount):
+                defaults.setdefault(PRODUCT_EXTERNAL_GRID, amount)
             elif kind_code == "051074" and _is_positive_amount(amount):
                 defaults.setdefault(PRODUCT_COMPULSORY, _wan_or_amount_to_wan_text(amount, "20"))
         return defaults
@@ -4636,9 +4633,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 continue
             if _has_configured_product_default(configured_defaults, key):
                 ignored_configured_renewal_defaults[key] = value
-                continue
-            if _canonical_product_name(key) in PICC_OPTIONAL_RENEWAL_DEFAULTS_REQUIRE_CONFIG:
-                ignored_unconfigured_optional_renewal_defaults[key] = value
                 continue
             if (
                 key == PRODUCT_SHARED_LIMIT

@@ -2354,6 +2354,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
                     {"kindCode": "051053", "unitAmount": "", "amount": "0"},
                     {"kindCode": "051063", "amount": "0", "sharedAmountFlag": "1"},
                     {"kindCode": "051064", "quantity": "0"},
+                    {"kindCode": "051085", "amount": "0"},
                     {"kindCode": "051074", "amount": ""},
                 ]
             }
@@ -2363,6 +2364,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertNotIn("车上人员责任险（乘客）", defaults)
         self.assertNotIn("医保外医疗费用责任险（第三者责任险）", defaults)
         self.assertNotIn("机动车增值服务特约条款（道路救援服务）", defaults)
+        self.assertNotIn("附加外部电网故障损失险", defaults)
         self.assertNotIn("交强险", defaults)
 
         positive_defaults = adapter._renewal_product_defaults_from_prefill(
@@ -2373,6 +2375,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
                     {"kindCode": "051053", "unitAmount": "30000"},
                     {"kindCode": "051063", "amount": "3000000", "sharedAmountFlag": "1"},
                     {"kindCode": "051064", "quantity": "7"},
+                    {"kindCode": "051085", "amount": "99957.18"},
                 ]
             }
         )
@@ -2381,6 +2384,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(positive_defaults["车上人员责任险（乘客）"], "30000")
         self.assertEqual(positive_defaults["共享主险限额"], True)
         self.assertEqual(positive_defaults["机动车增值服务特约条款（道路救援服务）"], "7")
+        self.assertEqual(positive_defaults["附加外部电网故障损失险"], "99957.18")
 
     def test_renewal_prepare_merge_keeps_configured_defaults_over_renewal_defaults(self) -> None:
         adapter = _adapter()
@@ -2466,7 +2470,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         )
         self.assertEqual(body["preflight"]["renewalQuoteFieldPriority"], "会话明确调参值 > 默认参数配置 > 有效续保接口返回值 > profile内置默认值")
 
-    def test_renewal_prepare_merge_ignores_unconfigured_optional_defaults(self) -> None:
+    def test_renewal_prepare_merge_keeps_unconfigured_optional_defaults_from_prefill(self) -> None:
         adapter = _adapter()
         captured: dict[str, object] = {}
 
@@ -2532,15 +2536,16 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         )
 
         merged_defaults = captured["default_config_json"]
-        self.assertNotIn("机动车增值服务特约条款（道路救援服务）", merged_defaults)
-        self.assertNotIn("附加外部电网故障损失险", merged_defaults)
+        self.assertEqual(merged_defaults["机动车增值服务特约条款（道路救援服务）"], "7")
+        self.assertEqual(merged_defaults["附加外部电网故障损失险"], "99957.18")
         self.assertEqual(
-            body["preflight"]["renewalMergeTrace"]["ignoredUnconfiguredOptionalRenewalDefaults"],
+            body["preflight"]["renewalMergeTrace"]["acceptedRenewalDefaults"],
             {
                 "机动车增值服务特约条款（道路救援服务）": "7",
                 "附加外部电网故障损失险": "99957.18",
             },
         )
+        self.assertEqual(body["preflight"]["renewalMergeTrace"]["ignoredUnconfiguredOptionalRenewalDefaults"], {})
 
     def test_quote_form_pre_submit_blocks_selected_zero_amounts(self) -> None:
         form = {
