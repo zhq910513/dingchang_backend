@@ -7511,6 +7511,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vehicle = _clean_vehicle_cert_fields(_json_obj(request_body.get("vehicleForm")))
         owner = _clean_vehicle_cert_fields(_json_obj(request_body.get("ownerForm")))
         form = _clean_vehicle_cert_fields(_json_obj(request_body.get("quoteForm")))
+        selected_form_kind_rows = {
+            _to_str(row.get("kind_code")).strip(): row
+            for row in _quote_form_kind_rows(form)
+            if _to_str(row.get("kind_code")).strip() and _checked(row.get("choose_flag"), default=False)
+        }
         shared_main_limit = _quote_form_shared_main_limit(form)
         preflight = _json_obj(request_body.get("preflight"))
         selected_vehicle = _json_obj(preflight.get("selectedVehicle"))
@@ -7562,6 +7567,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 platform_name=platform_kind_name,
                 is_new_energy=is_new_energy_vehicle,
             )
+            form_kind_row = selected_form_kind_rows.get(kind_code, {})
+            amount = _clean_money_text_or_empty(row.get("amount"))
+            quantity = _to_str(row.get("quantity")).strip()
+            amount_text_row = dict(row)
+            if kind_code == "051064" and _safe_int_local(quantity, 0) <= 0:
+                form_quantity = _safe_int_local(form_kind_row.get("quantity"), 0)
+                if form_quantity > 0:
+                    quantity = str(form_quantity)
+                    amount_text_row["quantity"] = quantity
+            elif kind_code == "051085" and not _is_positive_amount(amount):
+                form_amount = _clean_money_text_or_empty(form_kind_row.get("amount"))
+                if _is_positive_amount(form_amount):
+                    amount = form_amount
+                    amount_text_row["amount"] = amount
             premium_present = _has_text(row.get("premium"))
             premium = _money(row.get("premium")) if premium_present else Decimal("0")
             if kind_code == "051074" or name == "交强险":
@@ -7594,14 +7613,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "code": kind_code,
                     "name": name,
                     "platform_name": platform_kind_name,
-                    "amount": _clean_money_text_or_empty(row.get("amount")),
+                    "amount": amount,
                     "amount_text": picc_result_amount_text(
-                        row,
+                        amount_text_row,
                         seat_count=_first_text(vehicle.get("seatCount"), form.get("prpCitemCar.seatCount")),
                         shared_main_limit=shared_main_limit,
                     ),
                     "unit_amount": _clean_money_text_or_empty(row.get("unitAmount")),
-                    "quantity": _to_str(row.get("quantity")).strip(),
+                    "quantity": quantity,
                     "shared_amount_flag": _to_str(row.get("sharedAmountFlag")).strip(),
                     "premium": _money_text_or_empty(row.get("premium")),
                     "premium_text": _proposal_money_yuan(row.get("premium")),
