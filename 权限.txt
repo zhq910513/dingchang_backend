@@ -113,7 +113,7 @@ SALES（销售）
 
 助手内查询订单必须复用订单 ACL：
     super_admin：可查全部订单
-    sales：仅可查自己名下订单
+    sales：可查自己团队范围内订单
     manager：仅可查自己团队范围内订单
     finance / market：仅可查自己单团队范围内订单
 

@@ -2252,10 +2252,11 @@ def _order_acl_clause_for_ctx(ctx: Dict[str, Any]):
         return None
 
     if role_name == ROLE_SALES:
-        current_user_id = _ctx_current_user_id(ctx)
-        if current_user_id <= 0:
+        team_names = _ctx_team_names(ctx)
+        if not team_names:
             return sql_false()
-        return Order.salesperson_id == current_user_id
+        team_user_ids = select(User.id).where(user_team_match_expr(team_names))
+        return Order.salesperson_id.in_(team_user_ids)
 
     if role_name in (ROLE_MANAGER, ROLE_FINANCE, ROLE_MARKET):
         team_names = _ctx_team_names(ctx)
