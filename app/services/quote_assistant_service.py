@@ -116,6 +116,7 @@ def _log_quote_perf(
 
 
 def _quote_result_image_async_enabled() -> bool:
+    # 默认异步生成结果图，先把报价文本返回给前端，再由历史页补齐结果图。
     value = _to_str(os.getenv("QUOTE_RESULT_IMAGE_ASYNC_ENABLED", "1")).strip().lower()
     return value not in {"0", "false", "no", "off", "否", "关闭"}
 
@@ -11359,6 +11360,31 @@ def _quote_result_insurance_date_auto_adjustments(result: Mapping[str, Any]) -> 
     return adjustments
 
 
+def _quote_snapshot_optional_renewal_defaults(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    defaults = _json_obj(_json_obj(snapshot).get("default_config_json"))
+    overrides: Dict[str, Any] = {}
+
+    road_rescue_raw = _to_str(defaults.get("机动车增值服务特约条款（道路救援服务）")).strip()
+    if road_rescue_raw:
+        road_rescue_quantity = _safe_int(road_rescue_raw, 0)
+        if road_rescue_quantity > 0:
+            overrides["机动车增值服务特约条款（道路救援服务）"] = str(road_rescue_quantity)
+
+    external_grid_raw = _to_str(defaults.get("附加外部电网故障损失险")).strip()
+    if external_grid_raw:
+        numeric = external_grid_raw.replace(",", "").replace("元", "").strip()
+        try:
+            amount = Decimal(numeric)
+        except Exception:
+            amount = None
+        if amount is not None and amount > 0:
+            overrides["附加外部电网故障损失险"] = _quote_money_text(amount)
+        elif amount is None and external_grid_raw not in {"0", "0.0", "0.00"}:
+            overrides["附加外部电网故障损失险"] = external_grid_raw
+
+    return overrides
+
+
 def _quote_snapshot_with_auto_adjusted_dates(
     snapshot: Mapping[str, Any],
     adjustments: Mapping[str, Any],
@@ -11384,13 +11410,50 @@ def _quote_snapshot_with_auto_adjusted_dates(
         if value and _to_str(normalized.get(key)).strip() != value:
             normalized[key] = value
             changed = True
-    if changed:
-        safe_snapshot["normalized_data"] = _clean_quote_dynamic_data(normalized)
     request_body = deepcopy(_json_obj(adjusted_request_body)) or dict(_json_obj(safe_snapshot.get("request_body")))
     if adjusted_request_body and request_body != _json_obj(safe_snapshot.get("request_body")):
         changed = True
     quote_form = dict(_json_obj(request_body.get("quoteForm")))
     vehicle = dict(_json_obj(request_body.get("vehicleForm")))
+
+    request_body_updates = {
+        "commercial_start_date": _normalize_quote_date_text(_quote_first_text(quote_form.get("prpCmain.startDate"), vehicle.get("startDateBI"))),
+        "compulsory_start_date": _normalize_quote_date_text(_quote_first_text(quote_form.get("prpCmain.startDateCI"), vehicle.get("startDateCI"))),
+    }
+    if _quote_period_time_explicit(quote_form.get("prpCmain.starthourbi"), quote_form.get("prpCmain.startminutebi")):
+        hour, minute = _quote_period_time_texts(quote_form.get("prpCmain.starthourbi"), quote_form.get("prpCmain.startminutebi"))
+        request_body_updates["commercial_start_hour"] = hour
+        request_body_updates["commercial_start_minute"] = minute
+    elif _quote_period_time_explicit(vehicle.get("startHourBI"), vehicle.get("startMinuteBI")):
+        hour, minute = _quote_period_time_texts(vehicle.get("startHourBI"), vehicle.get("startMinuteBI"))
+        request_body_updates["commercial_start_hour"] = hour
+        request_body_updates["commercial_start_minute"] = minute
+    if _quote_period_time_explicit(quote_form.get("prpCmain.starthourci"), quote_form.get("prpCmain.startminuteci")):
+        hour, minute = _quote_period_time_texts(quote_form.get("prpCmain.starthourci"), quote_form.get("prpCmain.startminuteci"))
+        request_body_updates["compulsory_start_hour"] = hour
+        request_body_updates["compulsory_start_minute"] = minute
+    elif _quote_period_time_explicit(vehicle.get("startHourCI"), vehicle.get("startMinuteCI")):
+        hour, minute = _quote_period_time_texts(vehicle.get("startHourCI"), vehicle.get("startMinuteCI"))
+        request_body_updates["compulsory_start_hour"] = hour
+        request_body_updates["compulsory_start_minute"] = minute
+    for key, value in request_body_updates.items():
+        if value and key not in normalized_updates and _to_str(normalized.get(key)).strip() != value:
+            normalized[key] = value
+            changed = True
+
+    optional_overrides = _quote_snapshot_optional_renewal_defaults(safe_snapshot)
+    if optional_overrides:
+        merged_overrides = _merge_quote_config_overrides(
+            normalized.get("quote_field_overrides"),
+            optional_overrides,
+            validate_positive=False,
+        )
+        if merged_overrides != _json_obj(normalized.get("quote_field_overrides")):
+            normalized["quote_field_overrides"] = merged_overrides
+            changed = True
+
+    if changed:
+        safe_snapshot["normalized_data"] = _clean_quote_dynamic_data(normalized)
     if adjustments.get("commercial_start_date"):
         day = _normalize_quote_date_text(adjustments.get("commercial_start_date"))
         if _to_str(quote_form.get("prpCmain.startDate")).strip() != day:
@@ -11490,35 +11553,12 @@ async def _persist_quote_auto_adjusted_dates_to_case(
 ) -> Dict[str, str]:
     adjustments = _quote_result_insurance_date_auto_adjustments(result)
     request_body_changed = _quote_task_with_final_request_body(task, result)
-    if not adjustments:
-        if request_body_changed:
-            await db.flush()
-        return {}
-
-    changed = False
-    normalized = dict(_json_obj(case.normalized_data))
-    draft = dict(_json_obj(case.draft_order_data))
-    for key, value in adjustments.items():
-        if key in {"commercial_start_date", "compulsory_start_date"}:
-            value = _normalize_quote_date_text(value)
-        else:
-            value = _to_str(value).strip()
-        if value and _to_str(normalized.get(key)).strip() != value:
-            normalized[key] = value
-            changed = True
-        if value and _to_str(draft.get(key)).strip() != value:
-            draft[key] = value
-            changed = True
-    if changed:
-        case.normalized_data = _clean_quote_dynamic_data(normalized)
-        case.draft_order_data = _clean_quote_dynamic_data(draft)
-        case.updated_at = _now()
-
     next_snapshot = _quote_snapshot_with_auto_adjusted_dates(
         task.submitted_snapshot,
         adjustments,
         adjusted_request_body=_json_obj(_json_obj(result).get("request_body")),
     )
+    changed = False
     if next_snapshot != _json_obj(task.submitted_snapshot):
         task.submitted_snapshot = next_snapshot
         final_request_body = _json_obj(next_snapshot.get("request_body"))
@@ -11528,6 +11568,15 @@ async def _persist_quote_auto_adjusted_dates_to_case(
                 "request_body": final_request_body,
             }
         task.updated_at = _now()
+        changed = True
+    next_normalized = _clean_quote_dynamic_data(_json_obj(next_snapshot.get("normalized_data")))
+    if next_normalized and (
+        next_normalized != _json_obj(case.normalized_data)
+        or next_normalized != _json_obj(case.draft_order_data)
+    ):
+        case.normalized_data = next_normalized
+        case.draft_order_data = deepcopy(next_normalized)
+        case.updated_at = _now()
         changed = True
 
     if changed or request_body_changed:
@@ -18049,7 +18098,7 @@ async def handle_quote_message(
         if not summary and transfer_vehicle_text_data:
             summary = "已按过户车处理" if bool(transfer_vehicle_text_data.get("is_transfer_vehicle")) else "已按非过户车处理"
         response_data = _mk_data(
-            result_status=RESULT_SUCCESS,
+            result_status=RESULT_NOT_READY,
             message="已记录报价调整",
             entities={"quote_case_id": case.id, "order_id": case.order_id},
             payload={
@@ -18066,20 +18115,20 @@ async def handle_quote_message(
                     "matched": repair_code_resolution.get("matched"),
                     "query": repair_code_resolution.get("query"),
                 } if repair_code_resolution else {},
-                "silent": True,
-                "ui_visible": False,
+                "silent": False,
+                "ui_visible": True,
             },
         )
-        response_data["silent"] = True
-        response_data["ui_visible"] = False
+        response_data["silent"] = False
+        response_data["ui_visible"] = True
         return (
             f"已记录：{summary}。",
             {
                 "status": "success",
                 "intent": "quote_config_override",
                 "trace_id": _new_trace_id(),
-                "silent": True,
-                "ui_visible": False,
+                "silent": False,
+                "ui_visible": True,
                 "data": response_data,
                 "actions": [],
             },

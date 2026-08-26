@@ -4374,6 +4374,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         data = _json_obj(prefill.get("response") or prefill)
         car = _clean_vehicle_cert_fields(_json_obj(data.get("renewItemCarVo")))
         main = _json_obj(data.get("renewMainVo"))
+        main_sub = _json_obj(data.get("renewMainSub"))
         selected_license_type = _normalize_license_type_value(
             car.get("licenseType")
             or candidate.get("license_type")
@@ -4384,7 +4385,54 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         plate_no = _clean_vehicle_cert_value("plate_no", _first_text(car.get("licenseNo"), candidate.get("license_no")))
         start_date_bi = _renewal_next_start_date(main.get("endDate") or candidate.get("end_date"))
         start_date_ci = _renewal_next_start_date(main.get("endDateCI") or candidate.get("end_date"))
+        start_hour_bi = _first_text(
+            main.get("startHourBI"),
+            main.get("starthourbi"),
+            main_sub.get("startHourBI"),
+            main_sub.get("starthourbi"),
+            candidate.get("start_hour_bi"),
+            candidate.get("commercial_start_hour"),
+        )
+        start_minute_bi = _first_text(
+            main.get("startMinuteBI"),
+            main.get("startminutebi"),
+            main_sub.get("startMinuteBI"),
+            main_sub.get("startminutebi"),
+            candidate.get("start_minute_bi"),
+            candidate.get("commercial_start_minute"),
+        )
+        start_hour_ci = _first_text(
+            main.get("startHourCI"),
+            main.get("starthourci"),
+            main_sub.get("startHourCI"),
+            main_sub.get("starthourci"),
+            candidate.get("start_hour_ci"),
+            candidate.get("compulsory_start_hour"),
+        )
+        start_minute_ci = _first_text(
+            main.get("startMinuteCI"),
+            main.get("startminuteci"),
+            main_sub.get("startMinuteCI"),
+            main_sub.get("startminuteci"),
+            candidate.get("start_minute_ci"),
+            candidate.get("compulsory_start_minute"),
+        )
         account_type_name = NEW_ENERGY_USED_ACCOUNT_TYPE if selected_license_type == "52" else USED_FUEL_ACCOUNT_TYPE
+        renewal_policy_prefill = {
+            "policy_no": _first_text(main.get("policyNo"), candidate.get("policy_no")),
+            "policy_ci_no": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
+            "proposal_no_bi": _first_text(main.get("proposalNoBI"), _json_obj(data.get("renewMainSub")).get("proposalNoBI")),
+            "proposal_no_ci": _first_text(main.get("proposalNoCI"), _json_obj(data.get("renewMainSub")).get("proposalNoCI")),
+            "start_date_bi": start_date_bi,
+            "start_date_ci": start_date_ci,
+            "start_hour_bi": start_hour_bi,
+            "start_minute_bi": start_minute_bi,
+            "start_hour_ci": start_hour_ci,
+            "start_minute_ci": start_minute_ci,
+        }
+        renewal_policy_prefill = {
+            key: value for key, value in renewal_policy_prefill.items() if value not in (None, "")
+        }
         out = {
             "account_type_name": account_type_name,
             "plate_no": plate_no,
@@ -4395,7 +4443,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "vehicle_brand_name": _first_text(car.get("brandName"), car.get("modelName")),
             "first_register_date": _date_text(car.get("enrollDate")),
             "commercial_start_date": start_date_bi,
+            "commercial_start_hour": start_hour_bi,
+            "commercial_start_minute": start_minute_bi,
             "compulsory_start_date": start_date_ci,
+            "compulsory_start_hour": start_hour_ci,
+            "compulsory_start_minute": start_minute_ci,
             "approved_passenger_count": _first_text(car.get("seatCount"), "5"),
             "license_type": selected_license_type,
             "license_color_code": _license_color_for_type(selected_license_type),
@@ -4407,14 +4459,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "reason": "人保续保一键回填返回号牌种类",
                 }
             ),
-            "renewal_policy_prefill": {
-                "policy_no": _first_text(main.get("policyNo"), candidate.get("policy_no")),
-                "policy_ci_no": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
-                "proposal_no_bi": _first_text(main.get("proposalNoBI"), _json_obj(data.get("renewMainSub")).get("proposalNoBI")),
-                "proposal_no_ci": _first_text(main.get("proposalNoCI"), _json_obj(data.get("renewMainSub")).get("proposalNoCI")),
-                "start_date_bi": start_date_bi,
-                "start_date_ci": start_date_ci,
-            },
+            "renewal_policy_prefill": renewal_policy_prefill,
         }
         quote_overrides = self._renewal_product_defaults_from_prefill(data)
         if quote_overrides:
@@ -4429,7 +4474,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "useNatureCode": _first_text(car.get("useNatureCode"), "211"),
             "enrollDate": _date_text(car.get("enrollDate")),
             "startDateBI": start_date_bi,
+            "startHourBI": start_hour_bi,
+            "startMinuteBI": start_minute_bi,
             "startDateCI": start_date_ci,
+            "startHourCI": start_hour_ci,
+            "startMinuteCI": start_minute_ci,
             "modelName": _first_text(car.get("brandName"), car.get("modelName")),
             "rawModelName": _first_text(car.get("brandName"), car.get("modelName")),
             "seatCount": _first_text(car.get("seatCount"), "5"),
@@ -4440,6 +4489,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "selectedVehicleId": _to_str(car.get("modelCode")).strip(),
             "selectedModelName": _first_text(car.get("brandName"), car.get("modelName")),
         }
+        vehicle_form = {key: value for key, value in vehicle_form.items() if value not in (None, "")}
         out["renewal_request_body_seed"] = {
             "vehicleForm": _clean_vehicle_cert_fields(vehicle_form),
             "ownerForm": {

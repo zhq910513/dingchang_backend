@@ -851,34 +851,47 @@ async def get_ai_history(
     rows = page.get("items") if isinstance(page, dict) else []
     items: List[Dict[str, Any]] = []
     for m in rows:
-        raw_metadata = _pick(m, "metadata", default={}) or {}
-        filtered_metadata = _normalize_quote_result_metadata(
-            _filter_metadata_for_quote_permission(
-                raw_metadata,
-                can_quote_use=can_quote_use,
-                can_platform_account_manage=can_account_manage,
-                can_default_config_manage=can_default_config_manage,
-            ),
-            allow_legacy_success_image=True,
-        )
-        raw_content = sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", "")
-        history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
-        if history_validation_error and str(_pick(m, "role", default="assistant") or "").lower() == "assistant":
-            raw_content = (
-                "历史报价结果未通过真实性校验，未展示报价结果图："
-                f"{history_validation_error}。请重新发起报价。"
+        try:
+            raw_metadata = _pick(m, "metadata", default={}) or {}
+            filtered_metadata = _normalize_quote_result_metadata(
+                _filter_metadata_for_quote_permission(
+                    raw_metadata,
+                    can_quote_use=can_quote_use,
+                    can_platform_account_manage=can_account_manage,
+                    can_default_config_manage=can_default_config_manage,
+                ),
+                allow_legacy_success_image=True,
             )
-        if not can_quote_use and _metadata_is_quote_material(raw_metadata):
-            raw_content = QUOTE_HIDDEN_MESSAGE
-        items.append(
-            {
+            raw_content = sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", "")
+            history_validation_error = _quote_result_validation_error_in_metadata(filtered_metadata)
+            if history_validation_error and str(_pick(m, "role", default="assistant") or "").lower() == "assistant":
+                raw_content = (
+                    "历史报价结果未通过真实性校验，未展示报价结果图："
+                    f"{history_validation_error}。请重新发起报价。"
+                )
+            if not can_quote_use and _metadata_is_quote_material(raw_metadata):
+                raw_content = QUOTE_HIDDEN_MESSAGE
+            item = {
                 "id": _pick(m, "id", default=None),
                 "role": _pick(m, "role", default="assistant"),
                 "content": raw_content,
                 "created_at": _pick(m, "created_at", default=None),
                 "metadata": filtered_metadata,
             }
-        )
+        except Exception:
+            logger.exception(
+                "quote history item normalization failed: session_id=%s message_id=%s",
+                session_id,
+                _pick(m, "id", default=None),
+            )
+            item = {
+                "id": _pick(m, "id", default=None),
+                "role": _pick(m, "role", default="assistant"),
+                "content": sanitize_quote_user_message(_pick(m, "content", "text", default="") or "", ""),
+                "created_at": _pick(m, "created_at", default=None),
+                "metadata": {},
+            }
+        items.append(item)
     return {
         "session_id": session_id,
         "items": items,

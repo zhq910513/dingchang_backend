@@ -2059,6 +2059,55 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCmain.endhourci"], "14")
         self.assertEqual(vehicle["startHourCI"], "14")
 
+    def test_case_snapshot_persists_final_request_state_without_adjustments(self) -> None:
+        snapshot = {
+            "normalized_data": {
+                "commercial_start_date": "2026-10-08",
+                "compulsory_start_date": "2026-10-07",
+            },
+            "default_config_json": {
+                "机动车增值服务特约条款（道路救援服务）": "2",
+                "附加外部电网故障损失险": "99957.18",
+            },
+            "request_body": {
+                "quoteForm": {
+                    "prpCmain.startDate": "2026-10-08",
+                    "prpCmain.starthourbi": "0",
+                    "prpCmain.startminutebi": "0",
+                    "prpCmain.startDateCI": "2026-10-07",
+                    "prpCmain.starthourci": "17",
+                    "prpCmain.startminuteci": "30",
+                    "prpCmain.endDateCI": "2027-10-07",
+                    "prpCmain.endhourci": "17",
+                    "prpCmain.endminuteci": "30",
+                },
+                "vehicleForm": {
+                    "startDateBI": "2026-10-08",
+                    "startHourBI": "0",
+                    "startMinuteBI": "0",
+                    "startDateCI": "2026-10-07",
+                    "startHourCI": "17",
+                    "startMinuteCI": "30",
+                },
+            },
+        }
+        persisted = _quote_snapshot_with_auto_adjusted_dates(snapshot, {})
+        form = persisted["request_body"]["quoteForm"]
+        vehicle = persisted["request_body"]["vehicleForm"]
+        overrides = persisted["normalized_data"]["quote_field_overrides"]
+        self.assertEqual(persisted["normalized_data"]["commercial_start_date"], "2026-10-08")
+        self.assertEqual(persisted["normalized_data"]["commercial_start_hour"], "0")
+        self.assertEqual(persisted["normalized_data"]["commercial_start_minute"], "0")
+        self.assertEqual(persisted["normalized_data"]["compulsory_start_date"], "2026-10-07")
+        self.assertEqual(persisted["normalized_data"]["compulsory_start_hour"], "17")
+        self.assertEqual(persisted["normalized_data"]["compulsory_start_minute"], "30")
+        self.assertEqual(overrides["机动车增值服务特约条款（道路救援服务）"], "2")
+        self.assertEqual(overrides["附加外部电网故障损失险"], "99957.18")
+        self.assertEqual(form["prpCmain.starthourbi"], "0")
+        self.assertEqual(form["prpCmain.starthourci"], "17")
+        self.assertEqual(vehicle["startHourBI"], "0")
+        self.assertEqual(vehicle["startHourCI"], "17")
+
     def test_road_rescue_command_can_adjust_or_remove_product(self) -> None:
         overrides = extract_quote_config_overrides("道路救援 7")
         self.assertEqual(overrides["机动车增值服务特约条款（道路救援服务）"], "7")
@@ -2078,6 +2127,73 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
             "附加外部电网故障损失险",
             _normalize_quote_product_exclusions(["电网故障"]),
         )
+
+    def test_renewal_prefill_vehicle_data_preserves_period_time_fields(self) -> None:
+        adapter = _adapter()
+        prefill = {
+            "response": {
+                "renewItemCarVo": {
+                    "licenseNo": "赣GF78199",
+                    "engineNo": "CDSJC0660",
+                    "vinNo": "LNNBBDEE2SH202251",
+                    "carOwner": "廖瑞波",
+                    "brandName": "雷克萨斯LEXUS CT200h轿车",
+                    "seatCount": "5",
+                },
+                "renewMainVo": {
+                    "policyNo": "PDZA202600000000000001",
+                    "policyCINo": "PDZA202600000000000002",
+                    "endDate": "2026-10-07",
+                    "endDateCI": "2026-10-06",
+                    "startHourBI": "0",
+                    "startMinuteBI": "0",
+                    "startHourCI": "17",
+                    "startMinuteCI": "30",
+                },
+                "renewItemKindVoList": [],
+            }
+        }
+        vehicle_data = adapter._renewal_prefill_vehicle_data(prefill, {"policy_no": "PDZA202600000000000001"})
+        self.assertEqual(vehicle_data["commercial_start_date"], "2026-10-08")
+        self.assertEqual(vehicle_data["commercial_start_hour"], "0")
+        self.assertEqual(vehicle_data["commercial_start_minute"], "0")
+        self.assertEqual(vehicle_data["compulsory_start_date"], "2026-10-07")
+        self.assertEqual(vehicle_data["compulsory_start_hour"], "17")
+        self.assertEqual(vehicle_data["compulsory_start_minute"], "30")
+        self.assertEqual(vehicle_data["renewal_request_body_seed"]["vehicleForm"]["startHourCI"], "17")
+        self.assertEqual(vehicle_data["renewal_request_body_seed"]["vehicleForm"]["startMinuteCI"], "30")
+
+    def test_renewal_prefill_vehicle_data_does_not_fabricate_missing_period_time_fields(self) -> None:
+        adapter = _adapter()
+        prefill = {
+            "response": {
+                "renewItemCarVo": {
+                    "licenseNo": "赣GF78199",
+                    "engineNo": "CDSJC0660",
+                    "vinNo": "LNNBBDEE2SH202251",
+                    "carOwner": "廖瑞波",
+                    "brandName": "雷克萨斯LEXUS CT200h轿车",
+                    "seatCount": "5",
+                },
+                "renewMainVo": {
+                    "policyNo": "PDZA202600000000000001",
+                    "policyCINo": "PDZA202600000000000002",
+                    "endDate": "2026-10-07",
+                    "endDateCI": "2026-10-06",
+                },
+                "renewMainSub": {},
+                "renewItemKindVoList": [],
+            }
+        }
+        vehicle_data = adapter._renewal_prefill_vehicle_data(prefill, {"policy_no": "PDZA202600000000000001"})
+        self.assertNotIn("commercial_start_hour", vehicle_data)
+        self.assertNotIn("commercial_start_minute", vehicle_data)
+        self.assertNotIn("compulsory_start_hour", vehicle_data)
+        self.assertNotIn("compulsory_start_minute", vehicle_data)
+        self.assertNotIn("start_hour_bi", vehicle_data["renewal_policy_prefill"])
+        self.assertNotIn("start_hour_ci", vehicle_data["renewal_policy_prefill"])
+        self.assertNotIn("startHourBI", vehicle_data["renewal_request_body_seed"]["vehicleForm"])
+        self.assertNotIn("startHourCI", vehicle_data["renewal_request_body_seed"]["vehicleForm"])
 
     def test_duplicate_insurance_with_explicit_period_change_enters_retry_path(self) -> None:
         response = {
