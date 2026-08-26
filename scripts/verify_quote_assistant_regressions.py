@@ -491,6 +491,76 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "新能源汽车损失保险")
         self.assertEqual(rows[1]["amount_text"], "7次")
 
+    def test_picc_result_builder_uses_successful_request_quantity_when_platform_row_is_zero(self) -> None:
+        result = _adapter()._build_motor_quote_result_from_response(
+            ctx=None,
+            quote_payload={},
+            request_body={
+                "accountTypeName": "新能源车-旧",
+                "vehicleForm": {"seatCount": "5"},
+                "ownerForm": {},
+                "quoteForm": {
+                    "prpCitemKindVos[0].kindCode": "051064",
+                    "prpCitemKindVos[0].kindName": "机动车增值服务特约条款（道路救援服务）",
+                    "prpCitemKindVos[0].chooseFlag": "true",
+                    "prpCitemKindVos[0].amount": "",
+                    "prpCitemKindVos[0].quantity": "7",
+                },
+                "preflight": {},
+            },
+            quote_response={
+                "status": 0,
+                "data": {"biPremium": "100.00", "ciPremium": "0.00", "sumPayTax": "0.00"},
+                "itemKindTempList": [
+                    {"kindCode": "051050", "kindName": "机动车损失保险", "amount": "99957.18", "premium": "100.00"},
+                    {
+                        "kindCode": "051064",
+                        "kindName": "附加机动车增值服务特约条款（道路救援服务）",
+                        "amount": "0",
+                        "quantity": "0",
+                        "premium": "0.00",
+                    },
+                ],
+            },
+        )
+        road_rescue = result["result_card"]["proposal_coverage_items"][1]
+        self.assertEqual(road_rescue["quantity"], "7")
+        self.assertEqual(road_rescue["amount_text"], "7次")
+
+    def test_picc_result_builder_uses_successful_request_external_grid_amount_when_platform_row_is_zero(self) -> None:
+        result = _adapter()._build_motor_quote_result_from_response(
+            ctx=None,
+            quote_payload={},
+            request_body={
+                "accountTypeName": "新能源车-旧",
+                "vehicleForm": {"seatCount": "5"},
+                "ownerForm": {},
+                "quoteForm": {
+                    "prpCitemKindVos[0].kindCode": "051085",
+                    "prpCitemKindVos[0].kindName": "附加外部电网故障损失险",
+                    "prpCitemKindVos[0].chooseFlag": "true",
+                    "prpCitemKindVos[0].amount": "99957.18",
+                },
+                "preflight": {},
+            },
+            quote_response={
+                "status": 0,
+                "data": {"biPremium": "113.52", "ciPremium": "0.00", "sumPayTax": "0.00"},
+                "itemKindTempList": [
+                    {"kindCode": "051050", "kindName": "机动车损失保险", "amount": "99957.18", "premium": "100.00"},
+                    {
+                        "kindCode": "051085",
+                        "kindName": "附加外部电网故障损失险",
+                        "amount": "0",
+                        "premium": "13.52",
+                    },
+                ],
+            },
+        )
+        external_grid = result["result_card"]["proposal_coverage_items"][1]
+        self.assertEqual(external_grid["amount"], "99957.18")
+        self.assertEqual(external_grid["premium"], "13.52")
+
 
 class RunningQuoteInterruptionTests(unittest.TestCase):
     def test_chat_context_uses_the_request_session_id(self) -> None:
@@ -3209,11 +3279,15 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCitemKindVos[5].sharedAmountFlag"], "1")
         self.assertIsNone(_quote_form_kind_index(form, "051064"))
 
-    def test_0818_result_keeps_response_road_rescue_quantity_when_response_returns_zero(self) -> None:
+    def test_0818_result_displays_submitted_road_rescue_quantity_when_response_returns_zero(self) -> None:
         har = _load_0818_smooth_quote_har()
+        form = _har_form_params(har, 142)
+        road_index = _quote_form_kind_index(form, "051064")
+        self.assertIsNotNone(road_index)
+        form[f"prpCitemKindVos[{road_index}].quantity"] = "7"
         request_body = {
             "accountTypeName": "新能源车-旧",
-            "quoteForm": _har_form_params(har, 142),
+            "quoteForm": form,
             "vehicleForm": {
                 "licenseNo": "赣KF88172",
                 "vin": "LC0C76C4XR6182655",
@@ -3236,7 +3310,8 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             for item in result["result_card"]["proposal_coverage_items"]
             if item["code"] == "051064"
         )
-        self.assertEqual(road_rescue["amount_text"], "-")
+        self.assertEqual(road_rescue["quantity"], "7")
+        self.assertEqual(road_rescue["amount_text"], "7次")
 
 
 class QuoteFailureEnvelopeTests(unittest.TestCase):
