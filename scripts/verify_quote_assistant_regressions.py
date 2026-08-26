@@ -2937,8 +2937,8 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "accountTypeName": "新能源车-旧",
             "quoteForm": source_form,
             "vehicleForm": {
-                "startDateBI": source_form["prpCmain.startDate"],
-                "startDateCI": source_form["prpCmain.startDateCI"],
+                "startDateBI": "2026-09-30",
+                "startDateCI": "2026-09-30",
                 "seatCount": source_form.get("prpCitemCar.seatCount", "5"),
             },
             "defaultFields": {},
@@ -2985,6 +2985,65 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         road_rescue_index = _quote_form_kind_index(configured_form, "051064")
         self.assertIsNotNone(road_rescue_index)
         self.assertEqual(configured_form[f"prpCitemKindVos[{road_rescue_index}].quantity"], "2")
+
+    def test_0818_sync_period_preserves_configured_optional_addons_without_reinsure_hint(self) -> None:
+        from app.services.quote_platforms.platforms.picc.business import (
+            USED_FUEL_ACCOUNT_TYPE,
+            _motor_quote_profile,
+            _normalize_platform_adjusted_quote_products,
+            _picc_business_defaults,
+        )
+
+        adapter = _adapter()
+        profile = _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
+        defaults = _picc_business_defaults(
+            {
+                "机动车增值服务特约条款（道路救援服务）": "2",
+                "附加外部电网故障损失险": "99957.18",
+            }
+        )
+        form = adapter._build_used_fuel_quote_form(
+            defaults,
+            {
+                "licenseNo": "赣GF78199",
+                "engineNo": "CDSJC0660",
+                "vin": "LNNBBDEE2SH202251",
+                "enrollDate": "2025-10-09",
+                "startDateBI": "2026-09-30",
+                "startDateCI": "2026-09-30",
+                "modelName": "捷途SQR6480CHEVT1N插电式混合动力多用途乘用车",
+                "actualValue": "99957.18",
+                "purchasePrice": "107400",
+                "seatCount": "5",
+            },
+            {
+                "ownerName": "测试",
+                "ownerIdNo": "360402199001011234",
+                "ownerPhone": "13900000000",
+            },
+            {"vehicleId": "JTVALD0004", "vehicleModelCode": "PLAT001", "purchasePrice": "107400"},
+            {},
+            [],
+            profile=profile,
+        )
+        for key in list(form.keys()):
+            if key.endswith(".kindCode") and form[key] in {"051064", "051085"}:
+                index = key.split("[", 1)[1].split("]", 1)[0]
+                for suffix in ("kindCode", "kindName", "chooseFlag", "amount", "quantity", "sharedAmountFlag"):
+                    form.pop(f"prpCitemKindVos[{index}].{suffix}", None)
+        changed = _normalize_platform_adjusted_quote_products(
+            form,
+            defaults,
+            profile,
+            {"reinsure_items": []},
+        )
+        self.assertTrue(changed)
+        road_rescue_index = _quote_form_kind_index(form, "051064")
+        self.assertIsNotNone(road_rescue_index)
+        self.assertEqual(form[f"prpCitemKindVos[{road_rescue_index}].quantity"], "2")
+        external_grid_index = _quote_form_kind_index(form, "051085")
+        self.assertIsNotNone(external_grid_index)
+        self.assertEqual(form[f"prpCitemKindVos[{external_grid_index}].amount"], "99957.18")
 
     def test_0818_sync_period_restores_missing_passenger_before_medical(self) -> None:
         har = _load_0818_original_quote_har()

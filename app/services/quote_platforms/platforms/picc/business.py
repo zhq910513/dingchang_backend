@@ -2879,7 +2879,7 @@ def _normalize_platform_adjusted_quote_products(
     profile: Mapping[str, Any],
     adjustment: Mapping[str, Any],
 ) -> bool:
-    """Keep configured core cover amounts after PICC's date/risk sync prompts."""
+    """Keep configured core cover amounts and optional add-ons after PICC's date/risk sync prompts."""
 
     changed = False
     exclusions = _product_exclusions(defaults)
@@ -2910,19 +2910,27 @@ def _normalize_platform_adjusted_quote_products(
             shared_amount_flag=shared_flag,
         ) or changed
 
-    if (
-        _canonical_product_name(PRODUCT_ROAD_RESCUE) not in exclusions
-        and _reinsure_items_include_kind(adjustment.get("reinsure_items"), "051064", "道路救援")
-    ):
-        quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
-        if quantity > 0:
-            changed = _set_quote_form_kind_row(
-                form,
-                kind_code="051064",
-                kind_name=PRODUCT_ROAD_RESCUE,
-                amount="",
-                quantity=str(quantity),
-            ) or changed
+    actual_value = _first_text(
+        form.get("prpCitemCar.actualValue"),
+        form.get("prpCitemCar.referenceActualValue"),
+    )
+    road_rescue_quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
+    if _canonical_product_name(PRODUCT_ROAD_RESCUE) not in exclusions and road_rescue_quantity > 0:
+        changed = _set_quote_form_kind_row(
+            form,
+            kind_code="051064",
+            kind_name=PRODUCT_ROAD_RESCUE,
+            amount="",
+            quantity=str(road_rescue_quantity),
+        ) or changed
+    external_grid_amount = _external_grid_amount(defaults, actual_value)
+    if _canonical_product_name(PRODUCT_EXTERNAL_GRID) not in exclusions and _is_positive_amount(external_grid_amount):
+        changed = _set_quote_form_kind_row(
+            form,
+            kind_code="051085",
+            kind_name=PRODUCT_EXTERNAL_GRID,
+            amount=external_grid_amount,
+        ) or changed
     changed = _reorder_quote_form_kind_rows(form) or changed
     return changed
 
@@ -7201,9 +7209,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 form["prpCmain.endminuteci"] = ci_minute
                 changed = True
 
-        if kinds and _normalize_platform_adjusted_quote_products(form, defaults, profile, adjustment):
-            changed = True
-
         recalculated_actual_value = ""
         if bi_changed and selected:
             try:
@@ -7237,6 +7242,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                             body["productForm"] = product_form
             except Exception as exc:
                 preflight["insuranceDateAutoAdjustActualValueError"] = str(exc)[:300] or exc.__class__.__name__
+
+        if kinds and _normalize_platform_adjusted_quote_products(form, defaults, profile, adjustment):
+            changed = True
 
         if not changed:
             return body, False, {}
