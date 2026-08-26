@@ -1377,7 +1377,7 @@ async def ai_chat(
             result = await _run_chat_once()
     except ValueError as e:
         await db.rollback()
-        raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "消息处理失败"))
+        raise HTTPException(status_code=400, detail=f"消息处理失败：{_humanize_chat_exception(e)}")
     except Exception as e:
         await db.rollback()
         logger.exception(
