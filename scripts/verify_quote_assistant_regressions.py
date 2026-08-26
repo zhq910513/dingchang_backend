@@ -2265,6 +2265,198 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertNotIn("startHourBI", vehicle_data["renewal_request_body_seed"]["vehicleForm"])
         self.assertNotIn("startHourCI", vehicle_data["renewal_request_body_seed"]["vehicleForm"])
 
+    def test_renewal_prefill_uses_paired_compulsory_end_time_from_candidate(self) -> None:
+        adapter = _adapter()
+        prefill = {
+            "response": {
+                "renewItemCarVo": {
+                    "licenseNo": "赣GF78199",
+                    "engineNo": "CDSJC0660",
+                    "vinNo": "LNNBBDEE2SH202251",
+                    "carOwner": "廖瑞波",
+                    "brandName": "捷途SQR6480CHEVT1N插电式混合动力多用途乘用车",
+                    "seatCount": "5",
+                },
+                "renewMainVo": {
+                    "policyNo": "PDAA202536040000255139",
+                    "endDate": "2026-10-07 24:00",
+                },
+                "renewMainSub": {},
+                "renewItemKindVoList": [],
+            }
+        }
+        selected = {
+            "policy_no": "PDAA202536040000255139",
+            "policy_no_encode": "ENC_DAA",
+            "risk_code": "DAA",
+            "license_no": "赣GF78199",
+            "engine_no": "CDSJC0660",
+            "vin": "LNNBBDEE2SH202251",
+            "end_date": "2026-10-07 24:00",
+            "ci_policy_no": "PDZA202536040000368134",
+            "ci_end_date": "2026-10-07 17:30",
+        }
+
+        vehicle_data = adapter._renewal_prefill_vehicle_data(prefill, selected)
+
+        self.assertEqual(vehicle_data["commercial_start_date"], "2026-10-08")
+        self.assertEqual(vehicle_data["commercial_start_hour"], "0")
+        self.assertEqual(vehicle_data["commercial_start_minute"], "0")
+        self.assertEqual(vehicle_data["compulsory_start_date"], "2026-10-07")
+        self.assertEqual(vehicle_data["compulsory_start_hour"], "17")
+        self.assertEqual(vehicle_data["compulsory_start_minute"], "30")
+        self.assertEqual(vehicle_data["renewal_policy_prefill"]["source_end_date_ci"], "2026-10-07 17:30")
+        self.assertEqual(vehicle_data["renewal_request_body_seed"]["vehicleForm"]["startHourCI"], "17")
+
+    def test_renewal_prefill_does_not_use_commercial_end_date_for_missing_compulsory(self) -> None:
+        adapter = _adapter()
+        prefill = {
+            "response": {
+                "renewItemCarVo": {
+                    "licenseNo": "赣GF78199",
+                    "engineNo": "CDSJC0660",
+                    "vinNo": "LNNBBDEE2SH202251",
+                    "carOwner": "廖瑞波",
+                    "brandName": "捷途SQR6480CHEVT1N插电式混合动力多用途乘用车",
+                    "seatCount": "5",
+                },
+                "renewMainVo": {
+                    "policyNo": "PDAA202536040000255139",
+                    "endDate": "2026-10-07 24:00",
+                },
+                "renewMainSub": {},
+                "renewItemKindVoList": [],
+            }
+        }
+        selected = {
+            "policy_no": "PDAA202536040000255139",
+            "policy_no_encode": "ENC_DAA",
+            "risk_code": "DAA",
+            "license_no": "赣GF78199",
+            "engine_no": "CDSJC0660",
+            "vin": "LNNBBDEE2SH202251",
+            "end_date": "2026-10-07 24:00",
+        }
+
+        vehicle_data = adapter._renewal_prefill_vehicle_data(prefill, selected)
+
+        self.assertEqual(vehicle_data["commercial_start_date"], "2026-10-08")
+        self.assertNotIn("compulsory_start_date", vehicle_data)
+        self.assertNotIn("start_date_ci", vehicle_data["renewal_policy_prefill"])
+        self.assertNotIn("startDateCI", vehicle_data["renewal_request_body_seed"]["vehicleForm"])
+
+    def test_renewal_prepare_pairs_compulsory_candidate_before_building_quote_body(self) -> None:
+        adapter = _adapter()
+        captured: dict[str, object] = {}
+
+        def fake_fetch(self, client, selected):
+            captured["selected_for_fetch"] = dict(selected)
+            return {
+                "request": {
+                    "policyNo": selected.get("policy_no"),
+                    "policyNoEncode": selected.get("policy_no_encode"),
+                },
+                "response": {
+                    "renewItemCarVo": {
+                        "licenseNo": "赣GF78199",
+                        "engineNo": "CDSJC0660",
+                        "vinNo": "LNNBBDEE2SH202251",
+                        "carOwner": "廖瑞波",
+                        "brandName": "捷途SQR6480CHEVT1N插电式混合动力多用途乘用车",
+                        "seatCount": "5",
+                    },
+                    "renewMainVo": {
+                        "policyNo": "PDAA202536040000255139",
+                        "endDate": "2026-10-07 24:00",
+                    },
+                    "renewMainSub": {},
+                    "renewItemKindVoList": [],
+                },
+            }
+
+        def fake_prepare(self, client, ctx, payload, account_type_name="油车-旧"):
+            normalized = dict(payload["normalized_data"])
+            captured["normalized_data"] = normalized
+            return {
+                "accountTypeName": account_type_name,
+                "vehicleForm": {
+                    "startDateBI": normalized.get("commercial_start_date"),
+                    "startHourBI": normalized.get("commercial_start_hour"),
+                    "startMinuteBI": normalized.get("commercial_start_minute"),
+                    "startDateCI": normalized.get("compulsory_start_date"),
+                    "startHourCI": normalized.get("compulsory_start_hour"),
+                    "startMinuteCI": normalized.get("compulsory_start_minute"),
+                },
+                "ownerForm": {},
+                "quoteForm": {
+                    "prpCmain.startDate": normalized.get("commercial_start_date"),
+                    "prpCmain.starthourbi": normalized.get("commercial_start_hour"),
+                    "prpCmain.startminutebi": normalized.get("commercial_start_minute"),
+                    "prpCmain.startDateCI": normalized.get("compulsory_start_date"),
+                    "prpCmain.starthourci": normalized.get("compulsory_start_hour"),
+                    "prpCmain.startminuteci": normalized.get("compulsory_start_minute"),
+                },
+                "preflight": {},
+            }
+
+        adapter._fetch_renewal_policy_prefill = MethodType(fake_fetch, adapter)
+        adapter._prepare_used_fuel_quote = MethodType(fake_prepare, adapter)
+
+        daa = {
+            "policy_no": "PDAA202536040000255139",
+            "policy_no_encode": "ENC_DAA",
+            "risk_code": "DAA",
+            "license_no": "赣GF78199",
+            "engine_no": "CDSJC0660",
+            "vin": "LNNBBDEE2SH202251",
+            "end_date": "2026-10-07 24:00",
+        }
+        dza = {
+            "policy_no": "PDZA202536040000368134",
+            "policy_no_encode": "ENC_DZA",
+            "risk_code": "DZA",
+            "license_no": "赣GF78199",
+            "engine_no": "CDSJC0660",
+            "vin": "LNNBBDEE2SH202251",
+            "end_date": "2026-10-07 17:30",
+        }
+
+        body = adapter._prepare_renewal_used_fuel_quote(
+            SimpleNamespace(),
+            SimpleNamespace(account_type_name="新能源车-旧"),
+            {
+                "quote_flow_type": "renewal_motor_quote",
+                "normalized_data": {
+                    "account_type_name": "新能源车-旧",
+                    "plate_no": "赣GF78199",
+                    "engine_no": "CDSJC0660",
+                    "vin": "LNNBBDEE2SH202251",
+                    "renewal_lookup": {
+                        "found": True,
+                        "selected": daa,
+                        "candidates": [daa, dza],
+                    },
+                },
+                "default_config_json": {},
+                "platform_default_config": {"resolved_type_name": "新能源车-旧"},
+            },
+            account_type_name="新能源车-旧",
+        )
+
+        selected_for_fetch = captured["selected_for_fetch"]
+        normalized = captured["normalized_data"]
+        self.assertEqual(selected_for_fetch["ci_end_date"], "2026-10-07 17:30")
+        self.assertEqual(selected_for_fetch["ci_policy_no"], "PDZA202536040000368134")
+        self.assertEqual(normalized["commercial_start_date"], "2026-10-08")
+        self.assertEqual(normalized["commercial_start_hour"], "0")
+        self.assertEqual(normalized["commercial_start_minute"], "0")
+        self.assertEqual(normalized["compulsory_start_date"], "2026-10-07")
+        self.assertEqual(normalized["compulsory_start_hour"], "17")
+        self.assertEqual(normalized["compulsory_start_minute"], "30")
+        self.assertEqual(body["quoteForm"]["prpCmain.startDateCI"], "2026-10-07")
+        self.assertEqual(body["quoteForm"]["prpCmain.starthourci"], "17")
+        self.assertEqual(body["renewalPolicyPrefill"]["source_end_date_ci"], "2026-10-07 17:30")
+
     def test_duplicate_insurance_with_explicit_period_change_enters_retry_path(self) -> None:
         response = {
             "status": -1,

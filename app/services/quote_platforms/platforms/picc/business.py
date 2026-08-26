@@ -873,6 +873,47 @@ def _platform_datetime_parts(value: Any) -> Dict[str, str]:
     return out
 
 
+def _renewal_start_parts_from_end_date(value: Any) -> Dict[str, str]:
+    """Derive the next policy start from a platform end datetime."""
+    text = _to_str(value).strip()
+    end_day = _parse_date(text)
+    if not end_day:
+        return {}
+    out = {"date": (end_day + timedelta(days=1)).strftime("%Y-%m-%d"), "hour": "", "minute": ""}
+    match = re.search(r"(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})日?", text)
+    if not match:
+        return out
+    suffix = re.sub(r"^[\sT]+", "", text[match.end():])
+    time_match = re.match(r"^(\d{1,2})(?:\s*[:：时点]\s*(\d{1,2}))?(?:分)?", suffix)
+    if not time_match:
+        return out
+    hour = _safe_int_local(time_match.group(1), -1)
+    minute = _safe_int_local(time_match.group(2), 0) if time_match.group(2) is not None else 0
+    if hour == 24 and minute == 0:
+        out["date"] = (end_day + timedelta(days=1)).strftime("%Y-%m-%d")
+        out["hour"] = "0"
+        out["minute"] = "0"
+    elif 0 <= hour <= 23 and 0 <= minute <= 59:
+        out["date"] = end_day.strftime("%Y-%m-%d")
+        out["hour"] = str(hour)
+        out["minute"] = str(minute)
+    return out
+
+
+def _renewal_end_datetime_text(date_value: Any, hour_value: Any = "", minute_value: Any = "") -> str:
+    day = _date_text(date_value)
+    text = _to_str(date_value).strip()
+    if not day or not _has_text(hour_value):
+        return text
+    hour = _safe_int_local(hour_value, -1)
+    minute = _safe_int_local(minute_value, 0) if _has_text(minute_value) else 0
+    if hour == 24 and minute == 0:
+        return f"{day} 24:00"
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return f"{day} {hour}:{minute:02d}"
+    return text
+
+
 def _next_day_text() -> str:
     return (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -2539,6 +2580,74 @@ def _pick_renewal_policy_candidate(rows: List[Dict[str, Any]], current: Optional
     if not rows:
         return {}
     return max(rows, key=lambda row: _renewal_candidate_sort_value(row, current))
+
+
+def _renewal_candidate_risk_code(row: Mapping[str, Any]) -> str:
+    return _to_str(row.get("risk_code") or row.get("riskCode")).strip().upper()
+
+
+def _renewal_candidate_compare_values(row: Mapping[str, Any], *keys: str) -> set[str]:
+    return {
+        value
+        for value in (_renewal_compare_text(row.get(key)) for key in keys)
+        if value
+    }
+
+
+def _renewal_candidates_same_vehicle(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    matched = False
+    for keys in (
+        ("license_no", "licenseNo"),
+        ("vin", "vinNo", "frameNo"),
+        ("engine_no", "engineNo"),
+    ):
+        left_values = _renewal_candidate_compare_values(left, *keys)
+        right_values = _renewal_candidate_compare_values(right, *keys)
+        if not left_values or not right_values:
+            continue
+        if left_values.isdisjoint(right_values):
+            return False
+        matched = True
+    return matched
+
+
+def _renewal_apply_period_candidate(out: Dict[str, Any], row: Mapping[str, Any], prefix: str) -> None:
+    end_date = _to_str(row.get("end_date") or row.get("endDate")).strip()
+    policy_no = _to_str(row.get("policy_no") or row.get("policyNo")).strip()
+    policy_no_encode = _to_str(row.get("policy_no_encode") or row.get("policyNoEncode")).strip()
+    relation_policy_no = _to_str(row.get("relation_policy_no") or row.get("relationPolicyNo")).strip()
+    relation_policy_no_encode = _to_str(row.get("relation_policy_no_encode") or row.get("relationPolicyNoEncode")).strip()
+    if end_date and not _to_str(out.get(f"{prefix}_end_date")).strip():
+        out[f"{prefix}_end_date"] = end_date
+    if policy_no and not _to_str(out.get(f"{prefix}_policy_no")).strip():
+        out[f"{prefix}_policy_no"] = policy_no
+    if policy_no_encode and not _to_str(out.get(f"{prefix}_policy_no_encode")).strip():
+        out[f"{prefix}_policy_no_encode"] = policy_no_encode
+    opposite_prefix = "ci" if prefix == "bi" else "bi"
+    if relation_policy_no and not _to_str(out.get(f"{opposite_prefix}_policy_no")).strip():
+        out[f"{opposite_prefix}_policy_no"] = relation_policy_no
+    if relation_policy_no_encode and not _to_str(out.get(f"{opposite_prefix}_policy_no_encode")).strip():
+        out[f"{opposite_prefix}_policy_no_encode"] = relation_policy_no_encode
+
+
+def _renewal_enrich_candidate_period_sources(
+    selected: Mapping[str, Any],
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not selected:
+        return {}
+    out = dict(selected)
+    rows: List[Mapping[str, Any]] = []
+    for row in [selected, *candidates]:
+        if isinstance(row, Mapping) and _renewal_candidates_same_vehicle(out, row):
+            rows.append(row)
+    for row in rows:
+        risk_code = _renewal_candidate_risk_code(row)
+        if risk_code == "DAA":
+            _renewal_apply_period_candidate(out, row, "bi")
+        elif risk_code == "DZA":
+            _renewal_apply_period_candidate(out, row, "ci")
+    return out
 
 
 def _quote_loss_override_amount(quote_payload: Mapping[str, Any], defaults: Optional[Mapping[str, Any]] = None) -> Decimal:
@@ -4228,6 +4337,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 reverse=True,
             )
             selected = _pick_renewal_policy_candidate(candidates, vehicle)
+            if selected:
+                selected = _renewal_enrich_candidate_period_sources(selected, candidates)
             selected_score = _renewal_candidate_score(selected, vehicle) if selected else 0
             selected_reason = _renewal_candidate_selection_reason(selected, vehicle) if selected else ""
 
@@ -4383,8 +4494,41 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         vin = _clean_vehicle_cert_value("vin", _first_text(car.get("vinNo"), car.get("frameNo"), candidate.get("vin")))
         engine_no = _clean_vehicle_cert_value("engine_no", _first_text(car.get("engineNo"), candidate.get("engine_no")))
         plate_no = _clean_vehicle_cert_value("plate_no", _first_text(car.get("licenseNo"), candidate.get("license_no")))
-        start_date_bi = _renewal_next_start_date(main.get("endDate") or candidate.get("end_date"))
-        start_date_ci = _renewal_next_start_date(main.get("endDateCI") or candidate.get("end_date"))
+        selected_risk_code = _renewal_candidate_risk_code(candidate)
+        main_bi_end_source = _renewal_end_datetime_text(
+            _first_text(main.get("endDateBI"), main.get("endDate")),
+            _first_text(main.get("endHourBI"), main.get("endHour")),
+            _first_text(main.get("endMinuteBI"), main.get("endMinute")),
+        )
+        main_ci_end_source = _renewal_end_datetime_text(
+            main.get("endDateCI"),
+            main.get("endHourCI"),
+            main.get("endMinuteCI"),
+        )
+        bi_end_source = _first_text(
+            main_bi_end_source,
+            candidate.get("bi_end_date"),
+            candidate.get("commercial_end_date"),
+            candidate.get("end_date") if selected_risk_code == "DAA" else "",
+        )
+        ci_end_source = _first_text(
+            main_ci_end_source,
+            candidate.get("ci_end_date"),
+            candidate.get("compulsory_end_date"),
+            candidate.get("end_date") if selected_risk_code == "DZA" else "",
+        )
+        bi_start_parts = _renewal_start_parts_from_end_date(bi_end_source)
+        ci_start_parts = _renewal_start_parts_from_end_date(ci_end_source)
+        start_date_bi = _first_text(
+            _date_text(main.get("startDateBI")),
+            _date_text(main_sub.get("startDateBI")),
+            bi_start_parts.get("date"),
+        )
+        start_date_ci = _first_text(
+            _date_text(main.get("startDateCI")),
+            _date_text(main_sub.get("startDateCI")),
+            ci_start_parts.get("date"),
+        )
         start_hour_bi = _first_text(
             main.get("startHourBI"),
             main.get("starthourbi"),
@@ -4392,6 +4536,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             main_sub.get("starthourbi"),
             candidate.get("start_hour_bi"),
             candidate.get("commercial_start_hour"),
+            bi_start_parts.get("hour"),
         )
         start_minute_bi = _first_text(
             main.get("startMinuteBI"),
@@ -4400,6 +4545,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             main_sub.get("startminutebi"),
             candidate.get("start_minute_bi"),
             candidate.get("commercial_start_minute"),
+            bi_start_parts.get("minute"),
         )
         start_hour_ci = _first_text(
             main.get("startHourCI"),
@@ -4408,6 +4554,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             main_sub.get("starthourci"),
             candidate.get("start_hour_ci"),
             candidate.get("compulsory_start_hour"),
+            ci_start_parts.get("hour"),
         )
         start_minute_ci = _first_text(
             main.get("startMinuteCI"),
@@ -4416,11 +4563,28 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             main_sub.get("startminuteci"),
             candidate.get("start_minute_ci"),
             candidate.get("compulsory_start_minute"),
+            ci_start_parts.get("minute"),
         )
         account_type_name = NEW_ENERGY_USED_ACCOUNT_TYPE if selected_license_type == "52" else USED_FUEL_ACCOUNT_TYPE
+        policy_no_bi = _first_text(
+            main.get("policyNoBI"),
+            main_sub.get("policyNoBI"),
+            candidate.get("bi_policy_no"),
+            main.get("policyNo") if selected_risk_code == "DAA" else "",
+            candidate.get("relation_policy_no") if selected_risk_code == "DZA" else "",
+            candidate.get("policy_no") if selected_risk_code in {"", "DAA"} else "",
+        )
+        policy_no_ci = _first_text(
+            main.get("policyCINo"),
+            main_sub.get("policyNoCI"),
+            candidate.get("ci_policy_no"),
+            main.get("policyNo") if selected_risk_code == "DZA" else "",
+            candidate.get("relation_policy_no") if selected_risk_code == "DAA" else "",
+            candidate.get("policy_no") if selected_risk_code == "DZA" else "",
+        )
         renewal_policy_prefill = {
-            "policy_no": _first_text(main.get("policyNo"), candidate.get("policy_no")),
-            "policy_ci_no": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
+            "policy_no": policy_no_bi,
+            "policy_ci_no": policy_no_ci,
             "proposal_no_bi": _first_text(main.get("proposalNoBI"), _json_obj(data.get("renewMainSub")).get("proposalNoBI")),
             "proposal_no_ci": _first_text(main.get("proposalNoCI"), _json_obj(data.get("renewMainSub")).get("proposalNoCI")),
             "start_date_bi": start_date_bi,
@@ -4429,6 +4593,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "start_minute_bi": start_minute_bi,
             "start_hour_ci": start_hour_ci,
             "start_minute_ci": start_minute_ci,
+            "source_end_date_bi": bi_end_source,
+            "source_end_date_ci": ci_end_source,
         }
         renewal_policy_prefill = {
             key: value for key, value in renewal_policy_prefill.items() if value not in (None, "")
@@ -4498,8 +4664,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "preflight": {
                 "renewalPolicyPrefill": {
                     "request": _json_obj(prefill.get("request")),
-                    "policyNo": _first_text(main.get("policyNo"), candidate.get("policy_no")),
-                    "policyCINo": _first_text(main.get("policyCINo"), candidate.get("relation_policy_no")),
+                    "policyNo": policy_no_bi,
+                    "policyCINo": policy_no_ci,
                 }
             },
         }
@@ -4639,11 +4805,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         payload = _json_obj(quote_payload)
         normalized_data = _json_obj(payload.get("normalized_data"))
         renewal_lookup = _json_obj(normalized_data.get("renewal_lookup") or payload.get("renewal_lookup"))
+        raw_candidates = renewal_lookup.get("candidates") if isinstance(renewal_lookup.get("candidates"), list) else []
+        candidates = [dict(item) for item in raw_candidates if isinstance(item, Mapping)]
         selected = _json_obj(renewal_lookup.get("selected"))
         if not selected:
-            candidates = renewal_lookup.get("candidates") if isinstance(renewal_lookup.get("candidates"), list) else []
             selected = _pick_renewal_policy_candidate(
-                [dict(item) for item in candidates if isinstance(item, Mapping)],
+                candidates,
                 normalized_data,
             )
         if not selected:
@@ -4661,6 +4828,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 }
         if not selected:
             raise PiccRequestError("人保续保报价缺少可用续保保单，请重新发起续保查询")
+        selected = _renewal_enrich_candidate_period_sources(selected, candidates)
         prefill = self._fetch_renewal_policy_prefill(client, selected)
         renewal_data = self._renewal_prefill_vehicle_data(prefill, selected)
         # OCR / user-corrected case data stays above renewal prefill; renewal
