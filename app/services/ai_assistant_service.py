@@ -10,7 +10,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -1547,6 +1547,18 @@ def _quote_result_needs_async_image(result: Mapping[str, Any]) -> bool:
 
 _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS: set[Tuple[str, str]] = set()
 _ASYNC_QUOTE_RESULT_IMAGE_SCHEDULED_KEYS_LOCK = threading.Lock()
+_ASYNC_QUOTE_RESULT_IMAGE_REDIS_KEY_PREFIX = "dingchang:quote_result_image:claim"
+try:
+    _ASYNC_QUOTE_RESULT_IMAGE_REDIS_TTL_SECONDS = max(60, int(os.getenv("QUOTE_RESULT_IMAGE_CLAIM_TTL_SECONDS", "600") or "600"))
+except Exception:
+    _ASYNC_QUOTE_RESULT_IMAGE_REDIS_TTL_SECONDS = 600
+_ASYNC_QUOTE_RESULT_IMAGE_REDIS_RELEASE_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
 
 
 def _async_quote_result_image_schedule_key(
@@ -1561,6 +1573,81 @@ def _async_quote_result_image_schedule_key(
     if owner <= 0 or not session_text or not message_text:
         return None
     return _to_str(owner), f"{session_text}:{message_text}"
+
+
+def _async_quote_result_image_claim_redis_key(
+    *,
+    owner_user_id: Any,
+    session_id: Any,
+    assistant_message_id: Any,
+) -> Optional[str]:
+    key = _async_quote_result_image_schedule_key(
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+    )
+    if key is None:
+        return None
+    owner, item_key = key
+    return f"{_ASYNC_QUOTE_RESULT_IMAGE_REDIS_KEY_PREFIX}:{owner}:{item_key}"
+
+
+async def _async_quote_result_image_acquire_claim(
+    *,
+    owner_user_id: int,
+    session_id: str,
+    assistant_message_id: str,
+) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    claim_key = _async_quote_result_image_claim_redis_key(
+        owner_user_id=owner_user_id,
+        session_id=session_id,
+        assistant_message_id=assistant_message_id,
+    )
+    if not claim_key:
+        return True, None
+
+    claim_token = f"{os.getpid()}:{uuid.uuid4().hex}"
+    try:
+        from app.core.db import redis as app_redis  # type: ignore
+    except Exception:
+        return True, None
+    if app_redis is None:
+        return True, None
+
+    try:
+        acquired = await app_redis.set(
+            claim_key,
+            claim_token,
+            nx=True,
+            ex=_ASYNC_QUOTE_RESULT_IMAGE_REDIS_TTL_SECONDS,
+        )
+    except Exception:
+        logger.debug(
+            "async quote result image redis claim unavailable owner=%s session=%s message=%s",
+            owner_user_id,
+            session_id,
+            assistant_message_id,
+            exc_info=True,
+        )
+        return True, None
+
+    if not acquired:
+        return False, None
+    return True, (claim_key, claim_token)
+
+
+async def _async_quote_result_image_release_claim(claim: Optional[Tuple[str, str]]) -> None:
+    if not claim:
+        return
+    claim_key, claim_token = claim
+    try:
+        from app.core.db import redis as app_redis  # type: ignore
+    except Exception:
+        return
+    if app_redis is None:
+        return
+    with suppress(Exception):
+        await app_redis.eval(_ASYNC_QUOTE_RESULT_IMAGE_REDIS_RELEASE_SCRIPT, 1, claim_key, claim_token)
 
 
 def _schedule_async_quote_result_image_completion_once(
@@ -1695,7 +1782,22 @@ async def _complete_async_quote_result_image(
 ) -> None:
     started = time.perf_counter()
     cleanup_needed = False
+    claim: Optional[Tuple[str, str]] = None
     try:
+        claim_acquired, claim = await _async_quote_result_image_acquire_claim(
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            assistant_message_id=assistant_message_id,
+        )
+        if not claim_acquired:
+            logger.debug(
+                "async quote result image already claimed owner=%s session=%s message=%s task=%s",
+                owner_user_id,
+                session_id,
+                assistant_message_id,
+                quote_task_id,
+            )
+            return
         async with async_session_factory() as db:
             msg = await _db_get_message_by_public_id(
                 db,
@@ -1803,6 +1905,7 @@ async def _complete_async_quote_result_image(
                 exc_info=True,
             )
     finally:
+        await _async_quote_result_image_release_claim(claim)
         key = _async_quote_result_image_schedule_key(
             owner_user_id=owner_user_id,
             session_id=session_id,
