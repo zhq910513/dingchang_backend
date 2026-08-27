@@ -135,6 +135,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _picc_encrypt_renewal_policy_no,
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
+    _used_fuel_quote_platform_dialog,
     _vehicle_brand_prefix,
     _vehicle_candidate_score,
     _apply_vehicle_model_seed_hints,
@@ -2480,6 +2481,118 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
                 {"quoteForm": {"prpCmain.startDate": "2026-08-13"}},
             )
         self.assertEqual(caught.exception.platform_response, response)
+
+    def test_duplicate_insurance_with_end_dates_enters_retry_path(self) -> None:
+        response = {
+            "status": -1,
+            "statusText": "Fail",
+            "data": {
+                "normalizeErrorMsg": (
+                    "传统报价服务提示:商业险重复投保:保单号:2235103562025007537；"
+                    "商业起保日期:2025-09-26；商业终保日期:2026-09-26。"
+                    "交强险平台返回异常：号牌号码“赣B3700M”的保单发生重复投保，"
+                    "与其重复投保的其它公司的保单信息如下：投保确认码 02DJPC360025090128257274819634;"
+                    "保单号 2235103202025007897;起保日期 2025-09-26 00:00;"
+                    "终保日期 2026-09-26 00:00;号牌号码 赣B3700M;号牌种类 02;"
+                    "车架号 ;发动机号 18H51311423;地区 江西。"
+                ),
+            },
+        }
+        dialog = _used_fuel_quote_platform_dialog(response)
+        self.assertEqual(dialog["subtype"], "insurance_date_adjust")
+        self.assertEqual(dialog["raw_suggested_commercial_start_date"], "2026-09-27")
+        self.assertEqual(dialog["raw_suggested_compulsory_start_date"], "2026-09-26")
+        self.assertEqual(dialog["raw_suggested_compulsory_start_hour"], "0")
+        self.assertEqual(dialog["raw_suggested_compulsory_start_minute"], "0")
+
+        with self.assertRaises(PiccBusinessRequestError) as caught:
+            _adapter()._submit_used_fuel_quote(
+                _QuoteResponseClient(response),
+                {
+                    "quoteForm": {
+                        "prpCmain.startDate": "2026-08-28",
+                        "prpCmain.startDateCI": "2026-08-28",
+                    },
+                },
+            )
+        self.assertEqual(caught.exception.platform_response, response)
+
+    def test_duplicate_insurance_with_end_dates_auto_adjusts_and_retries(self) -> None:
+        duplicate_response = {
+            "status": -1,
+            "statusText": "Fail",
+            "data": {
+                "normalizeErrorMsg": (
+                    "传统报价服务提示:商业险重复投保:保单号:2235103562025007537；"
+                    "商业起保日期:2025-09-26；商业终保日期:2026-09-26。"
+                    "交强险平台返回异常：号牌号码“赣B3700M”的保单发生重复投保，"
+                    "与其重复投保的其它公司的保单信息如下：投保确认码 02DJPC360025090128257274819634;"
+                    "保单号 2235103202025007897;起保日期 2025-09-26 00:00;"
+                    "终保日期 2026-09-26 00:00;号牌号码 赣B3700M;号牌种类 02;"
+                    "车架号 ;发动机号 18H51311423;地区 江西。"
+                ),
+            },
+        }
+        success_response = {"status": 0, "data": {"proposalNo": "T-PROPOSAL-1"}}
+        adapter = _adapter()
+        submitted_bodies: list[dict] = []
+        emitted: list[dict] = []
+
+        def fake_platform_next_day(_client: object) -> str:
+            return "2026-08-28"
+
+        def fake_submit(_client: object, body: dict) -> tuple[dict, dict]:
+            submitted_bodies.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(submitted_bodies) == 1:
+                raise PiccBusinessRequestError(
+                    "重复投保",
+                    platform_response=duplicate_response,
+                    request_body=body,
+                )
+            return body, success_response
+
+        adapter._platform_next_quote_start_date = fake_platform_next_day  # type: ignore[method-assign]
+        adapter._submit_used_fuel_quote_with_vehicle_retry = fake_submit  # type: ignore[method-assign]
+
+        body, response, notices = adapter._submit_used_fuel_quote_with_period_auto_adjust(
+            SimpleNamespace(),
+            {
+                "quoteForm": {
+                    "prpCmain.startDate": "2026-08-28",
+                    "prpCmain.startDateCI": "2026-08-28",
+                    "prpCmain.endDateCI": "2027-08-27",
+                    "prpCmain.starthourci": "8",
+                    "prpCmain.startminuteci": "30",
+                    "prpCmain.endhourci": "8",
+                    "prpCmain.endminuteci": "30",
+                },
+                "vehicleForm": {
+                    "startDateBI": "2026-08-28",
+                    "startDateCI": "2026-08-28",
+                },
+                "defaultFields": {},
+                "preflight": {},
+            },
+            auto_notice_callback=lambda notice: emitted.append(dict(notice)) or True,
+        )
+
+        self.assertEqual(response, success_response)
+        self.assertEqual(len(submitted_bodies), 2)
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(len(emitted), 1)
+        self.assertIn("赣B3700M", notices[0]["message"])
+        second_form = submitted_bodies[1]["quoteForm"]
+        second_vehicle = submitted_bodies[1]["vehicleForm"]
+        self.assertEqual(second_form["prpCmain.startDate"], "2026-09-27")
+        self.assertEqual(second_vehicle["startDateBI"], "2026-09-27")
+        self.assertEqual(second_form["prpCmain.startDateCI"], "2026-09-26")
+        self.assertEqual(second_vehicle["startDateCI"], "2026-09-26")
+        self.assertEqual(second_form["prpCmain.starthourci"], "0")
+        self.assertEqual(second_form["prpCmain.startminuteci"], "0")
+        self.assertEqual(second_form["prpCmain.endDateCI"], "2027-09-25")
+        self.assertEqual(second_form["prpCmain.endhourci"], "24")
+        self.assertEqual(second_form["prpCmain.endminuteci"], "0")
+        self.assertEqual(body["quoteForm"]["prpCmain.startDate"], "2026-09-27")
 
     def test_plain_duplicate_insurance_remains_duplicate_quote(self) -> None:
         response = {

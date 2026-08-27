@@ -1530,6 +1530,34 @@ def _reinsure_notice_suggested_start_datetime(message: Any) -> Dict[str, str]:
     return {}
 
 
+def _reinsure_notice_start_datetimes_from_end_dates(message: Any) -> Dict[str, Dict[str, str]]:
+    """Derive retry start dates from duplicate-insurance end dates returned by PICC."""
+
+    text = _platform_notice_text(message)
+    compact = re.sub(r"\s+", "", text)
+    if not compact or "重复投保" not in compact or "终保" not in compact:
+        return {}
+
+    date_time_pattern = r"(\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?(?:\d{1,2}(?:[:：时点]\d{1,2})?分?)?)"
+    end_label_pattern = r"(?:终保日期|终保时间|保险终期|终保期|止期|终期)"
+    specs = (
+        ("bi", r"(?:商业险?|商业)", 180),
+        ("ci", r"(?:交强险?|交强)", 260),
+    )
+    values: Dict[str, Dict[str, str]] = {}
+    for kind, label_pattern, max_span in specs:
+        match = re.search(
+            rf"{label_pattern}.{{0,{max_span}}}?{end_label_pattern}\s*[:：]?\s*{date_time_pattern}",
+            compact,
+        )
+        if not match:
+            continue
+        parts = _renewal_start_parts_from_end_date(match.group(1))
+        if parts.get("date"):
+            values[kind] = parts
+    return values
+
+
 def _insurance_date_error_adjustment_kinds(message: Any) -> List[str]:
     text = _platform_notice_text(message)
     compact = re.sub(r"\s+", "", text)
@@ -1660,6 +1688,7 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
     # into a synthetic date-adjustment instruction.
     notice_suggested_date = _reinsure_notice_suggested_start_date(notice)
     notice_suggested_datetime = _reinsure_notice_suggested_start_datetime(notice)
+    notice_end_date_datetimes = _reinsure_notice_start_datetimes_from_end_dates(notice)
     adjustment_kinds = list(suggested_dates.keys())
     if not adjustment_kinds and notice_suggested_date:
         adjustment_kinds = _reinsure_notice_adjustment_kinds(message)
@@ -1667,6 +1696,12 @@ def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
             suggested_dates[kind] = notice_suggested_date
             if notice_suggested_datetime.get("date"):
                 suggested_datetimes[kind] = notice_suggested_datetime
+    if not adjustment_kinds and notice_end_date_datetimes:
+        adjustment_kinds = [kind for kind in ("bi", "ci") if kind in notice_end_date_datetimes]
+        for kind in adjustment_kinds:
+            parts = notice_end_date_datetimes[kind]
+            suggested_dates[kind] = _to_str(parts.get("date")).strip()
+            suggested_datetimes[kind] = parts
     if not adjustment_kinds and first_reinsure:
         adjustment_kinds = _reinsure_adjustment_kinds(first_reinsure)
     # A reinsure row without any usable suggested/effective date is historical
