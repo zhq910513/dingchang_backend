@@ -2058,6 +2058,85 @@ def _duplicate_quote_confirmation_payload(request_body: Mapping[str, Any]) -> Di
     }
 
 
+def _duplicate_quote_next_day_adjustments(request_body: Mapping[str, Any], *, next_day: Any = "") -> Dict[str, str]:
+    """Return the next-day insurance dates used for duplicate-quote retries."""
+
+    body = _clean_used_fuel_request_body(request_body)
+    form = _clean_vehicle_cert_fields(_json_obj(body.get("quoteForm")))
+    vehicle = _clean_vehicle_cert_fields(_json_obj(body.get("vehicleForm")))
+    target_day = _date_obj(_date_text(next_day)) or _date_obj(_next_day_text()) or (date.today() + timedelta(days=1))
+    if not target_day:
+        return {}
+
+    adjustments: Dict[str, str] = {}
+    for kind, current_values in (
+        ("bi", (form.get("prpCmain.startDate"), vehicle.get("startDateBI"))),
+        ("ci", (form.get("prpCmain.startDateCI"), vehicle.get("startDateCI"))),
+    ):
+        candidates = [day for day in (_date_obj(target_day), *(_date_obj(value) for value in current_values)) if day]
+        if not candidates:
+            continue
+        day = max(candidates).strftime("%Y-%m-%d")
+        if kind == "bi":
+            adjustments["commercial_start_date"] = day
+        else:
+            adjustments["compulsory_start_date"] = day
+    return adjustments
+
+
+def _duplicate_quote_request_body_with_next_day(
+    request_body: Mapping[str, Any],
+    *,
+    next_day: Any = "",
+) -> Dict[str, Any]:
+    body = _clean_used_fuel_request_body(request_body)
+    adjustments = _duplicate_quote_next_day_adjustments(body, next_day=next_day)
+    if not adjustments:
+        return body
+
+    form = _clean_vehicle_cert_fields(_json_obj(body.get("quoteForm")))
+    vehicle = _clean_vehicle_cert_fields(_json_obj(body.get("vehicleForm")))
+    changed = False
+
+    bi_day = _date_text(adjustments.get("commercial_start_date"))
+    if bi_day:
+        if _to_str(form.get("prpCmain.startDate")).strip() != bi_day:
+            form["prpCmain.startDate"] = bi_day
+            changed = True
+        if _to_str(vehicle.get("startDateBI")).strip() != bi_day:
+            vehicle["startDateBI"] = bi_day
+            changed = True
+
+    ci_day = _date_text(adjustments.get("compulsory_start_date"))
+    if ci_day:
+        if _to_str(form.get("prpCmain.startDateCI")).strip() != ci_day:
+            form["prpCmain.startDateCI"] = ci_day
+            changed = True
+        if _to_str(vehicle.get("startDateCI")).strip() != ci_day:
+            vehicle["startDateCI"] = ci_day
+            changed = True
+        ci_hour = _to_str(form.get("prpCmain.starthourci")).strip()
+        ci_minute = _to_str(form.get("prpCmain.startminuteci")).strip()
+        has_ci_time = _period_time_explicit(ci_hour, ci_minute)
+        end_day = _ci_end_date_text(ci_day, ci_hour, ci_minute) if has_ci_time else _end_date_text(ci_day)
+        if end_day and _to_str(form.get("prpCmain.endDateCI")).strip() != end_day:
+            form["prpCmain.endDateCI"] = end_day
+            changed = True
+        if has_ci_time:
+            expected_end_hour = "24" if ci_hour == "0" and ci_minute == "0" else ci_hour
+            if _safe_int_local(form.get("prpCmain.endhourci"), 24) != _safe_int_local(expected_end_hour, 24):
+                form["prpCmain.endhourci"] = expected_end_hour
+                changed = True
+            if _safe_int_local(form.get("prpCmain.endminuteci"), 0) != _safe_int_local(ci_minute, 0):
+                form["prpCmain.endminuteci"] = ci_minute
+                changed = True
+
+    if changed:
+        body["quoteForm"] = form
+        body["vehicleForm"] = vehicle
+    return _clean_used_fuel_request_body(body)
+
+
 def _duplicate_quote_auto_notice_from_confirmation_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     data = _json_obj(payload)
     duplicate = _json_obj(data.get("duplicateVin"))
@@ -5316,6 +5395,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     request_body = self._prepare_used_fuel_quote(client, ctx, quote_payload, account_type_name=real_account_type)
                 duplicate_confirm_payload = _duplicate_quote_confirmation_payload(request_body)
                 if duplicate_confirm_payload and not _duplicate_quote_confirmed(quote_payload, request_body):
+                    next_day = self._platform_next_quote_start_date(client)
+                    request_body = _duplicate_quote_request_body_with_next_day(
+                        request_body,
+                        next_day=next_day,
+                    )
                     preflight = dict(_json_obj(request_body.get("preflight")))
                     preflight["confirmDuplicateQuote"] = True
                     preflight["duplicateQuoteConfirmed"] = True

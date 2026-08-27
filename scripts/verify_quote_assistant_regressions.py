@@ -77,6 +77,7 @@ from app.services.quote_assistant_service import (
     _merge_quote_extracted_prefer,
     _backfill_quote_sales_model_fields,
     _quote_auto_notice_message_id,
+    _duplicate_quote_confirmed_snapshot,
     _quote_snapshot_with_auto_adjusted_dates,
     _quote_result_insurance_date_auto_adjustments,
     _quote_result_reply_text,
@@ -120,6 +121,8 @@ from app.services.quote_platforms.platforms.picc.business import (
     PiccBusinessRequestError,
     PiccDuplicateQuoteError,
     _contains_duplicate_quote,
+    _duplicate_quote_next_day_adjustments,
+    _duplicate_quote_request_body_with_next_day,
     _duplicate_quote_notice_from_success_dialog,
     _end_date_text,
     _format_reinsure_items_prompt,
@@ -2593,6 +2596,70 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertEqual(second_form["prpCmain.endhourci"], "24")
         self.assertEqual(second_form["prpCmain.endminuteci"], "0")
         self.assertEqual(body["quoteForm"]["prpCmain.startDate"], "2026-09-27")
+
+    def test_duplicate_quote_next_day_adjustment_updates_request_body(self) -> None:
+        request_body = {
+            "quoteForm": {
+                "prpCmain.startDate": "2026-08-27",
+                "prpCmain.startDateCI": "2026-08-27",
+                "prpCmain.starthourci": "0",
+                "prpCmain.startminuteci": "0",
+                "prpCmain.endDateCI": "2027-08-26",
+                "prpCmain.endhourci": "24",
+                "prpCmain.endminuteci": "0",
+            },
+            "vehicleForm": {
+                "startDateBI": "2026-08-27",
+                "startDateCI": "2026-08-27",
+            },
+        }
+        adjusted = _duplicate_quote_request_body_with_next_day(request_body, next_day="2026-08-28")
+        quote_form = adjusted["quoteForm"]
+        vehicle_form = adjusted["vehicleForm"]
+        self.assertEqual(quote_form["prpCmain.startDate"], "2026-08-28")
+        self.assertEqual(vehicle_form["startDateBI"], "2026-08-28")
+        self.assertEqual(quote_form["prpCmain.startDateCI"], "2026-08-28")
+        self.assertEqual(vehicle_form["startDateCI"], "2026-08-28")
+        self.assertEqual(quote_form["prpCmain.endDateCI"], "2027-08-27")
+        self.assertEqual(quote_form["prpCmain.endhourci"], "24")
+        self.assertEqual(quote_form["prpCmain.endminuteci"], "0")
+
+    def test_duplicate_quote_confirmed_snapshot_promotes_next_day(self) -> None:
+        snapshot = {
+            "request_body": {
+                "quoteForm": {
+                    "prpCmain.startDate": "2026-08-27",
+                    "prpCmain.startDateCI": "2026-08-27",
+                    "prpCmain.starthourci": "0",
+                    "prpCmain.startminuteci": "0",
+                    "prpCmain.endDateCI": "2027-08-26",
+                    "prpCmain.endhourci": "24",
+                    "prpCmain.endminuteci": "0",
+                },
+                "vehicleForm": {
+                    "startDateBI": "2026-08-27",
+                    "startDateCI": "2026-08-27",
+                },
+            },
+            "normalized_data": {
+                "commercial_start_date": "2026-08-27",
+                "compulsory_start_date": "2026-08-27",
+            },
+        }
+        confirmed = _duplicate_quote_confirmed_snapshot(snapshot, next_day="2026-08-28")
+        quote_form = confirmed["request_body"]["quoteForm"]
+        vehicle_form = confirmed["request_body"]["vehicleForm"]
+        self.assertTrue(confirmed["confirm_duplicate_quote"])
+        self.assertTrue(confirmed["duplicate_quote_confirmed"])
+        self.assertEqual(quote_form["prpCmain.startDate"], "2026-08-28")
+        self.assertEqual(vehicle_form["startDateBI"], "2026-08-28")
+        self.assertEqual(quote_form["prpCmain.startDateCI"], "2026-08-28")
+        self.assertEqual(vehicle_form["startDateCI"], "2026-08-28")
+        self.assertEqual(quote_form["prpCmain.endDateCI"], "2027-08-27")
+        self.assertEqual(quote_form["prpCmain.endhourci"], "24")
+        self.assertEqual(quote_form["prpCmain.endminuteci"], "0")
+        self.assertEqual(confirmed["normalized_data"]["commercial_start_date"], "2026-08-28")
+        self.assertEqual(confirmed["normalized_data"]["compulsory_start_date"], "2026-08-28")
 
     def test_plain_duplicate_insurance_remains_duplicate_quote(self) -> None:
         response = {

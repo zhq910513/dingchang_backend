@@ -58,7 +58,10 @@ from app.services.quote_platforms import runtime as quote_platform_runtime
 from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
 from app.services.chat_session_lock import release_chat_session_lock_for_platform_io
 from app.services.quote_platforms.browser_manager import account_profile_dir
-from app.services.quote_platforms.platforms.picc.business import picc_motor_builtin_default_values
+from app.services.quote_platforms.platforms.picc.business import (
+    picc_motor_builtin_default_values,
+    _duplicate_quote_next_day_adjustments,
+)
 from app.services.quote_platforms.platforms.picc.presentation import (
     picc_is_new_energy_vehicle,
     picc_result_amount_text,
@@ -6291,7 +6294,7 @@ def looks_like_duplicate_quote_cancel(text: Any) -> bool:
     return _is_duplicate_quote_cancel_text(text)
 
 
-def _duplicate_quote_confirmed_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def _duplicate_quote_confirmed_snapshot(snapshot: Dict[str, Any], *, next_day: Any = "") -> Dict[str, Any]:
     safe_snapshot = dict(_json_obj(snapshot))
     safe_snapshot["confirm_duplicate_quote"] = True
     safe_snapshot["duplicate_quote_confirmed"] = True
@@ -6301,6 +6304,13 @@ def _duplicate_quote_confirmed_snapshot(snapshot: Dict[str, Any]) -> Dict[str, A
     preflight["duplicateQuoteConfirmed"] = True
     request_body["preflight"] = preflight
     safe_snapshot["request_body"] = request_body
+    adjustments = _duplicate_quote_next_day_adjustments(request_body, next_day=next_day)
+    if adjustments:
+        safe_snapshot = _quote_snapshot_with_auto_adjusted_dates(
+            safe_snapshot,
+            adjustments,
+            adjusted_request_body=request_body,
+        )
     return _snapshot_with_quote_fingerprint(safe_snapshot)
 
 
