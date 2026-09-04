@@ -73,6 +73,7 @@ from app.services.quote_assistant_service import (
     _quote_car_name_from_features,
     _quote_end_date_text,
     _quote_image_extracted_fields_from_features,
+    _quote_material_form_overrides_from_values,
     _quote_sales_model_hint_from_model_text,
     _merge_quote_extracted_prefer,
     _backfill_quote_sales_model_fields,
@@ -1412,6 +1413,17 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(filled.get("car_name"), "CT200h")
         self.assertEqual(filled.get("vehicle_brand_name"), "雷克萨斯")
+
+    def test_manual_vehicle_model_override_backfills_sales_model(self) -> None:
+        overrides = _quote_material_form_overrides_from_values(
+            {
+                "vehicle_model": "雷克萨斯LEXUS CT200h轿车",
+                "car_name": "",
+                "vin": "JTHKR5BH3J2327186",
+            }
+        )
+        self.assertEqual(overrides.get("vehicle_model"), "雷克萨斯LEXUS CT200h轿车")
+        self.assertEqual(overrides.get("car_name"), "CT200h")
 
     def test_slot_merge_prefers_better_vin_and_model_over_later_weak_ocr(self) -> None:
         merged = _merge_quote_extracted_prefer(

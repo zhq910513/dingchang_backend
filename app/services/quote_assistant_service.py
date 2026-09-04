@@ -10201,6 +10201,7 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
         if key != "account_type_name" and _to_str(value).strip()
     }
     overrides = _clean_quote_dynamic_data(raw, derive_owner_name=False) if raw else {}
+    overrides = _backfill_quote_sales_model_fields(overrides)
     license_type = _normalize_license_type_value(raw.get("license_type"))
     if license_type:
         overrides["license_type"] = license_type
