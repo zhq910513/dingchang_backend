@@ -9603,6 +9603,7 @@ QUOTE_ENTITY_FIELD_KEYS = tuple(
             "transfer_date",
             "transfer_vehicle_override",
             QUOTE_DATA_OVERRIDES_KEY,
+            "quote_field_overrides",
             QUOTE_PRODUCT_EXCLUSIONS_KEY,
             QUOTE_FLOW_TYPE_KEY,
             "quote_command_mode",
@@ -10233,6 +10234,29 @@ def _quote_material_form_values_from_context(ctx: Mapping[str, Any]) -> Dict[str
     }
 
 
+def _quote_material_form_selected_extra_field_keys_from_context(ctx: Mapping[str, Any]) -> Tuple[List[str], bool]:
+    if not isinstance(ctx, Mapping) or not ctx.get("quote_material_form_submit"):
+        return [], False
+    has_key = "quote_material_form_selected_extra_field_keys" in ctx
+    raw = ctx.get("quote_material_form_selected_extra_field_keys")
+    if not has_key and "quoteMaterialFormSelectedExtraFieldKeys" in ctx:
+        has_key = True
+        raw = ctx.get("quoteMaterialFormSelectedExtraFieldKeys")
+    if not has_key:
+        return [], False
+    items = raw if isinstance(raw, list) else re.split(r"[,，、;；\s]+", _to_str(raw))
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        canonical = _canonical_quote_config_override_label(item)
+        key = canonical if canonical in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS else _to_str(item).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out, True
+
+
 def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dict[str, Any]:
     raw = {
         key: value
@@ -10248,16 +10272,47 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
     return overrides
 
 
-def _quote_material_form_config_overrides_from_values(values: Mapping[str, Any]) -> Dict[str, Any]:
+def _quote_material_form_config_overrides_from_values(
+    values: Mapping[str, Any],
+    *,
+    selected_extra_field_keys: Optional[Iterable[Any]] = None,
+) -> Dict[str, Any]:
+    selected: Optional[Set[str]] = None
+    if selected_extra_field_keys is not None:
+        selected = {
+            canonical
+            for canonical in (
+                _canonical_quote_config_override_label(item)
+                for item in selected_extra_field_keys
+            )
+            if canonical in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS
+        }
     raw: Dict[str, Any] = {}
     for key, value in _json_obj(values).items():
         canonical = _canonical_quote_config_override_label(key)
         if canonical not in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS:
             continue
+        if selected is not None and canonical not in selected:
+            continue
         if not _to_str(value).strip():
             continue
         raw[canonical] = value
     return _merge_quote_config_overrides(raw) if raw else {}
+
+
+def _quote_material_form_rebased_config_overrides(
+    base_overrides: Any,
+    values: Mapping[str, Any],
+    selected_extra_field_keys: Iterable[Any],
+) -> Dict[str, Any]:
+    merged = _merge_quote_config_overrides(base_overrides, validate_positive=False)
+    for key in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS:
+        merged.pop(key, None)
+    selected_values = _quote_material_form_config_overrides_from_values(
+        values,
+        selected_extra_field_keys=selected_extra_field_keys,
+    )
+    return _merge_quote_config_overrides(merged, selected_values)
 
 
 async def _quote_case_by_id_for_form(
@@ -17184,6 +17239,9 @@ async def handle_quote_text_material_message(
         for_update=True,
     )
     form_values = _quote_material_form_values_from_context(ctx or {})
+    form_selected_extra_field_keys, has_form_selected_extra_keys = (
+        _quote_material_form_selected_extra_field_keys_from_context(ctx or {})
+    )
     form_session_id = _to_str((ctx or {}).get("quote_material_form_session_id")).strip()
     form_case_id = _safe_int((ctx or {}).get("quote_material_form_case_id"), 0)
     if form_values and form_session_id and session_id and form_session_id != session_id:
@@ -17226,7 +17284,12 @@ async def handle_quote_text_material_message(
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
     form_overrides = _quote_material_form_overrides_from_values(form_values)
-    form_config_overrides = _quote_material_form_config_overrides_from_values(form_values)
+    form_config_overrides = _quote_material_form_config_overrides_from_values(
+        form_values,
+        selected_extra_field_keys=form_selected_extra_field_keys
+        if has_form_selected_extra_keys
+        else None,
+    )
     if form_values.get("account_type_name"):
         merged_entities["account_type_name"] = form_values.get("account_type_name")
     if form_overrides:
@@ -18293,11 +18356,21 @@ async def handle_quote_message(
     if quote_flow_type != QUOTE_FLOW_NORMAL or QUOTE_FLOW_TYPE_KEY in merged_entities:
         merged_entities[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
         text_data[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
-    merged_quote_field_overrides = _merge_quote_config_overrides(
-        old_draft.get("quote_field_overrides"),
-        merged_entities.get("quote_field_overrides"),
-    )
-    if merged_quote_field_overrides:
+    if has_form_selected_extra_keys:
+        # The form owns only these two optional config fields. Rebase those
+        # fields from the submitted selection while preserving other manual
+        # quote overrides such as loss, third-party, driver, and passenger.
+        merged_quote_field_overrides = _quote_material_form_rebased_config_overrides(
+            base_data.get("quote_field_overrides"),
+            form_values,
+            form_selected_extra_field_keys,
+        )
+    else:
+        merged_quote_field_overrides = _merge_quote_config_overrides(
+            old_draft.get("quote_field_overrides"),
+            merged_entities.get("quote_field_overrides"),
+        )
+    if merged_quote_field_overrides or has_form_selected_extra_keys:
         text_data["quote_field_overrides"] = merged_quote_field_overrides
     merged_quote_data_overrides = _merge_quote_data_overrides(
         old_draft.get(QUOTE_DATA_OVERRIDES_KEY),

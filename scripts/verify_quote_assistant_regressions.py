@@ -76,7 +76,10 @@ from app.services.quote_assistant_service import (
     _quote_material_form_command_mode,
     _quote_material_form_payload,
     _quote_material_form_config_overrides_from_values,
+    _quote_material_form_rebased_config_overrides,
+    _quote_material_form_selected_extra_field_keys_from_context,
     _quote_material_form_overrides_from_values,
+    QUOTE_ENTITY_FIELD_KEYS,
     _quote_sales_model_hint_from_model_text,
     _merge_quote_extracted_prefer,
     _backfill_quote_sales_model_fields,
@@ -1468,6 +1471,51 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(overrides.get("机动车增值服务特约条款（道路救援服务）"), "7")
         self.assertEqual(overrides.get("附加外部电网故障损失险"), "32.43")
+
+    def test_quote_material_form_rebased_config_overrides_removes_unselected_fields(self) -> None:
+        rebased = _quote_material_form_rebased_config_overrides(
+            {
+                "机动车损失保险": "93600",
+                "机动车增值服务特约条款（道路救援服务）": "7",
+                "附加外部电网故障损失险": "32.43",
+            },
+            {"附加外部电网故障损失险": "13.52"},
+            ["附加外部电网故障损失险"],
+        )
+        self.assertEqual(rebased.get("机动车损失保险"), "93600")
+        self.assertNotIn("机动车增值服务特约条款（道路救援服务）", rebased)
+        self.assertEqual(rebased.get("附加外部电网故障损失险"), "13.52")
+
+    def test_quote_material_form_rebased_config_overrides_empty_selection_clears_form_fields(self) -> None:
+        rebased = _quote_material_form_rebased_config_overrides(
+            {
+                "机动车损失保险": "93600",
+                "机动车增值服务特约条款（道路救援服务）": "7",
+                "附加外部电网故障损失险": "32.43",
+            },
+            {},
+            [],
+        )
+        self.assertEqual(rebased, {"机动车损失保险": "93600"})
+
+    def test_quote_material_form_context_distinguishes_empty_selection_from_missing_selection(self) -> None:
+        selected, has_selected = _quote_material_form_selected_extra_field_keys_from_context(
+            {
+                "quote_material_form_submit": True,
+                "quote_material_form_selected_extra_field_keys": [],
+            }
+        )
+        self.assertEqual(selected, [])
+        self.assertTrue(has_selected)
+
+        selected, has_selected = _quote_material_form_selected_extra_field_keys_from_context(
+            {"quote_material_form_submit": True}
+        )
+        self.assertEqual(selected, [])
+        self.assertFalse(has_selected)
+
+    def test_quote_entity_fields_keep_quote_config_overrides(self) -> None:
+        self.assertIn("quote_field_overrides", QUOTE_ENTITY_FIELD_KEYS)
 
     def test_quote_material_form_command_mode_accepts_edit_material_alias(self) -> None:
         self.assertEqual(_quote_material_form_command_mode("改资料"), "supplement")
