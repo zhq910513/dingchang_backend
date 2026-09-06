@@ -73,6 +73,9 @@ from app.services.quote_assistant_service import (
     _quote_car_name_from_features,
     _quote_end_date_text,
     _quote_image_extracted_fields_from_features,
+    _quote_material_form_command_mode,
+    _quote_material_form_payload,
+    _quote_material_form_config_overrides_from_values,
     _quote_material_form_overrides_from_values,
     _quote_sales_model_hint_from_model_text,
     _merge_quote_extracted_prefer,
@@ -1424,6 +1427,51 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(overrides.get("vehicle_model"), "雷克萨斯LEXUS CT200h轿车")
         self.assertEqual(overrides.get("car_name"), "CT200h")
+
+    def test_quote_material_form_payload_exposes_optional_fields(self) -> None:
+        payload = _quote_material_form_payload(
+            mode="supplement",
+            normalized_data={
+                "account_type_name": "油车-旧",
+                "owner_name": "李四",
+                "license_type": "52",
+                "car_name": "CT200h",
+                "commercial_start_date": "2026-09-05",
+                "quote_field_overrides": {
+                    "机动车增值服务特约条款（道路救援服务）": "7",
+                    "附加外部电网故障损失险": "32.43",
+                },
+            },
+            missing=[],
+            platform_code="PICC",
+            platform_name="人保",
+            account_type_name="油车-旧",
+        )
+        optional_keys = [str(item.get("key") or "").strip() for item in payload.get("optional_fields") or []]
+        self.assertIn("license_type", optional_keys)
+        self.assertIn("car_name", optional_keys)
+        self.assertIn("commercial_start_date", optional_keys)
+        self.assertIn("机动车增值服务特约条款（道路救援服务）", optional_keys)
+        self.assertIn("附加外部电网故障损失险", optional_keys)
+        self.assertIn("license_type", payload.get("selected_extra_field_keys") or [])
+        self.assertIn("car_name", payload.get("selected_extra_field_keys") or [])
+        self.assertIn("机动车增值服务特约条款（道路救援服务）", payload.get("selected_extra_field_keys") or [])
+        self.assertIn("附加外部电网故障损失险", payload.get("selected_extra_field_keys") or [])
+
+    def test_quote_material_form_config_overrides_from_values(self) -> None:
+        overrides = _quote_material_form_config_overrides_from_values(
+            {
+                "机动车增值服务特约条款（道路救援服务）": "7",
+                "附加外部电网故障损失险": "32.43",
+                "car_name": "CT200h",
+            }
+        )
+        self.assertEqual(overrides.get("机动车增值服务特约条款（道路救援服务）"), "7")
+        self.assertEqual(overrides.get("附加外部电网故障损失险"), "32.43")
+
+    def test_quote_material_form_command_mode_accepts_edit_material_alias(self) -> None:
+        self.assertEqual(_quote_material_form_command_mode("改资料"), "supplement")
+        self.assertEqual(_quote_material_form_command_mode("修改资料"), "supplement")
 
     def test_slot_merge_prefers_better_vin_and_model_over_later_weak_ocr(self) -> None:
         merged = _merge_quote_extracted_prefer(

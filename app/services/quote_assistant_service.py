@@ -1123,6 +1123,13 @@ QUOTE_MANUAL_MATERIAL_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
     ("car_name", "销售车型", "text"),
 )
 
+QUOTE_MANUAL_EXTRA_CONFIG_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
+    ("机动车增值服务特约条款（道路救援服务）", "道路救援次数", "text"),
+    ("附加外部电网故障损失险", "外部电网故障损失险", "text"),
+)
+
+QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS = {key for key, _, _ in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_ORDER}
+
 QUOTE_MATERIAL_FORM_REQUIRED_BY_TYPE: Dict[str, Tuple[str, ...]] = {
     type_name: tuple(key for key, _ in fields)
     for type_name, fields in CORE_REQUIRED_FIELDS_BY_ACCOUNT_TYPE.items()
@@ -10021,6 +10028,8 @@ def _quote_material_form_command_mode(text: Any) -> str:
         "补全材料",
         "缺什么",
         "缺少什么",
+        "改资料",
+        "修改资料",
     }
     if compact in manual_commands:
         return "manual"
@@ -10046,6 +10055,9 @@ def _quote_material_form_value(data: Mapping[str, Any], key: str, *, account_typ
     if key == "account_type_name":
         return _normalize_account_type_name(account_type_name or _json_obj(data).get(key)) or ""
     value = _to_str(_json_obj(data).get(key)).strip()
+    if not value and _to_str(key).strip() in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS:
+        quote_field_overrides = _json_obj(_json_obj(data).get("quote_field_overrides"))
+        value = _to_str(quote_field_overrides.get(_canonical_quote_config_override_label(key) or key)).strip()
     if key.endswith("_date"):
         return _normalize_quote_date_text(value) or value
     return value
@@ -10080,6 +10092,10 @@ def _quote_material_form_field(
             {"label": "52-小型新能源汽车", "value": LICENSE_TYPE_NEW_ENERGY},
         ]
         field["placeholder"] = "请选择号牌种类"
+    elif key == QUOTE_ROAD_RESCUE_LABEL:
+        field["placeholder"] = "请输入道路救援次数"
+    elif key == QUOTE_EXTERNAL_GRID_LABEL:
+        field["placeholder"] = "请输入外部电网故障损失险金额"
     elif field_type == "date":
         field["placeholder"] = "请选择或输入日期"
     else:
@@ -10154,6 +10170,27 @@ def _quote_material_form_payload(
             )
         )
 
+    field_key_set = set(field_keys)
+    optional_fields: List[Dict[str, Any]] = []
+    selected_extra_field_keys: List[str] = []
+    for key, label, field_type in (
+        *QUOTE_MANUAL_MATERIAL_FIELD_ORDER,
+        *QUOTE_MANUAL_EXTRA_CONFIG_FIELD_ORDER,
+    ):
+        if key in field_key_set:
+            continue
+        field = _quote_material_form_field(
+            key,
+            label,
+            field_type,
+            data=data,
+            account_type_name=selected_type,
+            required=False,
+        )
+        optional_fields.append(field)
+        if _to_str(field.get("value")).strip():
+            selected_extra_field_keys.append(key)
+
     missing_texts = [_missing_item_text(item) for item in missing or []]
     title = "手工填写报价资料" if mode == "manual" else "补充报价资料"
     if mode == "supplement" and missing_texts:
@@ -10172,6 +10209,8 @@ def _quote_material_form_payload(
         "session_id": _to_str(session_id).strip(),
         "quote_case_id": _safe_int(quote_case_id, 0) or None,
         "fields": fields,
+        "optional_fields": optional_fields,
+        "selected_extra_field_keys": selected_extra_field_keys,
         "missing": missing or [],
         "missing_texts": missing_texts,
         "submit_prefix": "手工资料" if mode == "manual" else "补充资料",
@@ -10186,7 +10225,7 @@ def _quote_material_form_values_from_context(ctx: Mapping[str, Any]) -> Dict[str
         values = _json_obj(ctx.get("quoteMaterialFormValues"))
     if not values:
         return {}
-    allowed = {key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER}
+    allowed = {key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER} | QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS
     return {
         key: value
         for key, value in values.items()
@@ -10207,6 +10246,18 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
         overrides["license_type"] = license_type
         overrides["license_type_override"] = license_type
     return overrides
+
+
+def _quote_material_form_config_overrides_from_values(values: Mapping[str, Any]) -> Dict[str, Any]:
+    raw: Dict[str, Any] = {}
+    for key, value in _json_obj(values).items():
+        canonical = _canonical_quote_config_override_label(key)
+        if canonical not in QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS:
+            continue
+        if not _to_str(value).strip():
+            continue
+        raw[canonical] = value
+    return _merge_quote_config_overrides(raw) if raw else {}
 
 
 async def _quote_case_by_id_for_form(
@@ -17137,7 +17188,7 @@ async def handle_quote_text_material_message(
     form_case_id = _safe_int((ctx or {}).get("quote_material_form_case_id"), 0)
     if form_values and form_session_id and session_id and form_session_id != session_id:
         return (
-            "这份资料表单属于另一个会话，我没有写入当前会话。请在当前会话重新输入“手工”或“补资料”后再提交。",
+            "这份资料表单属于另一个会话，我没有写入当前会话。请在当前会话重新输入“手工”、“补资料”或“改资料”后再提交。",
             {
                 "status": "success",
                 "intent": "quote_material_form",
@@ -17175,12 +17226,18 @@ async def handle_quote_text_material_message(
     signal = detect_quote_signal(text)
     merged_entities = {**(entities or {}), **_json_obj(signal.get("entities"))}
     form_overrides = _quote_material_form_overrides_from_values(form_values)
+    form_config_overrides = _quote_material_form_config_overrides_from_values(form_values)
     if form_values.get("account_type_name"):
         merged_entities["account_type_name"] = form_values.get("account_type_name")
     if form_overrides:
         merged_entities[QUOTE_DATA_OVERRIDES_KEY] = _merge_quote_data_overrides(
             merged_entities.get(QUOTE_DATA_OVERRIDES_KEY),
             form_overrides,
+        )
+    if form_config_overrides:
+        merged_entities["quote_field_overrides"] = _merge_quote_config_overrides(
+            merged_entities.get("quote_field_overrides"),
+            form_config_overrides,
         )
     text_data = _quote_text_data_from_entities(extracted, merged_entities)
     type_data = vehicle_type_text_data or _quote_vehicle_type_text_data(text, text_data)
@@ -17242,7 +17299,7 @@ async def handle_quote_text_material_message(
         )
         if case is None:
             return (
-                "这份资料表单对应的会话材料已变化或不可用，我没有写入当前会话。请重新输入“手工”或“补资料”打开最新表单。",
+                "这份资料表单对应的会话材料已变化或不可用，我没有写入当前会话。请重新输入“手工”、“补资料”或“改资料”打开最新表单。",
                 {
                     "status": "success",
                     "intent": "quote_material_form",
