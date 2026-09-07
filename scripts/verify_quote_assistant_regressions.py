@@ -144,6 +144,8 @@ from app.services.quote_platforms.platforms.picc.business import (
     _reinsure_notice_adjustment_kinds,
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
+    _picc_quote_response_payload,
+    _quote_response_has_display_result,
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
     _used_fuel_quote_platform_dialog,
@@ -564,6 +566,51 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual(result["result_card"]["compulsory_premium"], "665.00")
         self.assertEqual(result["result_card"]["joint_sales_premium"], "368.00")
         self.assertIn("医保外用药", result["platform_warning"])
+
+    def test_picc_result_builder_unwraps_persisted_platform_response_snapshot(self) -> None:
+        live_response = {
+            "status": 0,
+            "statusText": "Success",
+            "data": {
+                "quotationNo": "FDAA20263604X000659985",
+                "ciPremium": 665,
+                "itemKindTempList": [
+                    {"kindCode": "051050", "kindName": "机动车损失保险", "premium": 741.79},
+                    {"kindCode": "051051", "kindName": "机动车第三者责任保险", "premium": 566.29},
+                ],
+            },
+        }
+        persisted = {
+            "status": 0,
+            "statusText": "Success",
+            "message": "当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+            "response": {
+                "status": 0,
+                "statusText": "Success",
+                "data": {
+                    **live_response["data"],
+                    "itemKindTempList": live_response["data"]["itemKindTempList"],
+                },
+            },
+        }
+        self.assertEqual(
+            _picc_quote_response_payload(persisted)["data"]["quotationNo"],
+            "FDAA20263604X000659985",
+        )
+        self.assertTrue(_quote_response_has_display_result(persisted))
+
+    def test_picc_display_result_does_not_require_picc_score(self) -> None:
+        response = {
+            "status": 0,
+            "data": {
+                "quotationNo": "FDAA20263604X000659985",
+                "ciPremium": 665,
+                "itemKindTempList": [
+                    {"kindCode": "051050", "premium": 741.79},
+                ],
+            },
+        }
+        self.assertTrue(_quote_response_has_display_result(response))
 
     def test_picc_result_builder_uses_successful_request_quantity_when_platform_row_is_zero(self) -> None:
         result = _adapter()._build_motor_quote_result_from_response(

@@ -1084,15 +1084,12 @@ def _picc_quote_response_payload(data: Any) -> Dict[str, Any]:
     """Unwrap a PICC response retained inside safe diagnostics.
 
     The live quote endpoint returns ``{"status": 0, "data": {...}}``. Some
-    retry/error persistence paths additionally wrap that response as
-    ``{"status": 0, "message": "...", "response": <live response>}``.
-    Only unwrap the latter when the nested payload demonstrably contains
-    quote-result fields; ordinary platform responses remain unchanged.
+    retry/error persistence paths additionally wrap that response in
+    ``response`` or ``platform_response`` diagnostic fields. Keep the
+    unwrapping bounded and evidence-based so ordinary platform responses
+    remain unchanged.
     """
     payload = _json_obj(data)
-    nested = _json_obj(payload.get("response"))
-    if not nested:
-        return payload
 
     def has_quote_data(candidate: Mapping[str, Any]) -> bool:
         body = _json_obj(candidate.get("data"))
@@ -1115,7 +1112,25 @@ def _picc_quote_response_payload(data: Any) -> Dict[str, Any]:
             )
         )
 
-    if has_quote_data(nested) and not has_quote_data(payload):
+    def find_quote_payload(candidate: Mapping[str, Any], *, depth: int = 0) -> Dict[str, Any]:
+        if has_quote_data(candidate):
+            return dict(candidate)
+        if depth >= 5:
+            return {}
+        # These are the only envelope keys used by PICC runtime responses and
+        # our persisted diagnostics. Do not recursively inspect arbitrary
+        # business fields or turn an unrelated nested object into a quote.
+        for key in ("response", "platform_response", "quote_response", "data", "result", "payload"):
+            child = candidate.get(key)
+            if not isinstance(child, Mapping):
+                continue
+            found = find_quote_payload(child, depth=depth + 1)
+            if found:
+                return found
+        return {}
+
+    nested = find_quote_payload(payload)
+    if nested:
         return nested
     return payload
 
@@ -1123,7 +1138,7 @@ def _picc_quote_response_payload(data: Any) -> Dict[str, Any]:
 def _quote_response_has_display_result(data: Any) -> bool:
     response_payload = _picc_quote_response_payload(data)
     payload = _json_obj(response_payload.get("data"))
-    if not payload or not _has_text(payload.get("piccScore")):
+    if not payload:
         return False
     premium_keys = (
         "sumPremium",
@@ -1674,7 +1689,7 @@ def _implicit_renewal_quote_adjustment_from_response(
     hint = _implicit_renewal_quote_hint(message)
     if not hint:
         return {}
-    payload = _json_obj(_json_obj(platform_response).get("data"))
+    payload = _json_obj(_picc_quote_response_payload(platform_response).get("data"))
     commercial_parts = _platform_datetime_parts(payload.get("lastExpireDateBI"))
     compulsory_parts = _platform_datetime_parts(payload.get("lastExpireDateCI"))
     commercial_start = _to_str(commercial_parts.get("date")).strip()
