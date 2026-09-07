@@ -503,6 +503,68 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         self.assertEqual(rows[0]["name"], "新能源汽车损失保险")
         self.assertEqual(rows[1]["amount_text"], "7次")
 
+    def test_picc_result_builder_unwraps_prompt_wrapper_with_real_quote(self) -> None:
+        result = _adapter()._build_motor_quote_result_from_response(
+            ctx=None,
+            quote_payload={},
+            request_body={
+                "accountTypeName": "油车-旧",
+                "vehicleForm": {"seatCount": "5"},
+                "ownerForm": {"ownerName": "苏慧骞"},
+                "quoteForm": {
+                    "prpCmain.startDate": "2026-10-19",
+                    "prpCmain.startDateCI": "2026-09-08",
+                },
+                "preflight": {},
+                "jointSaleForm": {
+                    "tujiaAnshun": {
+                        "enabled": True,
+                        "success": True,
+                        "premium": "368",
+                        "amount": "6322600",
+                        "selected_plan": {
+                            "planPremium": "368",
+                            "planAmount": "6322600",
+                        },
+                    }
+                },
+            },
+            quote_response={
+                "status": 0,
+                "message": "当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+                "response": {
+                    "status": 0,
+                    "statusText": "Success",
+                    "data": {
+                        "ciPremium": 665,
+                        "prePayTax": 0,
+                        "delayPayTax": 0,
+                        "quotationNo": "FDAA20263604X000652365",
+                        "errorMessage": "4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+                        "itemKindTempList": [
+                            {"kindCode": "051050", "kindName": "机动车损失保险", "amount": 64507.2, "premium": 741.79},
+                            {"kindCode": "051051", "kindName": "机动车第三者责任保险", "amount": 3000000, "premium": 566.29},
+                            {"kindCode": "051052", "kindName": "机动车车上人员责任保险（司机）", "amount": 20000, "premium": 27.16},
+                            {"kindCode": "051053", "kindName": "机动车车上人员责任保险（乘客）", "amount": 80000, "premium": 68.91},
+                            {
+                                "kindCode": "051063",
+                                "kindName": "附加医保外医疗费用责任险（机动车第三者责任保险）",
+                                "amount": 3000000,
+                                "premium": 43.21,
+                            },
+                            {"kindCode": "051074", "kindName": "交强险", "amount": 200000, "premium": 665},
+                        ],
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(result["quotation_no"], "FDAA20263604X000652365")
+        self.assertEqual(result["result_card"]["commercial_premium"], "1447.36")
+        self.assertEqual(result["result_card"]["compulsory_premium"], "665.00")
+        self.assertEqual(result["result_card"]["joint_sales_premium"], "368.00")
+        self.assertIn("医保外用药", result["platform_warning"])
+
     def test_picc_result_builder_uses_successful_request_quantity_when_platform_row_is_zero(self) -> None:
         result = _adapter()._build_motor_quote_result_from_response(
             ctx=None,

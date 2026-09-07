@@ -1080,8 +1080,49 @@ def _platform_status_code(data: Any) -> int:
         return 0
 
 
+def _picc_quote_response_payload(data: Any) -> Dict[str, Any]:
+    """Unwrap a PICC response retained inside safe diagnostics.
+
+    The live quote endpoint returns ``{"status": 0, "data": {...}}``. Some
+    retry/error persistence paths additionally wrap that response as
+    ``{"status": 0, "message": "...", "response": <live response>}``.
+    Only unwrap the latter when the nested payload demonstrably contains
+    quote-result fields; ordinary platform responses remain unchanged.
+    """
+    payload = _json_obj(data)
+    nested = _json_obj(payload.get("response"))
+    if not nested:
+        return payload
+
+    def has_quote_data(candidate: Mapping[str, Any]) -> bool:
+        body = _json_obj(candidate.get("data"))
+        if not body:
+            return False
+        if isinstance(body.get("itemKindTempList"), list):
+            return True
+        return any(
+            key in body
+            for key in (
+                "quotationNo",
+                "quotationId",
+                "biPremium",
+                "ciPremium",
+                "sumPremium",
+                "totalPremium",
+                "premiumTotal",
+                "carDamagePremium",
+                "thirdPartyPremium",
+            )
+        )
+
+    if has_quote_data(nested) and not has_quote_data(payload):
+        return nested
+    return payload
+
+
 def _quote_response_has_display_result(data: Any) -> bool:
-    payload = _json_obj(_json_obj(data).get("data"))
+    response_payload = _picc_quote_response_payload(data)
+    payload = _json_obj(response_payload.get("data"))
     if not payload or not _has_text(payload.get("piccScore")):
         return False
     premium_keys = (
@@ -1097,7 +1138,7 @@ def _quote_response_has_display_result(data: Any) -> bool:
     )
     if any(_has_text(payload.get(key)) for key in premium_keys):
         return True
-    item_rows = _json_obj(data).get("itemKindTempList")
+    item_rows = response_payload.get("itemKindTempList")
     if not isinstance(item_rows, list):
         item_rows = payload.get("itemKindTempList")
     if not isinstance(item_rows, list):
@@ -1659,7 +1700,7 @@ def _implicit_renewal_quote_adjustment_from_response(
 
 
 def _used_fuel_quote_platform_dialog(data: Any) -> Dict[str, Any]:
-    payload = _json_obj(_json_obj(data).get("data"))
+    payload = _json_obj(_picc_quote_response_payload(data).get("data"))
     if not payload:
         return {}
     notice = _platform_notice_text(
@@ -5637,7 +5678,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         client: PiccProtocolClient,
         quote_response: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        data = _json_obj(_json_obj(quote_response).get("data"))
+        data = _json_obj(_picc_quote_response_payload(quote_response).get("data"))
         quotation_id = _to_str(data.get("quotationId")).strip()
         if not quotation_id:
             return {"attempted": False, "success": False, "reason": "平台未返回报价流水号，跳过报价缓存清理"}
@@ -5706,7 +5747,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body: Mapping[str, Any],
         quote_response: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        data = _json_obj(_json_obj(quote_response).get("data"))
+        data = _json_obj(_picc_quote_response_payload(quote_response).get("data"))
         form = _json_obj(_json_obj(request_body).get("quoteForm"))
         vin_no = _clean_vehicle_cert_value("vin", _first_text(data.get("vinNo"), data.get("frameNo"), form.get("prpCitemCar.vinNo")))
         quotation_id = _first_text(data.get("quotationId"), form.get("quotationId"))
@@ -5741,7 +5782,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body: Mapping[str, Any],
         quote_response: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        data = _json_obj(_json_obj(quote_response).get("data"))
+        data = _json_obj(_picc_quote_response_payload(quote_response).get("data"))
         body = _json_obj(request_body)
         form = _json_obj(body.get("quoteForm"))
         vehicle = _json_obj(body.get("vehicleForm"))
@@ -7783,6 +7824,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         request_body: Mapping[str, Any],
         quote_response: Mapping[str, Any],
     ) -> Dict[str, Any]:
+        quote_response = _picc_quote_response_payload(quote_response)
         account_type_name = _normalize_account_type(
             request_body.get("accountTypeName")
             or ctx.account_type_name
