@@ -145,6 +145,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _reinsure_notice_suggested_start_date,
     _picc_encrypt_renewal_policy_no,
     _picc_quote_response_payload,
+    _picc_quote_response_has_real_premium_evidence,
     _quote_response_has_display_result,
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
@@ -611,6 +612,27 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
             },
         }
         self.assertTrue(_quote_response_has_display_result(response))
+
+    def test_picc_raw_quote_evidence_requires_quote_and_core_premiums(self) -> None:
+        response = {
+            "status": 0,
+            "message": "当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+            "response": {
+                "status": 0,
+                "statusText": "Success",
+                "data": {
+                    "quotationNo": "FDAA20263604X000659985",
+                    "ciPremium": 665,
+                    "itemKindTempList": [
+                        {"kindCode": "051050", "premium": 741.79},
+                        {"kindCode": "051074", "premium": 665},
+                    ],
+                },
+            },
+        }
+        self.assertTrue(_picc_quote_response_has_real_premium_evidence(response))
+        response["response"]["data"]["itemKindTempList"][0]["premium"] = 0
+        self.assertFalse(_picc_quote_response_has_real_premium_evidence(response))
 
     def test_picc_result_builder_uses_successful_request_quantity_when_platform_row_is_zero(self) -> None:
         result = _adapter()._build_motor_quote_result_from_response(

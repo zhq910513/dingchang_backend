@@ -1161,6 +1161,35 @@ def _quote_response_has_display_result(data: Any) -> bool:
     return any(_has_text(_json_obj(row).get("premium")) for row in item_rows)
 
 
+def _picc_quote_response_has_real_premium_evidence(data: Any) -> bool:
+    """Require raw PICC proof before tolerating a result-shape mismatch."""
+    response_payload = _picc_quote_response_payload(data)
+    body = _json_obj(response_payload.get("data"))
+    if not body:
+        return False
+    quotation_present = any(
+        _has_text(body.get(key))
+        for key in ("quotationNo", "quotationId", "proposalNoBI", "proposalNoCI")
+    )
+    if not quotation_present:
+        return False
+
+    item_rows = body.get("itemKindTempList")
+    if not isinstance(item_rows, list):
+        item_rows = []
+    core_premium = any(
+        _to_str(_json_obj(row).get("kindCode")).strip() in PICC_CORE_MOTOR_KIND_CODES
+        and _money(_json_obj(row).get("premium")) > 0
+        for row in item_rows
+    )
+    compulsory_premium = _money(body.get("ciPremium")) > 0 or any(
+        _to_str(_json_obj(row).get("kindCode")).strip() == "051074"
+        and _money(_json_obj(row).get("premium")) > 0
+        for row in item_rows
+    )
+    return core_premium and compulsory_premium
+
+
 def _platform_message(data: Any, default: str = "平台返回业务校验失败") -> str:
     payload = _json_obj(data)
 
@@ -5476,25 +5505,38 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 runtime_stage = "build_quote_result"
                 quote_result = self._build_motor_quote_result_from_response(ctx, quote_payload, request_body, quote_response)
                 if not _picc_quote_result_has_real_premium(quote_result):
-                    failure_auto_notices = [*prequote_auto_notices, *auto_period_notices]
-                    _remember_platform_notice_from_quote_response(
-                        failure_auto_notices,
-                        quote_response,
-                        auto_notice_callback=auto_notice_callback,
-                    )
-                    data_payload: Dict[str, Any] = {
-                        "error_code": "quote_result_missing_premium",
-                        "error_stage": runtime_stage,
-                        "request_body": request_body,
-                        "platform_response": _platform_debug_payload(quote_response),
-                    }
-                    if failure_auto_notices:
-                        data_payload["platform_auto_notices"] = [dict(item) for item in failure_auto_notices]
-                    return PlatformRuntimeResult(
-                        status="failed",
-                        message="人保报价接口返回成功状态，但没有返回真实保费明细，未生成报价结果",
-                        data=success_data(client, extra=data_payload),
-                    )
+                    raw_quote_evidence = _picc_quote_response_has_real_premium_evidence(quote_response)
+                    result_card_present = bool(_json_obj(quote_result.get("result_card")))
+                    if raw_quote_evidence and result_card_present:
+                        # The shared materialization guard remains the final
+                        # authority before a result or image can be persisted.
+                        quote_result["raw_quote_evidence_fallback"] = True
+                    else:
+                        failure_auto_notices = [*prequote_auto_notices, *auto_period_notices]
+                        _remember_platform_notice_from_quote_response(
+                            failure_auto_notices,
+                            quote_response,
+                            auto_notice_callback=auto_notice_callback,
+                        )
+                        data_payload: Dict[str, Any] = {
+                            "error_code": "quote_result_missing_premium",
+                            "error_stage": runtime_stage,
+                            "request_body": request_body,
+                            "platform_response": _platform_debug_payload(quote_response),
+                            "quote_result_diagnostics": {
+                                "raw_quote_evidence": raw_quote_evidence,
+                                "result_card_present": result_card_present,
+                                "quotation_no": _to_str(quote_result.get("quotation_no")).strip(),
+                                "result_status": _to_str(quote_result.get("status")).strip(),
+                            },
+                        }
+                        if failure_auto_notices:
+                            data_payload["platform_auto_notices"] = [dict(item) for item in failure_auto_notices]
+                        return PlatformRuntimeResult(
+                            status="failed",
+                            message="人保报价接口返回成功状态，但没有返回真实保费明细，未生成报价结果",
+                            data=success_data(client, extra=data_payload),
+                        )
                 platform_auto_notices = [*prequote_auto_notices, *auto_period_notices]
                 platform_dialog = _used_fuel_quote_platform_dialog(quote_response)
                 platform_dialog_subtype = _to_str(platform_dialog.get("subtype")).strip().lower()
