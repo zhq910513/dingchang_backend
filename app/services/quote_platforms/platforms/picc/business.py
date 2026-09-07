@@ -8161,6 +8161,20 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             # Never label an unknown tax-inclusive total with the pre-tax
             # amount. A missing platform total/tax is unknown, not zero.
             total_with_vehicle_tax = None
+        # PICC occasionally serializes totals as binary-float artifacts. Keep
+        # the card, provenance, and numeric compatibility field on the same
+        # cent-rounded value before the shared truthfulness validator compares
+        # them.
+        if total_without_vehicle_tax is not None:
+            total_without_vehicle_tax = total_without_vehicle_tax.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+        if total_with_vehicle_tax is not None:
+            total_with_vehicle_tax = total_with_vehicle_tax.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
         # Keep the historical field as the final payable total while exposing both table totals explicitly.
         total = total_with_vehicle_tax
         vehicle_type_code = _first_text(data.get("carKindCode"), data.get("vehicleClassPicc"), form.get("prpCitemCar.carKindCode"), vehicle.get("carKindCode"))

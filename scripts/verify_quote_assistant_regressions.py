@@ -634,6 +634,33 @@ class PiccDynamicResultPresentationTests(unittest.TestCase):
         response["response"]["data"]["itemKindTempList"][0]["premium"] = 0
         self.assertFalse(_picc_quote_response_has_real_premium_evidence(response))
 
+    def test_picc_result_totals_are_cent_rounded_before_numeric_validation(self) -> None:
+        result = _adapter()._build_motor_quote_result_from_response(
+            ctx=None,
+            quote_payload={},
+            request_body={
+                "accountTypeName": "油车-旧",
+                "vehicleForm": {"seatCount": "5"},
+                "ownerForm": {},
+                "quoteForm": {},
+                "preflight": {},
+            },
+            quote_response={
+                "status": 0,
+                "data": {
+                    "biPremium": "100.10",
+                    "ciPremium": "200.20",
+                    "totalPremium": 300.30500000000006,
+                    "itemKindTempList": [
+                        {"kindCode": "051050", "premium": "100.10"},
+                        {"kindCode": "051074", "premium": "200.20"},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(result["result_card"]["total_with_vehicle_tax"], "300.31")
+        self.assertEqual(result["premium_total"], 300.31)
+
     def test_picc_result_builder_uses_successful_request_quantity_when_platform_row_is_zero(self) -> None:
         result = _adapter()._build_motor_quote_result_from_response(
             ctx=None,
