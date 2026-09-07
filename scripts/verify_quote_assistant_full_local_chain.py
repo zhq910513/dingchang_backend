@@ -411,12 +411,11 @@ async def main() -> None:
                     assert quote_result.get("intent") == "quote", (account_type, quote_result)
                     assert _result_status(quote_result) == "success", (account_type, quote_result)
                     assert "人保风险水平：" in reply and "分" in reply, (account_type, reply)
-                    assert isinstance(quote_payload.get("result_image"), dict), (
+                    assert quote_payload.get("result_image_pending") is True, (
                         account_type,
                         quote_payload,
                     )
-                    assert quote_payload["result_image"].get("provider") == "bos", quote_payload
-                    assert quote_payload["result_image"].get("image_url"), quote_payload
+                    assert not quote_payload.get("result_image"), quote_payload
 
                     call = runtime_patch.quote_calls[-1]
                     normalized = call["normalized"]
