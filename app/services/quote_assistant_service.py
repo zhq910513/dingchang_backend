@@ -17407,6 +17407,15 @@ async def handle_quote_text_material_message(
 
     images_by_slot = await _active_images_by_slot(db, case.id)
     base_data = _json_obj(case.normalized_data) or _json_obj(case.draft_order_data)
+    if has_form_selected_extra_keys:
+        # The form owns only these two optional config fields. Rebase those
+        # fields from the submitted selection while preserving other manual
+        # quote overrides such as loss, third-party, driver, and passenger.
+        text_data["quote_field_overrides"] = _quote_material_form_rebased_config_overrides(
+            base_data.get("quote_field_overrides"),
+            form_values,
+            form_selected_extra_field_keys,
+        )
     material_text = _norm_text(text)
     if material_text:
         previous_raw_text = _to_str(base_data.get("raw_text")).strip()
@@ -18356,21 +18365,11 @@ async def handle_quote_message(
     if quote_flow_type != QUOTE_FLOW_NORMAL or QUOTE_FLOW_TYPE_KEY in merged_entities:
         merged_entities[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
         text_data[QUOTE_FLOW_TYPE_KEY] = quote_flow_type
-    if has_form_selected_extra_keys:
-        # The form owns only these two optional config fields. Rebase those
-        # fields from the submitted selection while preserving other manual
-        # quote overrides such as loss, third-party, driver, and passenger.
-        merged_quote_field_overrides = _quote_material_form_rebased_config_overrides(
-            base_data.get("quote_field_overrides"),
-            form_values,
-            form_selected_extra_field_keys,
-        )
-    else:
-        merged_quote_field_overrides = _merge_quote_config_overrides(
-            old_draft.get("quote_field_overrides"),
-            merged_entities.get("quote_field_overrides"),
-        )
-    if merged_quote_field_overrides or has_form_selected_extra_keys:
+    merged_quote_field_overrides = _merge_quote_config_overrides(
+        old_draft.get("quote_field_overrides"),
+        merged_entities.get("quote_field_overrides"),
+    )
+    if merged_quote_field_overrides:
         text_data["quote_field_overrides"] = merged_quote_field_overrides
     merged_quote_data_overrides = _merge_quote_data_overrides(
         old_draft.get(QUOTE_DATA_OVERRIDES_KEY),

@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import app.services.quote_assistant_service as quote_assistant_service
 from app.services.quote_assistant_service import (
     CASE_STATUS_READY,
     CASE_STATUS_WAITING_SMS,
@@ -752,6 +753,99 @@ class QuoteCaseTaskAlignmentTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.quote_assistant_service._now", return_value=started):
             self.assertFalse(_is_sms_task_expired(fresh))
             self.assertTrue(_is_sms_task_expired(expired))
+
+
+class NormalQuoteEntryRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_normal_quote_command_reaches_preflight_without_form_state(self) -> None:
+        case = SimpleNamespace(
+            id=101,
+            case_no="QA101",
+            owner_user_id=8,
+            session_id="normal-quote-session",
+            order_id=None,
+            platform_code="PICC",
+            platform_name="人保",
+            status=CASE_STATUS_READY,
+            current_task_id=None,
+            draft_order_data={
+                "owner_name": "张善国",
+                "quote_field_overrides": {"机动车第三者责任保险": "3000000"},
+            },
+            normalized_data={
+                "owner_name": "张善国",
+                "quote_field_overrides": {"机动车第三者责任保险": "3000000"},
+            },
+            missing_requirements=[],
+            updated_at=None,
+        )
+        db = AsyncMock()
+        normalize_case_data = MagicMock(
+            side_effect=lambda *, base_data, order_data, text_data, images_by_slot: {
+                **base_data,
+                **order_data,
+                **text_data,
+            }
+        )
+        blocked_response = (
+            "人保报价前还需要补充材料。",
+            {"status": "success", "intent": "quote", "data": {"result_status": RESULT_NEED_MORE}},
+        )
+
+        with patch.multiple(
+            quote_assistant_service,
+            _ensure_quote_flow_access=MagicMock(),
+            _expire_stale_waiting_sms_tasks_for_owner_session=AsyncMock(),
+            _expire_stale_running_quote_tasks_for_owner_session=AsyncMock(),
+            _cancel_orphaned_waiting_duplicate_confirm_tasks=AsyncMock(),
+            detect_quote_signal=MagicMock(
+                return_value={
+                    "is_quote": True,
+                    "entities": {"platform_code": "PICC", "platform_name": "人保"},
+                }
+            ),
+            _find_waiting_task=AsyncMock(return_value=None),
+            _find_waiting_duplicate_quote_confirm_task=AsyncMock(return_value=None),
+            _find_order=AsyncMock(return_value=None),
+            _get_or_create_case=AsyncMock(return_value=case),
+            _lock_quote_case=AsyncMock(return_value=case),
+            _add_event=AsyncMock(),
+            _cancel_active_quote_tasks_for_case=AsyncMock(return_value=0),
+            _sync_order_images_to_case=AsyncMock(),
+            _attach_uploaded_images=AsyncMock(return_value=[]),
+            _active_images_by_slot=AsyncMock(return_value={}),
+            _normalize_quote_case_data=normalize_case_data,
+            detect_quote_vehicle_type=MagicMock(return_value={}),
+            _select_logged_quote_platform_account=AsyncMock(return_value=None),
+            _has_enabled_quote_platform_account=AsyncMock(return_value=False),
+            _missing_requirements_for_quote_flow=MagicMock(return_value=["行驶证"]),
+            _collect_quote_command_preflight_items=AsyncMock(
+                return_value=[
+                    {
+                        "failure_code": FAILURE_CODE_MATERIAL_MISSING,
+                        "message": "缺少行驶证",
+                    }
+                ]
+            ),
+            _case_payload=MagicMock(return_value={}),
+            _build_quote_preflight_blocked_response=MagicMock(return_value=blocked_response),
+        ):
+            reply, meta = await quote_assistant_service.handle_quote_message(
+                db,
+                ctx={
+                    "current_user_id": 8,
+                    "session_id": "normal-quote-session",
+                    "role_name": "业务员",
+                },
+                entities={},
+                text="人保报价",
+            )
+
+        self.assertEqual((reply, meta), blocked_response)
+        self.assertIn(
+            "3000000",
+            case.normalized_data["quote_field_overrides"].values(),
+        )
+        normalize_case_data.assert_called_once()
 
 
 class OrphanDuplicateConfirmCleanupTests(unittest.IsolatedAsyncioTestCase):
