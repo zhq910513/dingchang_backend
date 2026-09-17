@@ -36,6 +36,7 @@ from app.services.quote_assistant_service import (
     FAILURE_CODE_STALE_TIMEOUT,
     QUOTE_CHAT_POLARITY_AFFIRM,
     QUOTE_CHAT_POLARITY_NEGATE,
+    QUOTE_DATA_OVERRIDES_KEY,
     QUOTE_DUPLICATE_CONFIRM_HINT,
     QUOTE_FLOW_NORMAL,
     QUOTE_FLOW_RENEWAL,
@@ -1683,6 +1684,54 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(overrides.get("vehicle_model"), "雷克萨斯LEXUS CT200h轿车")
         self.assertEqual(overrides.get("car_name"), "CT200h")
 
+    def test_material_form_user_values_override_ocr_and_order_data(self) -> None:
+        overrides = _quote_material_form_overrides_from_values(
+            {
+                "account_type_name": "新能源旧车",
+                "vehicle_model": "用户填写车型ABC123",
+                "car_name": "用户销售ABC123",
+                "license_type": "52",
+                "vin": "LGBH92E29NY123456",
+            }
+        )
+        self.assertEqual(overrides.get("account_type_name"), "新能源车-旧")
+        self.assertEqual(overrides.get("vehicle_model"), "用户填写车型ABC123")
+        self.assertEqual(overrides.get("car_name"), "用户销售ABC123")
+
+        normalized = _normalize_quote_case_data(
+            base_data={
+                "account_type_name": "油车-旧",
+                "vehicle_model": "订单旧车型",
+                "car_name": "订单旧销售车型",
+            },
+            order_data={
+                "vehicle_model": "订单同步车型",
+                "car_name": "订单同步销售车型",
+            },
+            text_data={QUOTE_DATA_OVERRIDES_KEY: overrides},
+            images_by_slot={
+                "driving_license_main": [
+                    {
+                        "extracted_fields": {
+                            "vehicle_model": "OCR旧车型",
+                            "car_name": "OCR旧销售车型",
+                            "vin": "LGBH92E29NY123456",
+                            "license_type": "02",
+                        },
+                        "method": "upload",
+                        "text_features": {"quote_image_upload": True},
+                    }
+                ]
+            },
+        )
+        self.assertEqual(normalized.get("account_type_name"), "新能源车-旧")
+        self.assertEqual(normalized.get("quote_vehicle_type"), "旧车")
+        self.assertEqual(normalized.get("vehicle_energy_type"), "new_energy")
+        self.assertEqual(normalized.get("license_type"), "52")
+        self.assertEqual(normalized.get("license_type_decision", {}).get("source"), "user_override")
+        self.assertEqual(normalized.get("vehicle_model"), "用户填写车型ABC123")
+        self.assertEqual(normalized.get("car_name"), "用户销售ABC123")
+
     def test_quote_material_form_payload_exposes_optional_fields(self) -> None:
         payload = _quote_material_form_payload(
             mode="supplement",
@@ -3263,6 +3312,89 @@ class QuotePromptStateRegressionTests(unittest.TestCase):
 
 
 class PiccRenewalHarRegressionTests(unittest.TestCase):
+    def test_renewal_prefill_preserves_user_confirmed_account_type(self) -> None:
+        adapter = _adapter()
+        captured = {}
+
+        def fake_fetch(self, client, selected):
+            captured["selected_for_fetch"] = dict(selected)
+            return {
+                "request": {"policyNo": selected.get("policy_no")},
+                "response": {
+                    "renewItemCarVo": {
+                        "licenseNo": "赣A12345",
+                        "licenseType": "02",
+                        "engineNo": "ENG12345",
+                        "vinNo": "LGBH92E29NY123456",
+                        "carOwner": "张三",
+                        "brandName": "平台续保车型",
+                        "seatCount": "5",
+                    },
+                    "renewMainVo": {
+                        "policyNo": "PDAA202609180000001",
+                        "endDate": "2026-10-07 24:00",
+                    },
+                    "renewMainSub": {},
+                    "renewItemKindVoList": [],
+                },
+            }
+
+        def fake_prepare(self, client, ctx, payload, account_type_name="油车-旧"):
+            captured["normalized_data"] = dict(payload["normalized_data"])
+            captured["account_type_name"] = account_type_name
+            return {
+                "accountTypeName": account_type_name,
+                "vehicleForm": {},
+                "ownerForm": {},
+                "quoteForm": {},
+                "preflight": {},
+            }
+
+        adapter._fetch_renewal_policy_prefill = MethodType(fake_fetch, adapter)
+        adapter._prepare_used_fuel_quote = MethodType(fake_prepare, adapter)
+
+        selected = {
+            "policy_no": "PDAA202609180000001",
+            "policy_no_encode": "ENC_DAA",
+            "risk_code": "DAA",
+            "license_type": "02",
+            "license_no": "赣A12345",
+            "engine_no": "ENG12345",
+            "vin": "LGBH92E29NY123456",
+            "end_date": "2026-10-07 24:00",
+        }
+        adapter._prepare_renewal_used_fuel_quote(
+            SimpleNamespace(),
+            SimpleNamespace(account_type_name="新能源车-旧"),
+            {
+                "quote_flow_type": "renewal_motor_quote",
+                "normalized_data": {
+                    "account_type_name": "新能源车-旧",
+                    "license_type": "52",
+                    "license_color_code": "52",
+                    "plate_no": "赣A12345",
+                    "engine_no": "ENG12345",
+                    "vin": "LGBH92E29NY123456",
+                    QUOTE_DATA_OVERRIDES_KEY: {"account_type_name": "新能源车-旧"},
+                    "renewal_lookup": {
+                        "found": True,
+                        "selected": selected,
+                        "candidates": [selected],
+                    },
+                },
+                "default_config_json": {},
+                "platform_default_config": {"resolved_type_name": "新能源车-旧"},
+            },
+            account_type_name="新能源车-旧",
+        )
+
+        normalized = captured["normalized_data"]
+        self.assertEqual(captured["account_type_name"], "新能源车-旧")
+        self.assertEqual(normalized["account_type_name"], "新能源车-旧")
+        self.assertEqual(normalized["license_type"], "52")
+        self.assertEqual(normalized["license_color_code"], "52")
+        self.assertEqual(normalized[QUOTE_DATA_OVERRIDES_KEY]["account_type_name"], "新能源车-旧")
+
     def test_renewal_prefill_ignores_zero_amount_coverages(self) -> None:
         adapter = _adapter()
         defaults = adapter._renewal_product_defaults_from_prefill(

@@ -98,6 +98,7 @@ PRODUCT_ROAD_RESCUE = "机动车增值服务特约条款（道路救援服务）
 PRODUCT_EXTERNAL_GRID = "附加外部电网故障损失险"
 PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
 PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
+QUOTE_DATA_OVERRIDES_KEY = "quote_data_overrides"
 
 PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_COMPULSORY: ("交强", "交强险"),
@@ -5031,17 +5032,41 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         prefill = self._fetch_renewal_policy_prefill(client, selected)
         renewal_data = self._renewal_prefill_vehicle_data(prefill, selected)
         # OCR / user-corrected case data stays above renewal prefill; renewal
-        # only supplies missing vehicle fields, except license type because it
-        # is platform-confirmed by quotePolicy.do and drives the account type.
+        # only supplies missing vehicle fields. Platform-confirmed license
+        # type may drive the account type unless the user explicitly confirmed
+        # either field in quote_data_overrides.
         merged_normalized = _deep_merge(renewal_data, normalized_data)
+        user_data_overrides = _json_obj(normalized_data.get(QUOTE_DATA_OVERRIDES_KEY))
+        user_account_type = _normalize_account_type(user_data_overrides.get("account_type_name"))
+        user_license_type = _normalize_license_type_value(user_data_overrides.get("license_type"))
         renewal_license_type = _normalize_license_type_value(renewal_data.get("license_type"))
-        if renewal_license_type:
+        renewal_license_type_preserved_by_user = bool(
+            renewal_license_type
+            and (
+                user_account_type in PICC_REAL_QUOTE_ACCOUNT_TYPES
+                or user_license_type in {"02", "52"}
+            )
+        )
+        if renewal_license_type and not renewal_license_type_preserved_by_user:
             merged_normalized["license_type"] = renewal_license_type
             merged_normalized["license_color_code"] = _license_color_for_type(renewal_license_type)
             merged_normalized["account_type_name"] = (
                 NEW_ENERGY_USED_ACCOUNT_TYPE if renewal_license_type == "52" else USED_FUEL_ACCOUNT_TYPE
             )
             merged_normalized["license_type_decision"] = _json_obj(renewal_data.get("license_type_decision"))
+        elif user_account_type in PICC_REAL_QUOTE_ACCOUNT_TYPES:
+            merged_normalized["account_type_name"] = user_account_type
+        if user_license_type in {"02", "52"}:
+            merged_normalized["license_type"] = user_license_type
+            merged_normalized["license_color_code"] = _license_color_for_type(user_license_type)
+            decision = _json_obj(merged_normalized.get("license_type_decision"))
+            if not decision or _to_str(decision.get("source")).strip() != "user_override":
+                merged_normalized["license_type_decision"] = {
+                    "license_type": user_license_type,
+                    "license_color_code": _license_color_for_type(user_license_type),
+                    "source": "user_override",
+                    "reason": "用户指定号牌种类",
+                }
         renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
         user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
         configured_defaults = _json_obj(payload.get("default_config_json"))
@@ -5092,6 +5117,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "ignoredUserOverrideRenewalDefaults": ignored_user_override_renewal_defaults,
                 "ignoredUnconfiguredOptionalRenewalDefaults": ignored_unconfigured_optional_renewal_defaults,
                 "userOverrideKeys": list(user_overrides.keys()),
+                "preservedUserDataOverrideKeys": [
+                    key
+                    for key in ("account_type_name", "license_type")
+                    if _to_str(user_data_overrides.get(key)).strip()
+                ],
+                "renewalLicenseTypePreservedByUser": renewal_license_type_preserved_by_user,
             }
         body["preflight"] = preflight
         body["renewalPolicyPrefill"] = _json_obj(renewal_data.get("renewal_policy_prefill"))

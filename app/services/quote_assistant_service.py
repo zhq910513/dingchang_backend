@@ -1359,6 +1359,7 @@ QUOTE_CONFIG_GENERIC_FIELD_BLOCKLIST = {
 QUOTE_DATA_OVERRIDES_KEY = "quote_data_overrides"
 
 QUOTE_DATA_OVERRIDE_ALIASES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("account_type_name", "报价类型", ("报价类型", "账号类型", "账户类型", "报价账号类型", "报价账户类型", "车辆报价类型")),
     ("owner_name", "车主姓名", ("车主姓名", "车主名称", "客户姓名", "客户名称", "行驶证所有人", "所有人", "被保险人姓名", "被保险人", "投保人姓名", "投保人", "联系人姓名", "车主", "姓名")),
     ("id_name", "身份证姓名", ("身份证姓名", "证件姓名", "身份证名字", "证件名字")),
     ("owner_phone", "车主手机号", ("车主手机号", "车主手机", "车主电话", "客户手机号", "客户手机", "被保险人手机号", "被保人手机号", "投保人手机号", "联系电话", "手机号", "手机号码", "手机", "电话")),
@@ -1675,6 +1676,13 @@ def _resolve_license_type_decision(
     manual_value = _normalize_license_type_value(manual_source_value)
     if manual_value:
         return _license_type_decision_payload(manual_value, source="user_override", reason="用户指定号牌种类")
+    manual_account_type = _normalize_account_type_name(data_overrides.get("account_type_name"))
+    if manual_account_type in QUOTE_ACCOUNT_TYPE_SET:
+        return _license_type_decision_payload(
+            LICENSE_TYPE_NEW_ENERGY if manual_account_type.startswith("新能源") else LICENSE_TYPE_FUEL,
+            source="user_override",
+            reason=f"用户指定报价类型为{manual_account_type}",
+        )
 
     if previous_source in {"user_override", "renewal_lookup"}:
         previous_value = _normalize_license_type_value(previous.get("license_type"))
@@ -2193,6 +2201,7 @@ def _normalize_quote_case_data(
     merged_overrides = _merge_quote_data_overrides(base_overrides, text_overrides)
     merged = _clean_quote_dynamic_data(_merge_data(base, image_data, text_clean, merged_overrides))
     merged = _backfill_quote_sales_model_fields(merged)
+    merged = _apply_user_account_type_override(merged, merged_overrides)
     if merged_overrides:
         merged[QUOTE_DATA_OVERRIDES_KEY] = merged_overrides
     merged = _apply_transfer_vehicle_state(merged)
@@ -2845,6 +2854,30 @@ def _ensure_fixed_quote_account_type(value: Any, *, allow_empty: bool = False) -
     return type_name
 
 
+def _quote_account_type_derived_fields(account_type_name: Any) -> Dict[str, str]:
+    type_name = _normalize_account_type_name(account_type_name)
+    if type_name not in QUOTE_ACCOUNT_TYPE_SET:
+        return {}
+    usage = "used_car" if type_name.endswith("-旧") else "new_car"
+    energy = "new_energy" if type_name.startswith("新能源") else "fuel"
+    return {
+        "account_type_name": type_name,
+        "quote_vehicle_type": "旧车" if usage == "used_car" else "新车",
+        "vehicle_usage_type": usage,
+        "vehicle_energy_type": energy,
+        "energy_type": energy,
+    }
+
+
+def _apply_user_account_type_override(data: Dict[str, Any], overrides: Any) -> Dict[str, Any]:
+    override_type = _normalize_account_type_name(_json_obj(overrides).get("account_type_name"))
+    if override_type not in QUOTE_ACCOUNT_TYPE_SET:
+        return data
+    out = dict(_json_obj(data))
+    out.update(_quote_account_type_derived_fields(override_type))
+    return out
+
+
 def _normalize_quote_config_override_value(value: Any, unit: Any = "") -> str:
     text = _to_str(value).strip()
     text = re.sub(r"[，,。；;]+$", "", text).strip()
@@ -3187,6 +3220,8 @@ def _quote_data_override_alias_items() -> Tuple[Tuple[str, str, str], ...]:
 
 
 def _quote_data_override_value_pattern(field_key: str) -> str:
+    if field_key == "account_type_name":
+        return r"(油车-新|油车-旧|新能源车-新|新能源车-旧|新油车|旧油车|燃油新车|燃油旧车|新能源新车|新能源旧车|新新能源车|旧新能源车|新能源车新|新能源车旧|新车|旧车|二手车|过户车)"
     if field_key == "owner_phone":
         return r"(1\d{10})"
     if field_key == "id_number":
@@ -3240,6 +3275,9 @@ def _clean_quote_data_override_value(field_key: str, value: Any) -> Any:
     raw = _trim_quote_data_override_value(field_key, _to_str(value)).strip().strip("，,。.;；")
     if not raw:
         return None
+    if field_key == "account_type_name":
+        normalized = _normalize_account_type_name(raw)
+        return normalized if normalized in QUOTE_ACCOUNT_TYPE_SET else None
     if field_key in {"first_register_date", "issue_date", "commercial_start_date", "compulsory_start_date"}:
         return _normalize_quote_date_text(raw) or None
     if field_key == "license_type":
@@ -7639,15 +7677,7 @@ def _quote_vehicle_type_text_data(text: Any, extracted: Optional[Mapping[str, An
     type_name = _quote_account_type_from_material_text(text, extracted)
     if not type_name:
         return {}
-    usage = "used_car" if type_name.endswith("-旧") else "new_car"
-    energy = "new_energy" if type_name.startswith("新能源") else "fuel"
-    return {
-        "account_type_name": type_name,
-        "quote_vehicle_type": "旧车" if usage == "used_car" else "新车",
-        "vehicle_usage_type": usage,
-        "vehicle_energy_type": energy,
-        "energy_type": energy,
-    }
+    return _quote_account_type_derived_fields(type_name)
 
 
 def _looks_like_quote_vehicle_type_followup_command(text: Any) -> bool:
@@ -10261,7 +10291,7 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
     raw = {
         key: value
         for key, value in _json_obj(values).items()
-        if key != "account_type_name" and _to_str(value).strip()
+        if _to_str(value).strip()
     }
     overrides = _clean_quote_dynamic_data(raw, derive_owner_name=False) if raw else {}
     overrides = _backfill_quote_sales_model_fields(overrides)
@@ -10269,7 +10299,7 @@ def _quote_material_form_overrides_from_values(values: Mapping[str, Any]) -> Dic
     if license_type:
         overrides["license_type"] = license_type
         overrides["license_type_override"] = license_type
-    return overrides
+    return _merge_quote_data_overrides(overrides)
 
 
 def _quote_material_form_config_overrides_from_values(
