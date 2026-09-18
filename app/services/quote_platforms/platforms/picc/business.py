@@ -7444,6 +7444,43 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                             raw_compulsory_hour = _to_str(implicit_renewal.get("compulsory_start_hour")).strip()
                             raw_compulsory_minute = _to_str(implicit_renewal.get("compulsory_start_minute")).strip()
 
+        # A successful renewal response can expose one insurance through
+        # prpReInsureItems and the other only through lastExpireDateBI/CI.
+        # Merge missing implicit dates instead of treating them as a fallback
+        # for responses without any explicit adjustment.
+        implicit_renewal = _implicit_renewal_quote_adjustment_from_response(
+            platform_response,
+            _join_unique_platform_notice_parts(message, error_message),
+        )
+        implicit_kinds = [
+            item
+            for item in (
+                implicit_renewal.get("adjustment_kinds")
+                if isinstance(implicit_renewal.get("adjustment_kinds"), list)
+                else []
+            )
+            if _to_str(item).strip() in {"bi", "ci"}
+        ]
+        implicit_added = False
+        for kind in implicit_kinds:
+            if kind in kinds:
+                continue
+            kinds.append(kind)
+            implicit_added = True
+            if kind == "bi":
+                commercial_candidate = _date_text(implicit_renewal.get("commercial_start_date"))
+                raw_commercial_candidate = commercial_candidate
+                raw_commercial_hour = _to_str(implicit_renewal.get("commercial_start_hour")).strip()
+                raw_commercial_minute = _to_str(implicit_renewal.get("commercial_start_minute")).strip()
+            else:
+                compulsory_candidate = _date_text(implicit_renewal.get("compulsory_start_date"))
+                raw_compulsory_candidate = compulsory_candidate
+                raw_compulsory_hour = _to_str(implicit_renewal.get("compulsory_start_hour")).strip()
+                raw_compulsory_minute = _to_str(implicit_renewal.get("compulsory_start_minute")).strip()
+        if implicit_added:
+            message = message or _to_str(implicit_renewal.get("message")).strip()
+            adjustment_source = "implicit_renewal_quote_hint"
+
         if not kinds:
             return {}
 
