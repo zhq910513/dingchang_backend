@@ -1715,10 +1715,8 @@ def _implicit_renewal_quote_adjustment_from_response(
     platform_response: Any,
     message: Any,
 ) -> Dict[str, Any]:
-    """Detect PICC's successful quote response that silently turned into renewal."""
+    """Read structured PICC renewal dates even when its notice omits the renewal hint."""
     hint = _implicit_renewal_quote_hint(message)
-    if not hint:
-        return {}
     payload = _json_obj(_picc_quote_response_payload(platform_response).get("data"))
     commercial_parts = _platform_datetime_parts(payload.get("lastExpireDateBI"))
     compulsory_parts = _platform_datetime_parts(payload.get("lastExpireDateCI"))
@@ -1732,7 +1730,7 @@ def _implicit_renewal_quote_adjustment_from_response(
     if not kinds:
         return {}
     return {
-        "message": hint,
+        "message": hint or "人保接口返回续保起保日期，已按接口返回值调整。",
         "commercial_start_date": commercial_start,
         "compulsory_start_date": compulsory_start,
         "commercial_start_hour": _to_str(commercial_parts.get("hour")).strip(),

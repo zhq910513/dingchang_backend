@@ -2533,6 +2533,76 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
         self.assertEqual(form["prpCmain.endhourci"], "14")
         self.assertEqual(notice["adjustment_kinds"], ["bi", "ci"])
 
+    def test_structured_expire_dates_merge_without_renewal_hint_text(self) -> None:
+        adapter = _adapter()
+        client = _HarRouteClient(
+            {
+                "getCurrentTime.do": {
+                    "status": 0,
+                    "data": {"currentTime": "2026-09-19"},
+                }
+            }
+        )
+        request_body = {
+            "accountTypeName": "油车-旧",
+            "quoteForm": {
+                "prpCmain.startDate": "2026-09-20",
+                "prpCmain.starthourbi": "0",
+                "prpCmain.startminutebi": "0",
+                "prpCmain.startDateCI": "2026-09-20",
+                "prpCmain.starthourci": "0",
+                "prpCmain.startminuteci": "0",
+                "prpCmain.endDateCI": "2027-09-19",
+                "prpCmain.endhourci": "24",
+                "prpCmain.endminuteci": "0",
+            },
+            "vehicleForm": {
+                "startDateBI": "2026-09-20",
+                "startDateCI": "2026-09-20",
+            },
+            "defaultFields": {},
+            "preflight": {},
+        }
+        response = {
+            "status": 0,
+            "data": {
+                "errorMessage": "FGGZ012-4当前仅对三者险附加医保外用药,车上人员未附加医保外用药,请确认。",
+                "lastExpireDateBI": "2026-10-28",
+                "lastExpireDateCI": "2026-10-27",
+                "prpReInsureItems": [
+                    {
+                        "adviseStartDate": "2026-10-28 00:00:00",
+                        "itemList": [
+                            {
+                                "coverageRealCode": "051050",
+                                "coverageName": "机动车损失保险",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        adjustment = adapter._insurance_date_adjustment_from_platform_response(
+            client,
+            response,
+            request_body=request_body,
+        )
+        self.assertEqual(adjustment["adjustment_kinds"], ["bi", "ci"])
+        self.assertEqual(adjustment["commercial_start_date"], "2026-10-28")
+        self.assertEqual(adjustment["compulsory_start_date"], "2026-10-27")
+
+        adjusted_body, changed, notice = adapter._apply_insurance_date_adjustment_to_request_body(
+            client,
+            request_body,
+            adjustment,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(adjusted_body["vehicleForm"]["startDateBI"], "2026-10-28")
+        self.assertEqual(adjusted_body["vehicleForm"]["startDateCI"], "2026-10-27")
+        self.assertEqual(adjusted_body["quoteForm"]["prpCmain.startDateCI"], "2026-10-27")
+        self.assertEqual(notice["adjustment_kinds"], ["bi", "ci"])
+
     def test_case_snapshot_persists_final_period_fields(self) -> None:
         snapshot = {
             "normalized_data": {
