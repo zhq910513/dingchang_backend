@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.core.db import async_session_factory
+from app.core.db import async_session_factory, engine
 from app.models.quote_assistant import QuotePlatformDefaultConfig
 from app.services.quote_assistant_service import (
     JOINT_SALES_CONFIG_FIELD_ALIASES,
@@ -94,6 +94,7 @@ async def migrate(*, apply, backup):
             for item in changes:
                 item["row"].default_values_json = item["after"]
             await db.flush()
+        if apply and changes:
             print(json.dumps({"updated": len(changes), "backup": str(backup)}, ensure_ascii=False))
 
 
@@ -104,7 +105,13 @@ def main():
     args = parser.parse_args()
     if args.apply and (not args.backup or not args.backup.is_absolute() or not args.backup.parent.is_dir()):
         parser.error("--apply requires a new absolute backup file in an existing directory")
-    asyncio.run(migrate(apply=args.apply, backup=args.backup))
+    async def run():
+        try:
+            await migrate(apply=args.apply, backup=args.backup)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
