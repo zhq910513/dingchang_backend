@@ -98,16 +98,41 @@ async def migrate(*, apply, backup):
             print(json.dumps({"updated": len(changes), "backup": str(backup)}, ensure_ascii=False))
 
 
+async def verify_backup(backup):
+    snapshot = json.loads(backup.read_text(encoding="utf-8"))
+    if snapshot.get("table") != QuotePlatformDefaultConfig.__tablename__:
+        raise ValueError("Backup table does not match default config table")
+    originals = {row["id"]: row["default_values_json"] for row in snapshot["rows"]}
+    if len(originals) != len(snapshot["rows"]) or not originals:
+        raise ValueError("Backup has duplicate IDs or no rows")
+    async with async_session_factory() as db:
+        rows = (await db.execute(
+            select(QuotePlatformDefaultConfig).where(QuotePlatformDefaultConfig.id.in_(originals))
+        )).scalars().all()
+    actual = {row.id: row.default_values_json for row in rows}
+    mismatches = [id_ for id_, before in originals.items() if actual.get(id_) != migrated_values(before)]
+    print(json.dumps({"checked": len(originals), "mismatched_ids": mismatches}, ensure_ascii=False))
+    if mismatches:
+        raise RuntimeError(f"Migrated config does not match backup for IDs {mismatches}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--verify-backup", action="store_true")
     parser.add_argument("--backup", type=Path)
     args = parser.parse_args()
     if args.apply and (not args.backup or not args.backup.is_absolute() or not args.backup.parent.is_dir()):
         parser.error("--apply requires a new absolute backup file in an existing directory")
+    if args.verify_backup and (not args.backup or not args.backup.is_absolute() or not args.backup.is_file()):
+        parser.error("--verify-backup requires an existing absolute backup file")
     async def run():
         try:
-            await migrate(apply=args.apply, backup=args.backup)
+            if args.verify_backup:
+                await verify_backup(args.backup)
+            else:
+                await migrate(apply=args.apply, backup=args.backup)
         finally:
             await engine.dispose()
 
