@@ -74,6 +74,7 @@ from app.services.quote_assistant_service import (
     quote_message_may_interrupt_running_task,
     resolve_platform_default_config as _resolve_platform_default_config,
     save_platform_default_config as _save_platform_default_config,
+    platform_default_config_save_payload as _platform_default_config_save_payload,
     save_platform_account_type as _save_platform_account_type,
     start_platform_account_login as _start_platform_account_login,
     sanitize_quote_user_message,
@@ -978,8 +979,9 @@ async def create_platform_default_config(
             values=body.dict(),
             operator_user_id=operator_user_id,
         )
+        saved = _platform_default_config_save_payload(row)
         await db.commit()
-        return {"ok": True, "data": {"item": row and row.id}}
+        return {"ok": True, "data": saved}
     except ValueError as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "默认参数配置保存失败"))
@@ -1004,8 +1006,9 @@ async def update_platform_default_config(
             config_id=config_id,
             operator_user_id=operator_user_id,
         )
+        saved = _platform_default_config_save_payload(row)
         await db.commit()
-        return {"ok": True, "data": {"item": row and row.id}}
+        return {"ok": True, "data": saved}
     except ValueError as e:
         await db.rollback()
         raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "默认参数配置保存失败"))

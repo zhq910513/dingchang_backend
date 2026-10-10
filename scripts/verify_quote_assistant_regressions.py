@@ -82,6 +82,9 @@ from app.services.quote_assistant_service import (
     _quote_material_form_config_overrides_from_values,
     _quote_material_form_rebased_config_overrides,
     _quote_material_form_selected_extra_field_keys_from_context,
+    _quote_material_form_submitted_field_keys_from_context,
+    _quote_material_form_values_from_context,
+    _quote_material_form_rebased_case_data,
     _quote_material_form_overrides_from_values,
     QUOTE_ENTITY_FIELD_KEYS,
     _quote_sales_model_hint_from_model_text,
@@ -99,6 +102,7 @@ from app.services.quote_assistant_service import (
     _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
     _platform_default_config_payload,
+    platform_default_config_save_payload,
     _platform_default_values_with_legacy_fixes,
     _picc_existing_proposal_table_card_for_display,
     _picc_result_coverage_items_for_display,
@@ -1353,6 +1357,10 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(payload["deleted_default_fields"], [PRODUCT_EXTERNAL_GRID])
         self.assertIn(PICC_DELETED_DEFAULT_FIELDS_KEY, stored)
 
+        save_payload = platform_default_config_save_payload(row)
+        self.assertEqual(save_payload["item"], 1)
+        self.assertEqual(save_payload["config"], payload)
+
     def test_snapshot_merge_removes_deleted_builtin_before_quote(self) -> None:
         resolved = {
             "config": {"id": 1},
@@ -2154,6 +2162,65 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(selected, [])
         self.assertFalse(has_selected)
+
+    def test_quote_material_form_context_preserves_submitted_blank_values(self) -> None:
+        ctx = {
+            "quote_material_form_submit": True,
+            "quote_material_form_values": {
+                "owner_name": " 新车主 ",
+                "commercial_start_date": " ",
+                "unknown": "ignored",
+            },
+            "quote_material_form_submitted_field_keys": [
+                "owner_name",
+                "commercial_start_date",
+                "unknown",
+            ],
+        }
+        values = _quote_material_form_values_from_context(ctx)
+        submitted = _quote_material_form_submitted_field_keys_from_context(ctx, values)
+        self.assertEqual(values, {"owner_name": "新车主", "commercial_start_date": ""})
+        self.assertEqual(submitted, {"owner_name", "commercial_start_date"})
+
+    def test_quote_material_form_rebase_clears_only_submitted_blank_fields(self) -> None:
+        rebased, cleared = _quote_material_form_rebased_case_data(
+            {
+                "owner_name": "旧车主",
+                "commercial_start_date": "2026-10-01",
+                "compulsory_start_date": "2026-10-02",
+                QUOTE_DATA_OVERRIDES_KEY: {
+                    "owner_name": "旧车主",
+                    "id_name": "旧车主",
+                    "commercial_start_date": "2026-10-01",
+                    "compulsory_start_date": "2026-10-02",
+                },
+            },
+            {"owner_name": "新车主", "commercial_start_date": ""},
+            {"owner_name", "commercial_start_date"},
+        )
+        self.assertNotIn("owner_name", rebased)
+        self.assertNotIn("commercial_start_date", rebased)
+        self.assertEqual(rebased.get("compulsory_start_date"), "2026-10-02")
+        self.assertNotIn("owner_name", rebased.get(QUOTE_DATA_OVERRIDES_KEY, {}))
+        self.assertNotIn("commercial_start_date", rebased.get(QUOTE_DATA_OVERRIDES_KEY, {}))
+        self.assertEqual(
+            rebased.get(QUOTE_DATA_OVERRIDES_KEY, {}).get("compulsory_start_date"),
+            "2026-10-02",
+        )
+        self.assertEqual(cleared, {"commercial_start_date"})
+
+        submitted_overrides = _quote_material_form_overrides_from_values(
+            {"owner_name": "新车主", "commercial_start_date": ""}
+        )
+        normalized = _normalize_quote_case_data(
+            base_data=rebased,
+            order_data={},
+            text_data={QUOTE_DATA_OVERRIDES_KEY: submitted_overrides},
+            images_by_slot={},
+        )
+        self.assertEqual(normalized.get("owner_name"), "新车主")
+        self.assertNotIn("commercial_start_date", normalized)
+        self.assertEqual(normalized.get("compulsory_start_date"), "2026-10-02")
 
     def test_quote_entity_fields_keep_quote_config_overrides(self) -> None:
         self.assertIn("quote_field_overrides", QUOTE_ENTITY_FIELD_KEYS)

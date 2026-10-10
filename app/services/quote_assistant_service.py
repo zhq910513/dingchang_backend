@@ -4682,6 +4682,11 @@ def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[st
     }
 
 
+def platform_default_config_save_payload(row: QuotePlatformDefaultConfig) -> Dict[str, Any]:
+    payload = _platform_default_config_payload(row)
+    return {"item": payload.get("id"), "config": payload}
+
+
 def _normalize_default_values(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("默认参数必须是字段名和值组成的对象")
@@ -10288,10 +10293,57 @@ def _quote_material_form_values_from_context(ctx: Mapping[str, Any]) -> Dict[str
         return {}
     allowed = {key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER} | QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS
     return {
-        key: value
+        key: _to_str(value).strip()
         for key, value in values.items()
-        if key in allowed and _to_str(value).strip()
+        if key in allowed
     }
+
+
+def _quote_material_form_submitted_field_keys_from_context(
+    ctx: Mapping[str, Any],
+    values: Mapping[str, Any],
+) -> Set[str]:
+    if not isinstance(ctx, Mapping) or not ctx.get("quote_material_form_submit"):
+        return set()
+    allowed = {key for key, _, _ in QUOTE_MANUAL_MATERIAL_FIELD_ORDER} | QUOTE_MANUAL_EXTRA_CONFIG_FIELD_KEYS
+    raw = ctx.get("quote_material_form_submitted_field_keys")
+    if raw is None:
+        raw = ctx.get("quoteMaterialFormSubmittedFieldKeys")
+    if raw is None:
+        items: Iterable[Any] = _json_obj(values).keys()
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = re.split(r"[,，、;；\s]+", _to_str(raw))
+    return {_to_str(item).strip() for item in items if _to_str(item).strip() in allowed}
+
+
+def _quote_material_form_rebased_case_data(
+    base_data: Mapping[str, Any],
+    values: Mapping[str, Any],
+    submitted_field_keys: Iterable[Any],
+) -> Tuple[Dict[str, Any], Set[str]]:
+    rebased = dict(_json_obj(base_data))
+    overrides = dict(_json_obj(rebased.get(QUOTE_DATA_OVERRIDES_KEY)))
+    allowed = set(QUOTE_DATA_OVERRIDE_LABELS)
+    cleared: Set[str] = set()
+    for raw_key in submitted_field_keys:
+        key = _to_str(raw_key).strip()
+        if key not in allowed:
+            continue
+        rebased.pop(key, None)
+        overrides.pop(key, None)
+        if key == "license_type":
+            rebased.pop("license_type_override", None)
+            rebased.pop("license_type_decision", None)
+            overrides.pop("license_type_override", None)
+        if not _to_str(_json_obj(values).get(key)).strip():
+            cleared.add(key)
+    if overrides:
+        rebased[QUOTE_DATA_OVERRIDES_KEY] = overrides
+    else:
+        rebased.pop(QUOTE_DATA_OVERRIDES_KEY, None)
+    return rebased, cleared
 
 
 def _quote_material_form_selected_extra_field_keys_from_context(ctx: Mapping[str, Any]) -> Tuple[List[str], bool]:
@@ -17299,6 +17351,7 @@ async def handle_quote_text_material_message(
         for_update=True,
     )
     form_values = _quote_material_form_values_from_context(ctx or {})
+    form_submitted_field_keys = _quote_material_form_submitted_field_keys_from_context(ctx or {}, form_values)
     form_selected_extra_field_keys, has_form_selected_extra_keys = (
         _quote_material_form_selected_extra_field_keys_from_context(ctx or {})
     )
@@ -17315,7 +17368,7 @@ async def handle_quote_text_material_message(
                     result_status=RESULT_NEED_MORE,
                     message="资料表单会话不一致",
                     entities={"quote_case_id": form_case_id or None},
-                    payload={"quote_material_form_stale": True},
+                    payload={"quote_material_form_stale": True, "material_saved": False},
                 ),
                 "actions": [],
             },
@@ -17431,7 +17484,7 @@ async def handle_quote_text_material_message(
                         result_status=RESULT_NEED_MORE,
                         message="资料表单对应 case 不可用",
                         entities={"quote_case_id": form_case_id},
-                        payload={"quote_material_form_stale": True},
+                        payload={"quote_material_form_stale": True, "material_saved": False},
                     ),
                     "actions": [],
                 },
@@ -17467,6 +17520,11 @@ async def handle_quote_text_material_message(
 
     images_by_slot = await _active_images_by_slot(db, case.id)
     base_data = _json_obj(case.normalized_data) or _json_obj(case.draft_order_data)
+    base_data, cleared_form_field_keys = _quote_material_form_rebased_case_data(
+        base_data,
+        form_values,
+        form_submitted_field_keys,
+    )
     if has_form_selected_extra_keys:
         # The form owns only these two optional config fields. Rebase those
         # fields from the submitted selection while preserving other manual
@@ -17489,6 +17547,19 @@ async def handle_quote_text_material_message(
         text_data=text_data,
         images_by_slot=images_by_slot,
     )
+    if cleared_form_field_keys:
+        normalized_overrides = dict(_json_obj(normalized_data.get(QUOTE_DATA_OVERRIDES_KEY)))
+        for key in cleared_form_field_keys:
+            normalized_data.pop(key, None)
+            normalized_overrides.pop(key, None)
+            if key == "license_type":
+                normalized_data.pop("license_type_override", None)
+                normalized_data.pop("license_type_decision", None)
+                normalized_overrides.pop("license_type_override", None)
+        if normalized_overrides:
+            normalized_data[QUOTE_DATA_OVERRIDES_KEY] = normalized_overrides
+        else:
+            normalized_data.pop(QUOTE_DATA_OVERRIDES_KEY, None)
     platform_code = _to_str(case.platform_code or platform_code).strip().upper()
     platform_name = _to_str(case.platform_name or platform_name).strip()
     if platform_code and not platform_name:
@@ -17567,6 +17638,9 @@ async def handle_quote_text_material_message(
         if isinstance(data, dict):
             payload = data.setdefault("payload", {})
             if isinstance(payload, dict):
+                payload["material_saved"] = True
+                payload["material_quote_case_id"] = case.id
+                payload["material_snapshot"] = normalized_data
                 payload["auto_started_after_text_collect"] = True
                 payload["text_collect"] = {
                     "field_count": _quote_text_material_field_count(text_data),
@@ -17595,6 +17669,9 @@ async def handle_quote_text_material_message(
         payload.update(
             {
                 "text_material": True,
+                "material_saved": True,
+                "material_quote_case_id": case.id,
+                "material_snapshot": normalized_data,
                 "vehicle_type_detect": vehicle_type_detect,
                 "pending_quote_check": True,
             }
@@ -17638,6 +17715,9 @@ async def handle_quote_text_material_message(
     payload.update(
         {
             "text_material": True,
+            "material_saved": True,
+            "material_quote_case_id": case.id,
+            "material_snapshot": normalized_data,
             "vehicle_type_detect": vehicle_type_detect,
             "silent": True,
             "ui_visible": False,
