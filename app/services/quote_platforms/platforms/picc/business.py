@@ -7370,10 +7370,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             vehicle.pop("modelQueryBlockReason", None)
         last_data: Any = {}
         attempted_terms: set[str] = set()
+        saw_fact_conflict = False
         has_vin_prefixes = bool(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
         has_usable_sales_hint = _vehicle_model_hint_is_usable(vehicle, vehicle.get("vehicleNameHint"))
 
-        def _request_term(term: str, *, rows_limit: int) -> Any:
+        def _request_term(term: str, *, rows_limit: int, require_vin_correlation: bool = False) -> Any:
+            nonlocal saw_fact_conflict
             last_local: Any = {}
             for resource_code in resource_codes:
                 params = {
@@ -7404,8 +7406,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     if _is_vehicle_query_no_data_response(data):
                         continue
                     raise
-                if _vehicle_rows(data):
+                rows = _vehicle_rows(data)
+                if require_vin_correlation:
+                    rows = _vehicle_rows_correlated_to_vin(rows, vehicle) if has_vin_prefixes else []
+                if rows and any(_vehicle_candidate_compatibility(row, vehicle)[0] for row in rows):
                     return data
+                if rows:
+                    saw_fact_conflict = True
             return last_local
 
         for term in terms:
@@ -7416,7 +7423,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             # PICC may return many generations for a sales name (for example
             # 740Li). Request the largest useful first page so registration-
             # date filtering is not limited to the newest ten catalogue rows.
-            data = _request_term(term, rows_limit=100)
+            needs_vin_correlation = _vehicle_query_term_requires_vin_correlation(term, vehicle)
+            lacks_sales_specificity = _vehicle_term_lacks_sales_specificity(term, vehicle)
+            requires_correlation = needs_vin_correlation or (lacks_sales_specificity and not has_usable_sales_hint)
+            data = _request_term(term, rows_limit=100, require_vin_correlation=requires_correlation)
             last_data = data
             try:
                 _ensure_platform_success(data, action="车型配置查询")
@@ -7427,9 +7437,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             rows = _vehicle_rows(data)
             if not rows:
                 continue
-            needs_vin_correlation = _vehicle_query_term_requires_vin_correlation(term, vehicle)
-            lacks_sales_specificity = _vehicle_term_lacks_sales_specificity(term, vehicle)
-            if needs_vin_correlation or (lacks_sales_specificity and not has_usable_sales_hint):
+            if requires_correlation:
                 if not has_vin_prefixes:
                     # Platform may have returned brand catalogue rows, but accepting
                     # them without VIN correlation or a sales-model hint is unsafe.
@@ -7441,7 +7449,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         )
                     continue
                 correlated_rows = _vehicle_rows_correlated_to_vin(rows, vehicle)
-                if not correlated_rows:
+                if not correlated_rows or not any(_vehicle_candidate_compatibility(row, vehicle)[0] for row in correlated_rows):
                     continue
                 correlated_data = dict(_json_obj(data))
                 correlated_data["result"] = correlated_rows
@@ -7456,6 +7464,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     )
                     vehicle.pop("modelQueryBlockReason", None)
                 return correlated_data
+            if not any(_vehicle_candidate_compatibility(row, vehicle)[0] for row in rows):
+                continue
             if isinstance(vehicle, dict):
                 vehicle["modelName"] = term
                 vehicle["modelQueryTerms"] = terms
@@ -7487,7 +7497,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if not term_key or term_key in attempted_terms:
                     continue
                 attempted_terms.add(term_key)
-                data = _request_term(term, rows_limit=100)
+                data = _request_term(term, rows_limit=100, require_vin_correlation=True)
                 try:
                     _ensure_platform_success(data, action="车型配置查询")
                 except PiccBusinessRequestError:
@@ -7496,7 +7506,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     raise
                 broad_rows = _vehicle_rows(data)
                 correlated_rows = _vehicle_rows_correlated_to_vin(broad_rows, vehicle)
-                if correlated_rows:
+                if correlated_rows and any(_vehicle_candidate_compatibility(row, vehicle)[0] for row in correlated_rows):
                     correlated_data = dict(_json_obj(data))
                     correlated_data["result"] = correlated_rows
                     if isinstance(vehicle, dict):
@@ -7517,6 +7527,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         last_data["result"] = []
         if isinstance(vehicle, dict):
             vehicle["modelQueryTerms"] = terms
+            if saw_fact_conflict:
+                vehicle["modelSelectionBlockReason"] = "candidate_facts_conflict"
         return last_data
 
     def _query_precise_vehicle(

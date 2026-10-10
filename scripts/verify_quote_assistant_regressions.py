@@ -1607,6 +1607,58 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(len(rows.get("result") or []), 1)
         self.assertEqual(client.row_limits[0], 100)
 
+    def test_vehicle_query_retries_only_when_every_candidate_conflicts(self) -> None:
+        class _GenerationClient:
+            def __init__(self, first_year: str) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.names: list[str] = []
+                self.first_year = first_year
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                name = str(kwargs["params"]["jyVehicleRequest.vehicleName"])
+                self.names.append(name)
+                return {
+                    "status": 0,
+                    "result": [{
+                        "vehicleId": "FIRST" if name.upper() == "BMW740LI*" else "OLD-F02",
+                        "vehicleName": "宝马BMW 740Li轿车",
+                        "vehicleYear": self.first_year if name.upper() == "BMW740LI*" else "200903",
+                    }],
+                }
+
+        vehicle = {"rawModelName": "BMW740Li", "vehicleNameHint": "740Li", "enrollDate": "2012-09-28"}
+        with patch("app.services.quote_platforms.platforms.picc.business._used_fuel_model_query_terms", return_value=["BMW740LI", "740Li"]):
+            client = _GenerationClient("202511")
+            result = _adapter()._query_vehicle_candidates(client, dict(vehicle))
+            self.assertEqual(result["result"][0]["vehicleId"], "OLD-F02")
+            self.assertEqual(client.names, ["BMW740LI*", "740Li*"])
+
+            successful_client = _GenerationClient("200903")
+            successful = _adapter()._query_vehicle_candidates(successful_client, dict(vehicle))
+            self.assertEqual(successful["result"][0]["vehicleId"], "FIRST")
+            self.assertEqual(successful_client.names, ["BMW740LI*"])
+
+    def test_vehicle_query_retries_next_resource_after_incompatible_batch(self) -> None:
+        class _ResourceClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.resources: list[str] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                resource = str(kwargs["params"]["jyVehicleRequest.resources"])
+                self.resources.append(resource)
+                return {"status": 0, "result": [{"vehicleId": resource, "vehicleYear": "202511" if resource == "0524" else "200903"}]}
+
+        client = _ResourceClient()
+        with patch("app.services.quote_platforms.platforms.picc.business._used_fuel_model_query_terms", return_value=["740Li"]):
+            result = _adapter()._query_vehicle_candidates(
+                client,
+                {"rawModelName": "740Li", "vehicleNameHint": "740Li", "enrollDate": "2012-09-28"},
+                defaults={"车型查询资源码": "0524,0999"},
+            )
+        self.assertEqual(result["result"][0]["vehicleId"], "0999")
+        self.assertEqual(client.resources, ["0524", "0999"])
+
     def test_merged_chinese_brand_model_code_is_not_guessed_as_a_sales_model(self) -> None:
         terms = _used_fuel_model_query_terms(
             "雷克萨斯JTHKR5BH",
@@ -2313,6 +2365,38 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(normalized.get("owner_name"), "新车主")
         self.assertNotIn("commercial_start_date", normalized)
         self.assertEqual(normalized.get("compulsory_start_date"), "2026-10-02")
+
+    def test_edited_model_discards_prefilled_sales_model_when_left_blank(self) -> None:
+        base = {"vehicle_model": "BMW740Li", "car_name": "740Li", QUOTE_DATA_OVERRIDES_KEY: {"car_name": "740Li"}}
+        values = {"vehicle_model": "BMW730Li", "car_name": ""}
+        rebased, cleared = _quote_material_form_rebased_case_data(base, values, values.keys())
+        self.assertNotIn("car_name", cleared)
+        normalized = _normalize_quote_case_data(
+            base_data=rebased,
+            order_data={},
+            text_data={QUOTE_DATA_OVERRIDES_KEY: _quote_material_form_overrides_from_values(values)},
+            images_by_slot={},
+        )
+        self.assertEqual(normalized.get("vehicle_model"), "BMW730Li")
+        self.assertEqual(normalized.get("car_name"), "730Li")
+
+    def test_removed_optional_sales_model_clears_inherited_value(self) -> None:
+        base = {"vehicle_model": "BMW740Li", "car_name": "740Li", QUOTE_DATA_OVERRIDES_KEY: {"car_name": "740Li"}}
+        values = {"vehicle_model": "BMW"}
+        submitted = {"vehicle_model", "car_name"}
+        rebased, cleared = _quote_material_form_rebased_case_data(base, values, submitted)
+        self.assertEqual(cleared, {"car_name"})
+        normalized = _normalize_quote_case_data(
+            base_data=rebased,
+            order_data={},
+            text_data={QUOTE_DATA_OVERRIDES_KEY: _quote_material_form_overrides_from_values(values)},
+            images_by_slot={},
+        )
+        for key in cleared:
+            normalized.pop(key, None)
+            normalized.get(QUOTE_DATA_OVERRIDES_KEY, {}).pop(key, None)
+        self.assertNotIn("car_name", normalized)
+        self.assertNotIn("car_name", normalized.get(QUOTE_DATA_OVERRIDES_KEY, {}))
 
     def test_quote_entity_fields_keep_quote_config_overrides(self) -> None:
         self.assertIn("quote_field_overrides", QUOTE_ENTITY_FIELD_KEYS)

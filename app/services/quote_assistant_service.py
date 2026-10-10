@@ -10381,7 +10381,13 @@ def _quote_material_form_rebased_case_data(
             rebased.pop("license_type_decision", None)
             overrides.pop("license_type_override", None)
         if not _to_str(_json_obj(values).get(key)).strip():
-            cleared.add(key)
+            derived_sales_model = (
+                _quote_material_form_overrides_from_values(values).get("car_name")
+                if key == "car_name" and key in values
+                else ""
+            )
+            if not derived_sales_model:
+                cleared.add(key)
     if overrides:
         rebased[QUOTE_DATA_OVERRIDES_KEY] = overrides
     else:
