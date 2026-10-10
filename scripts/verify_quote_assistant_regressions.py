@@ -1278,6 +1278,50 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(vehicle.get("modelSelectionBlockReason"), "candidate_facts_conflict")
         self.assertIn("年款、代际或座位数", _vehicle_model_resolution_failure_message(vehicle, ["740Li"]))
 
+    def test_registration_month_transition_requires_explicit_catalogue_code(self) -> None:
+        vehicle = {
+            "rawModelName": "宝马牌740Li",
+            "modelName": "740Li",
+            "vehicleNameHint": "740Li",
+            "enrollDate": "2012-09-28",
+            "seatCount": "5",
+            "seatCountConfirmed": True,
+        }
+        selected = _pick_best_vehicle_candidate(
+            [
+                {
+                    "vehicleId": "BMAAEI0044",
+                    "vehicleModelCode": "BBMBQYUD0032",
+                    "vehicleName": "宝马BMW 740Li轿车",
+                    "groupName": "宝马7系 F02(09-12/09)",
+                    "vehicleYear": "200903",
+                    "vehicleSeat": 5,
+                    "enginePower": "240",
+                    "priceP": 938000,
+                    "remark": "手自一体 领先型",
+                },
+                {
+                    "vehicleId": "BMAAEI0059",
+                    "vehicleModelCode": "BBMBQYUD0010",
+                    "vehicleName": "宝马BMW 740Li轿车",
+                    "groupName": "宝马7系 F02 LCI(12/09-15/10)",
+                    "vehicleYear": "201209",
+                    "vehicleSeat": 5,
+                    "enginePower": "235",
+                    "priceP": 1150000,
+                    "remark": "手自一体 豪华型",
+                },
+            ],
+            vehicle,
+        )
+        self.assertEqual(selected, {})
+        self.assertEqual(vehicle.get("modelSelectionBlockReason"), "ambiguous_generation")
+        message = _vehicle_model_resolution_failure_message(vehicle, ["740Li"])
+        self.assertIn("跨代配置", message)
+        self.assertIn("BMAAEI0044", message)
+        self.assertIn("BMAAEI0059", message)
+        self.assertIn("车型编码", message)
+
     def test_candidate_selection_keeps_legacy_price_rule_without_registration_date(self) -> None:
         vehicle = {
             "rawModelName": "宝马牌740Li",
@@ -1293,7 +1337,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
         self.assertEqual(selected.get("vehicleId"), "LOW")
 
-    def test_specific_model_query_requests_enough_rows_for_old_generations(self) -> None:
+    def test_specific_model_query_collects_remaining_catalogue_pages(self) -> None:
         class _GenerationClient:
             def __init__(self) -> None:
                 self.config = SimpleNamespace(base_url="https://picc.test")
@@ -1302,8 +1346,26 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             def request_json(self, method: str, path: str, **kwargs: object) -> dict:
                 params = kwargs["params"]
                 self.row_limits.append(int(params["rows"]))
+                page = int(params["page"])
+                if page == 1:
+                    return {
+                        "status": 0,
+                        "totalCount": 51,
+                        "result": [
+                            {
+                                "vehicleId": f"NEW-{index}",
+                                "vehicleName": "宝马BMW 740Li轿车",
+                                "groupName": "宝马7系 G70(22/12-)",
+                                "vehicleYear": "202511",
+                                "vehicleSeat": 5,
+                                "priceP": 745300 + index,
+                            }
+                            for index in range(50)
+                        ],
+                    }
                 return {
                     "status": 0,
+                    "totalCount": 51,
                     "result": [
                         {
                             "vehicleId": "OLD-F02",
@@ -1326,8 +1388,10 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             "enrollDate": "2012-09-28",
         }
         rows = _adapter()._query_vehicle_candidates(client, vehicle)
-        self.assertEqual(len(rows.get("result") or []), 1)
-        self.assertEqual(client.row_limits[0], 100)
+        selected = _pick_best_vehicle_candidate(rows.get("result") or [], vehicle)
+        self.assertEqual(len(rows.get("result") or []), 51)
+        self.assertEqual(selected.get("vehicleId"), "OLD-F02")
+        self.assertEqual(client.row_limits, [50, 50])
 
     def test_merged_chinese_brand_model_code_is_not_guessed_as_a_sales_model(self) -> None:
         terms = _used_fuel_model_query_terms(

@@ -2651,6 +2651,72 @@ def _vehicle_candidate_compatibility(row: Mapping[str, Any], vehicle: Mapping[st
     return True, ""
 
 
+def _vehicle_candidate_summary(row: Mapping[str, Any]) -> Dict[str, str]:
+    return {
+        "vehicle_id": _first_text(row.get("vehicleId"), row.get("modelCode")),
+        "model_code": _first_text(row.get("vehicleModelCode"), row.get("platModelCode")),
+        "name": _first_text(row.get("vehicleName"), row.get("carName")),
+        "group": _first_text(row.get("groupName"), row.get("vehicleGroupName")),
+        "year": _first_text(row.get("vehicleYear"), row.get("modelYear")),
+        "seats": _first_text(row.get("vehicleSeat"), row.get("seatCount")),
+        "power": _first_text(row.get("enginePower"), row.get("vehiclePower")),
+        "remark": _first_text(row.get("remark"), row.get("vehicleAlias")),
+    }
+
+
+def _vehicle_transition_candidates(
+    rows: List[tuple[int, Dict[str, Any]]],
+    vehicle: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Find competing catalogue generations that both cover the registration month."""
+    registered_month = _vehicle_registration_month(vehicle)
+    if registered_month is None:
+        return []
+    matching: List[Dict[str, Any]] = []
+    groups: set[str] = set()
+    for _, row in rows:
+        start, end = _vehicle_group_period_months(row)
+        group = _first_text(row.get("groupName"), row.get("vehicleGroupName"), row.get("seriesName"))
+        if start is None or not group:
+            continue
+        if start <= registered_month and (end is None or registered_month <= end):
+            matching.append(row)
+            groups.add(_compact_vehicle_compare_text(group))
+    return matching if len(groups) > 1 else []
+
+
+def _vehicle_candidate_summaries_by_group(rows: List[Dict[str, Any]], *, limit: int = 12) -> List[Dict[str, str]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            _vehicle_year_month(item.get("vehicleYear")) or 0,
+            _to_str(item.get("vehicleId")),
+        ),
+    ):
+        group = _compact_vehicle_compare_text(
+            _first_text(row.get("groupName"), row.get("vehicleGroupName"), row.get("seriesName"))
+        )
+        buckets.setdefault(group or "-", []).append(row)
+    summaries: List[Dict[str, str]] = []
+    offset = 0
+    ordered_groups = sorted(buckets)
+    while len(summaries) < max(1, limit):
+        added = False
+        for group in ordered_groups:
+            group_rows = buckets[group]
+            if offset >= len(group_rows):
+                continue
+            summaries.append(_vehicle_candidate_summary(group_rows[offset]))
+            added = True
+            if len(summaries) >= max(1, limit):
+                break
+        if not added:
+            break
+        offset += 1
+    return summaries
+
+
 def _vehicle_model_resolution_failure_message(
     vehicle: Mapping[str, Any],
     tried_terms: List[str],
@@ -2661,6 +2727,35 @@ def _vehicle_model_resolution_failure_message(
     block_reason = _to_str(vehicle.get("modelQueryBlockReason")).strip()
     selection_block_reason = _to_str(vehicle.get("modelSelectionBlockReason")).strip()
     usable_hint = _vehicle_model_hint_is_usable(vehicle, name_hint)
+    if selection_block_reason == "ambiguous_generation":
+        summaries = [
+            _json_obj(item)
+            for item in (
+                vehicle.get("vehicleSelectionCandidates")
+                if isinstance(vehicle.get("vehicleSelectionCandidates"), list)
+                else []
+            )
+        ]
+        choices: List[str] = []
+        for item in summaries[:5]:
+            code = _first_text(item.get("vehicle_id"), item.get("model_code"))
+            detail = " / ".join(
+                text
+                for text in (
+                    _to_str(item.get("group")).strip(),
+                    _to_str(item.get("year")).strip(),
+                    _to_str(item.get("power")).strip() + "kW" if _to_str(item.get("power")).strip() else "",
+                    _to_str(item.get("remark")).strip(),
+                )
+                if text
+            )
+            if code:
+                choices.append(f"{code}（{detail or _to_str(item.get('name')).strip()}）")
+        choice_text = "；候选：" + "、".join(choices) if choices else ""
+        return (
+            f"车型名称【{raw_model}】在初登月份存在跨代配置，无法安全自动选定{choice_text}。"
+            "请核对车辆功率/配置，并在补资料的车型名称中填写对应车型编码后重试"
+        )
     if selection_block_reason == "candidate_facts_conflict":
         return (
             f"车型名称【{raw_model}】已查询到平台候选，但候选的年款、代际或座位数与车辆初登资料不一致，"
@@ -2999,6 +3094,15 @@ def _pick_best_vehicle_candidate(
     if not compatible_rows:
         if isinstance(vehicle, dict):
             vehicle["modelSelectionBlockReason"] = "candidate_facts_conflict"
+        return {}
+    transition_rows = _vehicle_transition_candidates(compatible_rows, vehicle)
+    if transition_rows:
+        if isinstance(vehicle, dict):
+            vehicle["modelSelectionBlockReason"] = "ambiguous_generation"
+            vehicle["vehicleSelectionCandidates"] = _vehicle_candidate_summaries_by_group(
+                transition_rows,
+                limit=12,
+            )
         return {}
     scored_rows = [
         (_vehicle_candidate_score(row, vehicle), index, row)
@@ -7240,28 +7344,33 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         has_vin_prefixes = bool(_vehicle_vin_model_code_candidates(vehicle.get("vin")))
         has_usable_sales_hint = _vehicle_model_hint_is_usable(vehicle, vehicle.get("vehicleNameHint"))
 
-        def _request_term(term: str, *, rows_limit: int) -> Any:
+        def _request_term(term: str, *, rows_limit: int, paginate: bool = False) -> Any:
             last_local: Any = {}
             for resource_code in resource_codes:
-                params = {
-                    "jyVehicleRequest.resources": resource_code,
-                    "jyVehicleRequest.brandName": "",
-                    "jyVehicleRequest.vinno": vehicle.get("vin") or "",
-                    "jyVehicleRequest.vehicleName": term if term.endswith("*") else f"{term}*",
-                    "jyVehicleRequest.vehicleAlias": "",
-                    "jyVehicleRequest.vehicleId": "",
-                    "jyVehicleRequest.searchCode": "",
-                    "jyVehicleRequest.platModelCode": "",
-                    "page": 1,
-                    "rows": rows_limit,
-                }
-                data = client.request_json(
-                    "GET",
-                    VEHICLE_QUERY_PATH,
-                    purpose="business",
-                    params=params,
-                    headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
-                )
+                page_size = max(1, min(int(rows_limit or 50), 50))
+
+                def fetch_page(page_no: int) -> Any:
+                    params = {
+                        "jyVehicleRequest.resources": resource_code,
+                        "jyVehicleRequest.brandName": "",
+                        "jyVehicleRequest.vinno": vehicle.get("vin") or "",
+                        "jyVehicleRequest.vehicleName": term if term.endswith("*") else f"{term}*",
+                        "jyVehicleRequest.vehicleAlias": "",
+                        "jyVehicleRequest.vehicleId": "",
+                        "jyVehicleRequest.searchCode": "",
+                        "jyVehicleRequest.platModelCode": "",
+                        "page": page_no,
+                        "rows": page_size,
+                    }
+                    return client.request_json(
+                        "GET",
+                        VEHICLE_QUERY_PATH,
+                        purpose="business",
+                        params=params,
+                        headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
+                    )
+
+                data = fetch_page(1)
                 last_local = data
                 if isinstance(vehicle, dict):
                     vehicle["vehicleQueryResourcesUsed"] = resource_code
@@ -7271,8 +7380,48 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     if _is_vehicle_query_no_data_response(data):
                         continue
                     raise
-                if _vehicle_rows(data):
-                    return data
+                first_rows = _vehicle_rows(data)
+                if first_rows:
+                    if not paginate:
+                        return data
+                    total = max(_safe_int_local(_json_obj(data).get("totalCount"), 0), len(first_rows))
+                    total_pages = max(1, min(8, (total + page_size - 1) // page_size))
+                    collected = list(first_rows)
+                    for page_no in range(2, total_pages + 1):
+                        page_data = fetch_page(page_no)
+                        try:
+                            _ensure_platform_success(page_data, action="车型配置查询")
+                        except PiccBusinessRequestError:
+                            if _is_vehicle_query_no_data_response(page_data):
+                                break
+                            raise
+                        page_rows = _vehicle_rows(page_data)
+                        if not page_rows:
+                            break
+                        collected.extend(page_rows)
+                    unique_rows: List[Dict[str, Any]] = []
+                    seen_rows: set[tuple[str, ...]] = set()
+                    for row in collected:
+                        identity = tuple(
+                            _to_str(row.get(key)).strip()
+                            for key in (
+                                "vehicleId",
+                                "vehicleModelCode",
+                                "vehicleYear",
+                                "vehicleSeat",
+                                "enginePower",
+                                "remark",
+                            )
+                        )
+                        if identity in seen_rows:
+                            continue
+                        seen_rows.add(identity)
+                        unique_rows.append(row)
+                    combined = dict(_json_obj(data))
+                    combined["result"] = unique_rows
+                    combined["collectedCount"] = len(unique_rows)
+                    combined["requestedPageSize"] = page_size
+                    return combined
             return last_local
 
         for term in terms:
@@ -7280,10 +7429,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if not term_key or term_key in attempted_terms:
                 continue
             attempted_terms.add(term_key)
-            # PICC may return many generations for a sales name (for example
-            # 740Li). Request the largest useful first page so registration-
-            # date filtering is not limited to the newest ten catalogue rows.
-            data = _request_term(term, rows_limit=100)
+            # PICC caps one response at 50 rows even when rows=100, and then
+            # incorrectly reports one page. Use the real 50-row page size and
+            # collect the remaining pages before generation filtering.
+            data = _request_term(term, rows_limit=50, paginate=True)
             last_data = data
             try:
                 _ensure_platform_success(data, action="车型配置查询")
@@ -7354,7 +7503,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if not term_key or term_key in attempted_terms:
                     continue
                 attempted_terms.add(term_key)
-                data = _request_term(term, rows_limit=100)
+                data = _request_term(term, rows_limit=50)
                 try:
                     _ensure_platform_success(data, action="车型配置查询")
                 except PiccBusinessRequestError:
