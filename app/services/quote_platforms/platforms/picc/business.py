@@ -99,6 +99,11 @@ PRODUCT_EXTERNAL_GRID = "附加外部电网故障损失险"
 PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
 PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 QUOTE_DATA_OVERRIDES_KEY = "quote_data_overrides"
+# Stored inside the JSON configuration as an internal tombstone list.  It is
+# deliberately not rendered as an editable field; its only purpose is to
+# distinguish "never configured" from "explicitly removed" when built-in
+# defaults are merged for a quote.
+PICC_DELETED_DEFAULT_FIELDS_KEY = "__quote_deleted_default_fields__"
 
 PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
     PRODUCT_COMPULSORY: ("交强", "交强险"),
@@ -123,6 +128,19 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
         "电网故障",
     ),
     PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途家安顺保费", "途家安顺", "途家安顺非车保费"),
+}
+
+# Aliases used by the PICC request builder for editable channel fields.  A
+# deleted visible field must also suppress the protocol aliases that would
+# otherwise be recovered from the hidden common defaults.
+PICC_CONFIG_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
+    "操作机构代码": ("操作机构代码", "出单机构代码", "opconfComCode", "opconf_makecomCode"),
+    "操作配置ID": ("操作配置ID", "车型配置ID", "selectedOperateConfigId", "selectedOperateConfig"),
+    "送修码启用": ("送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus"),
+    "送修码": ("送修码", "送修码代码", "专管代码", "monopolyCode"),
+    "送修码名称": ("送修码名称", "送修码机构", "专管名称", "monopolyName"),
+    "业务性质代码": ("业务性质代码", "businesNature"),
+    "业务性质名称": ("业务性质名称", "businesNatureName"),
 }
 
 PICC_TUJIA_ANSHUN_RISK_CODE = "LCO"
@@ -354,8 +372,21 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
 
 def _picc_business_defaults(default_values: Any) -> Dict[str, Any]:
     """Merge hidden protocol defaults behind the editable PICC product config."""
+    raw = dict(_json_obj(default_values))
+    deleted = _deleted_default_fields(raw)
+    raw.pop(PICC_DELETED_DEFAULT_FIELDS_KEY, None)
     defaults = dict(PICC_COMMON_PLATFORM_DEFAULTS)
-    defaults.update(_json_obj(default_values))
+    defaults.update(raw)
+    # Remove the hidden/common aliases for an explicitly deleted visible
+    # field.  If the user renamed a field to one of its accepted aliases, the
+    # active raw value remains and _default_field_is_deleted() will treat the
+    # rename as an override rather than a deletion.
+    for deleted_name in deleted:
+        aliases = _default_field_aliases(deleted_name)
+        for key in aliases:
+            if key not in raw or key == deleted_name:
+                defaults.pop(key, None)
+    defaults[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted
     return defaults
 
 
@@ -689,6 +720,57 @@ def _to_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def _deleted_default_fields(defaults: Mapping[str, Any]) -> List[str]:
+    raw = defaults.get(PICC_DELETED_DEFAULT_FIELDS_KEY) if isinstance(defaults, Mapping) else None
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = re.sub(r"\s+", " ", _to_str(item).strip())[:128]
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _default_field_aliases(name: Any) -> set[str]:
+    text = re.sub(r"\s+", " ", _to_str(name).strip())
+    if not text:
+        return set()
+    for canonical, aliases in PRODUCT_FIELD_ALIASES.items():
+        candidates = {canonical, *aliases}
+        if text in candidates:
+            return candidates
+    for canonical, aliases in PICC_CONFIG_FIELD_ALIASES.items():
+        candidates = {canonical, *aliases}
+        if text in candidates:
+            return candidates
+    return {text}
+
+
+def _default_field_is_deleted(defaults: Mapping[str, Any], *names: str) -> bool:
+    deleted = set(_deleted_default_fields(defaults))
+    if not deleted:
+        return False
+    for name in names:
+        aliases = _default_field_aliases(name)
+        if not aliases or not deleted.intersection(aliases):
+            continue
+        # A current value under another accepted alias means this was a
+        # rename/override, not a removal.
+        if any(
+            key != PICC_DELETED_DEFAULT_FIELDS_KEY
+            and key in aliases
+            and _to_str(value).strip() != ""
+            for key, value in defaults.items()
+        ):
+            continue
+        return True
+    return False
+
+
 def _normalize_account_type(value: Any) -> str:
     text = re.sub(r"\s+", "", _to_str(value).strip())
     return ACCOUNT_TYPE_ALIASES.get(text, text)
@@ -716,6 +798,8 @@ def _profile_product_default(
     canonical_name: str,
     fallback: Any = "",
 ) -> Any:
+    if _default_field_is_deleted(defaults, canonical_name):
+        return None
     profile_defaults = _json_obj(profile.get("product_defaults"))
     return _default_value(defaults, canonical_name, profile_defaults.get(canonical_name, fallback))
 
@@ -1006,6 +1090,8 @@ def _period_last_year(start_date: Any) -> str:
 
 
 def _default_value(defaults: Mapping[str, Any], canonical_name: str, fallback: Any = "") -> Any:
+    if _default_field_is_deleted(defaults, canonical_name):
+        return None
     for key in PRODUCT_FIELD_ALIASES.get(canonical_name, (canonical_name,)):
         if key in defaults and _to_str(defaults.get(key)).strip() != "":
             return defaults.get(key)
@@ -1015,6 +1101,8 @@ def _default_value(defaults: Mapping[str, Any], canonical_name: str, fallback: A
 
 
 def _has_configured_product_default(defaults: Mapping[str, Any], canonical_name: str) -> bool:
+    if _default_field_is_deleted(defaults, canonical_name):
+        return True
     for key in PRODUCT_FIELD_ALIASES.get(canonical_name, (canonical_name,)):
         if key in defaults and _to_str(defaults.get(key)).strip() != "":
             return True
@@ -1022,6 +1110,8 @@ def _has_configured_product_default(defaults: Mapping[str, Any], canonical_name:
 
 
 def _field_value(defaults: Mapping[str, Any], *names: str, fallback: Any = "") -> Any:
+    if _default_field_is_deleted(defaults, *names):
+        return None
     for name in names:
         if name in defaults and _to_str(defaults.get(name)).strip() != "":
             return defaults.get(name)
@@ -1991,6 +2081,13 @@ def _pick_joint_sale_plan_by_premium(data: Any, premium: Any) -> Dict[str, Any]:
 
 
 def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
+    if _default_field_is_deleted(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM):
+        return {
+            "enabled": False,
+            "premium": "0",
+            "amount": "0",
+            "reason": "途家安顺保费配置已删除，按规则不查询保额",
+        }
     premium = _money(_default_value(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM, "398"))
     if premium <= 0:
         return {
@@ -2090,6 +2187,8 @@ def _checked_flag_text(value: Any, default: bool = True) -> str:
 
 
 def _repair_code_enabled(defaults: Mapping[str, Any]) -> bool:
+    if _default_field_is_deleted(defaults, "送修码启用"):
+        return False
     return _checked(
         _field_value(defaults, "送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus", fallback="1"),
         default=True,
@@ -2950,7 +3049,10 @@ def _renewal_enrich_candidate_period_sources(
 
 
 def _quote_loss_override_amount(quote_payload: Mapping[str, Any], defaults: Optional[Mapping[str, Any]] = None) -> Decimal:
-    if defaults is not None and _product_excluded(defaults, PRODUCT_LOSS):
+    if defaults is not None and (
+        _product_excluded(defaults, PRODUCT_LOSS)
+        or _default_field_is_deleted(defaults, PRODUCT_LOSS)
+    ):
         return Decimal("0")
     normalized_data = _json_obj(_json_obj(quote_payload).get("normalized_data"))
     if _product_excluded({PRODUCT_EXCLUSIONS_KEY: normalized_data.get(PRODUCT_EXCLUSIONS_KEY)}, PRODUCT_LOSS):
@@ -3313,7 +3415,11 @@ def _normalize_platform_adjusted_quote_products(
     exclusions = _product_exclusions(defaults)
     third_party_config = _profile_product_default(defaults, profile, PRODUCT_THIRD_PARTY, "300")
     third_party_wan = _wan_or_amount_to_wan_text(third_party_config, "300")
-    shared_main_limit = _checked(_profile_product_default(defaults, profile, PRODUCT_SHARED_LIMIT, True), default=True)
+    shared_main_limit_deleted = _default_field_is_deleted(defaults, PRODUCT_SHARED_LIMIT)
+    shared_main_limit = False if shared_main_limit_deleted else _checked(
+        _profile_product_default(defaults, profile, PRODUCT_SHARED_LIMIT, True),
+        default=True,
+    )
     medical_third_amount = _wan_or_amount_to_amount(
         _profile_product_default(defaults, profile, PRODUCT_MEDICAL_THIRD, third_party_config),
         third_party_wan or "300",
@@ -3325,10 +3431,19 @@ def _normalize_platform_adjusted_quote_products(
         (PRODUCT_THIRD_PARTY, "051051", PRODUCT_THIRD_PARTY, third_party_wan, None),
         (PRODUCT_DRIVER, "051052", PRODUCT_DRIVER, _wan_or_amount_to_amount(_profile_product_default(defaults, profile, PRODUCT_DRIVER, "2"), "2"), None),
         (PRODUCT_PASSENGER, "051053", PRODUCT_PASSENGER, _wan_or_amount_to_amount(_profile_product_default(defaults, profile, PRODUCT_PASSENGER, "2"), "2"), None),
-        (PRODUCT_MEDICAL_THIRD, "051063", PRODUCT_MEDICAL_THIRD, medical_third_amount, "1" if shared_main_limit else "0"),
+        (
+            PRODUCT_MEDICAL_THIRD,
+            "051063",
+            PRODUCT_MEDICAL_THIRD,
+            medical_third_amount,
+            None if shared_main_limit_deleted else ("1" if shared_main_limit else "0"),
+        ),
     ]
     for canonical_name, kind_code, kind_name, amount, shared_flag in core_specs:
-        if _canonical_product_name(canonical_name) in exclusions:
+        if (
+            _canonical_product_name(canonical_name) in exclusions
+            or _default_field_is_deleted(defaults, canonical_name)
+        ):
             continue
         changed = _set_quote_form_kind_row(
             form,
@@ -6749,7 +6864,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         third_party_amount = _wan_or_amount_to_wan_text(third_party_config, "300")
         driver_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_DRIVER, "2"), "2")
         passenger_amount = _wan_or_amount_to_amount(_profile_product_default(defaults, prof, PRODUCT_PASSENGER, "2"), "2")
-        shared_main_limit = _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True)
+        shared_main_limit_deleted = _default_field_is_deleted(defaults, PRODUCT_SHARED_LIMIT)
+        shared_main_limit = False if shared_main_limit_deleted else _checked(
+            _profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True),
+            default=True,
+        )
         medical_third_amount = _wan_or_amount_to_amount(
             _profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, third_party_config),
             third_party_amount or "300",
@@ -6957,6 +7076,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             spec
             for spec in product_specs
             if _canonical_product_name(spec.get("kind_name")) not in excluded_products
+            and not _default_field_is_deleted(defaults, _to_str(spec.get("kind_name")))
         ]
         medical_third_index: Optional[int] = None
         for index, spec in enumerate(product_rows):
@@ -6972,7 +7092,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 form[f"prpCitemKindVos[{index}].quantity"] = quantity
             if kind_name == PRODUCT_MEDICAL_THIRD:
                 medical_third_index = index
-        if medical_third_index is not None:
+        if medical_third_index is not None and not shared_main_limit_deleted:
             form[f"prpCitemKindVos[{medical_third_index}].sharedAmountFlag"] = "1" if shared_main_limit else "0"
         for key in USED_FUEL_QUOTE_EMPTY_FORM_FIELDS:
             form.setdefault(key, "")
@@ -6985,6 +7105,19 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if _is_dangerous_quote_form_override_key(form_key):
                 raise PiccRequestError(f"人保报价请求体覆盖包含危险字段：{form_key}，请改用会话调参或默认参数配置")
             form[form_key] = value
+        deleted_form_keys = {
+            "操作机构代码": ("opconfComCode", "opconf_makecomCode"),
+            "操作配置ID": ("selectedOperateConfigId", "selectedOperateConfig"),
+            "送修码启用": ("groupCodeValidStatus", "monopolyCode", "monopolyName"),
+            "送修码": ("monopolyCode",),
+            "送修码名称": ("monopolyName",),
+            "业务性质代码": ("businesNature",),
+            "业务性质名称": ("businesNatureName",),
+        }
+        for field_name, form_keys in deleted_form_keys.items():
+            if _default_field_is_deleted(defaults, field_name):
+                for form_key in form_keys:
+                    form.pop(form_key, None)
         form = _clean_vehicle_cert_fields(form)
         return {key: value for key, value in form.items() if value is not None}
 
@@ -8039,7 +8172,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         loss_amount = _first_text(_profile_product_default(defaults, prof, PRODUCT_LOSS), actual_value, "0")
         third_party_default = _profile_product_default(defaults, prof, PRODUCT_THIRD_PARTY, "300")
         third_party_amount = _wan_or_amount_to_amount(third_party_default, "300")
-        shared_main_limit = _checked(_profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True), default=True)
+        shared_main_limit_deleted = _default_field_is_deleted(defaults, PRODUCT_SHARED_LIMIT)
+        shared_main_limit = False if shared_main_limit_deleted else _checked(
+            _profile_product_default(defaults, prof, PRODUCT_SHARED_LIMIT, True),
+            default=True,
+        )
         medical_third_amount = _wan_or_amount_to_amount(
             _profile_product_default(defaults, prof, PRODUCT_MEDICAL_THIRD, third_party_default),
             _wan_or_amount_to_wan_text(third_party_default, "300"),
@@ -8048,15 +8185,21 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             medical_third_amount = third_party_amount
         road_rescue_quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
         external_grid_amount = _external_grid_amount(defaults, actual_value)
-        rows = [
-            {"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))},
-            {"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)},
-            {"code": "BI051", "name": PRODUCT_THIRD_PARTY, "required": True, "insuredAmount": third_party_amount},
-            {"code": "BI060", "name": PRODUCT_DRIVER, "required": True, "insuredAmount": driver_amount},
-            {"code": "BI061", "name": PRODUCT_PASSENGER, "required": True, "insuredAmount": passenger_amount},
-            {"code": "BI_SHARED", "name": PRODUCT_SHARED_LIMIT, "required": True, "checked": shared_main_limit},
-            {"code": "BI_MEDICAL_THIRD", "name": PRODUCT_MEDICAL_THIRD, "required": True, "insuredAmount": medical_third_amount},
-        ]
+        rows = []
+        if not _default_field_is_deleted(defaults, PRODUCT_COMPULSORY):
+            rows.append({"code": "CI", "name": PRODUCT_COMPULSORY, "required": True, "coverage": _to_str(_profile_product_default(defaults, prof, PRODUCT_COMPULSORY, "20"))})
+        if not _default_field_is_deleted(defaults, PRODUCT_LOSS):
+            rows.append({"code": "BI050", "name": PRODUCT_LOSS, "required": True, "insuredAmount": _money_text(loss_amount)})
+        if not _default_field_is_deleted(defaults, PRODUCT_THIRD_PARTY):
+            rows.append({"code": "BI051", "name": PRODUCT_THIRD_PARTY, "required": True, "insuredAmount": third_party_amount})
+        if not _default_field_is_deleted(defaults, PRODUCT_DRIVER):
+            rows.append({"code": "BI060", "name": PRODUCT_DRIVER, "required": True, "insuredAmount": driver_amount})
+        if not _default_field_is_deleted(defaults, PRODUCT_PASSENGER):
+            rows.append({"code": "BI061", "name": PRODUCT_PASSENGER, "required": True, "insuredAmount": passenger_amount})
+        if not _default_field_is_deleted(defaults, PRODUCT_SHARED_LIMIT):
+            rows.append({"code": "BI_SHARED", "name": PRODUCT_SHARED_LIMIT, "required": True, "checked": shared_main_limit})
+        if not _default_field_is_deleted(defaults, PRODUCT_MEDICAL_THIRD):
+            rows.append({"code": "BI_MEDICAL_THIRD", "name": PRODUCT_MEDICAL_THIRD, "required": True, "insuredAmount": medical_third_amount})
         if road_rescue_quantity > 0:
             rows.append({"code": "BI_ROAD_RESCUE", "name": PRODUCT_ROAD_RESCUE, "required": False, "quantity": road_rescue_quantity})
         if _is_positive_amount(external_grid_amount):

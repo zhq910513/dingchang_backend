@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import unittest
@@ -97,6 +98,7 @@ from app.services.quote_assistant_service import (
     _has_reusable_renewal_quote_context,
     _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
+    _platform_default_config_payload,
     _platform_default_values_with_legacy_fixes,
     _picc_existing_proposal_table_card_for_display,
     _picc_result_coverage_items_for_display,
@@ -154,6 +156,11 @@ from app.services.quote_platforms.platforms.picc.business import (
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
     _pick_best_vehicle_candidate,
+    _picc_business_defaults,
+    PICC_DELETED_DEFAULT_FIELDS_KEY,
+    PRODUCT_EXTERNAL_GRID,
+    PRODUCT_ROAD_RESCUE,
+    PRODUCT_THIRD_PARTY,
     _used_fuel_quote_platform_dialog,
     _vehicle_brand_prefix,
     _vehicle_candidate_score,
@@ -1210,6 +1217,177 @@ class QuoteFlowMaterialRequirementRegressionTests(unittest.TestCase):
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _config_delete_quote_parts(config):
+        from app.services.quote_platforms.platforms.picc.business import _motor_quote_profile
+
+        adapter = _adapter()
+        defaults = _picc_business_defaults(config)
+        profile = _motor_quote_profile("油车-旧")
+        vehicle = {
+            "licenseNo": "赣G12345",
+            "engineNo": "ENGINE001",
+            "vin": "LTESTVIN000000001",
+            "enrollDate": "2024-01-01",
+            "startDateBI": "2026-10-11",
+            "startDateCI": "2026-10-11",
+            "modelName": "测试车型",
+            "actualValue": "100000",
+            "purchasePrice": "100000",
+            "seatCount": "5",
+        }
+        owner = {"ownerName": "测试", "ownerIdNo": "360402199001011234", "ownerPhone": "13900000000"}
+        selected = {"vehicleId": "MODEL001", "vehicleModelCode": "PLAT001", "purchasePrice": "100000"}
+        products = adapter._used_fuel_products(
+            defaults,
+            profile=profile,
+            actual_value="100000",
+            seat_count="5",
+        )
+        form = adapter._build_used_fuel_quote_form(
+            defaults,
+            vehicle,
+            owner,
+            selected,
+            {},
+            products,
+            profile=profile,
+            strict_config=False,
+        )
+        return defaults, products, form
+
+    def test_deleted_config_fields_do_not_reappear_in_final_quote_form(self) -> None:
+        deleted = [
+            PRODUCT_ROAD_RESCUE,
+            PRODUCT_EXTERNAL_GRID,
+            "操作机构代码",
+            "操作配置ID",
+            "送修码启用",
+            "送修码",
+            "送修码名称",
+            "业务性质代码",
+            "业务性质名称",
+        ]
+        _, products, form = self._config_delete_quote_parts(
+            {
+                PRODUCT_THIRD_PARTY: "500",
+                "PICC报价请求体覆盖": {
+                    "opconfComCode": "OVERRIDE-ORG",
+                    "selectedOperateConfigId": "OVERRIDE-CONFIG",
+                    "monopolyCode": "OVERRIDE-REPAIR",
+                    "businesNature": "OVERRIDE-NATURE",
+                },
+                PICC_DELETED_DEFAULT_FIELDS_KEY: deleted,
+            }
+        )
+
+        self.assertEqual(
+            next(item["insuredAmount"] for item in products if item.get("name") == PRODUCT_THIRD_PARTY),
+            "5000000",
+        )
+        self.assertNotIn("BI_ROAD_RESCUE", {item.get("code") for item in products})
+        self.assertNotIn("BI_EXTERNAL_GRID", {item.get("code") for item in products})
+        self.assertNotIn("051064", {value for key, value in form.items() if key.endswith(".kindCode")})
+        self.assertNotIn("051085", {value for key, value in form.items() if key.endswith(".kindCode")})
+        for key in (
+            "opconfComCode",
+            "opconf_makecomCode",
+            "selectedOperateConfigId",
+            "selectedOperateConfig",
+            "groupCodeValidStatus",
+            "monopolyCode",
+            "monopolyName",
+            "businesNature",
+            "businesNatureName",
+        ):
+            self.assertNotIn(key, form)
+
+    def test_deleted_core_product_is_not_restored_from_profile_default(self) -> None:
+        _, products, form = self._config_delete_quote_parts(
+            {PICC_DELETED_DEFAULT_FIELDS_KEY: [PRODUCT_THIRD_PARTY]}
+        )
+
+        self.assertNotIn(PRODUCT_THIRD_PARTY, {item.get("name") for item in products})
+        self.assertNotIn("051051", {value for key, value in form.items() if key.endswith(".kindCode")})
+
+    def test_renaming_product_to_supported_alias_keeps_new_value(self) -> None:
+        _, products, form = self._config_delete_quote_parts(
+            {
+                "三者险": "500",
+                PICC_DELETED_DEFAULT_FIELDS_KEY: [PRODUCT_THIRD_PARTY],
+            }
+        )
+
+        self.assertEqual(
+            next(item["insuredAmount"] for item in products if item.get("name") == PRODUCT_THIRD_PARTY),
+            "5000000",
+        )
+        third_index = next(
+            int(key.split("[", 1)[1].split("]", 1)[0])
+            for key, value in form.items()
+            if key.endswith(".kindCode") and value == "051051"
+        )
+        self.assertEqual(form[f"prpCitemKindVos[{third_index}].amount"], "500")
+
+    def test_default_config_payload_hides_internal_delete_markers(self) -> None:
+        stored = {
+            PRODUCT_THIRD_PARTY: "500",
+            PICC_DELETED_DEFAULT_FIELDS_KEY: [PRODUCT_EXTERNAL_GRID],
+        }
+        row = SimpleNamespace(
+            id=1,
+            platform_code="PICC",
+            platform_name="人保",
+            account_type_name="油车-旧",
+            default_values_json=stored,
+            enabled=True,
+            created_by=1,
+            updated_by=1,
+            created_at=None,
+            updated_at=None,
+        )
+
+        payload = _platform_default_config_payload(row)
+
+        self.assertEqual(payload["default_values"], {PRODUCT_THIRD_PARTY: "500"})
+        self.assertEqual(payload["deleted_default_fields"], [PRODUCT_EXTERNAL_GRID])
+        self.assertIn(PICC_DELETED_DEFAULT_FIELDS_KEY, stored)
+
+    def test_snapshot_merge_removes_deleted_builtin_before_quote(self) -> None:
+        resolved = {
+            "config": {"id": 1},
+            "default_values": {"三者险": "500"},
+            "deleted_default_fields": [PRODUCT_THIRD_PARTY, PRODUCT_EXTERNAL_GRID],
+            "builtin_default_values": {
+                PRODUCT_THIRD_PARTY: "300",
+                PRODUCT_EXTERNAL_GRID: "10",
+            },
+            "matched": "account_type",
+        }
+        with patch.object(
+            quote_assistant_service,
+            "resolve_platform_default_config",
+            new=AsyncMock(return_value=resolved),
+        ):
+            snapshot = asyncio.run(
+                quote_assistant_service.apply_platform_default_config_to_snapshot(
+                    AsyncMock(),
+                    snapshot={"normalized_data": {}, "images_by_slot": {}},
+                    platform_code="PICC",
+                    account_type_name="油车-旧",
+                    config_type_name="油车-旧",
+                )
+            )
+
+        defaults = snapshot["default_config_json"]
+        self.assertNotIn(PRODUCT_THIRD_PARTY, defaults)
+        self.assertNotIn(PRODUCT_EXTERNAL_GRID, defaults)
+        self.assertEqual(defaults["三者险"], "500")
+        self.assertEqual(
+            defaults[PICC_DELETED_DEFAULT_FIELDS_KEY],
+            [PRODUCT_THIRD_PARTY, PRODUCT_EXTERNAL_GRID],
+        )
+
     def test_old_vehicle_rejects_new_generation_before_price_tiebreak(self) -> None:
         vehicle = {
             "rawModelName": "宝马牌740Li",

@@ -104,4 +104,5 @@ class AiPlatformDefaultConfigIn(BaseModel):
     platform_name: Optional[str] = Field(default=None, max_length=64)
     account_type_name: str = Field(..., min_length=1, max_length=64)
     default_values: Dict[str, Any] = Field(default_factory=dict)
+    deleted_default_fields: List[str] = Field(default_factory=list, max_items=256)
     enabled: bool = True

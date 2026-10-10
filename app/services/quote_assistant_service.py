@@ -61,6 +61,8 @@ from app.services.quote_platforms.browser_manager import account_profile_dir
 from app.services.quote_platforms.platforms.picc.business import (
     picc_motor_builtin_default_values,
     _duplicate_quote_next_day_adjustments,
+    _default_field_aliases,
+    PICC_DELETED_DEFAULT_FIELDS_KEY,
 )
 from app.services.quote_platforms.platforms.picc.presentation import (
     picc_is_new_energy_vehicle,
@@ -4658,10 +4660,12 @@ def _account_event_snapshot(row: Optional[QuotePlatformAccountProfile]) -> Dict[
 def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[str, Any]:
     platform_code = _loaded_value(row, "platform_code")
     account_type_name = _normalize_account_type_name(_loaded_value(row, "account_type_name")) or ""
+    stored_values = dict(_json_obj(_loaded_value(row, "default_values_json")))
+    deleted_default_fields = stored_values.pop(PICC_DELETED_DEFAULT_FIELDS_KEY, [])
     default_values = _platform_default_values_with_legacy_fixes(
         platform_code,
         account_type_name,
-        _json_obj(_loaded_value(row, "default_values_json")),
+        stored_values,
     )
     return {
         "id": _loaded_value(row, "id"),
@@ -4669,6 +4673,7 @@ def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[st
         "platform_name": _loaded_value(row, "platform_name"),
         "account_type_name": account_type_name,
         "default_values": default_values,
+        "deleted_default_fields": deleted_default_fields if isinstance(deleted_default_fields, list) else [],
         "enabled": bool(_loaded_value(row, "enabled")),
         "created_by": _loaded_value(row, "created_by"),
         "updated_by": _loaded_value(row, "updated_by"),
@@ -4684,6 +4689,8 @@ def _normalize_default_values(value: Any) -> Dict[str, Any]:
     for raw_key, raw_value in value.items():
         key = re.sub(r"\s+", " ", _to_str(raw_key).strip())[:128]
         if not key:
+            continue
+        if key == PICC_DELETED_DEFAULT_FIELDS_KEY:
             continue
         if isinstance(raw_value, str):
             val: Any = raw_value.strip()
@@ -4975,6 +4982,13 @@ async def save_platform_default_config(
     code, platform_name = _normalize_platform_code_name(values.get("platform_code"), values.get("platform_name"))
     type_name = _ensure_fixed_quote_account_type(values.get("account_type_name"), allow_empty=False)
     default_values = _normalize_default_values(values.get("default_values") or {})
+    deleted_default_fields: List[str] = []
+    for raw_name in values.get("deleted_default_fields") or []:
+        name = re.sub(r"\s+", " ", _to_str(raw_name).strip())[:128]
+        if name and name not in default_values and name not in deleted_default_fields:
+            deleted_default_fields.append(name)
+    if deleted_default_fields:
+        default_values[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted_default_fields
     if not default_values:
         raise ValueError("请至少配置一个默认参数")
 
@@ -5095,11 +5109,11 @@ async def resolve_platform_default_config(
 ) -> Dict[str, Any]:
     code = _to_str(platform_code).strip().upper()
     if not code:
-        return {"config": None, "default_values": {}, "builtin_default_values": {}, "matched": "none"}
+        return {"config": None, "default_values": {}, "deleted_default_fields": [], "builtin_default_values": {}, "matched": "none"}
     type_name = _normalize_account_type_name(account_type_name)
     builtin_defaults = platform_builtin_default_values(code, type_name)
     if not type_name:
-        return {"config": None, "default_values": {}, "builtin_default_values": builtin_defaults, "matched": "none"}
+        return {"config": None, "default_values": {}, "deleted_default_fields": [], "builtin_default_values": builtin_defaults, "matched": "none"}
     candidates = list(_account_type_db_names(type_name))
     for candidate in candidates:
         row = (
@@ -5119,10 +5133,11 @@ async def resolve_platform_default_config(
             return {
                 "config": payload,
                 "default_values": _json_obj(payload.get("default_values")),
+                "deleted_default_fields": list(payload.get("deleted_default_fields") or []),
                 "builtin_default_values": builtin_defaults,
                 "matched": "account_type" if candidate else "platform_common",
             }
-    return {"config": None, "default_values": {}, "builtin_default_values": builtin_defaults, "matched": "none"}
+    return {"config": None, "default_values": {}, "deleted_default_fields": [], "builtin_default_values": builtin_defaults, "matched": "none"}
 
 
 async def _has_enabled_platform_default_config(
@@ -5248,7 +5263,13 @@ async def apply_platform_default_config_to_snapshot(
     resolved_defaults = _json_obj(resolved.get("default_values"))
     quote_field_overrides = _merge_quote_config_overrides(normalized_data.get("quote_field_overrides"))
     default_values = dict(builtin_defaults)
+    deleted_default_fields = list(resolved.get("deleted_default_fields") or [])
+    for deleted_name in deleted_default_fields:
+        for alias in _default_field_aliases(deleted_name):
+            default_values.pop(alias, None)
     default_values.update(resolved_defaults)
+    if deleted_default_fields:
+        default_values[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted_default_fields
     default_values.update(quote_field_overrides)
     quote_product_exclusions = _normalize_quote_product_exclusions(
         normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
