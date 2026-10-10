@@ -3722,6 +3722,7 @@ async def _dispatch_rule_with_db(
         confidence: float,
         entities: Dict[str, Any],
 ) -> Tuple[str, Dict[str, Any]]:
+    material_form_submission = bool((ctx or {}).get("quote_material_form_submit"))
     waiting_sms_active = False
     if intent != "quote":
         waiting_sms_active = await has_waiting_sms_task(db, ctx)
@@ -3768,9 +3769,15 @@ async def _dispatch_rule_with_db(
     )
     if (
         not image_result
-        and intent not in {"quote", "quote_credential", "query_material_status"}
+        and intent != "quote_credential"
         and not has_context_images
-        and (intent != "fallback" or text_material_candidate)
+        and (
+            material_form_submission
+            or (
+                intent not in {"quote", "query_material_status"}
+                and (intent != "fallback" or text_material_candidate)
+            )
+        )
     ):
         text_material_result = await handle_quote_text_material_message(db, ctx=ctx, entities=entities, text=text)
 

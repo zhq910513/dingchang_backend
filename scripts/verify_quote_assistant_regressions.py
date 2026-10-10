@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import app.services.quote_assistant_service as quote_assistant_service
+import app.services.ai_assistant_service as ai_assistant_service
 from app.services.quote_assistant_service import (
     CASE_STATUS_READY,
     CASE_STATUS_WAITING_SMS,
@@ -105,6 +106,7 @@ from app.services.quote_assistant_service import (
     quote_message_may_interrupt_running_task,
     _normalize_quote_product_exclusions,
     extract_quote_config_overrides,
+    extract_quote_fields,
 )
 from app.services.quote_platforms.platforms.picc.presentation import (
     picc_result_amount_text,
@@ -112,6 +114,7 @@ from app.services.quote_platforms.platforms.picc.presentation import (
 )
 from app.services.quote_result_image import _proposal_info_rows, save_quote_result_card_image
 from app.services.ai_assistant_service import (
+    _dispatch_rule_with_db,
     _humanize_exception,
     _message_preview_text,
     _complete_async_quote_result_image,
@@ -150,6 +153,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _quote_response_has_display_result,
     _renewal_candidate_score,
     _pick_renewal_policy_candidate,
+    _pick_best_vehicle_candidate,
     _used_fuel_quote_platform_dialog,
     _vehicle_brand_prefix,
     _vehicle_candidate_score,
@@ -768,6 +772,45 @@ class RunningQuoteInterruptionTests(unittest.TestCase):
         )
 
 
+class MaterialFormRoutingRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submitted_material_form_is_saved_before_quote_routing(self) -> None:
+        text = "补充资料 平台:人保 报价类型:油车-旧 车型:宝马牌740Li 车主姓名:测试车主"
+        ctx = {
+            "quote_material_form_submit": True,
+            "quote_material_form_values": {
+                "vehicle_model": "宝马牌740Li",
+                "owner_name": "测试车主",
+                "account_type_name": "油车-旧",
+            },
+        }
+        saved = (
+            "资料已保存",
+            {"intent": "quote_text_material", "data": {"payload": {"saved": True}}},
+        )
+        with (
+            patch.object(ai_assistant_service, "looks_like_quote_material_form_command", return_value=False),
+            patch.object(ai_assistant_service, "handle_quote_text_material_message", new=AsyncMock(return_value=saved)) as collect,
+            patch.object(ai_assistant_service, "handle_quote_message", new=AsyncMock()) as quote,
+        ):
+            result = await _dispatch_rule_with_db(
+                text,
+                ctx,
+                db=MagicMock(),
+                intent="quote",
+                confidence=0.98,
+                entities={"platform_code": "PICC", "platform_name": "人保"},
+            )
+
+        self.assertEqual(result, saved)
+        collect.assert_awaited_once()
+        quote.assert_not_awaited()
+
+    async def test_quote_text_parser_stops_model_at_owner_name_label(self) -> None:
+        fields = extract_quote_fields("车型:宝马牌740Li 车主姓名:测试车主 号牌号码:赣A12345")
+        self.assertEqual(fields.get("vehicle_model"), "宝马牌740Li")
+        self.assertEqual(fields.get("owner_name"), "测试车主")
+
+
 class AutoRenewalProbeFallthroughTests(unittest.TestCase):
     def test_auto_probe_only_for_picc_used_car_normal_flow(self) -> None:
         data = {"plate_no": "赣A12345", "engine_no": "ENG001"}
@@ -1167,6 +1210,125 @@ class QuoteFlowMaterialRequirementRegressionTests(unittest.TestCase):
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    def test_old_vehicle_rejects_new_generation_before_price_tiebreak(self) -> None:
+        vehicle = {
+            "rawModelName": "宝马牌740Li",
+            "modelName": "740Li",
+            "brandNameHint": "宝马",
+            "vehicleNameHint": "740Li",
+            "vin": "WBAKB4108CDX70191",
+            "enrollDate": "2012-09-28",
+            "seatCount": "5",
+            "seatCountConfirmed": True,
+        }
+        rows = [
+            {
+                "vehicleId": "NEW-G70",
+                "vehicleName": "宝马BMW 740Li轿车",
+                "groupName": "宝马7系 G70(22/12-)",
+                "vehicleYear": "202511",
+                "vehicleSeat": 5,
+                "priceP": 745300,
+            },
+            {
+                "vehicleId": "OLD-F02",
+                "vehicleName": "宝马BMW 740Li轿车",
+                "groupName": "宝马7系 F02(09-12/09)",
+                "vehicleYear": "200903",
+                "vehicleSeat": 5,
+                "priceP": 938000,
+            },
+            {
+                "vehicleId": "OLD-F02-FOUR-SEAT",
+                "vehicleName": "宝马BMW 740Li轿车",
+                "groupName": "宝马7系 F02(09-12/09)",
+                "vehicleYear": "201104",
+                "vehicleSeat": 4,
+                "priceP": 810000,
+            },
+        ]
+
+        selected = _pick_best_vehicle_candidate(rows, vehicle)
+
+        self.assertEqual(selected.get("vehicleId"), "OLD-F02")
+        self.assertEqual(vehicle.get("vehicleCompatibleCandidateCount"), 1)
+        self.assertEqual(vehicle.get("vehicleCandidateRejectedReasons", {}).get("model_year_after_registration"), 1)
+        self.assertEqual(vehicle.get("vehicleCandidateRejectedReasons", {}).get("seat_count_mismatch"), 1)
+
+    def test_candidate_selection_stops_when_all_models_conflict_with_registration(self) -> None:
+        vehicle = {
+            "rawModelName": "宝马牌740Li",
+            "modelName": "740Li",
+            "vehicleNameHint": "740Li",
+            "enrollDate": "2012-09-28",
+        }
+        selected = _pick_best_vehicle_candidate(
+            [
+                {
+                    "vehicleId": "NEW-G70",
+                    "vehicleName": "宝马BMW 740Li轿车",
+                    "groupName": "宝马7系 G70(22/12-)",
+                    "vehicleYear": "202511",
+                    "priceP": 745300,
+                }
+            ],
+            vehicle,
+        )
+        self.assertEqual(selected, {})
+        self.assertEqual(vehicle.get("modelSelectionBlockReason"), "candidate_facts_conflict")
+        self.assertIn("年款、代际或座位数", _vehicle_model_resolution_failure_message(vehicle, ["740Li"]))
+
+    def test_candidate_selection_keeps_legacy_price_rule_without_registration_date(self) -> None:
+        vehicle = {
+            "rawModelName": "宝马牌740Li",
+            "modelName": "740Li",
+            "vehicleNameHint": "740Li",
+        }
+        selected = _pick_best_vehicle_candidate(
+            [
+                {"vehicleId": "HIGH", "vehicleName": "宝马BMW 740Li轿车", "priceP": 938000},
+                {"vehicleId": "LOW", "vehicleName": "宝马BMW 740Li轿车", "priceP": 745300},
+            ],
+            vehicle,
+        )
+        self.assertEqual(selected.get("vehicleId"), "LOW")
+
+    def test_specific_model_query_requests_enough_rows_for_old_generations(self) -> None:
+        class _GenerationClient:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(base_url="https://picc.test")
+                self.row_limits: list[int] = []
+
+            def request_json(self, method: str, path: str, **kwargs: object) -> dict:
+                params = kwargs["params"]
+                self.row_limits.append(int(params["rows"]))
+                return {
+                    "status": 0,
+                    "result": [
+                        {
+                            "vehicleId": "OLD-F02",
+                            "vehicleName": "宝马BMW 740Li轿车",
+                            "groupName": "宝马7系 F02(09-12/09)",
+                            "vehicleYear": "200903",
+                            "vehicleSeat": 5,
+                            "priceP": 938000,
+                        }
+                    ],
+                }
+
+        client = _GenerationClient()
+        vehicle = {
+            "rawModelName": "宝马牌740Li",
+            "modelName": "740Li",
+            "brandNameHint": "宝马",
+            "vehicleNameHint": "740Li",
+            "vin": "WBAKB4108CDX70191",
+            "enrollDate": "2012-09-28",
+        }
+        rows = _adapter()._query_vehicle_candidates(client, vehicle)
+        self.assertEqual(len(rows.get("result") or []), 1)
+        self.assertEqual(client.row_limits[0], 100)
+
     def test_merged_chinese_brand_model_code_is_not_guessed_as_a_sales_model(self) -> None:
         terms = _used_fuel_model_query_terms(
             "雷克萨斯JTHKR5BH",

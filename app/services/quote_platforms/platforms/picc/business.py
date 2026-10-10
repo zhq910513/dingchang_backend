@@ -2577,6 +2577,80 @@ def _vehicle_rows_correlated_to_vin(rows: List[Dict[str, Any]], vehicle: Mapping
     ]
 
 
+def _vehicle_year_month(value: Any) -> Optional[int]:
+    digits = re.sub(r"\D+", "", _to_str(value))
+    if len(digits) < 4:
+        return None
+    year = _safe_int_local(digits[:4], 0)
+    month = _safe_int_local(digits[4:6], 1) if len(digits) >= 6 else 1
+    if year < 1900 or year > 2200 or month < 1 or month > 12:
+        return None
+    return year * 12 + month - 1
+
+
+def _vehicle_registration_month(vehicle: Mapping[str, Any]) -> Optional[int]:
+    registered = _parse_date(
+        _first_text(
+            vehicle.get("enrollDate"),
+            vehicle.get("first_register_date"),
+            vehicle.get("firstRegisterDate"),
+        )
+    )
+    return registered.year * 12 + registered.month - 1 if registered else None
+
+
+def _vehicle_group_period_months(row: Mapping[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    group = _first_text(row.get("groupName"), row.get("vehicleGroupName"), row.get("seriesName"))
+    match = re.search(
+        r"[（(](\d{2})(?:/(\d{1,2}))?\s*[-—~至]\s*(?:(\d{2})(?:/(\d{1,2}))?)?[）)]",
+        group,
+    )
+    if not match:
+        return None, None
+
+    def month_value(year_text: Any, month_text: Any) -> Optional[int]:
+        if not _to_str(year_text).strip():
+            return None
+        short_year = _safe_int_local(year_text, -1)
+        if short_year < 0:
+            return None
+        year = 2000 + short_year if short_year <= 30 else 1900 + short_year
+        month = _safe_int_local(month_text, 1) if _to_str(month_text).strip() else 1
+        if month < 1 or month > 12:
+            return None
+        return year * 12 + month - 1
+
+    start = month_value(match.group(1), match.group(2))
+    end = month_value(match.group(3), match.group(4))
+    if end is not None and not _to_str(match.group(4)).strip():
+        end += 11
+    return start, end
+
+
+def _vehicle_candidate_compatibility(row: Mapping[str, Any], vehicle: Mapping[str, Any]) -> tuple[bool, str]:
+    """Reject only candidates that clearly conflict with confirmed vehicle facts."""
+    registered_month = _vehicle_registration_month(vehicle)
+    candidate_month = _vehicle_year_month(
+        _first_text(row.get("vehicleYear"), row.get("modelYear"), row.get("yearPattern"))
+    )
+    if registered_month is not None and candidate_month is not None and candidate_month > registered_month + 18:
+        return False, "model_year_after_registration"
+
+    group_start, group_end = _vehicle_group_period_months(row)
+    if registered_month is not None and group_start is not None and group_start > registered_month + 6:
+        return False, "generation_after_registration"
+
+    if bool(vehicle.get("seatCountConfirmed")):
+        expected_seats = _safe_int_local(vehicle.get("seatCount"), 0)
+        candidate_seats = _safe_int_local(
+            _first_text(row.get("vehicleSeat"), row.get("seatCount"), row.get("seat")),
+            0,
+        )
+        if expected_seats > 0 and candidate_seats > 0 and expected_seats != candidate_seats:
+            return False, "seat_count_mismatch"
+    return True, ""
+
+
 def _vehicle_model_resolution_failure_message(
     vehicle: Mapping[str, Any],
     tried_terms: List[str],
@@ -2585,7 +2659,13 @@ def _vehicle_model_resolution_failure_message(
     vin_prefix = _first_text(*_vehicle_vin_model_code_candidates(vehicle.get("vin")))
     name_hint = _to_str(vehicle.get("vehicleNameHint")).strip()
     block_reason = _to_str(vehicle.get("modelQueryBlockReason")).strip()
+    selection_block_reason = _to_str(vehicle.get("modelSelectionBlockReason")).strip()
     usable_hint = _vehicle_model_hint_is_usable(vehicle, name_hint)
+    if selection_block_reason == "candidate_facts_conflict":
+        return (
+            f"车型名称【{raw_model}】已查询到平台候选，但候选的年款、代际或座位数与车辆初登资料不一致，"
+            "已停止自动选型；请核对初登日期和座位数，或补充更准确的销售车型后重试"
+        )
     if block_reason in {"broad_brand_without_vin", "brand_only_without_vin_or_sales_model"}:
         return (
             f"车型名称【{raw_model}】仅识别到品牌级信息，"
@@ -2647,6 +2727,27 @@ def _vehicle_candidate_score(row: Mapping[str, Any], vehicle: Mapping[str, Any])
         score += 20
     if name_hint and name_hint in haystack:
         score += 15
+    registered_month = _vehicle_registration_month(vehicle)
+    candidate_month = _vehicle_year_month(
+        _first_text(row.get("vehicleYear"), row.get("modelYear"), row.get("yearPattern"))
+    )
+    group_start, group_end = _vehicle_group_period_months(row)
+    if registered_month is not None:
+        if group_start is not None and group_start <= registered_month and (
+            group_end is None or registered_month <= group_end
+        ):
+            score += 40
+        if candidate_month is not None and candidate_month <= registered_month:
+            gap_months = registered_month - candidate_month
+            score += max(0, 24 - min(gap_months, 24))
+    if bool(vehicle.get("seatCountConfirmed")):
+        expected_seats = _safe_int_local(vehicle.get("seatCount"), 0)
+        candidate_seats = _safe_int_local(
+            _first_text(row.get("vehicleSeat"), row.get("seatCount"), row.get("seat")),
+            0,
+        )
+        if expected_seats > 0 and candidate_seats == expected_seats:
+            score += 8
     energy_expected = bool(re.search(r"(纯电|电动|新能源|插电|混合动力|BEV|PHEV|EV|增程)", _compact_vehicle_compare_text(vehicle.get("energyModelSuffix"))))
     if energy_expected and (
         re.search(r"(纯电|电动|新能源|插电|混合动力|BEV|PHEV|EV|增程)", haystack)
@@ -2882,7 +2983,27 @@ def _pick_best_vehicle_candidate(
 ) -> Dict[str, Any]:
     if not rows:
         return {}
-    scored_rows = [(_vehicle_candidate_score(row, vehicle), index, row) for index, row in enumerate(rows)]
+    compatible_rows: List[tuple[int, Dict[str, Any]]] = []
+    rejected_reasons: Dict[str, int] = {}
+    for index, row in enumerate(rows):
+        compatible, reason = _vehicle_candidate_compatibility(row, vehicle)
+        if compatible:
+            compatible_rows.append((index, row))
+            continue
+        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+    if isinstance(vehicle, dict):
+        vehicle["vehicleCandidateCount"] = len(rows)
+        vehicle["vehicleCompatibleCandidateCount"] = len(compatible_rows)
+        vehicle["vehicleCandidateRejectedReasons"] = rejected_reasons
+        vehicle.pop("modelSelectionBlockReason", None)
+    if not compatible_rows:
+        if isinstance(vehicle, dict):
+            vehicle["modelSelectionBlockReason"] = "candidate_facts_conflict"
+        return {}
+    scored_rows = [
+        (_vehicle_candidate_score(row, vehicle), index, row)
+        for index, row in compatible_rows
+    ]
     best_score = max(score for score, _, _ in scored_rows)
     best_rows = [(index, row, _vehicle_price(row)) for score, index, row in scored_rows if score == best_score]
     priced_rows = [(index, row, price) for index, row, price in best_rows if price > 0]
@@ -7032,6 +7153,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             vehicle_name=vehicle_name_hint,
             vin=vin,
         )
+        confirmed_seat_count = _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"))
         vehicle = {
             "licenseNo": license_no,
             "licenseType": license_fields["license_type"],
@@ -7056,7 +7178,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "vehicleNameHint": vehicle_name_hint,
             "vehicleType": vehicle_type,
             "energyModelSuffix": energy_model_suffix,
-            "seatCount": _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"), "5"),
+            "seatCount": _first_text(confirmed_seat_count, "5"),
+            "seatCountConfirmed": bool(confirmed_seat_count),
         }
         return _clean_vehicle_cert_fields(vehicle)
 
@@ -7157,7 +7280,10 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if not term_key or term_key in attempted_terms:
                 continue
             attempted_terms.add(term_key)
-            data = _request_term(term, rows_limit=10)
+            # PICC may return many generations for a sales name (for example
+            # 740Li). Request the largest useful first page so registration-
+            # date filtering is not limited to the newest ten catalogue rows.
+            data = _request_term(term, rows_limit=100)
             last_data = data
             try:
                 _ensure_platform_success(data, action="车型配置查询")

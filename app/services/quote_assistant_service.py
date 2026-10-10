@@ -2530,6 +2530,15 @@ def _extract_labeled_value(text: str, labels: Tuple[str, ...], *, max_len: int =
 
 
 _QUOTE_TEXT_VALUE_BOUNDARY_LABELS = (
+    "行驶证所有人",
+    "车主姓名",
+    "车主名称",
+    "客户姓名",
+    "客户名称",
+    "身份证姓名",
+    "被保险人姓名",
+    "投保人姓名",
+    "联系人姓名",
     "车主手机号",
     "车主手机",
     "车主电话",
