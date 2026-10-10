@@ -102,6 +102,7 @@ from app.services.quote_assistant_service import (
     _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
     _platform_default_config_payload,
+    save_platform_default_config,
     platform_default_config_save_payload,
     _platform_default_values_with_legacy_fixes,
     _picc_existing_proposal_table_card_for_display,
@@ -161,10 +162,12 @@ from app.services.quote_platforms.platforms.picc.business import (
     _pick_renewal_policy_candidate,
     _pick_best_vehicle_candidate,
     _picc_business_defaults,
+    _tujia_anshun_config,
     PICC_DELETED_DEFAULT_FIELDS_KEY,
     PRODUCT_EXTERNAL_GRID,
     PRODUCT_ROAD_RESCUE,
     PRODUCT_THIRD_PARTY,
+    PRODUCT_TUJIA_ANSHUN_PREMIUM,
     _used_fuel_quote_platform_dialog,
     _vehicle_brand_prefix,
     _vehicle_candidate_score,
@@ -1361,6 +1364,34 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(save_payload["item"], 1)
         self.assertEqual(save_payload["config"], payload)
 
+    def test_edit_default_config_replaces_fields_on_same_row(self) -> None:
+        row = SimpleNamespace(
+            id=123, platform_code="PICC", platform_name="人保", account_type_name="油车-旧",
+            default_values_json={"途家安顺保费": "398", PRODUCT_THIRD_PARTY: "300"},
+            enabled=True, created_by=1, updated_by=1, created_at=None, updated_at=None,
+        )
+        existing = MagicMock()
+        existing.scalars.return_value.first.return_value = row
+        no_duplicate = MagicMock()
+        no_duplicate.scalars.return_value.first.return_value = None
+        db = AsyncMock()
+        db.execute.side_effect = [existing, no_duplicate]
+
+        saved = asyncio.run(save_platform_default_config(
+            db, config_id=123, operator_user_id=1,
+            values={"platform_code": "PICC", "platform_name": "人保", "account_type_name": "油车-旧",
+                    "enabled": True, "default_values": {"途顺家安": "500", PRODUCT_THIRD_PARTY: "400"},
+                    "deleted_default_fields": ["途家安顺保费"]},
+        ))
+
+        self.assertIs(saved, row)
+        self.assertEqual(saved.id, 123)
+        self.assertEqual(saved.default_values_json["途顺家安"], "500")
+        self.assertNotIn("途家安顺保费", saved.default_values_json)
+        self.assertEqual(_platform_default_config_payload(saved)["deleted_default_fields"], ["途家安顺保费"])
+        db.add.assert_not_called()
+        db.flush.assert_awaited_once()
+
     def test_snapshot_merge_removes_deleted_builtin_before_quote(self) -> None:
         resolved = {
             "config": {"id": 1},
@@ -1395,6 +1426,45 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             defaults[PICC_DELETED_DEFAULT_FIELDS_KEY],
             [PRODUCT_THIRD_PARTY, PRODUCT_EXTERNAL_GRID],
         )
+
+    def test_joint_sales_rename_and_legacy_value_reach_quote_without_builtin_resurrection(self) -> None:
+        for configured, deleted, expected in (
+            ({"途顺家安": "500"}, ["途家安顺保费"], "500"),
+            ({"途家安顺保费": "600"}, [], "600"),
+            ({}, ["途家安顺保费"], "0"),
+        ):
+            with self.subTest(configured=configured, deleted=deleted):
+                resolved = {
+                    "config": {"id": 1},
+                    "default_values": configured,
+                    "deleted_default_fields": deleted,
+                    "builtin_default_values": {PRODUCT_TUJIA_ANSHUN_PREMIUM: "398"},
+                    "matched": "account_type",
+                }
+                with patch.object(quote_assistant_service, "resolve_platform_default_config", new=AsyncMock(return_value=resolved)):
+                    snapshot = asyncio.run(quote_assistant_service.apply_platform_default_config_to_snapshot(
+                        AsyncMock(), snapshot={"normalized_data": {}, "images_by_slot": {}},
+                        platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
+                    ))
+                defaults = snapshot["default_config_json"]
+                self.assertEqual(_tujia_anshun_config(_picc_business_defaults(defaults))["premium"], expected)
+                if deleted and not configured:
+                    self.assertNotIn(PRODUCT_TUJIA_ANSHUN_PREMIUM, defaults)
+                if "途家安顺保费" in configured:
+                    self.assertNotIn(PRODUCT_TUJIA_ANSHUN_PREMIUM, defaults)
+
+    def test_temporary_joint_sales_override_beats_saved_alias(self) -> None:
+        resolved = {
+            "config": {"id": 1}, "default_values": {"途家安顺保费": "600"},
+            "deleted_default_fields": [], "builtin_default_values": {PRODUCT_TUJIA_ANSHUN_PREMIUM: "398"},
+            "matched": "account_type",
+        }
+        with patch.object(quote_assistant_service, "resolve_platform_default_config", new=AsyncMock(return_value=resolved)):
+            snapshot = asyncio.run(quote_assistant_service.apply_platform_default_config_to_snapshot(
+                AsyncMock(), snapshot={"normalized_data": {"quote_field_overrides": {"途顺家安": "0"}}, "images_by_slot": {}},
+                platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
+            ))
+        self.assertEqual(_tujia_anshun_config(_picc_business_defaults(snapshot["default_config_json"]))["premium"], "0")
 
     def test_old_vehicle_rejects_new_generation_before_price_tiebreak(self) -> None:
         vehicle = {

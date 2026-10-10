@@ -96,7 +96,7 @@ PRODUCT_SHARED_LIMIT = "共享主险限额"
 PRODUCT_MEDICAL_THIRD = "医保外医疗费用责任险（第三者责任险）"
 PRODUCT_ROAD_RESCUE = "机动车增值服务特约条款（道路救援服务）"
 PRODUCT_EXTERNAL_GRID = "附加外部电网故障损失险"
-PRODUCT_TUJIA_ANSHUN_PREMIUM = "途家安顺保费"
+PRODUCT_TUJIA_ANSHUN_PREMIUM = "途顺家安"
 PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 QUOTE_DATA_OVERRIDES_KEY = "quote_data_overrides"
 # Stored inside the JSON configuration as an internal tombstone list.  It is
@@ -127,7 +127,7 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
         "电网故障损失险",
         "电网故障",
     ),
-    PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途家安顺保费", "途家安顺", "途家安顺非车保费"),
+    PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途顺家安", "途顺家安组合保险", "途家安顺保费", "途家安顺", "途家安顺非车保费"),
 }
 
 # Aliases used by the PICC request builder for editable channel fields.  A
@@ -2086,7 +2086,7 @@ def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
             "enabled": False,
             "premium": "0",
             "amount": "0",
-            "reason": "途家安顺保费配置已删除，按规则不查询保额",
+            "reason": "途顺家安配置已删除，按规则不查询保额",
         }
     premium = _money(_default_value(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM, "398"))
     if premium <= 0:
@@ -2094,7 +2094,7 @@ def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
             "enabled": False,
             "premium": "0",
             "amount": "0",
-            "reason": "途家安顺保费为0，按规则不查询保额",
+            "reason": "途顺家安保费为0，按规则不查询保额",
         }
     return {
         "enabled": True,
@@ -5373,14 +5373,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "success": True,
                 "premium": "0",
                 "amount": "0",
-                "reason": "途家安顺保费为0，按规则不查询保额",
+                "reason": "途顺家安保费为0，按规则不查询保额",
                 "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
                 "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
                 "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
             }
             return PlatformRuntimeResult(
                 status="success",
-                message="途家安顺保费为0，保额已按规则置为0",
+                message="途顺家安保费为0，保额已按规则置为0",
                 data={"joint_sales_plan": plan, "premium": "0", "amount": "0", "query_skipped": True},
             )
 
@@ -5424,7 +5424,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             if not plan.get("success"):
                 return PlatformRuntimeResult(
                     status="failed",
-                    message=_to_str(plan.get("message")).strip() or f"未查询到保费为{premium_text}的途家安顺方案",
+                    message=_to_str(plan.get("message")).strip() or f"未查询到保费为{premium_text}的途顺家安方案",
                     data=success_data(
                         client,
                         extra={
@@ -5437,7 +5437,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             amount = _clean_money_text(plan.get("amount"), "0")
             return PlatformRuntimeResult(
                 status="success",
-                message="途家安顺保额查询成功",
+                message="途顺家安保额查询成功",
                 data=success_data(
                     client,
                     extra={
@@ -6559,7 +6559,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "Referer": f"{client.config.base_url}/khyxui/my-tools/quotation",
                 },
             )
-            _ensure_platform_success(data, action="途家安顺保额查询")
+            _ensure_platform_success(data, action="途顺家安保额查询")
             rows = _plan_rows_from_response(data)
             selected = _pick_joint_sale_plan_by_premium(data, config.get("premium"))
             if not selected:
@@ -6573,7 +6573,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "risk_code": PICC_TUJIA_ANSHUN_RISK_CODE,
                     "brand_id": PICC_TUJIA_ANSHUN_BRAND_ID,
                     "service_group_type_code": PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE,
-                    "message": f"未查询到保费为{config.get('premium')}的途家安顺方案",
+                    "message": f"未查询到保费为{config.get('premium')}的途顺家安方案",
                 }
             amount = _clean_money_text(selected.get("planAmount"), "0")
             premium = _clean_money_text(selected.get("planPremium"), _to_str(config.get("premium") or "398"))
@@ -8396,7 +8396,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         tujia_anshun = _tujia_anshun_from_request_body(request_body)
         if tujia_anshun.get("enabled") and tujia_anshun.get("success") is False:
             msg = _to_str(tujia_anshun.get("message")).strip()
-            warning_parts.append(f"途家安顺保额查询失败：{msg or '平台未返回可用方案'}")
+            warning_parts.append(f"途顺家安保额查询失败：{msg or '平台未返回可用方案'}")
         warning = "\n".join(part for part in warning_parts if part)
 
         bi_risk = _json_obj(data.get("carQuoteRiskItemBIRsp"))
@@ -8441,7 +8441,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 }
             )
         elif tujia_plan_success and tujia_premium > 0 and selected_plan_premium <= 0:
-            warning_parts.append("途家安顺保额查询返回方案缺少真实保费，未填充配置保费")
+            warning_parts.append("途顺家安保额查询返回方案缺少真实保费，未填充配置保费")
         joint_sales_amount = (
             _money(
                 selected_plan.get("planAmount")
@@ -8572,7 +8572,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "back": _money_text_or_empty(data.get("prePayTax")),
                 "late_fee": _money_text_or_empty(data.get("delayPayTax")),
             },
-            "joint_sales_label": "途家安顺",
+            "joint_sales_label": "途顺家安",
             "joint_sales_display_label": "途顺家安组合保险",
             "joint_sales_premium": _money_text(joint_sales_premium) if joint_sales_premium_present else "",
             "joint_sales_amount": _money_text(joint_sales_amount) if joint_sales_amount_present else "",
@@ -8596,7 +8596,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if vehicle_tax_value is not None:
             price_items.append({"name": "车船税", "amount": float(vehicle_tax_value)})
         if joint_sales_premium:
-            price_items.append({"name": "途家安顺", "amount": float(joint_sales_premium)})
+            price_items.append({"name": "途顺家安", "amount": float(joint_sales_premium)})
         normalized_amounts: Dict[str, Dict[str, Any]] = {}
         if commercial_premium_value is not None:
             normalized_amounts["commercial"] = {

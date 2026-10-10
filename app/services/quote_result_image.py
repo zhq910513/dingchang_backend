@@ -387,7 +387,7 @@ def _render_legacy_quote_card_png(card: Mapping[str, Any]) -> bytes:
         _draw_right(draw, right, y, _num_text(joint_premium, money=True), font=font16b, fill="#ff0000")
         y += 25
         if joint_amount:
-            _draw_text(draw, (left + 12, y), "途家安顺保额", font=font14, fill="#7f899c")
+            _draw_text(draw, (left + 12, y), "途顺家安组合保险保额", font=font14, fill="#7f899c")
             _draw_right(draw, right, y, _num_text(joint_amount), font=font14, fill="#7f899c")
             y += 25
 

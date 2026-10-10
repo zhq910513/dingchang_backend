@@ -261,7 +261,7 @@ def _joint_sales_has_real_source(result: Mapping[str, Any], card: Mapping[str, A
             return False
     return _trusted_positive_evidence(
         _evidence_rows(provenance, "joint_sales_evidence", "joint_sales_sources"),
-        source_names=("joint_sales", "tujia_anshun", "途家安顺"),
+        source_names=("joint_sales", "tujia_anshun", "途家安顺", "途顺家安"),
     )
 
 
@@ -327,7 +327,7 @@ def quote_result_real_data_error(result: Any) -> str:
     if not card:
         return "平台返回成功状态但缺少真实报价结果卡，未生成报价结果"
     if not _joint_sales_has_real_source(result, card):
-        return "结果包含无法证明来源的途家安顺保费，未生成报价结果"
+        return "结果包含无法证明来源的途顺家安保费，未生成报价结果"
     price_items = result.get("price_items")
 
     expected_amounts: dict[str, tuple[bool, Any, str]] = {

@@ -1145,7 +1145,7 @@ CORE_REQUIRED_SLOTS_BY_ACCOUNT_TYPE: Dict[str, Tuple[str, ...]] = {
 }
 
 QUOTE_CONFIG_OVERRIDE_ALIASES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("途家安顺保费", ("途家安顺保费", "途家安顺", "途顺家安", "途家安顺非车保费", "非车", "意外", "意外险", "驾乘意外")),
+    ("途顺家安", ("途顺家安组合保险", "途家安顺保费", "途家安顺", "途家安顺非车保费", "非车", "意外", "意外险", "驾乘意外")),
     ("机动车损失保险", ("机动车损失保险", "车辆损失险", "车损险", "车损")),
     ("医保外医疗费用责任险（第三者责任险）", ("医保外医疗费用责任险（第三者责任险）", "医保外医疗费用责任险(第三者责任险)", "医保外三者", "医保外")),
     ("第三者责任险", ("机动车第三者责任保险", "第三者责任险", "第三责任险", "第三者", "三者险", "三者", "三责")),
@@ -2941,6 +2941,7 @@ def _quote_config_field_allows_zero(field_name: Any) -> bool:
         "途家安顺保费",
         "途家安顺",
         "途顺家安",
+        "途顺家安组合保险",
         "途家安顺非车保费",
         "非车",
         "送修码启用",
@@ -5267,9 +5268,15 @@ async def apply_platform_default_config_to_snapshot(
     for deleted_name in deleted_default_fields:
         for alias in _default_field_aliases(deleted_name):
             default_values.pop(alias, None)
+    for name in resolved_defaults:
+        for alias in _default_field_aliases(name) - {name}:
+            default_values.pop(alias, None)
     default_values.update(resolved_defaults)
     if deleted_default_fields:
         default_values[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted_default_fields
+    for name in quote_field_overrides:
+        for alias in _default_field_aliases(name) - {name}:
+            default_values.pop(alias, None)
     default_values.update(quote_field_overrides)
     quote_product_exclusions = _normalize_quote_product_exclusions(
         normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
@@ -12612,7 +12619,7 @@ def _picc_existing_proposal_table_card_for_display(result: Mapping[str, Any], ca
     total_with_tax = _quote_money_text_or_empty(
         _quote_result_normalized_amount(result, "total_with_vehicle_tax")
     )
-    safe_card["joint_sales_label"] = "途家安顺"
+    safe_card["joint_sales_label"] = "途顺家安"
     safe_card["joint_sales_display_label"] = "途顺家安组合保险"
     safe_card["joint_sales_premium"] = joint_premium
     safe_card["joint_sales_amount"] = joint_amount
@@ -12769,7 +12776,7 @@ def _picc_result_card_for_display(result: Mapping[str, Any], card: Mapping[str, 
         "compulsory_premium": compulsory,
         "vehicle_tax": vehicle_tax,
         "vehicle_tax_detail": tax_detail,
-        "joint_sales_label": "途家安顺",
+        "joint_sales_label": "途顺家安",
         "joint_sales_display_label": "途顺家安组合保险",
         "joint_sales_premium": joint_premium,
         "joint_sales_amount": joint_amount,
@@ -13045,7 +13052,7 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
     remove_group = "|".join(re.escape(word) for word in remove_words)
     remove_pattern = rf"^(?:请)?(?:(?:{remove_group})(?:{alias_group})(?:保费|金额|保额|险|保险)?|(?:{alias_group})(?:保费|金额|保额|险|保险)?(?:{remove_group}))$"
     if re.fullmatch(remove_pattern, compact, flags=re.IGNORECASE):
-        return {"field_name": "途家安顺保费", "field_value": "0", "remove": True}
+        return {"field_name": "途顺家安", "field_value": "0", "remove": True}
     number = r"(\d+(?:[,，]\d{3})*(?:\.\d+)?)"
     connector = r"(?:[:：=+＋]|改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|设置为|设为|变成|变为|变到|调整|改|变|到|为)?"
     pattern = rf"^(?:请)?(?:把|将)?(?:{alias_group})(?:保费|金额|保额)?{connector}{number}(万|元)?$"
@@ -13053,8 +13060,8 @@ def _extract_joint_sales_image_adjustment(text: Any) -> Dict[str, Any]:
     if not match:
         return {}
     value = _normalize_quote_config_override_value(match.group(1), match.group(2))
-    _ensure_positive_numeric_config_value("途家安顺保费", value, context="非车金额")
-    return {"field_name": "途家安顺保费", "field_value": value}
+    _ensure_positive_numeric_config_value("途顺家安", value, context="非车金额")
+    return {"field_name": "途顺家安", "field_value": value}
 
 
 def _result_has_quote_card(result: Any) -> bool:
@@ -13152,13 +13159,14 @@ def _update_joint_sales_price_items(result: Dict[str, Any], premium: Decimal) ->
         name = _to_str(row.get("name")).strip()
         if name and any(keyword in name for keyword in ("途家", "途顺", "非车")):
             if premium > 0:
+                row["name"] = "途顺家安"
                 row["amount"] = float(premium)
                 items.append(row)
                 found = True
             continue
         items.append(row)
     if premium > 0 and not found:
-        items.append({"name": "途家安顺", "amount": float(premium)})
+        items.append({"name": "途顺家安", "amount": float(premium)})
     result["price_items"] = items
 
 
@@ -13257,7 +13265,7 @@ async def _query_joint_sales_amount_for_image_adjustment(
                 "success": True,
                 "premium": "0.00",
                 "amount": "0.00",
-                "reason": "途家安顺保费为0，按规则不查询保额",
+                "reason": "途顺家安保费为0，按规则不查询保额",
             },
             None,
         )
@@ -13265,24 +13273,24 @@ async def _query_joint_sales_amount_for_image_adjustment(
     platform_code = _to_str(source_task.platform_code).strip().upper() or "PICC"
     platform_name = _to_str(source_task.platform_name).strip() or platform_code
     if platform_code != "PICC":
-        raise ValueError(f"{platform_name}暂不支持通过“非车 金额”重新查询途家安顺保额")
+        raise ValueError(f"{platform_name}暂不支持通过“非车 金额”重新查询途顺家安保额")
 
     account_id = _quote_task_platform_account_id(source_task)
     if account_id <= 0:
-        raise ValueError("最近一次报价缺少平台账号留档，无法查询途家安顺保额")
+        raise ValueError("最近一次报价缺少平台账号留档，无法查询途顺家安保额")
     platform_account = await _get_platform_account_profile_by_id(db, account_id=account_id)
     if platform_account is None:
         raise ValueError("最近一次报价使用的平台账号已不存在")
     if not bool(_loaded_value(platform_account, "enabled")):
-        raise ValueError("最近一次报价使用的平台账号已停用，无法查询途家安顺保额")
+        raise ValueError("最近一次报价使用的平台账号已停用，无法查询途顺家安保额")
 
     account_type_name = _quote_task_account_type_name(source_task)
     platform_ctx = _platform_account_quote_context(platform_account, account_type_name=account_type_name)
     query_payload = _joint_sales_query_snapshot_payload(source_task, premium_value)
     runtime_result = await quote_platform_runtime.query_joint_sales_plan(platform_ctx, query_payload, db=db)
     if _is_runtime_session_expired_result(runtime_result):
-        _apply_platform_account_runtime_status(platform_account, runtime_result, default_error="途家安顺保额查询失败")
-        raise ValueError(_runtime_detail(runtime_result, "途家安顺保额查询失败"))
+        _apply_platform_account_runtime_status(platform_account, runtime_result, default_error="途顺家安保额查询失败")
+        raise ValueError(_runtime_detail(runtime_result, "途顺家安保额查询失败"))
 
     runtime_status = _runtime_status(runtime_result)
     runtime_payload = _runtime_result_payload(runtime_result)
@@ -13290,11 +13298,11 @@ async def _query_joint_sales_amount_for_image_adjustment(
     plan = _json_obj(data.get("joint_sales_plan"))
     amount = data.get("amount") or plan.get("amount")
     if runtime_status not in {"success", "ok"} or not plan.get("success"):
-        detail = _runtime_detail(runtime_result, "途家安顺保额查询失败")
+        detail = _runtime_detail(runtime_result, "途顺家安保额查询失败")
         plan_message = _to_str(plan.get("message")).strip()
         raise ValueError(plan_message or detail)
     if _quote_money_decimal(amount) <= 0:
-        raise ValueError(f"未查询到保费为{_quote_money_text(premium)}的途家安顺保额")
+        raise ValueError(f"未查询到保费为{_quote_money_text(premium)}的途顺家安保额")
 
     return (
         _quote_money_text(amount),
@@ -13351,7 +13359,7 @@ def _apply_joint_sales_image_adjustment(
     enabled = premium > 0
     amount_text = original_amount_text if enabled else ""
 
-    card["joint_sales_label"] = "途家安顺"
+    card["joint_sales_label"] = "途顺家安"
     card["joint_sales_display_label"] = "途顺家安组合保险"
     card["joint_sales_premium"] = premium_text if enabled else ""
     card["joint_sales_amount"] = amount_text
@@ -13424,7 +13432,7 @@ def _apply_joint_sales_image_adjustment(
     adjusted.pop("result_image", None)
     adjusted.pop("resultImage", None)
     adjusted["joint_sales_image_adjustment"] = {
-        "field_name": "途家安顺保费",
+        "field_name": "途顺家安",
         "field_value": premium_text,
         "source": "chat_command",
     }
@@ -13470,7 +13478,7 @@ async def _handle_joint_sales_image_adjustment_message(
     case = await _lock_quote_case(db, case)
     trace_id = _new_trace_id()
     premium_value = adjustment.get("field_value")
-    premium_override = {"途家安顺保费": _quote_money_text(premium_value)}
+    premium_override = {"途顺家安": _quote_money_text(premium_value)}
     await _cancel_active_quote_tasks_for_case(
         db,
         case=case,
@@ -13501,11 +13509,11 @@ async def _handle_joint_sales_image_adjustment_message(
     submitted_snapshot["normalized_data"] = submitted_normalized
     submitted_defaults = _json_obj(submitted_snapshot.get("default_config_json"))
     if submitted_defaults:
-        submitted_defaults["途家安顺保费"] = _quote_money_text(premium_value)
+        submitted_defaults["途顺家安"] = _quote_money_text(premium_value)
         submitted_snapshot["default_config_json"] = submitted_defaults
     submitted_snapshot["joint_sales_image_adjustment"] = {
         "source_task_id": source_task.id,
-        "field_name": "途家安顺保费",
+        "field_name": "途顺家安",
         "field_value": _quote_money_text(premium_value),
         "raw_text": text,
     }
@@ -13556,7 +13564,7 @@ async def _handle_joint_sales_image_adjustment_message(
     source_validation_error = _quote_result_real_data_error(source_result)
     if source_validation_error or not _json_obj(source_result.get("result_card") or source_result.get("resultCard")):
         detail = source_validation_error or "历史报价结果缺少结果卡片"
-        reply = f"历史报价结果不完整，无法调整途家安顺并重绘结果图：{detail}。请重新发起报价。"
+        reply = f"历史报价结果不完整，无法调整途顺家安并重绘结果图：{detail}。请重新发起报价。"
         task = await _lock_quote_task(db, task)
         task.status = TASK_STATUS_FAILED
         task.error_detail = reply
@@ -13620,8 +13628,8 @@ async def _handle_joint_sales_image_adjustment_message(
             premium_value=premium_value,
         )
     except Exception as exc:
-        detail = sanitize_quote_user_message(exc, "途家安顺保额查询失败")
-        reply = f"途家安顺保额查询失败：{detail}，本次没有更新报价结果图。"
+        detail = sanitize_quote_user_message(exc, "途顺家安保额查询失败")
+        reply = f"途顺家安保额查询失败：{detail}，本次没有更新报价结果图。"
         task = await _lock_quote_task(db, task)
         if await _quote_task_was_cancelled(db, task=task):
             return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
@@ -17849,7 +17857,7 @@ async def handle_quote_message(
     if joint_sales_image_adjustment:
         quote_field_overrides = _merge_quote_config_overrides(
             quote_field_overrides,
-            {joint_sales_image_adjustment.get("field_name") or "途家安顺保费": joint_sales_image_adjustment.get("field_value")},
+            {joint_sales_image_adjustment.get("field_name") or "途顺家安": joint_sales_image_adjustment.get("field_value")},
         )
     if quote_field_overrides:
         merged_entities = {

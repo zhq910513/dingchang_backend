@@ -1249,7 +1249,7 @@ class AccountSessionActor:
                     except Exception as exc:
                         result = PlatformRuntimeResult(
                             status="failed",
-                            message=f"平台途家安顺保额查询异常：{str(exc) or exc.__class__.__name__}",
+                            message=f"平台途顺家安保额查询异常：{str(exc) or exc.__class__.__name__}",
                             data={"error_code": exc.__class__.__name__},
                         )
                     snapshot.last_business_at = iso_now()
