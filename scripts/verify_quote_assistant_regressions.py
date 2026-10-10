@@ -2325,7 +2325,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(cleaned["engine_no"], "W24L33464")
         self.assertEqual(cleaned["vin"], "LC0C76C4XR6182655")
 
-    def test_new_energy_used_legacy_driver_passenger_defaults_are_patched(self) -> None:
+    def test_new_energy_used_explicit_driver_passenger_defaults_are_preserved(self) -> None:
         source_values = {
             "第三者责任险": "300",
             "车上人员责任险（司机）": "1",
@@ -2336,9 +2336,25 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             "新能源车-旧",
             source_values,
         )
-        self.assertEqual(values["车上人员责任险（司机）"], "4")
-        self.assertEqual(values["车上人员责任险（乘客）"], "4")
+        self.assertEqual(values["车上人员责任险（司机）"], "1")
+        self.assertEqual(values["车上人员责任险（乘客）"], "1")
         self.assertEqual(source_values["车上人员责任险（司机）"], "1")
+
+        row = SimpleNamespace(
+            id=7,
+            platform_code="PICC",
+            platform_name="人保",
+            account_type_name="新能源车-旧",
+            default_values_json=source_values,
+            enabled=True,
+            created_by=1,
+            updated_by=1,
+            created_at=None,
+            updated_at=None,
+        )
+        payload = _platform_default_config_payload(row)
+        self.assertEqual(payload["default_values"]["车上人员责任险（司机）"], "1")
+        self.assertEqual(payload["default_values"]["车上人员责任险（乘客）"], "1")
 
         oil_values = _platform_default_values_with_legacy_fixes(
             "PICC",

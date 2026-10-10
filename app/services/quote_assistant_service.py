@@ -4730,18 +4730,13 @@ def _platform_default_values_with_legacy_fixes(
     account_type_name: Any,
     default_values: Any,
 ) -> Dict[str, Any]:
-    values = dict(_json_obj(default_values))
-    code = _to_str(platform_code).strip().upper()
-    type_name = _normalize_account_type_name(account_type_name)
-    if code != "PICC" or type_name != "新能源车-旧":
-        return values
-
-    builtin = platform_builtin_default_values(code, type_name)
-    for key in (QUOTE_DRIVER_LABEL, QUOTE_PASSENGER_LABEL):
-        raw = _to_str(values.get(key)).strip()
-        if raw in {"1", "10000"} and _to_str(builtin.get(key)).strip() in {"4", "40000"}:
-            values[key] = builtin[key]
-    return values
+    # Stored configuration is user-managed data.  Older releases treated a
+    # value of 1 for the new-energy/used driver and passenger coverages as a
+    # legacy sentinel and silently displayed/sent the builtin value 4 instead.
+    # That makes a successful edit appear not to save and changes the quote
+    # payload behind the administrator's back.  Keep the helper for callers
+    # that predate this fix, but always preserve explicit stored values.
+    return dict(_json_obj(default_values))
 
 
 def _build_quote_request_body(default_values: Dict[str, Any], normalized_data: Dict[str, Any]) -> Dict[str, Any]:
