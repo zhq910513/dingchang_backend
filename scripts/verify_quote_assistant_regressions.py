@@ -101,6 +101,7 @@ from app.services.quote_assistant_service import (
     _has_reusable_renewal_quote_context,
     _missing_requirements_for_quote_flow,
     _normalize_quote_case_data,
+    canonicalize_joint_sales_config_fields,
     _platform_default_config_payload,
     save_platform_default_config,
     platform_default_config_save_payload,
@@ -1386,11 +1387,32 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
 
         self.assertIs(saved, row)
         self.assertEqual(saved.id, 123)
-        self.assertEqual(saved.default_values_json["途顺家安"], "500")
+        self.assertEqual(saved.default_values_json["途顺家安组合保险"], "500")
         self.assertNotIn("途家安顺保费", saved.default_values_json)
-        self.assertEqual(_platform_default_config_payload(saved)["deleted_default_fields"], ["途家安顺保费"])
+        self.assertEqual(_platform_default_config_payload(saved)["deleted_default_fields"], [])
         db.add.assert_not_called()
         db.flush.assert_awaited_once()
+
+    def test_default_config_normalizes_legacy_names_without_losing_values_or_deletions(self) -> None:
+        row = SimpleNamespace(
+            id=5, platform_code="PICC", platform_name="人保", account_type_name="油车-旧",
+            default_values_json={"途家安顺保费": "600", "第三者责任险": "300"},
+            enabled=True, created_by=1, updated_by=1, created_at=None, updated_at=None,
+        )
+        payload = _platform_default_config_payload(row)
+        self.assertEqual(payload["default_values"]["途顺家安组合保险"], "600")
+        self.assertNotIn("途家安顺保费", payload["default_values"])
+        self.assertIn("途家安顺保费", row.default_values_json)
+
+        values, deleted = canonicalize_joint_sales_config_fields(
+            {"途家安顺保费": "398", "途顺家安": "500", "途顺家安组合保险": "700"},
+            ["途家安顺保费", PRODUCT_EXTERNAL_GRID],
+        )
+        self.assertEqual(values, {"途顺家安组合保险": "700"})
+        self.assertEqual(deleted, [PRODUCT_EXTERNAL_GRID])
+        values, deleted = canonicalize_joint_sales_config_fields({}, ["途家安顺保费"])
+        self.assertEqual(values, {})
+        self.assertEqual(deleted, ["途顺家安组合保险"])
 
     def test_snapshot_merge_removes_deleted_builtin_before_quote(self) -> None:
         resolved = {

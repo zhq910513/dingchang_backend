@@ -4658,15 +4658,53 @@ def _account_event_snapshot(row: Optional[QuotePlatformAccountProfile]) -> Dict[
     return _credential_public_payload(row) or {}
 
 
+JOINT_SALES_CONFIG_FIELD_NAME = "途顺家安组合保险"
+JOINT_SALES_CONFIG_FIELD_ALIASES = (
+    JOINT_SALES_CONFIG_FIELD_NAME,
+    "途顺家安",
+    "途家安顺保费",
+    "途家安顺",
+    "途家安顺非车保费",
+)
+
+
+def canonicalize_joint_sales_config_fields(
+    values: Mapping[str, Any], deleted_fields: Iterable[str]
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Rename the editable config key without changing its amount or deletion state."""
+    source = dict(values)
+    aliases = set(JOINT_SALES_CONFIG_FIELD_ALIASES)
+    preferred = next((name for name in JOINT_SALES_CONFIG_FIELD_ALIASES if name in source), None)
+    normalized: Dict[str, Any] = {}
+    for name, value in source.items():
+        if name in aliases:
+            if JOINT_SALES_CONFIG_FIELD_NAME not in normalized:
+                normalized[JOINT_SALES_CONFIG_FIELD_NAME] = source[preferred]
+        else:
+            normalized[name] = value
+
+    deleted: List[str] = []
+    for name in deleted_fields:
+        canonical = JOINT_SALES_CONFIG_FIELD_NAME if name in aliases else name
+        if canonical == JOINT_SALES_CONFIG_FIELD_NAME and canonical in normalized:
+            continue
+        if canonical != JOINT_SALES_CONFIG_FIELD_NAME or canonical not in deleted:
+            deleted.append(canonical)
+    return normalized, deleted
+
+
 def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[str, Any]:
     platform_code = _loaded_value(row, "platform_code")
     account_type_name = _normalize_account_type_name(_loaded_value(row, "account_type_name")) or ""
     stored_values = dict(_json_obj(_loaded_value(row, "default_values_json")))
     deleted_default_fields = stored_values.pop(PICC_DELETED_DEFAULT_FIELDS_KEY, [])
-    default_values = _platform_default_values_with_legacy_fixes(
-        platform_code,
-        account_type_name,
-        stored_values,
+    default_values, deleted_default_fields = canonicalize_joint_sales_config_fields(
+        _platform_default_values_with_legacy_fixes(
+            platform_code,
+            account_type_name,
+            stored_values,
+        ),
+        deleted_default_fields if isinstance(deleted_default_fields, list) else [],
     )
     return {
         "id": _loaded_value(row, "id"),
@@ -4674,7 +4712,7 @@ def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[st
         "platform_name": _loaded_value(row, "platform_name"),
         "account_type_name": account_type_name,
         "default_values": default_values,
-        "deleted_default_fields": deleted_default_fields if isinstance(deleted_default_fields, list) else [],
+        "deleted_default_fields": deleted_default_fields,
         "enabled": bool(_loaded_value(row, "enabled")),
         "created_by": _loaded_value(row, "created_by"),
         "updated_by": _loaded_value(row, "updated_by"),
@@ -4988,6 +5026,9 @@ async def save_platform_default_config(
         name = re.sub(r"\s+", " ", _to_str(raw_name).strip())[:128]
         if name and name not in default_values and name not in deleted_default_fields:
             deleted_default_fields.append(name)
+    default_values, deleted_default_fields = canonicalize_joint_sales_config_fields(
+        default_values, deleted_default_fields
+    )
     if deleted_default_fields:
         default_values[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted_default_fields
     if not default_values:
