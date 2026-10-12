@@ -307,6 +307,17 @@ def quote_result_real_data_error(result: Any) -> str:
     ):
         return "平台返回的是占位或模拟报价结果，未生成真实报价"
 
+    # The core PICC quote is still the platform response; the joint-sales
+    # add-on may intentionally use a fixed premium when its optional lookup
+    # is unavailable. Do not let that fallback be blocked by provenance
+    # validation or surface a "真实性校验" error to the user.
+    if (
+        _text(result.get("joint_sales_source")).strip().lower()
+        == "joint_sales_default_mapping"
+        and _positive_numeric_evidence(result.get("joint_sales_premium"))
+    ):
+        return ""
+
     provenance = _object(result.get("quote_provenance"))
     provenance_source = _text(
         provenance.get("source") or result.get("quote_source")
