@@ -147,6 +147,16 @@ PICC_TUJIA_ANSHUN_RISK_CODE = "LCO"
 PICC_TUJIA_ANSHUN_BRAND_ID = "BTA1"
 PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE = "05"
 
+# A positive 398 yuan premium appears in successful historical PICC results
+# for each supported account type. It is only used when the configured plan
+# lookup fails; an explicit zero/deletion still disables the product.
+PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE = {
+    NEW_FUEL_ACCOUNT_TYPE: "398",
+    USED_FUEL_ACCOUNT_TYPE: "398",
+    NEW_ENERGY_NEW_ACCOUNT_TYPE: "398",
+    NEW_ENERGY_USED_ACCOUNT_TYPE: "398",
+}
+
 PICC_KIND_NAME_BY_CODE = {
     "051050": "机动车损失保险",
     "051051": "机动车第三者责任保险",
@@ -2101,6 +2111,15 @@ def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
         "premium": _clean_money_text(premium),
         "amount": "",
     }
+
+
+def _tujia_anshun_fallback_premium(account_type_name: Any, configured_premium: Any) -> Decimal:
+    """Return the premium to materialize when PICC cannot return a plan."""
+    configured = _money(configured_premium)
+    if configured > 0:
+        return configured
+    account_type = _to_str(account_type_name).strip()
+    return _money(PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE.get(account_type, "398"))
 
 
 def _tujia_anshun_from_request_body(request_body: Mapping[str, Any]) -> Dict[str, Any]:
@@ -8409,8 +8428,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if tujia_anshun.get("enabled") and tujia_anshun.get("success") is False:
             msg = _to_str(tujia_anshun.get("message")).strip()
             warning_parts.append(f"途顺家安保额查询失败：{msg or '平台未返回可用方案'}")
-        warning = "\n".join(part for part in warning_parts if part)
-
         bi_risk = _json_obj(data.get("carQuoteRiskItemBIRsp"))
         ci_risk = _json_obj(data.get("carQuoteRiskItemCIRsp"))
         claim_bi_raw = _first_text(bi_risk.get("claimTimes"), data.get("lastDamagedBI"))
@@ -8432,10 +8449,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         joint_sales_premium = platform_joint_sales_premium
         tujia_premium = _money(tujia_anshun.get("premium"))
         joint_sales_premium_from_plan = False
+        joint_sales_premium_from_fallback = False
         selected_plan = _json_obj(tujia_anshun.get("selected_plan"))
         selected_plan_premium = _money(selected_plan.get("planPremium"))
-        # A configured premium is only an input to the plan lookup. It is not
-        # a quote result unless that lookup actually returned a usable plan.
+        # A configured premium is normally only an input to the plan lookup.
+        # When PICC's optional lookup is unavailable, retain the configured
+        # product in the quote using the fixed historical fallback mapping.
         tujia_plan_success = tujia_anshun.get("success") is True
         if (
             tujia_plan_success
@@ -8454,6 +8473,35 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             )
         elif tujia_plan_success and tujia_premium > 0 and selected_plan_premium <= 0:
             warning_parts.append("途顺家安保额查询返回方案缺少真实保费，未填充配置保费")
+        if (
+            tujia_anshun.get("enabled") is True
+            and not platform_joint_sales_premium_present
+            and not joint_sales_premium_from_plan
+        ):
+            fallback_premium = _tujia_anshun_fallback_premium(account_type_name, tujia_premium)
+            if fallback_premium > 0:
+                joint_sales_premium = fallback_premium
+                joint_sales_premium_present = True
+                joint_sales_premium_from_fallback = True
+                tujia_anshun = {
+                    **tujia_anshun,
+                    "enabled": True,
+                    "premium": _clean_money_text(fallback_premium),
+                    "amount": "0",
+                    "fallback_applied": True,
+                    "fallback_source": "joint_sales_default_mapping",
+                }
+                joint_sales_evidence.append(
+                    {
+                        "name": "joint_sales",
+                        "source": "joint_sales_default_mapping",
+                        "value": _clean_money_text(fallback_premium),
+                    }
+                )
+                warning_parts.append(
+                    f"途顺家安方案查询未返回可用保额，已按固定兜底保费{_clean_money_text(fallback_premium)}元计入报价，保额未填充"
+                )
+        warning = "\n".join(part for part in warning_parts if part)
         joint_sales_amount = (
             _money(
                 selected_plan.get("planAmount")
@@ -8475,22 +8523,33 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             joint_sales_source = "platform_quote_response"
         elif joint_sales_premium_from_plan:
             joint_sales_source = "joint_sales_plan_response"
+        elif joint_sales_premium_from_fallback:
+            joint_sales_source = "joint_sales_default_mapping"
         else:
             joint_sales_source = "none"
+        joint_sales_added_to_total = joint_sales_premium_from_plan or joint_sales_premium_from_fallback
         if _has_text(data.get("sumPremium")):
             total_without_vehicle_tax: Optional[Decimal] = _money(data.get("sumPremium"))
             total_without_vehicle_tax_source = "quote_response.data.sumPremium"
-            if joint_sales_premium_from_plan and platform_joint_sales_premium <= 0:
+            if joint_sales_added_to_total and platform_joint_sales_premium <= 0:
                 total_without_vehicle_tax += joint_sales_premium
                 total_without_vehicle_tax_source = (
                     "derived_from_quote_response.data.sumPremium+"
-                    "joint_sales_plan_response.selected_plan.planPremium"
+                    + (
+                        "joint_sales_plan_response.selected_plan.planPremium"
+                        if joint_sales_premium_from_plan
+                        else "joint_sales_default_mapping"
+                    )
                 )
         elif commercial_premium_value is not None and compulsory_premium_value is not None:
             total_without_vehicle_tax = commercial_premium_value + compulsory_premium_value + (joint_sales_premium if joint_sales_premium_present else Decimal("0"))
             total_without_vehicle_tax_source = "derived_from_quote_response_components"
-            if joint_sales_premium_from_plan:
-                total_without_vehicle_tax_source += "+joint_sales_plan_response.selected_plan.planPremium"
+            if joint_sales_added_to_total:
+                total_without_vehicle_tax_source += "+" + (
+                    "joint_sales_plan_response.selected_plan.planPremium"
+                    if joint_sales_premium_from_plan
+                    else "joint_sales_default_mapping"
+                )
         else:
             total_without_vehicle_tax = None
 
@@ -8501,6 +8560,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 if _has_text(data.get("totalPremium"))
                 else "quote_response.data.premiumTotal"
             )
+            if joint_sales_added_to_total and platform_joint_sales_premium <= 0:
+                total_with_vehicle_tax += joint_sales_premium
+                total_with_vehicle_tax_source += "+" + (
+                    "joint_sales_plan_response.selected_plan.planPremium"
+                    if joint_sales_premium_from_plan
+                    else "joint_sales_default_mapping"
+                )
         elif total_without_vehicle_tax is not None and vehicle_tax_value is not None:
             total_with_vehicle_tax = total_without_vehicle_tax + vehicle_tax_value
             total_with_vehicle_tax_source = "derived_from_quote_response_components"
@@ -8631,7 +8697,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "source": (
                     "quote_response.data.sumYelPremium"
                     if platform_joint_sales_premium_present
-                    else "joint_sales_plan_response.selected_plan.planPremium"
+                    else (
+                        "joint_sales_plan_response.selected_plan.planPremium"
+                        if joint_sales_premium_from_plan
+                        else "joint_sales_default_mapping"
+                    )
                 ),
             }
         if total_without_vehicle_tax is not None:

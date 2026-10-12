@@ -277,9 +277,12 @@ def main() -> None:
             },
         },
     )
-    assert failed_joint_query_result["joint_sales_premium"] == ""
-    assert all(item["name"] != "途家安顺" for item in failed_joint_query_result["price_items"])
-    assert failed_joint_query_result["premium_total"] == 2143.8
+    assert failed_joint_query_result["joint_sales_premium"] == "398.00"
+    assert failed_joint_query_result["joint_sales_source"] == "joint_sales_default_mapping"
+    assert failed_joint_query_result["joint_sales_amount"] == ""
+    assert {"name": "途顺家安", "amount": 398.0} in failed_joint_query_result["price_items"]
+    assert failed_joint_query_result["premium_total"] == 2541.8
+    assert "按固定兜底保费398元计入报价" in failed_joint_query_result["platform_warning"]
 
     runtime = _quote_runtime_result_or_failure(
         PlatformRuntimeResult(

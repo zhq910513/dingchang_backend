@@ -4460,7 +4460,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         changed_license_type = dict(base, license_type="02")
         self.assertFalse(_has_reusable_renewal_quote_context(changed_license_type))
 
-    def test_0813_renewal_result_does_not_use_configured_joint_sales_without_plan(self) -> None:
+    def test_0813_renewal_result_uses_joint_sales_fallback_without_plan(self) -> None:
         har = _load_0813_renewal_har()
         renewal_rows = _har_response_json(har, 4)["data"]["list"]
         summaries = [_adapter()._renewal_candidate_summary(row) for row in renewal_rows]
@@ -4512,11 +4512,15 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         ctx = SimpleNamespace(account_type_name="油车-旧")
         result = adapter._build_motor_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
         self.assertEqual(result["risk_score"], 45)
-        self.assertEqual(str(result["premium_total"]), "2896.79")
+        self.assertEqual(str(result["premium_total"]), "3294.79")
         self.assertEqual(result["result_card"]["commercial_premium"], "1741.79")
         self.assertEqual(result["result_card"]["compulsory_premium"], "855.00")
         self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
-        self.assertEqual(result["result_card"]["joint_sales_premium"], "")
+        self.assertEqual(result["result_card"]["joint_sales_premium"], "398.00")
+        self.assertEqual(result["joint_sales_source"], "joint_sales_default_mapping")
+        self.assertEqual(result["joint_sales_amount"], "")
+        self.assertIn({"name": "途顺家安", "amount": 398.0}, result["price_items"])
+        self.assertIn("按固定兜底保费398元计入报价", result["platform_warning"])
         self.assertEqual(result["result_card"]["proposal_info"]["plate_no"], "赣G872F6")
 
     def test_0813_renewal_prepare_builds_quote_body_like_har(self) -> None:

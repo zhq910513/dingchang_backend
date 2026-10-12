@@ -68,6 +68,7 @@ JOINT_SALES_ITEM_NAME_HINTS = (
 TRUSTED_JOINT_SALES_SOURCES = frozenset({
     "platform_quote_response",
     "joint_sales_plan_response",
+    "joint_sales_default_mapping",
 })
 
 TRUSTED_EXACT_AMOUNT_SOURCES = frozenset(
@@ -82,6 +83,7 @@ TRUSTED_EXACT_AMOUNT_SOURCES = frozenset(
         "quote_response.data.totalPremium",
         "quote_response.data.premiumTotal",
         "joint_sales_plan_response.selected_plan.planPremium",
+        "joint_sales_default_mapping",
         "derived_from_quote_response.data.prePayTax+delayPayTax",
         "derived_from_quote_response.data.sumPremium+joint_sales_plan_response.selected_plan.planPremium",
         "derived_from_quote_response_components",
