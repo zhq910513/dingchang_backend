@@ -86,8 +86,14 @@ TRUSTED_EXACT_AMOUNT_SOURCES = frozenset(
         "joint_sales_default_mapping",
         "derived_from_quote_response.data.prePayTax+delayPayTax",
         "derived_from_quote_response.data.sumPremium+joint_sales_plan_response.selected_plan.planPremium",
+        "derived_from_quote_response.data.sumPremium+joint_sales_default_mapping",
+        "quote_response.data.totalPremium+joint_sales_plan_response.selected_plan.planPremium",
+        "quote_response.data.totalPremium+joint_sales_default_mapping",
+        "quote_response.data.premiumTotal+joint_sales_plan_response.selected_plan.planPremium",
+        "quote_response.data.premiumTotal+joint_sales_default_mapping",
         "derived_from_quote_response_components",
         "derived_from_quote_response_components+joint_sales_plan_response.selected_plan.planPremium",
+        "derived_from_quote_response_components+joint_sales_default_mapping",
         "derived_from_real_quote",
     }
 )
