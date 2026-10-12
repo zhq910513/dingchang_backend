@@ -279,10 +279,11 @@ def main() -> None:
     )
     assert failed_joint_query_result["joint_sales_premium"] == "398.00"
     assert failed_joint_query_result["joint_sales_source"] == "joint_sales_default_mapping"
-    assert failed_joint_query_result["joint_sales_amount"] == ""
+    assert failed_joint_query_result["joint_sales_amount"] == "5152000.00"
     assert {"name": "途顺家安", "amount": 398.0} in failed_joint_query_result["price_items"]
     assert failed_joint_query_result["premium_total"] == 2541.8
-    assert "按固定兜底保费398元计入报价" in failed_joint_query_result["platform_warning"]
+    assert "固定保费-保额映射" in failed_joint_query_result["platform_warning"]
+    assert "保额5152000元" in failed_joint_query_result["platform_warning"]
     assert not quote_result_real_data_error(failed_joint_query_result), failed_joint_query_result
 
     runtime = _quote_runtime_result_or_failure(

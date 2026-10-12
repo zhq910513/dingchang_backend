@@ -164,6 +164,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _pick_best_vehicle_candidate,
     _picc_business_defaults,
     _tujia_anshun_config,
+    _tujia_anshun_fallback_amount,
     PICC_DELETED_DEFAULT_FIELDS_KEY,
     PRODUCT_EXTERNAL_GRID,
     PRODUCT_ROAD_RESCUE,
@@ -1225,6 +1226,20 @@ class QuoteFlowMaterialRequirementRegressionTests(unittest.TestCase):
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    def test_joint_sales_fallback_amount_uses_historical_premium_mapping(self) -> None:
+        expected = {
+            "198": "2152000",
+            "368": "6322600",
+            "398": "5152000",
+            "418": "2405000",
+            "468": "7592600",
+            "498": "6462000",
+            "598": "7712000",
+        }
+        for premium, amount in expected.items():
+            self.assertEqual(str(_tujia_anshun_fallback_amount(premium)), amount)
+        self.assertEqual(str(_tujia_anshun_fallback_amount("700")), "0")
+
     @staticmethod
     def _config_delete_quote_parts(config):
         from app.services.quote_platforms.platforms.picc.business import _motor_quote_profile
@@ -4518,9 +4533,10 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
         self.assertEqual(result["result_card"]["vehicle_tax"], "300.00")
         self.assertEqual(result["result_card"]["joint_sales_premium"], "398.00")
         self.assertEqual(result["joint_sales_source"], "joint_sales_default_mapping")
-        self.assertEqual(result["joint_sales_amount"], "")
+        self.assertEqual(result["joint_sales_amount"], "5152000.00")
         self.assertIn({"name": "途顺家安", "amount": 398.0}, result["price_items"])
-        self.assertIn("按固定兜底保费398元计入报价", result["platform_warning"])
+        self.assertIn("固定保费-保额映射", result["platform_warning"])
+        self.assertIn("保额5152000元", result["platform_warning"])
         self.assertEqual(result["result_card"]["proposal_info"]["plate_no"], "赣G872F6")
 
     def test_0813_renewal_prepare_builds_quote_body_like_har(self) -> None:

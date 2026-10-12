@@ -157,6 +157,19 @@ PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE = {
     NEW_ENERGY_USED_ACCOUNT_TYPE: "398",
 }
 
+# Historical successful PICC plan responses provide the amount paired with
+# each premium. The optional plan lookup may fail, but these known pairs can
+# still render the product's insured amount without inventing a new value.
+PICC_TUJIA_ANSHUN_FALLBACK_AMOUNT_BY_PREMIUM = {
+    "198": "2152000",
+    "368": "6322600",
+    "398": "5152000",
+    "418": "2405000",
+    "468": "7592600",
+    "498": "6462000",
+    "598": "7712000",
+}
+
 PICC_KIND_NAME_BY_CODE = {
     "051050": "机动车损失保险",
     "051051": "机动车第三者责任保险",
@@ -2120,6 +2133,12 @@ def _tujia_anshun_fallback_premium(account_type_name: Any, configured_premium: A
         return configured
     account_type = _to_str(account_type_name).strip()
     return _money(PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE.get(account_type, "398"))
+
+
+def _tujia_anshun_fallback_amount(premium: Any) -> Decimal:
+    """Return the historical insured amount paired with a fallback premium."""
+    premium_key = _clean_money_text(premium)
+    return _money(PICC_TUJIA_ANSHUN_FALLBACK_AMOUNT_BY_PREMIUM.get(premium_key, "0"))
 
 
 def _tujia_anshun_from_request_body(request_body: Mapping[str, Any]) -> Dict[str, Any]:
@@ -8450,6 +8469,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         tujia_premium = _money(tujia_anshun.get("premium"))
         joint_sales_premium_from_plan = False
         joint_sales_premium_from_fallback = False
+        joint_sales_amount_from_fallback = False
         selected_plan = _json_obj(tujia_anshun.get("selected_plan"))
         selected_plan_premium = _money(selected_plan.get("planPremium"))
         # A configured premium is normally only an input to the plan lookup.
@@ -8480,14 +8500,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         ):
             fallback_premium = _tujia_anshun_fallback_premium(account_type_name, tujia_premium)
             if fallback_premium > 0:
+                fallback_amount = _tujia_anshun_fallback_amount(fallback_premium)
                 joint_sales_premium = fallback_premium
                 joint_sales_premium_present = True
                 joint_sales_premium_from_fallback = True
+                joint_sales_amount_from_fallback = fallback_amount > 0
                 tujia_anshun = {
                     **tujia_anshun,
                     "enabled": True,
                     "premium": _clean_money_text(fallback_premium),
-                    "amount": "0",
+                    "amount": _clean_money_text(fallback_amount),
                     "fallback_applied": True,
                     "fallback_source": "joint_sales_default_mapping",
                 }
@@ -8499,22 +8521,30 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     }
                 )
                 warning_parts.append(
-                    f"途顺家安方案查询未返回可用保额，已按固定兜底保费{_clean_money_text(fallback_premium)}元计入报价，保额未填充"
+                    f"途顺家安方案查询未返回可用方案，已按固定保费-保额映射计入保费{_clean_money_text(fallback_premium)}元"
+                    + (
+                        f"、保额{_clean_money_text(fallback_amount)}元"
+                        if fallback_amount > 0
+                        else "，未匹配到保额"
+                    )
                 )
         warning = "\n".join(part for part in warning_parts if part)
-        joint_sales_amount = (
-            _money(
-                selected_plan.get("planAmount")
-                if _has_text(selected_plan.get("planAmount"))
-                else tujia_anshun.get("amount")
+        if joint_sales_amount_from_fallback:
+            joint_sales_amount = _money(tujia_anshun.get("amount"))
+        else:
+            joint_sales_amount = (
+                _money(
+                    selected_plan.get("planAmount")
+                    if _has_text(selected_plan.get("planAmount"))
+                    else tujia_anshun.get("amount")
+                )
+                if tujia_plan_success
+                and (
+                    _has_text(selected_plan.get("planAmount"))
+                    or _has_text(tujia_anshun.get("amount"))
+                )
+                else Decimal("0")
             )
-            if tujia_plan_success
-            and (
-                _has_text(selected_plan.get("planAmount"))
-                or _has_text(tujia_anshun.get("amount"))
-            )
-            else Decimal("0")
-        )
         joint_sales_amount_present = joint_sales_premium > 0 and joint_sales_amount > 0
         if not joint_sales_premium_present:
             joint_sales_amount_present = False
