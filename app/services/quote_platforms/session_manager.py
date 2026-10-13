@@ -554,6 +554,14 @@ class QuotePlatformSessionStore:
             if redis_current is not None and int(redis_current.session_version or 0) != int(expected_version):
                 return False
 
+        # Session persistence and account-owned metadata share one JSON column.
+        # Re-read it after platform I/O so a concurrent operation-config
+        # selection cannot be overwritten by this actor's stale ORM snapshot.
+        await db.refresh(
+            account,
+            attribute_names=["credential_payload"],
+            with_for_update=True,
+        )
         summary = snapshot.safe_summary()
         account.secret_payload_ciphertext = encrypt_json(snapshot.to_dict(), aad=_snapshot_aad(account))
         account.credential_payload = {
@@ -803,7 +811,7 @@ def _snapshot_from_business_runtime(
         snapshot.last_business_at = now
     elif action == "keepalive":
         snapshot.last_keepalive_at = now
-    elif action == "check_quota":
+    elif action in {"check_quota", "query_operation_configs"}:
         snapshot.last_validation_at = now
     if status == SESSION_STATUS_AUTHENTICATED:
         snapshot.last_authenticated_at = now
@@ -1144,6 +1152,9 @@ class AccountSessionActor:
         finally:
             self._business_waiters -= 1
 
+    async def query_operation_configs(self, db: AsyncSession, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
+        return await self._execute_business_like(db, ctx, action="query_operation_configs", payload={})
+
     async def _execute_business_like(
         self,
         db: AsyncSession,
@@ -1263,6 +1274,16 @@ class AccountSessionActor:
                             data={"error_code": exc.__class__.__name__},
                         )
                     snapshot.last_business_at = iso_now()
+                elif action == "query_operation_configs":
+                    try:
+                        result = await _await_runtime_result(action, adapter.query_operation_configs(runtime_ctx))
+                    except Exception as exc:
+                        result = PlatformRuntimeResult(
+                            status="failed",
+                            message=f"平台操作配置查询异常：{str(exc) or exc.__class__.__name__}",
+                            data={"error_code": exc.__class__.__name__},
+                        )
+                    snapshot.last_validation_at = iso_now()
                 elif action == "keepalive":
                     try:
                         result = await _await_runtime_result(action, adapter.keepalive(runtime_ctx))
@@ -1365,6 +1386,9 @@ class QuotePlatformSessionManager:
 
     async def query_repair_codes(self, db: AsyncSession, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await (await self.actor(ctx.platform_code, ctx.account_id)).query_repair_codes(db, ctx, quote_payload)
+
+    async def query_operation_configs(self, db: AsyncSession, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
+        return await (await self.actor(ctx.platform_code, ctx.account_id)).query_operation_configs(db, ctx)
 
     async def clear(self, db: AsyncSession, account: QuotePlatformAccountProfile, *, status: str = SESSION_STATUS_OFFLINE) -> None:
         await self.store.clear(db, account, status=status)

@@ -99,6 +99,10 @@ class AiPlatformAccountLoginChallengeIn(BaseModel):
     code: str = Field(..., min_length=4, max_length=8)
 
 
+class AiPlatformAccountOperationConfigSelectionIn(BaseModel):
+    selected_id: str = Field(..., min_length=1, max_length=128)
+
+
 class AiPlatformDefaultConfigIn(BaseModel):
     platform_code: str = Field(..., min_length=1, max_length=32)
     platform_name: Optional[str] = Field(default=None, max_length=64)

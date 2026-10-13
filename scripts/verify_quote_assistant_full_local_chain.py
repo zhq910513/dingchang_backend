@@ -29,6 +29,7 @@ from app.services.quote_platforms.base import PlatformRuntimeResult
 from app.services.quote_platforms.session_models import AccountSessionSnapshot, iso_now
 from app.services.quote_platforms import runtime as quote_platform_runtime
 from app.services.quote_platforms import session_manager as quote_session_module
+from app.services.quote_platforms.platforms.picc.operation_config import operation_config_state
 from app.services.quote_assistant_service import (
     ACCOUNT_LOGIN_AUTHENTICATED,
     ACCOUNT_QUOTA_AVAILABLE,
@@ -47,6 +48,27 @@ CONTEXT = {
     "current_user_id": OWNER_USER_ID,
     "role_name": ROLE_SUPER_ADMIN,
     "team_names": [],
+}
+
+LOCAL_OPERATION_CONFIG = {
+    "id": "QT-LOCAL-FULL-CHAIN",
+    "name": "本地完整链路配置",
+    "comCode": "36220019",
+    "makecom": "36220019",
+    "businessNature": "2",
+    "businessNatureName": "专业代理业务",
+    "operateCode": "36044347",
+    "handlerCode": "36044347",
+    "handler1Code": "36044347",
+    "agentCode": "360021100116",
+}
+
+SWITCHED_OPERATION_CONFIG = {
+    **LOCAL_OPERATION_CONFIG,
+    "id": "QT-LOCAL-SWITCHED",
+    "name": "本地竞态切换配置",
+    "comCode": "36220071",
+    "makecom": "36220071",
 }
 
 
@@ -79,10 +101,13 @@ class LocalRuntimePatch:
         self.quote_calls: List[Dict[str, Any]] = []
         self.renewal_calls: List[Dict[str, Any]] = []
         self.quote_result_variant = "recorded_contract"
+        self.force_next_renewal_not_found = False
+        self.switch_operation_config_during_next_renewal = False
         self._old_quote = quote_platform_runtime.quote
         self._old_query_renewal = quote_platform_runtime.query_renewal
         self._old_query_joint_sales_plan = quote_platform_runtime.query_joint_sales_plan
         self._old_query_repair_codes = quote_platform_runtime.query_repair_codes
+        self._old_query_operation_configs = quote_platform_runtime.query_operation_configs
 
     async def __aenter__(self) -> "LocalRuntimePatch":
         async def fake_quote(ctx, quote_payload, db=None):
@@ -103,8 +128,10 @@ class LocalRuntimePatch:
             )
             self.quote_calls.append(
                 {
+                    "account_id": int(getattr(ctx, "account_id", 0) or 0),
                     "ctx_account_type": getattr(ctx, "account_type_name", ""),
                     "account_type_name": account_type_name,
+                    "operation_config": (getattr(ctx, "payload", {}) or {}).get("operation_config_snapshot") or {},
                     "normalized": normalized,
                     "request_body": request_body,
                     "quote_flow_type": (quote_payload or {}).get("quote_flow_type"),
@@ -232,7 +259,37 @@ class LocalRuntimePatch:
                 "license_type": (normalized or {}).get("license_type") or "02",
                 "license_color_code": (normalized or {}).get("license_color_code") or "01",
             }
-            self.renewal_calls.append({"normalized": normalized, "vehicle": vehicle})
+            self.renewal_calls.append(
+                {
+                    "normalized": normalized,
+                    "vehicle": vehicle,
+                    "operation_config": (getattr(ctx, "payload", {}) or {}).get("operation_config_snapshot") or {},
+                }
+            )
+            if self.switch_operation_config_during_next_renewal and db is not None:
+                account = await db.get(QuotePlatformAccountProfile, int(ctx.account_id))
+                credential = dict(account.credential_payload or {})
+                credential["operation_configs"] = operation_config_state(
+                    {
+                        "items": [SWITCHED_OPERATION_CONFIG],
+                        "selected_id": SWITCHED_OPERATION_CONFIG["id"],
+                        "status": "ready",
+                    }
+                )
+                account.credential_payload = credential
+                await db.flush()
+                self.switch_operation_config_during_next_renewal = False
+            if self.force_next_renewal_not_found:
+                self.force_next_renewal_not_found = False
+                return PlatformRuntimeResult(
+                    status="success",
+                    message="没有此车辆信息或不是可续保车辆",
+                    data={
+                        "business_status": "renewal_not_found",
+                        "renewal_found": False,
+                        "renewal_lookup": {"vehicle": vehicle, "candidates": []},
+                    },
+                )
             return PlatformRuntimeResult(
                 status="success",
                 message="已查询到可续保保单",
@@ -296,10 +353,23 @@ class LocalRuntimePatch:
                 },
             )
 
+        async def fake_operation_configs(ctx, db=None):
+            config = dict(LOCAL_OPERATION_CONFIG)
+            return PlatformRuntimeResult(
+                status="success",
+                data={
+                    "operation_configs": {
+                        "items": [config],
+                        "platform_default_id": config["id"],
+                    }
+                },
+            )
+
         quote_platform_runtime.quote = fake_quote
         quote_platform_runtime.query_renewal = fake_query_renewal
         quote_platform_runtime.query_joint_sales_plan = fake_joint_sales
         quote_platform_runtime.query_repair_codes = fake_repair_codes
+        quote_platform_runtime.query_operation_configs = fake_operation_configs
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -307,6 +377,7 @@ class LocalRuntimePatch:
         quote_platform_runtime.query_renewal = self._old_query_renewal
         quote_platform_runtime.query_joint_sales_plan = self._old_query_joint_sales_plan
         quote_platform_runtime.query_repair_codes = self._old_query_repair_codes
+        quote_platform_runtime.query_operation_configs = self._old_query_operation_configs
 
 
 async def _ensure_local_pccc_account(db) -> int:
@@ -327,6 +398,15 @@ async def _ensure_local_pccc_account(db) -> int:
     account.quota_status = ACCOUNT_QUOTA_AVAILABLE
     account.last_error = None
     account.updated_at = _now()
+    credential = dict(account.credential_payload or {})
+    credential["operation_configs"] = operation_config_state(
+        {
+            "items": [LOCAL_OPERATION_CONFIG],
+            "selected_id": LOCAL_OPERATION_CONFIG["id"],
+            "status": "ready",
+        }
+    )
+    account.credential_payload = credential
     snapshot = AccountSessionSnapshot(
         platform_code="PICC",
         account_id=int(account.id),
@@ -387,10 +467,11 @@ async def main() -> None:
     session_ids: List[str] = []
     try:
         async with async_session_factory() as db:
-            await _ensure_local_pccc_account(db)
+            account_id = await _ensure_local_pccc_account(db)
             await db.commit()
 
             async with LocalRuntimePatch() as runtime_patch:
+                account_ids_by_type: Dict[str, int] = {}
                 for account_type in QUOTE_ACCOUNT_TYPE_OPTIONS:
                     session = await db_create_session(
                         db,
@@ -418,7 +499,9 @@ async def main() -> None:
                     assert not quote_payload.get("result_image"), quote_payload
 
                     call = runtime_patch.quote_calls[-1]
+                    account_ids_by_type[account_type] = int(call.get("account_id") or 0)
                     normalized = call["normalized"]
+                    assert call["operation_config"].get("selected_id") == "QT-LOCAL-FULL-CHAIN", call
                     assert normalized.get("account_type_name") == account_type, (account_type, normalized)
                     expected_license_type = "52" if "新能源" in account_type else "02"
                     actual_license_type = (
@@ -429,6 +512,50 @@ async def main() -> None:
                     assert actual_license_type == expected_license_type, (account_type, normalized)
                     request_body_text = str(call["request_body"])
                     assert expected_license_type in request_body_text, (account_type, call["request_body"])
+
+                # If the account selection changes while an automatic renewal
+                # probe is in flight, its normal-quote fallthrough must retain
+                # the route frozen at command start.
+                session = await db_create_session(db, owner_user_id=OWNER_USER_ID, title="Codex 本地续保回落机构冻结")
+                fallback_session_id = str(session["session_id"])
+                session_ids.append(fallback_session_id)
+                fallback_account_id = account_ids_by_type["油车-旧"]
+                fallback_account = await db.get(QuotePlatformAccountProfile, fallback_account_id)
+                fallback_credential = dict(fallback_account.credential_payload or {})
+                fallback_credential["operation_configs"] = operation_config_state(
+                    {
+                        "items": [LOCAL_OPERATION_CONFIG],
+                        "selected_id": LOCAL_OPERATION_CONFIG["id"],
+                        "status": "ready",
+                    }
+                )
+                fallback_account.credential_payload = fallback_credential
+                await db.commit()
+                await _send(db, session_id=fallback_session_id, message=TEST_MATERIALS["油车-旧"])
+                runtime_patch.force_next_renewal_not_found = True
+                runtime_patch.switch_operation_config_during_next_renewal = True
+                renewal_count_before = len(runtime_patch.renewal_calls)
+                quote_count_before = len(runtime_patch.quote_calls)
+                fallback_result = await _send(db, session_id=fallback_session_id, message="人保报价")
+                assert _result_status(fallback_result) == "success", fallback_result
+                assert len(runtime_patch.renewal_calls) == renewal_count_before + 1, fallback_result
+                assert len(runtime_patch.quote_calls) == quote_count_before + 1, fallback_result
+                renewal_route = runtime_patch.renewal_calls[-1]["operation_config"]
+                fallback_quote_route = runtime_patch.quote_calls[-1]["operation_config"]
+                assert renewal_route.get("selected_id") == LOCAL_OPERATION_CONFIG["id"], renewal_route
+                assert fallback_quote_route.get("selected_id") == LOCAL_OPERATION_CONFIG["id"], fallback_quote_route
+
+                account = await db.get(QuotePlatformAccountProfile, fallback_account_id)
+                credential = dict(account.credential_payload or {})
+                credential["operation_configs"] = operation_config_state(
+                    {
+                        "items": [LOCAL_OPERATION_CONFIG],
+                        "selected_id": LOCAL_OPERATION_CONFIG["id"],
+                        "status": "ready",
+                    }
+                )
+                account.credential_payload = credential
+                await db.commit()
 
                 # Product-mode commands should reuse the latest material and alter exclusions.
                 session = await db_create_session(db, owner_user_id=OWNER_USER_ID, title="Codex 本地命令链路")

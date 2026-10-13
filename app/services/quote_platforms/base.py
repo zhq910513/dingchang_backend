@@ -69,6 +69,9 @@ class QuotePlatformAdapter:
     async def query_repair_codes(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return PlatformRuntimeResult(status="failed", message="当前平台暂不支持送修码查询")
 
+    async def query_operation_configs(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
+        return PlatformRuntimeResult(status="failed", message="当前平台暂不支持操作配置查询")
+
     def _not_implemented_result(self, operation: str) -> PlatformRuntimeResult:
         platform = self.platform_name or self.platform_code or "当前平台"
         return PlatformRuntimeResult(

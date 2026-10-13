@@ -30,6 +30,17 @@ from app.services.quote_platforms.platforms.picc.presentation import (
     picc_result_amount_text,
     picc_result_kind_name,
 )
+from app.services.quote_platforms.platforms.picc.operation_config import (
+    DEFAULT_OPERATOR_PATH,
+    OPERATE_CONFIG_LIST_PATH,
+    SELECTED_OPERATOR_PATH,
+    operation_config_id_from_response,
+    operation_config_items_from_responses,
+    operation_config_quote_fields,
+    selected_operation_config_from_context_payload,
+    strip_account_managed_default_fields,
+    strip_account_managed_deleted_fields,
+)
 from app.services.ocr_cleaner import correct_vehicle_cert_field
 
 NEW_FUEL_ACCOUNT_TYPE = "油车-新"
@@ -328,9 +339,6 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
-    "归属机构代码": "36040200",
-    "操作机构代码": "36040213",
-    "操作配置ID": "QT360402131762390540324",
     "验车人工号": "24090664",
     "验车人姓名": "陈宛杰",
     "送修码启用": "1",
@@ -343,8 +351,6 @@ PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
     "查询区域代码": "360000",
     "税务机关代码": "13604010000",
     "税务机关名称": "国家税务总局九江市税务局第一税务分局",
-    "业务性质代码": "2",
-    "业务性质名称": "专业代理业务",
     "是否代收车船税": "1",
     "行驶区域代码": "11",
     "条款类型": "F42",
@@ -393,10 +399,10 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
     }
 
 
-def _picc_business_defaults(default_values: Any) -> Dict[str, Any]:
-    """Merge hidden protocol defaults behind the editable PICC product config."""
-    raw = dict(_json_obj(default_values))
-    deleted = _deleted_default_fields(raw)
+def _picc_business_defaults(default_values: Any, ctx: Optional[PlatformAccountContext] = None) -> Dict[str, Any]:
+    """Merge product defaults with the selected account-owned routing config."""
+    raw = strip_account_managed_default_fields(_json_obj(default_values))
+    deleted = strip_account_managed_deleted_fields(_deleted_default_fields(raw))
     raw.pop(PICC_DELETED_DEFAULT_FIELDS_KEY, None)
     defaults = dict(PICC_COMMON_PLATFORM_DEFAULTS)
     defaults.update(raw)
@@ -409,6 +415,8 @@ def _picc_business_defaults(default_values: Any) -> Dict[str, Any]:
         for key in aliases:
             if key not in raw or key == deleted_name:
                 defaults.pop(key, None)
+    selected_operation_config = selected_operation_config_from_context_payload(getattr(ctx, "payload", {}) if ctx else {})
+    defaults.update(operation_config_quote_fields(selected_operation_config))
     defaults[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted
     return defaults
 
@@ -3326,6 +3334,21 @@ def _quote_form_kind_rows(form: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 def _is_dangerous_quote_form_override_key(key: Any) -> bool:
     text = _to_str(key).strip()
+    if text in {
+        "prpCmain.comCode",
+        "opconfComCode",
+        "opconf_makecomCode",
+        "selectedOperateConfigId",
+        "selectedOperateConfig",
+        "businesNature",
+        "businesNatureName",
+        "prpCmain.businesNature",
+        "prpCmain.agentCode",
+        "prpCmain.handlerCode",
+        "prpCmain.handler1Code",
+        "prpCmain.operateCode",
+    }:
+        return True
     return bool(re.fullmatch(r"prpCitemKindVos\[\d+\]\.(kindCode|kindName|chooseFlag|amount)", text))
 
 
@@ -4460,11 +4483,117 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
     async def query_repair_codes(self, ctx: PlatformAccountContext, quote_payload: Dict[str, Any]) -> PlatformRuntimeResult:
         return await asyncio.to_thread(self._query_repair_codes_sync, ctx, quote_payload)
 
+    async def query_operation_configs(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
+        return await asyncio.to_thread(self._query_operation_configs_sync, ctx)
+
     def _client(self, ctx: PlatformAccountContext) -> PiccProtocolClient:
         snapshot = snapshot_from_context(ctx)
         if snapshot is None:
             raise PiccSessionExpiredError("PICC 当前账号没有可用会话，请先登录")
         return PiccProtocolClient(ctx, snapshot=snapshot)
+
+    def _query_operation_configs_sync(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
+        client: Optional[PiccProtocolClient] = None
+        try:
+            client = self._client(ctx)
+            referer = f"{client.config.base_url}/khyxui/my-tools/quotation"
+            list_response = client.request_json(
+                "GET",
+                OPERATE_CONFIG_LIST_PATH,
+                purpose="validate",
+                headers={"Referer": referer},
+            )
+            _ensure_platform_success(list_response, action="操作配置列表查询")
+            initial_items = operation_config_items_from_responses(list_response)
+            detail_responses: List[Any] = []
+            detail_errors: List[Dict[str, str]] = []
+            for item in initial_items:
+                config_id = _to_str(item.get("id")).strip()
+                if not config_id:
+                    continue
+                try:
+                    detail_response = client.request_json(
+                        "GET",
+                        SELECTED_OPERATOR_PATH,
+                        purpose="validate",
+                        params={"id": config_id},
+                        headers={"Referer": referer},
+                    )
+                    _ensure_platform_success(detail_response, action="操作配置详情查询")
+                    detail_responses.append(detail_response)
+                except Exception as exc:
+                    detail_errors.append(
+                        {
+                            "id": config_id,
+                            "error_code": exc.__class__.__name__,
+                            "message": str(exc)[:200] or exc.__class__.__name__,
+                        }
+                    )
+            default_response: Any = {}
+            default_error = ""
+            try:
+                default_response = client.request_json(
+                    "GET",
+                    DEFAULT_OPERATOR_PATH,
+                    purpose="validate",
+                    params={"source": "0"},
+                    headers={"Referer": referer},
+                )
+                _ensure_platform_success(default_response, action="默认操作配置查询")
+            except Exception as exc:
+                default_error = str(exc)[:200] or exc.__class__.__name__
+            items = operation_config_items_from_responses(list_response, *detail_responses)
+            platform_default_id = operation_config_id_from_response(default_response)
+            if not items:
+                return PlatformRuntimeResult(
+                    status="failed",
+                    message="PICC 当前账号未返回可用操作配置",
+                    data=success_data(
+                        client,
+                        extra={
+                            "error_code": "PICC_OPERATION_CONFIG_EMPTY",
+                            "operation_configs": {
+                                "items": [],
+                                "platform_default_id": "",
+                                "detail_errors": detail_errors,
+                                "default_error": default_error,
+                            },
+                        },
+                    ),
+                )
+            return PlatformRuntimeResult(
+                status="success",
+                message=f"PICC 已读取 {len(items)} 条账号操作配置",
+                data=success_data(
+                    client,
+                    extra={
+                        "operation_configs": {
+                            "items": items,
+                            "platform_default_id": platform_default_id,
+                            "detail_errors": detail_errors,
+                            "default_error": default_error,
+                        }
+                    },
+                ),
+            )
+        except PiccSessionExpiredError as exc:
+            return PlatformRuntimeResult(
+                status="expired",
+                message=str(exc) or "PICC 登录已过期，请重新登录",
+                data={"business_status": "16", "error_code": exc.__class__.__name__},
+            )
+        except PiccTransientGatewayError as exc:
+            return PlatformRuntimeResult(
+                status="network_error",
+                message=str(exc) or "PICC 平台网关临时异常，请稍后重试",
+                data={"error_code": exc.__class__.__name__, "transient": True},
+            )
+        except Exception as exc:
+            return PlatformRuntimeResult(
+                status="failed",
+                message=str(exc) or exc.__class__.__name__,
+                data={"error_code": exc.__class__.__name__},
+            )
 
     def _keepalive_sync(self, ctx: PlatformAccountContext) -> PlatformRuntimeResult:
         try:
@@ -5342,7 +5471,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
         user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
         configured_defaults = _json_obj(payload.get("default_config_json"))
-        default_config = _picc_business_defaults(configured_defaults)
+        default_config = _picc_business_defaults(configured_defaults, ctx)
         merged_defaults = dict(default_config)
         accepted_renewal_defaults: Dict[str, Any] = {}
         ignored_configured_renewal_defaults: Dict[str, Any] = {}
@@ -5449,7 +5578,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 )
 
             request_body = _json_obj(payload.get("request_body"))
-            defaults = _picc_business_defaults(payload.get("default_config_json"))
+            defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
             request_defaults = _json_obj(request_body.get("defaultFields"))
             if request_defaults:
                 defaults = _deep_merge(defaults, request_defaults)
@@ -5734,6 +5863,18 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "request_body_draft": request_body_draft,
                     "offline_request_body": True,
                     "request_body_error": draft_error,
+                },
+            )
+        selected_operation_config = selected_operation_config_from_context_payload(ctx.payload)
+        if not _to_str(selected_operation_config.get("id")).strip():
+            return PlatformRuntimeResult(
+                status="failed",
+                message="人保账号尚未选择有效操作配置，请在平台账号管理中重新登录、刷新并选择后再报价",
+                data={
+                    "error_code": "PICC_OPERATION_CONFIG_MISSING",
+                    "request_body": request_body_draft,
+                    "request_body_draft": request_body_draft,
+                    "offline_request_body": True,
                 },
             )
         try:
@@ -6284,7 +6425,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
         resolved_account_type = _profile_text(profile, "account_type_name", USED_FUEL_ACCOUNT_TYPE)
         payload = _json_obj(quote_payload)
-        defaults = _picc_business_defaults(payload.get("default_config_json"))
+        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
         normalized_data = _json_obj(payload.get("normalized_data"))
         explicit_loss_amount = _quote_loss_override_amount(payload, defaults)
         incoming_body = _json_obj(payload.get("request_body"))
@@ -6423,7 +6564,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
         resolved_account_type = _profile_text(profile, "account_type_name", USED_FUEL_ACCOUNT_TYPE)
         payload = _json_obj(quote_payload)
-        defaults = _picc_business_defaults(payload.get("default_config_json"))
+        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
         normalized_data = _json_obj(payload.get("normalized_data"))
         explicit_loss_amount = _quote_loss_override_amount(payload, defaults)
         incoming_body = _json_obj(payload.get("request_body"))
@@ -6854,7 +6995,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         repair_code_enabled = _repair_code_enabled(defaults)
         repair_code = _repair_code_value(defaults)
         repair_name = _repair_code_name(defaults)
-        main_com_code = _first_text(vehicle.get("mainComCode"), _field_value(defaults, "归属机构代码", "机构代码", "comCode"))
+        # The account-selected operation config owns routing. A car-checker
+        # response may contain a comCode, but it must never replace this route.
+        main_com_code = _first_text(_field_value(defaults, "归属机构代码", "机构代码", "comCode"), vehicle.get("mainComCode"))
+        business_nature = _to_str(_field_value(defaults, "业务性质代码", "businesNature", "businessNature")).strip()
+        business_nature_name = _to_str(
+            _field_value(defaults, "业务性质名称", "businesNatureName", "businessNatureName")
+        ).strip()
+        agent_code = _to_str(_field_value(defaults, "代理机构代码", "agentCode")).strip()
+        handler_code = _to_str(_field_value(defaults, "经办人代码", "handlerCode", "操作员代码", "operateCode")).strip()
+        handler1_code = _to_str(_field_value(defaults, "handler1Code", "经办人代码", "handlerCode", "操作员代码", "operateCode")).strip()
+        operate_code = _to_str(_field_value(defaults, "操作员代码", "operateCode", "经办人代码", "handlerCode")).strip()
         query_area = _first_text(_field_value(defaults, "查询区域代码", "queryArea"), (main_com_code[:2] + "0000") if len(main_com_code) >= 2 else "")
         model_code = _first_text(
             vehicle.get("platformModelCode"),
@@ -6922,13 +7073,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             missing_config.append("操作机构代码")
         if not selected_operate_config_id:
             missing_config.append("操作配置ID")
+        if not business_nature:
+            missing_config.append("业务性质代码")
         if not carchecker_code:
             missing_config.append("验车人工号")
         if missing_config and strict_config:
             raise PiccRequestError(
-                f"{_profile_text(prof, 'display_name', '人保报价')}缺少平台默认参数："
+                f"{_profile_text(prof, 'display_name', '人保报价')}缺少账号操作配置字段："
                 + "、".join(missing_config)
-                + "。请先在报价助手右上角“默认参数配置”中维护后再报价。"
+                + "。请在平台账号管理中重新登录或刷新操作配置后再报价。"
             )
 
         form: Dict[str, Any] = {
@@ -6948,8 +7101,13 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "prpCmain.vehicleModelCode": vehicle_model_code,
             "prpCmain.insuredChooseUsedName": "0",
             "prpCmain.carOwnerChooseUsedName": "0",
-            "businesNature": _to_str(_field_value(defaults, "业务性质代码", "businesNature", fallback="2")),
-            "businesNatureName": _to_str(_field_value(defaults, "业务性质名称", "businesNatureName", fallback="专业代理业务")),
+            "businesNature": business_nature,
+            "businesNatureName": business_nature_name,
+            "prpCmain.businesNature": business_nature,
+            "prpCmain.agentCode": agent_code,
+            "prpCmain.handlerCode": handler_code,
+            "prpCmain.handler1Code": handler1_code,
+            "prpCmain.operateCode": operate_code,
             "energyTypePlat": energy_fields["energy_type_plat"],
             "energyTypePlatTemp": energy_fields["energy_type_name"],
             "eadinfo.isEAD": "0",
@@ -7598,7 +7756,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "modelCode": _first_text(selected.get("vehicleId"), selected.get("modelCode")),
             "tonCount": _first_text(selected.get("tonCount"), selected.get("vehicleTonnage"), "0"),
             "exhaustScale": _first_text(selected.get("vehicleExhaust"), selected.get("exhaustScale"), "0"),
-            "selectedOperateConfigId": _field_value(defaults, "车型配置ID", "selectedOperateConfigId"),
+            "selectedOperateConfigId": _field_value(
+                defaults,
+                "操作配置ID",
+                "车型配置ID",
+                "selectedOperateConfigId",
+            ),
             "seatCount": _first_text(selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
             "carLotEquQuality": _first_text(selected.get("vehicleWeight"), selected.get("carLotEquQuality"), "0"),
             "clauseFlag": _field_value(defaults, "条款标识", fallback="1"),

@@ -42,6 +42,7 @@ from app.schemas.ai_assistant import (
     AiCreateSessionIn,
     AiDeleteSessionOut,
     AiPlatformAccountLoginChallengeIn,
+    AiPlatformAccountOperationConfigSelectionIn,
     AiPlatformAccountProfileIn,
     AiPlatformAccountTypeIn,
     AiPlatformDefaultConfigIn,
@@ -73,15 +74,18 @@ from app.services.quote_assistant_service import (
     recall_quote_case_images as _recall_quote_case_images,
     quote_message_may_interrupt_running_task,
     resolve_platform_default_config as _resolve_platform_default_config,
+    refresh_platform_account_operation_configs as _refresh_platform_account_operation_configs,
     save_platform_default_config as _save_platform_default_config,
     platform_default_config_save_payload as _platform_default_config_save_payload,
     save_platform_account_type as _save_platform_account_type,
     start_platform_account_login as _start_platform_account_login,
+    select_platform_account_operation_config as _select_platform_account_operation_config,
     sanitize_quote_user_message,
     submit_platform_account_login_challenge as _submit_platform_account_login_challenge,
     update_platform_account_profile as _update_platform_account_profile,
 )
 from app.services.image_slot_classifier import SLOT_KEYS
+from app.services.quote_platforms.platforms.picc.operation_config import public_operation_config_state
 from app.services.quote_result_validation import quote_result_real_data_error
 from app.services.storage import StorageService
 
@@ -1296,6 +1300,72 @@ async def login_platform_account(
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail="平台登录失败：%s" % sanitize_quote_user_message(str(e) or e.__class__.__name__, "服务器处理异常"))
+
+
+@router.get("/platform-accounts/{account_id}/operation-configs")
+async def get_platform_account_operation_configs(
+        account_id: int,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    _ensure_platform_account_manage(ctx)
+    account = await _get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="平台账号不存在或无权查看")
+    public = _credential_public_payload(account) or {}
+    return {"ok": True, "data": {"operation_configs": public.get("operation_configs") or {}}}
+
+
+@router.post("/platform-accounts/{account_id}/operation-configs/refresh")
+async def refresh_platform_account_operation_configs(
+        account_id: int,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    _ensure_platform_account_manage(ctx)
+    try:
+        state = await _refresh_platform_account_operation_configs(
+            db,
+            owner_user_id=owner_user_id,
+            account_id=account_id,
+            raise_on_error=False,
+        )
+        await db.commit()
+        return {"ok": True, "data": {"operation_configs": public_operation_config_state(state)}}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "操作配置刷新失败"))
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="操作配置刷新失败：%s" % sanitize_quote_user_message(str(e) or e.__class__.__name__, "服务器处理异常"))
+
+
+@router.put("/platform-accounts/{account_id}/operation-config-selection")
+async def update_platform_account_operation_config_selection(
+        account_id: int,
+        body: AiPlatformAccountOperationConfigSelectionIn,
+        ctx: CurrentUserContext = Depends(get_current_user_with_role_and_teams),
+        db: AsyncSession = Depends(get_db),
+):
+    owner_user_id = _owner_user_id_or_401(ctx)
+    _ensure_platform_account_manage(ctx)
+    try:
+        state = await _select_platform_account_operation_config(
+            db,
+            owner_user_id=owner_user_id,
+            account_id=account_id,
+            selected_id=body.selected_id,
+        )
+        await db.commit()
+        return {"ok": True, "data": {"operation_configs": public_operation_config_state(state)}}
+    except ValueError as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=sanitize_quote_user_message(str(e), "操作配置选择失败"))
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="操作配置选择失败：%s" % sanitize_quote_user_message(str(e) or e.__class__.__name__, "服务器处理异常"))
 
 
 @router.post("/platform-account-login-tasks/{task_id}/challenge")

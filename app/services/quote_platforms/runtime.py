@@ -68,3 +68,10 @@ async def query_repair_codes(
     db: AsyncSession | None = None,
 ) -> PlatformRuntimeResult:
     return await _with_db(db, lambda session: session_manager.query_repair_codes(session, ctx, quote_payload))
+
+
+async def query_operation_configs(
+    ctx: PlatformAccountContext,
+    db: AsyncSession | None = None,
+) -> PlatformRuntimeResult:
+    return await _with_db(db, lambda session: session_manager.query_operation_configs(session, ctx))

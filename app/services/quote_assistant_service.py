@@ -64,6 +64,15 @@ from app.services.quote_platforms.platforms.picc.business import (
     _default_field_aliases,
     PICC_DELETED_DEFAULT_FIELDS_KEY,
 )
+from app.services.quote_platforms.platforms.picc.operation_config import (
+    OPERATION_CONFIG_CREDENTIAL_KEY,
+    operation_config_items_from_responses,
+    operation_config_missing_quote_fields,
+    operation_config_state,
+    public_operation_config_state,
+    strip_account_managed_default_fields,
+    strip_account_managed_deleted_fields,
+)
 from app.services.quote_platforms.platforms.picc.presentation import (
     picc_is_new_energy_vehicle,
     picc_result_amount_text,
@@ -4545,6 +4554,19 @@ def _quote_quota_exhausted_message(
     )
 
 
+def _account_operation_config_state(row: Optional[QuotePlatformAccountProfile]) -> Dict[str, Any]:
+    if row is None:
+        return operation_config_state({"supported": False, "status": "unavailable"})
+    code = _to_str(_loaded_value(row, "platform_code")).strip().upper()
+    credential = _json_obj(_loaded_value(row, "credential_payload"))
+    raw = credential.get(OPERATION_CONFIG_CREDENTIAL_KEY)
+    if code != "PICC" and not isinstance(raw, Mapping):
+        return operation_config_state({"supported": False, "status": "unsupported"})
+    state = operation_config_state(raw)
+    state["supported"] = code == "PICC" or bool(state.get("supported"))
+    return state
+
+
 def _credential_public_payload(
     row: Optional[QuotePlatformAccountProfile],
     *,
@@ -4634,6 +4656,7 @@ def _credential_public_payload(
         "quota_last_consumed_at": quota_payload.get("last_consumed_at"),
         "quota_config": quota_payload,
         "platform_quote_usage": platform_quote_usage,
+        "operation_configs": public_operation_config_state(_account_operation_config_state(row)),
         "browser_env_key": _loaded_value(row, "browser_env_key"),
         "session": session_summary,
         "active_login_task": active_login_task_payload,
@@ -4698,6 +4721,9 @@ def _platform_default_config_payload(row: QuotePlatformDefaultConfig) -> Dict[st
     account_type_name = _normalize_account_type_name(_loaded_value(row, "account_type_name")) or ""
     stored_values = dict(_json_obj(_loaded_value(row, "default_values_json")))
     deleted_default_fields = stored_values.pop(PICC_DELETED_DEFAULT_FIELDS_KEY, [])
+    if _to_str(platform_code).strip().upper() == "PICC":
+        stored_values = strip_account_managed_default_fields(stored_values)
+        deleted_default_fields = strip_account_managed_deleted_fields(deleted_default_fields)
     default_values, deleted_default_fields = canonicalize_joint_sales_config_fields(
         _platform_default_values_with_legacy_fixes(
             platform_code,
@@ -5026,6 +5052,9 @@ async def save_platform_default_config(
         name = re.sub(r"\s+", " ", _to_str(raw_name).strip())[:128]
         if name and name not in default_values and name not in deleted_default_fields:
             deleted_default_fields.append(name)
+    if code == "PICC":
+        default_values = strip_account_managed_default_fields(default_values)
+        deleted_default_fields = strip_account_managed_deleted_fields(deleted_default_fields)
     default_values, deleted_default_fields = canonicalize_joint_sales_config_fields(
         default_values, deleted_default_fields
     )
@@ -5304,8 +5333,14 @@ async def apply_platform_default_config_to_snapshot(
     builtin_defaults = _json_obj(resolved.get("builtin_default_values"))
     resolved_defaults = _json_obj(resolved.get("default_values"))
     quote_field_overrides = _merge_quote_config_overrides(normalized_data.get("quote_field_overrides"))
+    if _to_str(platform_code).strip().upper() == "PICC":
+        builtin_defaults = strip_account_managed_default_fields(builtin_defaults)
+        resolved_defaults = strip_account_managed_default_fields(resolved_defaults)
+        quote_field_overrides = strip_account_managed_default_fields(quote_field_overrides)
+        deleted_default_fields = strip_account_managed_deleted_fields(resolved.get("deleted_default_fields") or [])
+    else:
+        deleted_default_fields = list(resolved.get("deleted_default_fields") or [])
     default_values = dict(builtin_defaults)
-    deleted_default_fields = list(resolved.get("deleted_default_fields") or [])
     for deleted_name in deleted_default_fields:
         for alias in _default_field_aliases(deleted_name):
             default_values.pop(alias, None)
@@ -5319,6 +5354,8 @@ async def apply_platform_default_config_to_snapshot(
         for alias in _default_field_aliases(name) - {name}:
             default_values.pop(alias, None)
     default_values.update(quote_field_overrides)
+    if _to_str(platform_code).strip().upper() == "PICC":
+        default_values = strip_account_managed_default_fields(default_values)
     quote_product_exclusions = _normalize_quote_product_exclusions(
         normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
     )
@@ -5926,6 +5963,10 @@ async def update_platform_account_profile(
             row,
             status=SESSION_STATUS_DISABLED if not row.enabled else SESSION_STATUS_OFFLINE,
         )
+        if session_reset_changes.intersection({"platform_code", "account_username", "account_password"}):
+            credential = _json_obj(row.credential_payload)
+            credential.pop(OPERATION_CONFIG_CREDENTIAL_KEY, None)
+            row.credential_payload = credential
     await _save_account_quota_config(db, account=row, incoming=incoming)
     row.updated_at = _now()
     await _add_account_event(
@@ -5939,6 +5980,170 @@ async def update_platform_account_profile(
     )
     await db.flush()
     return row
+
+
+async def refresh_platform_account_operation_configs(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    account_id: int,
+    raise_on_error: bool = True,
+) -> Dict[str, Any]:
+    account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if not account:
+        raise ValueError("平台账号不存在或无权查看")
+    if _to_str(account.platform_code).strip().upper() != "PICC":
+        raise ValueError("当前平台不支持账号操作配置查询")
+
+    result = await quote_platform_runtime.query_operation_configs(_platform_account_context(account), db=db)
+    refresh_account = getattr(db, "refresh", None)
+    if callable(refresh_account):
+        try:
+            await refresh_account(account, attribute_names=["credential_payload"], with_for_update=True)
+        except TypeError:
+            await refresh_account(account, attribute_names=["credential_payload"])
+    # The platform request can take seconds. Re-read under a row lock so a
+    # selection saved while it was in flight is preserved instead of being
+    # overwritten by the refresh response.
+    previous = _account_operation_config_state(account)
+    status = _runtime_status(result)
+    now_text = _fmt_dt(_now()) or ""
+    credential = _json_obj(account.credential_payload)
+    if status in {"success", "ok", "available"}:
+        runtime_state = _json_obj(_json_obj(result.data).get("operation_configs"))
+        items_state = operation_config_state(
+            {
+                "supported": True,
+                "status": "ready",
+                "items": runtime_state.get("items") or [],
+            }
+        )
+        runtime_items = list(items_state.get("items") or [])
+        previous_items = {
+            _to_str(item.get("id")).strip(): item
+            for item in previous.get("items") or []
+            if _to_str(item.get("id")).strip()
+        }
+        items: List[Dict[str, Any]] = []
+        for item in runtime_items:
+            item_id = _to_str(item.get("id")).strip()
+            old_item = previous_items.get(item_id)
+            if old_item:
+                merged = operation_config_items_from_responses(old_item, item)
+                item = next((row for row in merged if _to_str(row.get("id")).strip() == item_id), item)
+            items.append(item)
+        incomplete_items = [
+            {
+                "id": _to_str(item.get("id")).strip(),
+                "missing": operation_config_missing_quote_fields(item),
+            }
+            for item in items
+            if operation_config_missing_quote_fields(item)
+        ]
+        if incomplete_items:
+            missing_text = "；".join(
+                f"{item.get('id') or '未知配置'}缺少{'、'.join(item.get('missing') or [])}"
+                for item in incomplete_items[:5]
+            )
+            preserved = operation_config_state(
+                {
+                    **previous,
+                    "supported": True,
+                    "status": "stale" if previous.get("items") else "error",
+                    "last_error": f"平台操作配置详情不完整：{missing_text}",
+                    "last_error_at": now_text,
+                }
+            )
+            credential[OPERATION_CONFIG_CREDENTIAL_KEY] = preserved
+            account.credential_payload = credential
+            account.updated_at = _now()
+            await db.flush()
+            if raise_on_error:
+                raise ValueError(preserved["last_error"])
+            return preserved
+        item_ids = {_to_str(item.get("id")).strip() for item in items}
+        previous_selected_id = _to_str(previous.get("selected_id")).strip()
+        platform_default_id = _to_str(runtime_state.get("platform_default_id")).strip()
+        if previous_selected_id in item_ids:
+            selected_id = previous_selected_id
+        elif platform_default_id in item_ids:
+            selected_id = platform_default_id
+        elif len(items) == 1:
+            selected_id = _to_str(items[0].get("id")).strip()
+        else:
+            selected_id = ""
+        state = operation_config_state(
+            {
+                "supported": True,
+                "status": "ready" if selected_id else ("needs_selection" if items else "empty"),
+                "items": items,
+                "selected_id": selected_id,
+                "refreshed_at": now_text,
+                "last_error": "",
+                "last_error_at": "",
+            }
+        )
+        credential[OPERATION_CONFIG_CREDENTIAL_KEY] = state
+        account.credential_payload = credential
+        account.updated_at = _now()
+        await db.flush()
+        return state
+
+    detail = _runtime_detail(result, "账号操作配置读取失败")
+    preserved = operation_config_state(
+        {
+            **previous,
+            "supported": True,
+            "status": "stale" if previous.get("items") else "error",
+            "last_error": detail,
+            "last_error_at": now_text,
+        }
+    )
+    credential[OPERATION_CONFIG_CREDENTIAL_KEY] = preserved
+    account.credential_payload = credential
+    account.updated_at = _now()
+    await db.flush()
+    if raise_on_error:
+        raise ValueError(detail)
+    return preserved
+
+
+async def select_platform_account_operation_config(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    account_id: int,
+    selected_id: str,
+) -> Dict[str, Any]:
+    account = await get_platform_account_profile(db, owner_user_id=owner_user_id, account_id=account_id)
+    if not account:
+        raise ValueError("平台账号不存在或无权修改")
+    refresh_account = getattr(db, "refresh", None)
+    if callable(refresh_account):
+        try:
+            await refresh_account(account, attribute_names=["credential_payload"], with_for_update=True)
+        except TypeError:
+            await refresh_account(account, attribute_names=["credential_payload"])
+    state = _account_operation_config_state(account)
+    clean_id = _to_str(selected_id).strip()
+    selected = next((item for item in state.get("items") or [] if _to_str(item.get("id")).strip() == clean_id), None)
+    if selected is None:
+        raise ValueError("所选操作配置不属于当前账号，请刷新配置列表后重试")
+    updated = operation_config_state(
+        {
+            **state,
+            "status": "ready",
+            "selected_id": clean_id,
+            "last_error": "",
+            "last_error_at": "",
+        }
+    )
+    credential = _json_obj(account.credential_payload)
+    credential[OPERATION_CONFIG_CREDENTIAL_KEY] = updated
+    account.credential_payload = credential
+    account.updated_at = _now()
+    await db.flush()
+    return updated
 
 
 def _platform_account_context(account: QuotePlatformAccountProfile) -> PlatformAccountContext:
@@ -5975,6 +6180,7 @@ def _platform_account_context(account: QuotePlatformAccountProfile) -> PlatformA
             "browser_profile_path": str(profile_dir),
             "credential_error": credential_error,
             "credential_payload": _json_obj(account.credential_payload),
+            "operation_config_snapshot": _account_operation_config_state(account),
         },
     )
 
@@ -5983,8 +6189,14 @@ def _platform_account_quote_context(
     account: QuotePlatformAccountProfile,
     *,
     account_type_name: Optional[str] = None,
+    operation_config_snapshot: Optional[Mapping[str, Any]] = None,
 ) -> PlatformAccountContext:
     ctx = _platform_account_context(account)
+    if operation_config_snapshot is not None:
+        ctx.payload = {
+            **_json_obj(ctx.payload),
+            "operation_config_snapshot": operation_config_state(operation_config_snapshot),
+        }
     selected_type = _normalize_account_type_name(account_type_name)
     if not selected_type:
         return ctx
@@ -5996,6 +6208,73 @@ def _platform_account_quote_context(
         "quote_account_type_name": selected_type,
     }
     return ctx
+
+
+def _snapshot_with_account_operation_config(
+    snapshot: Dict[str, Any],
+    account: QuotePlatformAccountProfile,
+    *,
+    operation_config_snapshot: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bind one account-owned route to a task before platform I/O starts."""
+    safe_snapshot = deepcopy(_json_obj(snapshot))
+    account_id = _safe_int(_loaded_value(account, "id"), 0)
+    frozen_account_id = _safe_int(safe_snapshot.get("operation_config_account_id"), 0)
+    frozen_snapshot = _json_obj(safe_snapshot.get("operation_config_snapshot"))
+    frozen_state = operation_config_state(frozen_snapshot)
+    if (
+        operation_config_snapshot is None
+        and account_id
+        and frozen_account_id == account_id
+        and frozen_state.get("selected")
+    ):
+        operation_config_snapshot = frozen_state
+    state = operation_config_state(
+        operation_config_snapshot
+        if operation_config_snapshot is not None
+        else _account_operation_config_state(account)
+    )
+    selected = dict(_json_obj(state.get("selected")))
+    frozen_state = operation_config_state(
+        {
+            "supported": state.get("supported", True),
+            "status": state.get("status") or ("ready" if selected else "empty"),
+            "items": [selected] if selected else [],
+            "selected_id": state.get("selected_id") if selected else "",
+            "refreshed_at": state.get("refreshed_at"),
+            "last_error": state.get("last_error"),
+            "last_error_at": state.get("last_error_at"),
+        }
+    )
+    safe_snapshot["operation_config_account_id"] = account_id
+    safe_snapshot["operation_config_snapshot"] = frozen_state
+    safe_snapshot.pop("quote_fingerprint", None)
+    return _snapshot_with_quote_fingerprint(safe_snapshot)
+
+
+def _task_account_snapshot(
+    account: QuotePlatformAccountProfile,
+    operation_config_snapshot: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = _credential_public_payload(account) or {}
+    payload["operation_configs"] = operation_config_state(operation_config_snapshot)
+    return payload
+
+
+def _selected_task_operation_config_snapshot(
+    snapshot: Mapping[str, Any],
+    request_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return only a real task-frozen route; structural empty states are not routes."""
+    candidates = (
+        _json_obj(snapshot).get("operation_config_snapshot"),
+        _json_obj(_json_obj(request_payload).get("platform_account")).get("operation_configs"),
+    )
+    for candidate in candidates:
+        state = operation_config_state(candidate)
+        if state.get("selected"):
+            return state
+    return {}
 
 
 def _runtime_result_payload(result: Optional[PlatformRuntimeResult]) -> Dict[str, Any]:
@@ -6731,6 +7010,7 @@ def _platform_context_from_public_payload(
             "login_phone_mask": _to_str(safe.get("login_phone_mask")).strip(),
             "email": _to_str(safe.get("email")).strip(),
             "account_owner_name": _to_str(safe.get("account_owner_name")).strip(),
+            "operation_config_snapshot": operation_config_state(safe.get("operation_configs")),
         },
     )
 
@@ -6853,6 +7133,13 @@ async def start_platform_account_login(
         account.last_login_at = task.finished_at
         account.quota_status = ACCOUNT_QUOTA_AVAILABLE if account.quota_status == ACCOUNT_QUOTA_UNKNOWN else account.quota_status
         _clear_account_inspection_notice(account)
+        if _to_str(account.platform_code).strip().upper() == "PICC":
+            await refresh_platform_account_operation_configs(
+                db,
+                owner_user_id=owner_user_id,
+                account_id=int(account.id),
+                raise_on_error=False,
+            )
     elif status in RUNTIME_SESSION_DEGRADED_STATUSES and bool(_json_obj(runtime_result.data).get("preserved_previous_session")):
         task.status = LOGIN_TASK_FAILED
         task.error_detail = _runtime_detail(runtime_result, "平台登录未完成")
@@ -6948,6 +7235,13 @@ async def submit_platform_account_login_challenge(
         account.last_login_at = _now()
         account.quota_status = ACCOUNT_QUOTA_AVAILABLE if account.quota_status == ACCOUNT_QUOTA_UNKNOWN else account.quota_status
         _clear_account_inspection_notice(account)
+        if _to_str(account.platform_code).strip().upper() == "PICC":
+            await refresh_platform_account_operation_configs(
+                db,
+                owner_user_id=owner_user_id,
+                account_id=int(account.id),
+                raise_on_error=False,
+            )
     elif _is_runtime_challenge(status):
         task.status = LOGIN_TASK_NEEDS_CODE
         task.challenge_type = runtime_result.challenge_type or task.challenge_type or "sms"
@@ -10720,6 +11014,9 @@ def _compute_snapshot_quote_fingerprint(snapshot: Dict[str, Any]) -> str:
     quote_case = _json_obj(snap.get("quote_case"))
     platform_default = _json_obj(snap.get("platform_default_config"))
     default_config = _json_obj(platform_default.get("config"))
+    operation_config = operation_config_state(snap.get("operation_config_snapshot"))
+    selected_operation_config = _json_obj(operation_config.get("selected"))
+    selected_operation_config.pop("raw", None)
     quote_params = {
         "material_fingerprint": _snapshot_material_fingerprint(snap),
         "platform_code": _to_str(quote_case.get("platform_code")).strip().upper(),
@@ -10734,6 +11031,8 @@ def _compute_snapshot_quote_fingerprint(snapshot: Dict[str, Any]) -> str:
             validate_positive=False,
         ),
         "request_body": _compact_quote_data(_json_obj(snap.get("request_body"))),
+        "operation_config_account_id": _safe_int(snap.get("operation_config_account_id"), 0),
+        "operation_config": _compact_quote_data(selected_operation_config),
     }
     return _sha256_json(quote_params)
 
@@ -13332,7 +13631,12 @@ async def _query_joint_sales_amount_for_image_adjustment(
         raise ValueError("最近一次报价使用的平台账号已停用，无法查询途顺家安保额")
 
     account_type_name = _quote_task_account_type_name(source_task)
-    platform_ctx = _platform_account_quote_context(platform_account, account_type_name=account_type_name)
+    source_account_payload = _json_obj(_json_obj(source_task.request_payload).get("platform_account"))
+    platform_ctx = _platform_account_quote_context(
+        platform_account,
+        account_type_name=account_type_name,
+        operation_config_snapshot=_json_obj(source_account_payload.get("operation_configs")) or None,
+    )
     query_payload = _joint_sales_query_snapshot_payload(source_task, premium_value)
     runtime_result = await quote_platform_runtime.query_joint_sales_plan(platform_ctx, query_payload, db=db)
     if _is_runtime_session_expired_result(runtime_result):
@@ -14318,7 +14622,9 @@ async def _start_sms_task(
         )
     if prompt and phone_mask and phone_mask not in prompt:
         prompt = f"{prompt}（发送至 {phone_mask}）"
-    account_snapshot = _credential_public_payload(platform_account) or {}
+    snapshot = _snapshot_with_account_operation_config(snapshot, platform_account)
+    operation_config_snapshot = _json_obj(snapshot.get("operation_config_snapshot"))
+    account_snapshot = _task_account_snapshot(platform_account, operation_config_snapshot)
     response_payload = {}
     if challenge_result is not None:
         response_payload["platform_challenge"] = _runtime_result_payload(challenge_result)
@@ -14774,6 +15080,19 @@ async def _continue_quote_with_platform_account(
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "STUB"
     platform_name = case.platform_name or platform_account.platform_name or platform_code
+    operation_config = _account_operation_config_state(platform_account)
+    if (
+        _to_str(platform_code).strip().upper() == "PICC"
+        and not operation_config.get("items")
+        and platform_account.login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}
+        and await _account_has_usable_session_snapshot(platform_account)
+    ):
+        operation_config = await refresh_platform_account_operation_configs(
+            db,
+            owner_user_id=owner_user_id,
+            account_id=int(platform_account.id),
+            raise_on_error=False,
+        )
     account_snapshot = await _quote_snapshot_for_account(
         db,
         case=case,
@@ -15140,6 +15459,18 @@ async def _complete_renewal_lookup_without_sms(
 ) -> Tuple[str, Dict[str, Any]]:
     platform_code = case.platform_code or platform_account.platform_code or "PICC"
     platform_name = case.platform_name or platform_account.platform_name or "人保"
+    frozen_operation_config = (
+        _selected_task_operation_config_snapshot(snapshot, task.request_payload)
+        if task is not None
+        else {}
+    )
+    snapshot = _snapshot_with_account_operation_config(
+        snapshot,
+        platform_account,
+        operation_config_snapshot=frozen_operation_config or None,
+    )
+    operation_config_snapshot = _json_obj(snapshot.get("operation_config_snapshot"))
+    account_snapshot = _task_account_snapshot(platform_account, operation_config_snapshot)
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         return _quote_superseded_silent_response(case=case, task=task, trace_id=trace_id)
 
@@ -15156,7 +15487,7 @@ async def _complete_renewal_lookup_without_sms(
                 "operation": RENEWAL_LOOKUP_OPERATION,
                 "login": login_mode,
                 "owner_user_id": owner_user_id,
-                "platform_account": _credential_public_payload(platform_account),
+                "platform_account": account_snapshot,
                 "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
                 "normalized_data": _json_obj(snapshot.get("normalized_data")),
             },
@@ -15175,10 +15506,11 @@ async def _complete_renewal_lookup_without_sms(
             **_json_obj(task.request_payload),
             "operation": RENEWAL_LOOKUP_OPERATION,
             "login": login_mode,
-            "platform_account": _credential_public_payload(platform_account),
+            "platform_account": account_snapshot,
             "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
             "normalized_data": _json_obj(snapshot.get("normalized_data")),
         }
+        task.submitted_snapshot = snapshot
         task.updated_at = _now()
 
     case.status = CASE_STATUS_READY
@@ -15201,12 +15533,14 @@ async def _complete_renewal_lookup_without_sms(
     await db.flush()
     await db.commit()
 
+    renewal_account_payload = _json_obj(_json_obj(task.request_payload).get("platform_account"))
     platform_ctx = _platform_account_quote_context(
         platform_account,
         account_type_name=_normalize_account_type_name(
             _json_obj(snapshot.get("vehicle_type_detect")).get("config_type_name")
             or platform_account.account_type_name
         ),
+        operation_config_snapshot=_json_obj(renewal_account_payload.get("operation_configs")) or None,
     )
     started = time.perf_counter()
     async with release_chat_session_lock_for_platform_io():
@@ -15440,6 +15774,11 @@ async def _complete_renewal_lookup_without_sms(
             refreshed_normalized.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
         ),
     }
+    quote_snapshot = _snapshot_with_account_operation_config(
+        quote_snapshot,
+        platform_account,
+        operation_config_snapshot=operation_config_snapshot or None,
+    )
     quote_trace_id = _new_trace_id()
     return await _continue_quote_with_platform_account(
         db,
@@ -16014,7 +16353,11 @@ async def _complete_waiting_task(
         or _json_obj(snapshot.get("vehicle_type_detect")).get("config_type_name")
     )
     platform_ctx = (
-        _platform_account_quote_context(platform_account, account_type_name=snapshot_account_type_name)
+        _platform_account_quote_context(
+            platform_account,
+            account_type_name=snapshot_account_type_name,
+            operation_config_snapshot=_json_obj(account_payload.get("operation_configs")) or None,
+        )
         if platform_account
         else _platform_context_from_public_payload(account_payload, platform_code=platform_code, platform_name=platform_name)
     )
@@ -16195,6 +16538,33 @@ async def _complete_waiting_task(
             runtime_result=challenge_result,
             status=LOGIN_TASK_SUCCESS,
         )
+        if _to_str(platform_code).strip().upper() == "PICC":
+            frozen_operation_config = _selected_task_operation_config_snapshot(snapshot, task.request_payload)
+            current_operation_config = _account_operation_config_state(platform_account)
+            if not frozen_operation_config and not current_operation_config.get("items"):
+                await refresh_platform_account_operation_configs(
+                    db,
+                    owner_user_id=owner_user_id,
+                    account_id=int(platform_account.id),
+                    raise_on_error=False,
+                )
+            snapshot = _snapshot_with_account_operation_config(
+                snapshot,
+                platform_account,
+                operation_config_snapshot=frozen_operation_config or None,
+            )
+            operation_config_snapshot = _json_obj(snapshot.get("operation_config_snapshot"))
+            account_payload = _task_account_snapshot(platform_account, operation_config_snapshot)
+            task.request_payload = {
+                **_json_obj(task.request_payload),
+                "platform_account": account_payload,
+            }
+            task.submitted_snapshot = snapshot
+            platform_ctx = _platform_account_quote_context(
+                platform_account,
+                account_type_name=snapshot_account_type_name,
+                operation_config_snapshot=operation_config_snapshot,
+            )
     if not await _quote_snapshot_material_is_current(db, case=case, snapshot=snapshot):
         return await _stop_quote_for_material_change(
             db,
@@ -16580,7 +16950,14 @@ async def _complete_quote_without_sms(
         or _json_obj(snapshot.get("platform_default_config")).get("account_type_name")
         or _json_obj(snapshot.get("vehicle_type_detect")).get("config_type_name")
     )
-    platform_ctx = _platform_account_quote_context(platform_account, account_type_name=snapshot_account_type_name)
+    snapshot = _snapshot_with_account_operation_config(snapshot, platform_account)
+    operation_config_snapshot = _json_obj(snapshot.get("operation_config_snapshot"))
+    account_snapshot = _task_account_snapshot(platform_account, operation_config_snapshot)
+    platform_ctx = _platform_account_quote_context(
+        platform_account,
+        account_type_name=snapshot_account_type_name,
+        operation_config_snapshot=operation_config_snapshot,
+    )
     attempted = {int(x) for x in (attempted_account_ids or []) if _safe_int(x, 0)}
     current_account_id = _safe_int(platform_account.id, 0)
     if current_account_id:
@@ -16592,7 +16969,7 @@ async def _complete_quote_without_sms(
         "mode": "quote_attempt",
         "login": login_mode,
         "owner_user_id": owner_user_id,
-        "platform_account": _credential_public_payload(platform_account),
+        "platform_account": account_snapshot,
         "platform_default_config": _json_obj(snapshot.get("platform_default_config")),
         "default_config_json": _json_obj(snapshot.get("default_config_json")),
         "vehicle_type_detect": _json_obj(snapshot.get("vehicle_type_detect")),
@@ -18684,6 +19061,7 @@ async def handle_quote_message(
     case.updated_at = _now()
 
     snapshot = _snapshot_payload(case=case, normalized_data=normalized_data, images_by_slot=images_by_slot)
+    snapshot = _snapshot_with_account_operation_config(snapshot, platform_account)
     trace_id = _new_trace_id()
     if quote_flow_type == QUOTE_FLOW_RENEWAL:
         if _has_reusable_renewal_quote_context(normalized_data):

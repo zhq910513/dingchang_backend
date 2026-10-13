@@ -135,7 +135,8 @@ from app.services.ai_assistant_service import (
 from app.services.quote_assistant_service import _runtime_platform_auto_notice_message_for_failure
 from app.api.v1.ai_assistant import _chat_context
 from app.services.ocr_cleaner import clean_dynamic_data_for_ocr, correct_vehicle_cert_field
-from app.services.quote_platforms.base import PlatformRuntimeResult
+from app.services.quote_platforms.base import PlatformAccountContext, PlatformRuntimeResult
+from app.services.quote_platforms.platforms.picc.operation_config import operation_config_state
 from app.services.quote_platforms.platforms.picc.business import (
     PiccBusinessAdapter,
     PiccBusinessRequestError,
@@ -186,6 +187,35 @@ from app.services.quote_platforms.platforms.picc.business import (
 def _adapter() -> PiccBusinessAdapter:
     # The tested method only touches the client when a selected vehicle exists.
     return object.__new__(PiccBusinessAdapter)
+
+
+def _test_picc_operation_payload():
+    config = {
+        "id": "QT-REGRESSION",
+        "name": "回归测试配置",
+        "com_code": "36220019",
+        "makecom_code": "36220019",
+        "business_nature": "2",
+        "business_nature_name": "专业代理业务",
+        "operate_code": "36044347",
+        "handler_code": "36044347",
+        "handler1_code": "36044347",
+        "agent_code": "360021100116",
+    }
+    return {"operation_config_snapshot": operation_config_state({"items": [config], "selected_id": config["id"]})}
+
+
+def _test_picc_business_defaults(values):
+    return _picc_business_defaults(
+        values,
+        PlatformAccountContext(
+            platform_code="PICC",
+            platform_name="人保",
+            account_id=1,
+            account_username="regression",
+            payload=_test_picc_operation_payload(),
+        ),
+    )
 
 
 class PiccDynamicResultPresentationTests(unittest.TestCase):
@@ -1245,7 +1275,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         from app.services.quote_platforms.platforms.picc.business import _motor_quote_profile
 
         adapter = _adapter()
-        defaults = _picc_business_defaults(config)
+        defaults = _test_picc_business_defaults(config)
         profile = _motor_quote_profile("油车-旧")
         vehicle = {
             "licenseNo": "赣G12345",
@@ -1295,10 +1325,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             {
                 PRODUCT_THIRD_PARTY: "500",
                 "PICC报价请求体覆盖": {
-                    "opconfComCode": "OVERRIDE-ORG",
-                    "selectedOperateConfigId": "OVERRIDE-CONFIG",
                     "monopolyCode": "OVERRIDE-REPAIR",
-                    "businesNature": "OVERRIDE-NATURE",
                 },
                 PICC_DELETED_DEFAULT_FIELDS_KEY: deleted,
             }
@@ -1312,16 +1339,16 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertNotIn("BI_EXTERNAL_GRID", {item.get("code") for item in products})
         self.assertNotIn("051064", {value for key, value in form.items() if key.endswith(".kindCode")})
         self.assertNotIn("051085", {value for key, value in form.items() if key.endswith(".kindCode")})
+        self.assertEqual(form["opconfComCode"], "36220019")
+        self.assertEqual(form["opconf_makecomCode"], "36220019")
+        self.assertEqual(form["selectedOperateConfigId"], "QT-REGRESSION")
+        self.assertEqual(form["selectedOperateConfig"], "QT-REGRESSION")
+        self.assertEqual(form["businesNature"], "2")
+        self.assertEqual(form["businesNatureName"], "专业代理业务")
         for key in (
-            "opconfComCode",
-            "opconf_makecomCode",
-            "selectedOperateConfigId",
-            "selectedOperateConfig",
             "groupCodeValidStatus",
             "monopolyCode",
             "monopolyName",
-            "businesNature",
-            "businesNatureName",
         ):
             self.assertNotIn(key, form)
 
@@ -1484,7 +1511,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
                         platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
                     ))
                 defaults = snapshot["default_config_json"]
-                self.assertEqual(_tujia_anshun_config(_picc_business_defaults(defaults))["premium"], expected)
+                self.assertEqual(_tujia_anshun_config(_test_picc_business_defaults(defaults))["premium"], expected)
                 if deleted and not configured:
                     self.assertNotIn(PRODUCT_TUJIA_ANSHUN_PREMIUM, defaults)
                 if "途家安顺保费" in configured:
@@ -1501,7 +1528,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
                 AsyncMock(), snapshot={"normalized_data": {"quote_field_overrides": {"途顺家安": "0"}}, "images_by_slot": {}},
                 platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
             ))
-        self.assertEqual(_tujia_anshun_config(_picc_business_defaults(snapshot["default_config_json"]))["premium"], "0")
+        self.assertEqual(_tujia_anshun_config(_test_picc_business_defaults(snapshot["default_config_json"]))["premium"], "0")
 
     def test_old_vehicle_rejects_new_generation_before_price_tiebreak(self) -> None:
         vehicle = {
@@ -2601,7 +2628,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
 
         adapter = _adapter()
-        defaults = _picc_business_defaults({})
+        defaults = _test_picc_business_defaults({})
         vehicle = {
             "licenseNo": "赣G12345",
             "engineNo": "R20322895",
@@ -2664,7 +2691,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
 
         adapter = _adapter()
         form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({}),
+            _test_picc_business_defaults({}),
             {
                 "licenseNo": "赣KF88172",
                 "engineNo": "W24L33464",
@@ -2721,7 +2748,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         profile = _motor_quote_profile(NEW_ENERGY_USED_ACCOUNT_TYPE)
 
         form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({"外部电网": "跟随车损"}),
+            _test_picc_business_defaults({"外部电网": "跟随车损"}),
             vehicle,
             owner,
             selected,
@@ -2738,7 +2765,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(form[f"prpCitemKindVos[{external_index}].kindName"], "附加外部电网故障损失险")
 
         ten_wan_form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({"外部电网": "10"}),
+            _test_picc_business_defaults({"外部电网": "10"}),
             vehicle,
             owner,
             selected,
@@ -2754,7 +2781,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertEqual(ten_wan_form[f"prpCitemKindVos[{ten_wan_index}].amount"], "100000")
 
         excluded_form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({"外部电网": "跟随车损", "quote_product_exclusions": ["外部电网"]}),
+            _test_picc_business_defaults({"外部电网": "跟随车损", "quote_product_exclusions": ["外部电网"]}),
             vehicle,
             owner,
             selected,
@@ -2765,7 +2792,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         self.assertNotIn("051085", [value for key, value in excluded_form.items() if key.endswith(".kindCode")])
 
         invalid_form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({"外部电网": "abc"}),
+            _test_picc_business_defaults({"外部电网": "abc"}),
             vehicle,
             owner,
             selected,
@@ -2783,7 +2810,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         )
 
         adapter = _adapter()
-        defaults = _picc_business_defaults(
+        defaults = _test_picc_business_defaults(
             {
                 "号牌种类": "99",
                 "车牌颜色代码": "88",
@@ -2835,7 +2862,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
 
         adapter = _adapter()
         form = adapter._build_used_fuel_quote_form(
-            _picc_business_defaults({}),
+            _test_picc_business_defaults({}),
             {
                 "licenseNo": "赣GD68721",
                 "licenseType": "02",
@@ -4524,7 +4551,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             },
             "preflight": {},
         }
-        ctx = SimpleNamespace(account_type_name="油车-旧")
+        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
         result = adapter._build_motor_quote_result_from_response(ctx, {}, request_body, _har_response_json(har, 52))
         self.assertEqual(result["risk_score"], 45)
         self.assertEqual(str(result["premium_total"]), "3294.79")
@@ -4582,7 +4609,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "default_config_json": {},
             "platform_default_config": {"resolved_type_name": "油车-旧"},
         }
-        ctx = SimpleNamespace(account_type_name="油车-旧")
+        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
         body = _adapter()._prepare_renewal_used_fuel_quote(client, ctx, payload, account_type_name="油车-旧")
         form = body["quoteForm"]
         self.assertEqual(form["prpCitemCar.licenseNo"], "赣G872F6")
@@ -4664,7 +4691,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             },
             "platform_default_config": {"resolved_type_name": "油车-旧"},
         }
-        ctx = SimpleNamespace(account_type_name="油车-旧")
+        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
         body = _adapter()._prepare_renewal_used_fuel_quote(client, ctx, payload, account_type_name="油车-旧")
         form = body["quoteForm"]
         self.assertEqual(form["prpCitemKindVos[3].kindCode"], "051052")
@@ -4813,7 +4840,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
 
         adapter = _adapter()
         profile = _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
-        defaults = _picc_business_defaults(
+        defaults = _test_picc_business_defaults(
             {
                 "机动车增值服务特约条款（道路救援服务）": "2",
                 "附加外部电网故障损失险": "99957.18",
@@ -4928,7 +4955,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "jointSaleForm": {"tujiaAnshun": {"enabled": False, "success": True, "premium": "0", "amount": "0"}},
             "preflight": {},
         }
-        ctx = SimpleNamespace(account_type_name="新能源车-旧")
+        ctx = SimpleNamespace(account_type_name="新能源车-旧", payload=_test_picc_operation_payload())
         result = _adapter()._build_motor_quote_result_from_response(
             ctx,
             {},
