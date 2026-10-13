@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.quote_assistant_service import (
+    _extract_quote_product_exclusions,
     _extract_quote_repair_code_command,
     _extract_transfer_vehicle_command,
     detect_quote_config_override_signal,
@@ -41,6 +42,9 @@ def main() -> None:
     for command in config_commands:
         parsed = detect_quote_config_override_signal(command)
         assert parsed.get("is_override"), (command, parsed)
+    assert _extract_quote_product_exclusions("非车") == []
+    assert _extract_quote_product_exclusions("不要非车") == ["途顺家安"]
+    assert _extract_quote_product_exclusions("人保全保不要非车") == ["途顺家安"]
     repair_command = _extract_quote_repair_code_command("送修码3604731000027-濂溪区金鑫汽车修理厂")
     assert repair_command.get("enabled") is True and repair_command.get("query"), repair_command
 

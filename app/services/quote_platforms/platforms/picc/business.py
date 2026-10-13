@@ -138,7 +138,17 @@ PRODUCT_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
         "电网故障损失险",
         "电网故障",
     ),
-    PRODUCT_TUJIA_ANSHUN_PREMIUM: ("途顺家安", "途顺家安组合保险", "途家安顺保费", "途家安顺", "途家安顺非车保费"),
+    PRODUCT_TUJIA_ANSHUN_PREMIUM: (
+        "途顺家安",
+        "途顺家安组合保险",
+        "途家安顺保费",
+        "途家安顺",
+        "途家安顺非车保费",
+        "非车",
+        "意外",
+        "意外险",
+        "驾乘意外",
+    ),
 }
 
 # Aliases used by the PICC request builder for editable channel fields.  A
@@ -157,16 +167,6 @@ PICC_CONFIG_FIELD_ALIASES: Dict[str, tuple[str, ...]] = {
 PICC_TUJIA_ANSHUN_RISK_CODE = "LCO"
 PICC_TUJIA_ANSHUN_BRAND_ID = "BTA1"
 PICC_TUJIA_ANSHUN_SERVICE_GROUP_TYPE_CODE = "05"
-
-# A positive 398 yuan premium appears in successful historical PICC results
-# for each supported account type. It is only used when the configured plan
-# lookup fails; an explicit zero/deletion still disables the product.
-PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE = {
-    NEW_FUEL_ACCOUNT_TYPE: "398",
-    USED_FUEL_ACCOUNT_TYPE: "398",
-    NEW_ENERGY_NEW_ACCOUNT_TYPE: "398",
-    NEW_ENERGY_USED_ACCOUNT_TYPE: "398",
-}
 
 # Historical successful PICC plan responses provide the amount paired with
 # each premium. The optional plan lookup may fail, but these known pairs can
@@ -387,7 +387,6 @@ def picc_motor_builtin_default_values(account_type_name: Any) -> Dict[str, Any]:
     profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
     product_defaults = _json_obj(profile.get("product_defaults"))
     return {
-        PRODUCT_TUJIA_ANSHUN_PREMIUM: "398",
         PRODUCT_COMPULSORY: product_defaults.get(PRODUCT_COMPULSORY, "20"),
         PRODUCT_LOSS: product_defaults.get(PRODUCT_LOSS, ""),
         PRODUCT_THIRD_PARTY: product_defaults.get(PRODUCT_THIRD_PARTY, "300"),
@@ -2112,6 +2111,13 @@ def _pick_joint_sale_plan_by_premium(data: Any, premium: Any) -> Dict[str, Any]:
 
 
 def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
+    if _product_excluded(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM):
+        return {
+            "enabled": False,
+            "premium": "0",
+            "amount": "0",
+            "reason": "途顺家安已按本次报价要求去掉，按规则不查询保额",
+        }
     if _default_field_is_deleted(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM):
         return {
             "enabled": False,
@@ -2119,7 +2125,7 @@ def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
             "amount": "0",
             "reason": "途顺家安配置已删除，按规则不查询保额",
         }
-    premium = _money(_default_value(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM, "398"))
+    premium = _money(_default_value(defaults, PRODUCT_TUJIA_ANSHUN_PREMIUM, "0"))
     if premium <= 0:
         return {
             "enabled": False,
@@ -2135,12 +2141,9 @@ def _tujia_anshun_config(defaults: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _tujia_anshun_fallback_premium(account_type_name: Any, configured_premium: Any) -> Decimal:
-    """Return the premium to materialize when PICC cannot return a plan."""
+    """Retain an explicitly enabled premium when PICC cannot return a plan."""
     configured = _money(configured_premium)
-    if configured > 0:
-        return configured
-    account_type = _to_str(account_type_name).strip()
-    return _money(PICC_TUJIA_ANSHUN_FALLBACK_PREMIUM_BY_ACCOUNT_TYPE.get(account_type, "398"))
+    return configured if configured > 0 else Decimal("0")
 
 
 def _tujia_anshun_fallback_amount(premium: Any) -> Decimal:
@@ -8607,7 +8610,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         if duplicate_warning:
             warning_parts.append(duplicate_warning)
         tujia_anshun = _tujia_anshun_from_request_body(request_body)
-        if tujia_anshun.get("enabled") and tujia_anshun.get("success") is False:
+        tujia_enabled = _checked(tujia_anshun.get("enabled"), default=False) and _money(tujia_anshun.get("premium")) > 0
+        if tujia_enabled and tujia_anshun.get("success") is False:
             msg = _to_str(tujia_anshun.get("message")).strip()
             warning_parts.append(f"途顺家安保额查询失败：{msg or '平台未返回可用方案'}")
         bi_risk = _json_obj(data.get("carQuoteRiskItemBIRsp"))
@@ -8618,7 +8622,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         claim_ci = _safe_int_local(claim_ci_raw, 0) if _has_text(claim_ci_raw) else ""
         platform_joint_sales_premium_raw_present = _has_text(data.get("sumYelPremium"))
         platform_joint_sales_premium = _money(data.get("sumYelPremium")) if platform_joint_sales_premium_raw_present else Decimal("0")
-        platform_joint_sales_premium_present = platform_joint_sales_premium_raw_present and platform_joint_sales_premium > 0
+        platform_joint_sales_premium_present = (
+            tujia_enabled
+            and platform_joint_sales_premium_raw_present
+            and platform_joint_sales_premium > 0
+        )
         if platform_joint_sales_premium_present:
             joint_sales_evidence.append(
                 {
@@ -8628,7 +8636,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 }
             )
         joint_sales_premium_present = platform_joint_sales_premium_present
-        joint_sales_premium = platform_joint_sales_premium
+        joint_sales_premium = platform_joint_sales_premium if platform_joint_sales_premium_present else Decimal("0")
         tujia_premium = _money(tujia_anshun.get("premium"))
         joint_sales_premium_from_plan = False
         joint_sales_premium_from_fallback = False
@@ -8657,7 +8665,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         elif tujia_plan_success and tujia_premium > 0 and selected_plan_premium <= 0:
             warning_parts.append("途顺家安保额查询返回方案缺少真实保费，未填充配置保费")
         if (
-            tujia_anshun.get("enabled") is True
+            tujia_enabled
             and not platform_joint_sales_premium_present
             and not joint_sales_premium_from_plan
         ):
@@ -8691,7 +8699,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                         else "，未匹配到保额"
                     )
                 )
-        warning = "\n".join(part for part in warning_parts if part)
         if joint_sales_amount_from_fallback:
             joint_sales_amount = _money(tujia_anshun.get("amount"))
         else:
@@ -8708,6 +8715,26 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 )
                 else Decimal("0")
             )
+        # PICC may include the configured non-motor premium in the quote
+        # response while the optional plan lookup fails or omits its amount.
+        # The premium is already platform-sourced in that case, so only fill
+        # the insured amount from the historical mapping; never add the
+        # premium to the total a second time.
+        if joint_sales_premium_present and joint_sales_amount <= 0:
+            fallback_amount = _tujia_anshun_fallback_amount(joint_sales_premium)
+            if fallback_amount > 0:
+                joint_sales_amount = fallback_amount
+                joint_sales_amount_from_fallback = True
+                tujia_anshun = {
+                    **tujia_anshun,
+                    "amount": _clean_money_text(fallback_amount),
+                    "amount_fallback_applied": True,
+                    "amount_fallback_source": "joint_sales_default_mapping",
+                }
+                warning_parts.append(
+                    f"途顺家安方案未返回保额，已按固定保费-保额映射填充保额{_clean_money_text(fallback_amount)}元"
+                )
+        warning = "\n".join(part for part in warning_parts if part)
         joint_sales_amount_present = joint_sales_premium > 0 and joint_sales_amount > 0
         if not joint_sales_premium_present:
             joint_sales_amount_present = False

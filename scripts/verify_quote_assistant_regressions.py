@@ -164,6 +164,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     _pick_renewal_policy_candidate,
     _pick_best_vehicle_candidate,
     _picc_business_defaults,
+    picc_motor_builtin_default_values,
     _tujia_anshun_config,
     _tujia_anshun_fallback_amount,
     PICC_DELETED_DEFAULT_FIELDS_KEY,
@@ -1256,6 +1257,144 @@ class QuoteFlowMaterialRequirementRegressionTests(unittest.TestCase):
 
 
 class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
+    def test_joint_sales_requires_explicit_configuration(self) -> None:
+        for account_type in ("油车-新", "油车-旧", "新能源车-新", "新能源车-旧"):
+            with self.subTest(account_type=account_type):
+                self.assertNotIn(
+                    PRODUCT_TUJIA_ANSHUN_PREMIUM,
+                    picc_motor_builtin_default_values(account_type),
+                )
+
+        self.assertFalse(_tujia_anshun_config(_test_picc_business_defaults({}))["enabled"])
+        self.assertTrue(
+            _tujia_anshun_config(
+                _test_picc_business_defaults({"途顺家安组合保险": "398"})
+            )["enabled"]
+        )
+        excluded = _tujia_anshun_config(
+            _test_picc_business_defaults(
+                {
+                    "途顺家安组合保险": "398",
+                    "quote_product_exclusions": ["非车"],
+                }
+            )
+        )
+        self.assertFalse(excluded["enabled"])
+        self.assertEqual(excluded["premium"], "0")
+
+        plan = _adapter()._query_tujia_anshun_plan_best_effort(MagicMock(), {}, {})
+        self.assertFalse(plan["enabled"])
+        self.assertFalse(plan["attempted"])
+        self.assertTrue(plan["success"])
+
+    def test_unconfigured_joint_sales_is_not_materialized_in_quote_result(self) -> None:
+        request_body = {
+            "accountTypeName": "油车-旧",
+            "vehicleForm": {},
+            "ownerForm": {},
+            "quoteForm": {},
+            "jointSaleForm": {"tujiaAnshun": _tujia_anshun_config({})},
+            "preflight": {},
+        }
+        quote_response = {
+            "status": 0,
+            "statusText": "Success",
+            "data": {
+                "quotationNo": "NO-JOINT-SALES",
+                "biPremium": "1288.80",
+                "ciPremium": "855.00",
+                "sumPremium": "2143.80",
+                "totalPremium": "2143.80",
+                "sumYelPremium": "398.00",
+            },
+        }
+        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
+
+        result = _adapter()._build_motor_quote_result_from_response(ctx, {}, request_body, quote_response)
+
+        self.assertEqual(result["joint_sales_source"], "none")
+        self.assertEqual(result["joint_sales_premium"], "")
+        self.assertEqual(result["joint_sales_amount"], "")
+        self.assertEqual(str(result["premium_total"]), "2143.8")
+        self.assertNotIn("途顺家安", {item.get("name") for item in result["price_items"]})
+        self.assertNotIn("固定保费-保额映射", result["platform_warning"])
+
+    def test_platform_joint_sales_premium_keeps_mapping_amount_when_plan_lookup_fails(self) -> None:
+        request_body = {
+            "accountTypeName": "油车-旧",
+            "vehicleForm": {},
+            "ownerForm": {},
+            "quoteForm": {},
+            "jointSaleForm": {
+                "tujiaAnshun": {
+                    "enabled": True,
+                    "premium": "398",
+                    "amount": "0",
+                    "success": False,
+                    "message": "平台未返回方案",
+                },
+            },
+            "preflight": {},
+        }
+        quote_response = {
+            "status": 0,
+            "statusText": "Success",
+            "data": {
+                "quotationNo": "PLATFORM-JOINT-SALES",
+                "biPremium": "1288.80",
+                "ciPremium": "855.00",
+                "sumPremium": "2143.80",
+                "totalPremium": "2143.80",
+                "sumYelPremium": "398.00",
+            },
+        }
+        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
+
+        result = _adapter()._build_motor_quote_result_from_response(ctx, {}, request_body, quote_response)
+
+        self.assertEqual(result["joint_sales_source"], "platform_quote_response")
+        self.assertEqual(result["joint_sales_premium"], "398.00")
+        self.assertEqual(result["joint_sales_amount"], "5152000.00")
+        self.assertEqual(str(result["premium_total"]), "2143.8")
+        self.assertIn("固定保费-保额映射", result["platform_warning"])
+
+    def test_positive_joint_sales_override_clears_previous_exclusion(self) -> None:
+        exclusions, explicit = quote_assistant_service._merge_quote_product_exclusions_for_command(
+            current_exclusions=["途顺家安"],
+            merged_entities={"quote_field_overrides": {"途顺家安": "398"}},
+            quote_command_mode="",
+            quote_product_exclusions=[],
+        )
+        self.assertTrue(explicit)
+        self.assertNotIn("途顺家安", exclusions)
+
+        exclusions, _ = quote_assistant_service._merge_quote_product_exclusions_for_command(
+            current_exclusions=["途顺家安"],
+            merged_entities={"quote_field_overrides": {"途顺家安": "398"}},
+            quote_command_mode="",
+            quote_product_exclusions=["途顺家安"],
+        )
+        self.assertIn("途顺家安", exclusions)
+
+    def test_joint_sales_image_adjustment_uses_mapping_without_account(self) -> None:
+        amount, trace, account = asyncio.run(
+            quote_assistant_service._query_joint_sales_amount_for_image_adjustment(
+                AsyncMock(),
+                owner_user_id=1,
+                source_task=SimpleNamespace(
+                    platform_code="PICC",
+                    platform_name="人保",
+                    request_payload={},
+                    submitted_snapshot={},
+                ),
+                premium_value="398",
+            )
+        )
+        self.assertEqual(amount, "5152000.00")
+        self.assertTrue(trace["fallback_applied"])
+        self.assertEqual(trace["fallback_source"], "joint_sales_default_mapping")
+        self.assertIsNone(account)
+
     def test_joint_sales_fallback_amount_uses_historical_premium_mapping(self) -> None:
         expected = {
             "198": "2152000",
@@ -1491,18 +1630,19 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
             [PRODUCT_THIRD_PARTY, PRODUCT_EXTERNAL_GRID],
         )
 
-    def test_joint_sales_rename_and_legacy_value_reach_quote_without_builtin_resurrection(self) -> None:
+    def test_joint_sales_rename_and_legacy_value_reach_quote_without_implicit_default(self) -> None:
         for configured, deleted, expected in (
             ({"途顺家安": "500"}, ["途家安顺保费"], "500"),
             ({"途家安顺保费": "600"}, [], "600"),
             ({}, ["途家安顺保费"], "0"),
+            ({}, [], "0"),
         ):
             with self.subTest(configured=configured, deleted=deleted):
                 resolved = {
                     "config": {"id": 1},
                     "default_values": configured,
                     "deleted_default_fields": deleted,
-                    "builtin_default_values": {PRODUCT_TUJIA_ANSHUN_PREMIUM: "398"},
+                    "builtin_default_values": {},
                     "matched": "account_type",
                 }
                 with patch.object(quote_assistant_service, "resolve_platform_default_config", new=AsyncMock(return_value=resolved)):
@@ -1520,7 +1660,7 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
     def test_temporary_joint_sales_override_beats_saved_alias(self) -> None:
         resolved = {
             "config": {"id": 1}, "default_values": {"途家安顺保费": "600"},
-            "deleted_default_fields": [], "builtin_default_values": {PRODUCT_TUJIA_ANSHUN_PREMIUM: "398"},
+            "deleted_default_fields": [], "builtin_default_values": {},
             "matched": "account_type",
         }
         with patch.object(quote_assistant_service, "resolve_platform_default_config", new=AsyncMock(return_value=resolved)):
@@ -1529,6 +1669,21 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
                 platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
             ))
         self.assertEqual(_tujia_anshun_config(_test_picc_business_defaults(snapshot["default_config_json"]))["premium"], "0")
+
+    def test_temporary_joint_sales_override_can_enable_unconfigured_product(self) -> None:
+        resolved = {
+            "config": {"id": 1}, "default_values": {},
+            "deleted_default_fields": [], "builtin_default_values": {},
+            "matched": "account_type",
+        }
+        with patch.object(quote_assistant_service, "resolve_platform_default_config", new=AsyncMock(return_value=resolved)):
+            snapshot = asyncio.run(quote_assistant_service.apply_platform_default_config_to_snapshot(
+                AsyncMock(), snapshot={"normalized_data": {"quote_field_overrides": {"非车": "498"}}, "images_by_slot": {}},
+                platform_code="PICC", account_type_name="油车-旧", config_type_name="油车-旧",
+            ))
+        joint_sales = _tujia_anshun_config(_test_picc_business_defaults(snapshot["default_config_json"]))
+        self.assertTrue(joint_sales["enabled"])
+        self.assertEqual(joint_sales["premium"], "498")
 
     def test_old_vehicle_rejects_new_generation_before_price_tiebreak(self) -> None:
         vehicle = {
@@ -3389,6 +3544,13 @@ class PiccInsuranceDateRegressionTests(unittest.TestCase):
             _normalize_quote_product_exclusions(["道路救援"]),
         )
 
+    def test_non_vehicle_command_removes_joint_sales_in_combined_quote_command(self) -> None:
+        self.assertEqual(_extract_quote_product_exclusions("非车"), [])
+        self.assertEqual(extract_quote_config_overrides("非车0"), {"途顺家安": "0"})
+        self.assertIn("途顺家安", _extract_quote_product_exclusions("不要非车"))
+        self.assertIn("途顺家安", _extract_quote_product_exclusions("人保全保不要非车"))
+        self.assertIn("途顺家安", _normalize_quote_product_exclusions(["非车"]))
+
     def test_external_grid_command_can_adjust_or_remove_product(self) -> None:
         overrides = extract_quote_config_overrides("外部电网 10")
         self.assertEqual(overrides["附加外部电网故障损失险"], "10")
@@ -4606,7 +4768,7 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
                     "candidates": [],
                 },
             },
-            "default_config_json": {},
+            "default_config_json": {"途顺家安组合保险": "398"},
             "platform_default_config": {"resolved_type_name": "油车-旧"},
         }
         ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())

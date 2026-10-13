@@ -62,6 +62,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     picc_motor_builtin_default_values,
     _duplicate_quote_next_day_adjustments,
     _default_field_aliases,
+    _tujia_anshun_fallback_amount,
     PICC_DELETED_DEFAULT_FIELDS_KEY,
 )
 from app.services.quote_platforms.platforms.picc.operation_config import (
@@ -1175,6 +1176,7 @@ QUOTE_PASSENGER_LABEL = "车上人员责任险（乘客）"
 QUOTE_ROAD_RESCUE_LABEL = "机动车增值服务特约条款（道路救援服务）"
 QUOTE_EXTERNAL_GRID_LABEL = "附加外部电网故障损失险"
 QUOTE_COMPULSORY_LABEL = "交强"
+QUOTE_JOINT_SALES_LABEL = "途顺家安"
 QUOTE_PRODUCT_EXCLUSIONS_KEY = "quote_product_exclusions"
 
 PICC_FULL_COVER_COMMANDS = {
@@ -3044,6 +3046,7 @@ def _normalize_quote_product_exclusions(value: Any) -> List[str]:
         QUOTE_MEDICAL_THIRD_LABEL,
         QUOTE_ROAD_RESCUE_LABEL,
         QUOTE_EXTERNAL_GRID_LABEL,
+        QUOTE_JOINT_SALES_LABEL,
     }
     for item in items:
         label = _canonical_quote_config_override_label(item)
@@ -3069,6 +3072,7 @@ def _extract_quote_product_exclusions(text: Any) -> List[str]:
         QUOTE_MEDICAL_THIRD_LABEL,
         QUOTE_ROAD_RESCUE_LABEL,
         QUOTE_EXTERNAL_GRID_LABEL,
+        QUOTE_JOINT_SALES_LABEL,
     }
     exclusions: List[str] = []
     for canonical, aliases in QUOTE_CONFIG_OVERRIDE_ALIASES:
@@ -3578,16 +3582,36 @@ def _merge_quote_product_exclusions_for_command(
     explicit_exclusions = _normalize_quote_product_exclusions(quote_product_exclusions)
     mode = _to_str(quote_command_mode).strip()
     if mode == "全保":
-        return _normalize_quote_product_exclusions(explicit_exclusions), True
-    if mode == "单商":
-        return _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *explicit_exclusions]), True
-    if mode == "交三":
-        return _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *explicit_exclusions]), True
-    if explicit_exclusions:
-        return _normalize_quote_product_exclusions([*current, *incoming]), True
-    if QUOTE_PRODUCT_EXCLUSIONS_KEY in entities:
-        return incoming, True
-    return current, False
+        desired = _normalize_quote_product_exclusions(explicit_exclusions)
+        explicit = True
+    elif mode == "单商":
+        desired = _normalize_quote_product_exclusions([QUOTE_COMPULSORY_LABEL, *explicit_exclusions])
+        explicit = True
+    elif mode == "交三":
+        desired = _normalize_quote_product_exclusions([QUOTE_LOSS_LABEL, *explicit_exclusions])
+        explicit = True
+    elif explicit_exclusions:
+        desired = _normalize_quote_product_exclusions([*current, *incoming])
+        explicit = True
+    elif QUOTE_PRODUCT_EXCLUSIONS_KEY in entities:
+        desired = incoming
+        explicit = True
+    else:
+        desired = current
+        explicit = False
+
+    joint_sales_override = _json_obj(entities.get("quote_field_overrides")).get(QUOTE_JOINT_SALES_LABEL)
+    joint_sales_override_amount = _config_numeric_decimal(joint_sales_override)
+    if (
+        joint_sales_override_amount is not None
+        and joint_sales_override_amount > 0
+        and QUOTE_JOINT_SALES_LABEL not in explicit_exclusions
+        and mode not in {"单商", "交三"}
+        and QUOTE_JOINT_SALES_LABEL in desired
+    ):
+        desired = [name for name in desired if name != QUOTE_JOINT_SALES_LABEL]
+        explicit = True
+    return desired, explicit
 
 
 def _extract_quote_repair_code_command(text: Any) -> Dict[str, Any]:
@@ -13616,6 +13640,27 @@ async def _query_joint_sales_amount_for_image_adjustment(
             None,
         )
 
+    fallback_amount = _tujia_anshun_fallback_amount(premium)
+
+    def fallback(reason: Any, *, error_code: Any = "") -> Tuple[str, Dict[str, Any], None]:
+        if fallback_amount <= 0:
+            raise ValueError(_to_str(reason).strip() or f"未查询到保费为{_quote_money_text(premium)}的途顺家安保额")
+        reason_text = _to_str(reason).strip() or "平台未返回可用方案"
+        return (
+            _quote_money_text(fallback_amount),
+            {
+                "attempted": False,
+                "success": False,
+                "fallback_applied": True,
+                "fallback_source": "joint_sales_default_mapping",
+                "premium": _quote_money_text(premium),
+                "amount": _quote_money_text(fallback_amount),
+                "reason": reason_text,
+                "error_code": _to_str(error_code).strip(),
+            },
+            None,
+        )
+
     platform_code = _to_str(source_task.platform_code).strip().upper() or "PICC"
     platform_name = _to_str(source_task.platform_name).strip() or platform_code
     if platform_code != "PICC":
@@ -13623,12 +13668,12 @@ async def _query_joint_sales_amount_for_image_adjustment(
 
     account_id = _quote_task_platform_account_id(source_task)
     if account_id <= 0:
-        raise ValueError("最近一次报价缺少平台账号留档，无法查询途顺家安保额")
+        return fallback("最近一次报价缺少平台账号留档，已使用固定保费-保额映射", error_code="platform_account_missing")
     platform_account = await _get_platform_account_profile_by_id(db, account_id=account_id)
     if platform_account is None:
-        raise ValueError("最近一次报价使用的平台账号已不存在")
+        return fallback("最近一次报价使用的平台账号已不存在，已使用固定保费-保额映射", error_code="platform_account_not_found")
     if not bool(_loaded_value(platform_account, "enabled")):
-        raise ValueError("最近一次报价使用的平台账号已停用，无法查询途顺家安保额")
+        return fallback("最近一次报价使用的平台账号已停用，已使用固定保费-保额映射", error_code="platform_account_disabled")
 
     account_type_name = _quote_task_account_type_name(source_task)
     source_account_payload = _json_obj(_json_obj(source_task.request_payload).get("platform_account"))
@@ -13638,10 +13683,20 @@ async def _query_joint_sales_amount_for_image_adjustment(
         operation_config_snapshot=_json_obj(source_account_payload.get("operation_configs")) or None,
     )
     query_payload = _joint_sales_query_snapshot_payload(source_task, premium_value)
-    runtime_result = await quote_platform_runtime.query_joint_sales_plan(platform_ctx, query_payload, db=db)
+    try:
+        runtime_result = await quote_platform_runtime.query_joint_sales_plan(platform_ctx, query_payload, db=db)
+    except Exception as exc:
+        return fallback(
+            sanitize_quote_user_message(exc, "途顺家安保额查询失败") + "，已使用固定保费-保额映射",
+            error_code=exc.__class__.__name__,
+        )
     if _is_runtime_session_expired_result(runtime_result):
         _apply_platform_account_runtime_status(platform_account, runtime_result, default_error="途顺家安保额查询失败")
-        raise ValueError(_runtime_detail(runtime_result, "途顺家安保额查询失败"))
+        amount, trace, _ = fallback(
+            _runtime_detail(runtime_result, "途顺家安保额查询失败") + "，已使用固定保费-保额映射",
+            error_code="session_expired",
+        )
+        return amount, trace, platform_account
 
     runtime_status = _runtime_status(runtime_result)
     runtime_payload = _runtime_result_payload(runtime_result)
@@ -13651,9 +13706,17 @@ async def _query_joint_sales_amount_for_image_adjustment(
     if runtime_status not in {"success", "ok"} or not plan.get("success"):
         detail = _runtime_detail(runtime_result, "途顺家安保额查询失败")
         plan_message = _to_str(plan.get("message")).strip()
-        raise ValueError(plan_message or detail)
+        fallback_amount_text, trace, _ = fallback(
+            (plan_message or detail) + "，已使用固定保费-保额映射",
+            error_code=runtime_status or "joint_sales_plan_failed",
+        )
+        return fallback_amount_text, trace, platform_account
     if _quote_money_decimal(amount) <= 0:
-        raise ValueError(f"未查询到保费为{_quote_money_text(premium)}的途顺家安保额")
+        fallback_amount_text, trace, _ = fallback(
+            f"未查询到保费为{_quote_money_text(premium)}的途顺家安保额，已使用固定保费-保额映射",
+            error_code="joint_sales_amount_missing",
+        )
+        return fallback_amount_text, trace, platform_account
 
     return (
         _quote_money_text(amount),
@@ -13842,10 +13905,20 @@ async def _handle_joint_sales_image_adjustment_message(
         draft_base.get("quote_field_overrides"),
         premium_override,
     )
+    premium_enabled = _quote_money_decimal(premium_value) > 0
+    existing_exclusions = _normalize_quote_product_exclusions(draft_base.get(QUOTE_PRODUCT_EXCLUSIONS_KEY))
+    next_exclusions = (
+        [name for name in existing_exclusions if name != QUOTE_JOINT_SALES_LABEL]
+        if premium_enabled
+        else _normalize_quote_product_exclusions([*existing_exclusions, QUOTE_JOINT_SALES_LABEL])
+    )
     next_normalized = _normalize_quote_case_data(
         base_data=_json_obj(case.normalized_data) or draft_base,
         order_data={},
-        text_data={"quote_field_overrides": merged_overrides},
+        text_data={
+            "quote_field_overrides": merged_overrides,
+            QUOTE_PRODUCT_EXCLUSIONS_KEY: next_exclusions,
+        },
         images_by_slot=images_by_slot,
     )
     case.draft_order_data = next_normalized
@@ -13857,10 +13930,15 @@ async def _handle_joint_sales_image_adjustment_message(
         submitted_normalized.get("quote_field_overrides"),
         premium_override,
     )
+    submitted_normalized[QUOTE_PRODUCT_EXCLUSIONS_KEY] = next_exclusions
     submitted_snapshot["normalized_data"] = submitted_normalized
     submitted_defaults = _json_obj(submitted_snapshot.get("default_config_json"))
     if submitted_defaults:
         submitted_defaults["途顺家安"] = _quote_money_text(premium_value)
+        if next_exclusions:
+            submitted_defaults[QUOTE_PRODUCT_EXCLUSIONS_KEY] = next_exclusions
+        else:
+            submitted_defaults.pop(QUOTE_PRODUCT_EXCLUSIONS_KEY, None)
         submitted_snapshot["default_config_json"] = submitted_defaults
     submitted_snapshot["joint_sales_image_adjustment"] = {
         "source_task_id": source_task.id,
