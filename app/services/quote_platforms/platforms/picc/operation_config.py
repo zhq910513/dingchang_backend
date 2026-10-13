@@ -97,6 +97,33 @@ PICC_ACCOUNT_MANAGED_DEFAULT_FIELD_NAMES = frozenset(
         "prpCmain.handlerCode",
         "prpCmain.handler1Code",
         "prpCmain.operateCode",
+        # Repair-shop routing is returned by the authenticated account/platform
+        # flow. It must not be stored in a global product default.
+        "送修码启用",
+        "送修码",
+        "送修码代码",
+        "送修码名称",
+        "送修码机构",
+        "专管代码",
+        "专管名称",
+        "monopolyCode",
+        "monopolyName",
+        "groupCodeValidStatus",
+    }
+)
+
+PICC_RUNTIME_QUOTE_OVERRIDE_FIELD_NAMES = frozenset(
+    {
+        "送修码启用",
+        "送修码",
+        "送修码代码",
+        "送修码名称",
+        "送修码机构",
+        "专管代码",
+        "专管名称",
+        "monopolyCode",
+        "monopolyName",
+        "groupCodeValidStatus",
     }
 )
 
@@ -335,15 +362,36 @@ def operation_config_quote_fields(config: Any) -> Dict[str, Any]:
         "handler1Name": _text(selected.get("handler1_name")),
         "agentType": _text(selected.get("agent_type")),
     }
+    monopoly_code = _text(selected.get("monopoly_code"))
+    monopoly_name = _text(selected.get("monopoly_name"))
+    if monopoly_code or monopoly_name:
+        fields.update(
+            {
+                "送修码启用": "1" if monopoly_code else "0",
+                "送修码": monopoly_code,
+                "送修码名称": monopoly_name,
+                "专管代码": monopoly_code,
+                "专管名称": monopoly_name,
+                "monopolyCode": monopoly_code,
+                "monopolyName": monopoly_name,
+            }
+        )
     return {key: value for key, value in fields.items() if _text(value)}
 
 
-def strip_account_managed_default_fields(values: Any) -> Dict[str, Any]:
+def strip_account_managed_default_fields(
+    values: Any,
+    *,
+    keep_runtime_quote_overrides: bool = False,
+) -> Dict[str, Any]:
     source = dict(values) if isinstance(values, Mapping) else {}
+    blocked = PICC_ACCOUNT_MANAGED_DEFAULT_FIELD_NAMES
+    if keep_runtime_quote_overrides:
+        blocked = blocked - PICC_RUNTIME_QUOTE_OVERRIDE_FIELD_NAMES
     return {
         key: value
         for key, value in source.items()
-        if _text(key) not in PICC_ACCOUNT_MANAGED_DEFAULT_FIELD_NAMES
+        if _text(key) not in blocked
     }
 
 

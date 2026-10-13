@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from app.services.quote_assistant_service import (
     _complete_renewal_lookup_without_sms,
+    _apply_platform_account_runtime_status,
     _platform_default_config_payload,
     _selected_task_operation_config_snapshot,
     _snapshot_with_account_operation_config,
@@ -35,6 +36,7 @@ from app.services.quote_platforms.platforms.picc.business import (
     PiccBusinessAdapter,
     _motor_quote_profile,
     _picc_business_defaults,
+    _picc_runtime_quote_overrides,
 )
 from app.services.quote_platforms.platforms.picc.operation_config import (
     operation_config_id_from_response,
@@ -196,6 +198,42 @@ class PiccOperationConfigRoutingTests(unittest.TestCase):
         self.assertEqual(form["prpCmain.handlerCode"], "36044347")
         self.assertEqual(form["prpCmain.handler1Code"], "36044347")
         self.assertEqual(form["prpCmain.operateCode"], "36044347")
+        self.assertNotIn("monopolyCode", form)
+
+        manual_defaults = _picc_business_defaults({}, operation_context())
+        manual_defaults.update(
+            _picc_runtime_quote_overrides(
+                {
+                    "quote_field_overrides": {
+                        "送修码启用": "1",
+                        "送修码": "3604731000027",
+                        "送修码名称": "濂溪区金鑫汽车修理厂",
+                        "操作机构代码": "FORGED-ROUTE",
+                        "业务性质代码": "99",
+                    }
+                }
+            )
+        )
+        manual_products = adapter._used_fuel_products(
+            manual_defaults,
+            profile=profile,
+            actual_value="100000",
+            seat_count="5",
+        )
+        manual_form = adapter._build_used_fuel_quote_form(
+            manual_defaults,
+            vehicle,
+            owner,
+            selected_vehicle,
+            {},
+            manual_products,
+            profile=profile,
+            strict_config=False,
+        )
+        self.assertEqual(manual_form["monopolyCode"], "3604731000027")
+        self.assertEqual(manual_form["groupCodeValidStatus"], "1")
+        self.assertEqual(manual_form["opconfComCode"], "36220019")
+        self.assertEqual(manual_form["businesNature"], "2")
 
     def test_precise_vehicle_query_carries_selected_operation_config_id(self) -> None:
         class CaptureClient:
@@ -244,6 +282,11 @@ class PiccOperationConfigRoutingTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data.get("error_code"), "PICC_OPERATION_CONFIG_MISSING")
+        self.assertEqual(
+            result.data.get("missing_operation_config_fields"),
+            ["操作配置ID", "机构码", "业务性质代码"],
+        )
+        self.assertIn("机构码", result.message)
 
     def test_default_config_api_and_storage_filter_all_account_owned_fields(self) -> None:
         raw = {
@@ -343,17 +386,21 @@ class _FakeDb:
 
 
 class _SessionStoreDb:
-    def __init__(self) -> None:
+    def __init__(self, credential_payload=None) -> None:
         self.refresh_calls = []
         self.added = []
+        self.credential_payload = credential_payload
 
     async def refresh(self, account, **kwargs) -> None:
         self.refresh_calls.append(kwargs)
-        account.credential_payload = {
-            "operation_configs": operation_config_state(
-                {"items": [RAW_CONFIG_B], "selected_id": RAW_CONFIG_B["id"]}
-            )
-        }
+        if self.credential_payload is not None:
+            account.credential_payload = self.credential_payload
+        else:
+            account.credential_payload = {
+                "operation_configs": operation_config_state(
+                    {"items": [RAW_CONFIG_B], "selected_id": RAW_CONFIG_B["id"]}
+                )
+            }
 
     def add(self, value) -> None:
         self.added.append(value)
@@ -448,6 +495,23 @@ class PiccOperationConfigServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             state = await refresh_platform_account_operation_configs(db, owner_user_id=3, account_id=11)
         self.assertEqual(state["selected_id"], RAW_CONFIG_A["id"])
+
+    async def test_missing_route_fields_create_persistent_account_notice(self) -> None:
+        account = self.account()
+        account.login_status = "authenticated"
+        result = PlatformRuntimeResult(
+            status="failed",
+            message="人保账号操作配置不完整，缺少：机构码、业务性质代码",
+            data={
+                "error_code": "PICC_OPERATION_CONFIG_MISSING",
+                "missing_operation_config_fields": ["机构码", "业务性质代码"],
+            },
+        )
+        _apply_platform_account_runtime_status(account, result, default_error="平台报价失败")
+        notice = account.credential_payload["inspection_notice"]
+        self.assertEqual(notice["type"], "operation_config_missing")
+        self.assertEqual(notice["payload"]["missing_fields"], ["机构码", "业务性质代码"])
+        self.assertEqual(account.login_status, "authenticated")
 
     async def test_refresh_failure_preserves_last_valid_selection(self) -> None:
         previous = operation_config_state(
@@ -554,13 +618,82 @@ class PiccOperationConfigServiceTests(unittest.IsolatedAsyncioTestCase):
             owner_user_id=account.owner_user_id,
             status=SESSION_STATUS_AUTHENTICATED,
         )
-        saved = await store.save(db, account, snapshot)
+        saved = await store.save(
+            db,
+            account,
+            snapshot,
+            account_metadata={
+                "operation_config_snapshot": operation_config_state(
+                    {"items": [RAW_CONFIG_A], "selected_id": RAW_CONFIG_A["id"]}
+                )
+            },
+        )
         self.assertTrue(saved)
         self.assertEqual(db.refresh_calls[0]["with_for_update"], True)
         self.assertEqual(
             account.credential_payload["operation_configs"]["selected_id"],
             RAW_CONFIG_B["id"],
         )
+
+    async def test_session_save_restores_operation_config_when_refresh_returns_empty(self) -> None:
+        account = self.account({})
+        account.secret_payload_ciphertext = None
+        db = _SessionStoreDb({})
+        store = QuotePlatformSessionStore()
+        store.get_state = AsyncMock(return_value=None)
+        store.load_redis_mirror = AsyncMock(return_value=None)
+        store.save_redis_mirror = AsyncMock()
+        snapshot = AccountSessionSnapshot(
+            platform_code="PICC",
+            account_id=account.id,
+            owner_user_id=account.owner_user_id,
+            status=SESSION_STATUS_AUTHENTICATED,
+        )
+        incoming = operation_config_state(
+            {"items": [RAW_CONFIG_A, RAW_CONFIG_B], "selected_id": RAW_CONFIG_A["id"]}
+        )
+        saved = await store.save(
+            db,
+            account,
+            snapshot,
+            account_metadata={"operation_config_snapshot": incoming},
+        )
+        self.assertTrue(saved)
+        self.assertEqual(
+            account.credential_payload["operation_configs"]["selected_id"],
+            RAW_CONFIG_A["id"],
+        )
+        self.assertEqual(len(account.credential_payload["operation_configs"]["items"]), 2)
+
+    async def test_session_save_does_not_select_over_new_multi_config_state(self) -> None:
+        current = operation_config_state(
+            {"items": [RAW_CONFIG_A, RAW_CONFIG_B], "selected_id": "", "status": "needs_selection"}
+        )
+        account = self.account(current)
+        account.secret_payload_ciphertext = None
+        db = _SessionStoreDb({"operation_configs": current})
+        store = QuotePlatformSessionStore()
+        store.get_state = AsyncMock(return_value=None)
+        store.load_redis_mirror = AsyncMock(return_value=None)
+        store.save_redis_mirror = AsyncMock()
+        snapshot = AccountSessionSnapshot(
+            platform_code="PICC",
+            account_id=account.id,
+            owner_user_id=account.owner_user_id,
+            status=SESSION_STATUS_AUTHENTICATED,
+        )
+        saved = await store.save(
+            db,
+            account,
+            snapshot,
+            account_metadata={
+                "operation_config_snapshot": operation_config_state(
+                    {"items": [RAW_CONFIG_A], "selected_id": RAW_CONFIG_A["id"]}
+                )
+            },
+        )
+        self.assertTrue(saved)
+        self.assertEqual(account.credential_payload["operation_configs"]["selected_id"], "")
 
     async def test_renewal_lookup_to_quote_keeps_original_frozen_route(self) -> None:
         frozen_state = operation_config_state(

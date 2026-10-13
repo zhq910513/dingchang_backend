@@ -4009,6 +4009,12 @@ def _account_inspection_notice_from_payload(row: QuotePlatformAccountProfile) ->
     return notice if notice else {}
 
 
+ACCOUNT_OPERATION_CONFIG_NOTICE_TYPES = {
+    "operation_config_missing",
+    "operation_config_incomplete",
+}
+
+
 def _set_account_inspection_notice(
     row: QuotePlatformAccountProfile,
     *,
@@ -4039,6 +4045,16 @@ def _clear_account_inspection_notice(row: QuotePlatformAccountProfile) -> None:
         row.updated_at = _now()
 
 
+def _clear_account_inspection_notice_unless(
+    row: QuotePlatformAccountProfile,
+    preserved_types: set[str],
+) -> None:
+    notice = _account_inspection_notice_from_payload(row)
+    if _to_str(notice.get("type")).strip() in preserved_types:
+        return
+    _clear_account_inspection_notice(row)
+
+
 def _sync_account_status_from_session_state(
     row: QuotePlatformAccountProfile,
     session_state: Optional[QuotePlatformAccountSessionState],
@@ -4056,7 +4072,7 @@ def _sync_account_status_from_session_state(
             row.last_error = None
             row.last_check_at = ts
             row.updated_at = ts
-            _clear_account_inspection_notice(row)
+            _clear_account_inspection_notice_unless(row, ACCOUNT_OPERATION_CONFIG_NOTICE_TYPES)
         return
     if status in RUNTIME_SESSION_EXPIRED_STATUSES and current_login_status in {
         ACCOUNT_LOGIN_AUTHENTICATED,
@@ -4625,7 +4641,10 @@ def _credential_public_payload(
     quota_payload = _quota_public_payload(quota)
     inspection_notice = _account_inspection_notice_from_payload(row)
     login_status = _loaded_value(row, "login_status") or ACCOUNT_LOGIN_NOT_LOGGED_IN
-    if login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}:
+    if (
+        login_status in {ACCOUNT_LOGIN_AUTHENTICATED, ACCOUNT_LOGIN_DEGRADED}
+        and _to_str(inspection_notice.get("type")).strip() not in ACCOUNT_OPERATION_CONFIG_NOTICE_TYPES
+    ):
         inspection_notice = {}
     platform_quote_usage = _json_obj(_json_obj(_loaded_value(row, "credential_payload")).get("platform_quote_usage"))
     if platform_quote_usage:
@@ -5360,7 +5379,10 @@ async def apply_platform_default_config_to_snapshot(
     if _to_str(platform_code).strip().upper() == "PICC":
         builtin_defaults = strip_account_managed_default_fields(builtin_defaults)
         resolved_defaults = strip_account_managed_default_fields(resolved_defaults)
-        quote_field_overrides = strip_account_managed_default_fields(quote_field_overrides)
+        quote_field_overrides = strip_account_managed_default_fields(
+            quote_field_overrides,
+            keep_runtime_quote_overrides=True,
+        )
         deleted_default_fields = strip_account_managed_deleted_fields(resolved.get("deleted_default_fields") or [])
     else:
         deleted_default_fields = list(resolved.get("deleted_default_fields") or [])
@@ -5379,7 +5401,10 @@ async def apply_platform_default_config_to_snapshot(
             default_values.pop(alias, None)
     default_values.update(quote_field_overrides)
     if _to_str(platform_code).strip().upper() == "PICC":
-        default_values = strip_account_managed_default_fields(default_values)
+        default_values = strip_account_managed_default_fields(
+            default_values,
+            keep_runtime_quote_overrides=True,
+        )
     quote_product_exclusions = _normalize_quote_product_exclusions(
         normalized_data.get(QUOTE_PRODUCT_EXCLUSIONS_KEY)
     )
@@ -6081,6 +6106,13 @@ async def refresh_platform_account_operation_configs(
             credential[OPERATION_CONFIG_CREDENTIAL_KEY] = preserved
             account.credential_payload = credential
             account.updated_at = _now()
+            _set_account_inspection_notice(
+                account,
+                notice_type="operation_config_incomplete",
+                message=preserved["last_error"],
+                level="warning",
+                payload={"source": "operation_config_refresh", "missing_items": incomplete_items[:5]},
+            )
             await db.flush()
             if raise_on_error:
                 raise ValueError(preserved["last_error"])
@@ -6110,6 +6142,16 @@ async def refresh_platform_account_operation_configs(
         credential[OPERATION_CONFIG_CREDENTIAL_KEY] = state
         account.credential_payload = credential
         account.updated_at = _now()
+        if items:
+            _clear_account_inspection_notice_unless(account, ACCOUNT_OPERATION_CONFIG_NOTICE_TYPES)
+        else:
+            _set_account_inspection_notice(
+                account,
+                notice_type="operation_config_missing",
+                message="平台未返回可用账号操作配置，缺少机构码、操作配置ID或业务性质代码，请重新登录并刷新平台数据。",
+                level="warning",
+                payload={"source": "operation_config_refresh", "missing_fields": ["机构码", "操作配置ID", "业务性质代码"]},
+            )
         await db.flush()
         return state
 
@@ -6126,6 +6168,13 @@ async def refresh_platform_account_operation_configs(
     credential[OPERATION_CONFIG_CREDENTIAL_KEY] = preserved
     account.credential_payload = credential
     account.updated_at = _now()
+    _set_account_inspection_notice(
+        account,
+        notice_type="operation_config_missing" if not previous.get("items") else "operation_config_incomplete",
+        message=detail,
+        level="warning",
+        payload={"source": "operation_config_refresh", "missing_fields": ["机构码", "操作配置ID", "业务性质代码"]},
+    )
     await db.flush()
     if raise_on_error:
         raise ValueError(detail)
@@ -6989,6 +7038,22 @@ def _apply_platform_account_runtime_status(
         return
     status = _runtime_status(result)
     detail = _runtime_detail(result, default_error)
+    result_data = _json_obj(getattr(result, "data", None))
+    if _to_str(result_data.get("error_code")).strip().upper() == "PICC_OPERATION_CONFIG_MISSING":
+        _set_account_inspection_notice(
+            account,
+            notice_type="operation_config_missing",
+            message=detail or "账号操作配置不完整，请刷新平台操作配置后再报价",
+            level="warning",
+            payload={
+                "source": "quote_runtime",
+                "missing_fields": result_data.get("missing_operation_config_fields") or [],
+            },
+        )
+        account.last_error = detail
+        account.last_check_at = _now()
+        account.updated_at = _now()
+        return
     if _is_runtime_session_expired_result(result):
         account.login_status = ACCOUNT_LOGIN_EXPIRED
         account.last_error = detail or "平台登录已过期，请重新登录"
@@ -7565,7 +7630,7 @@ async def _try_keepalive_account(db: AsyncSession, account: QuotePlatformAccount
         if _runtime_keepalive_ok(status):
             account.login_status = ACCOUNT_LOGIN_AUTHENTICATED
             account.last_error = None
-            _clear_account_inspection_notice(account)
+            _clear_account_inspection_notice_unless(account, ACCOUNT_OPERATION_CONFIG_NOTICE_TYPES)
             return True
         if status in {"expired", "session_expired", "not_authenticated", "unauthorized", "status_16"}:
             account.login_status = ACCOUNT_LOGIN_EXPIRED

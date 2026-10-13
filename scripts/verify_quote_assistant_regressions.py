@@ -190,7 +190,7 @@ def _adapter() -> PiccBusinessAdapter:
     return object.__new__(PiccBusinessAdapter)
 
 
-def _test_picc_operation_payload():
+def _test_picc_operation_payload(*, include_repair_code: bool = False):
     config = {
         "id": "QT-REGRESSION",
         "name": "回归测试配置",
@@ -203,6 +203,13 @@ def _test_picc_operation_payload():
         "handler1_code": "36044347",
         "agent_code": "360021100116",
     }
+    if include_repair_code:
+        config.update(
+            {
+                "monopoly_code": "3604731000027",
+                "monopoly_name": "濂溪区金鑫汽车修理厂",
+            }
+        )
     return {"operation_config_snapshot": operation_config_state({"items": [config], "selected_id": config["id"]})}
 
 
@@ -1463,9 +1470,6 @@ class PiccPICCQuoteProfileRegressionTests(unittest.TestCase):
         _, products, form = self._config_delete_quote_parts(
             {
                 PRODUCT_THIRD_PARTY: "500",
-                "PICC报价请求体覆盖": {
-                    "monopolyCode": "OVERRIDE-REPAIR",
-                },
                 PICC_DELETED_DEFAULT_FIELDS_KEY: deleted,
             }
         )
@@ -4771,7 +4775,10 @@ class PiccRenewalHarRegressionTests(unittest.TestCase):
             "default_config_json": {"途顺家安组合保险": "398"},
             "platform_default_config": {"resolved_type_name": "油车-旧"},
         }
-        ctx = SimpleNamespace(account_type_name="油车-旧", payload=_test_picc_operation_payload())
+        ctx = SimpleNamespace(
+            account_type_name="油车-旧",
+            payload=_test_picc_operation_payload(include_repair_code=True),
+        )
         body = _adapter()._prepare_renewal_used_fuel_quote(client, ctx, payload, account_type_name="油车-旧")
         form = body["quoteForm"]
         self.assertEqual(form["prpCitemCar.licenseNo"], "赣G872F6")

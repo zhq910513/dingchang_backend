@@ -8,7 +8,7 @@ import random
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Dict, Optional
+from typing import Any, Awaitable, Dict, Mapping, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -28,6 +28,7 @@ from app.services.quote_platforms.session_models import (
     now_db,
 )
 from app.services.quote_secret_box import decrypt_json, encrypt_json
+from app.services.quote_platforms.platforms.picc.operation_config import operation_config_state
 
 SESSION_STATUS_OFFLINE = "offline"
 SESSION_STATUS_LOGGING_IN = "logging_in"
@@ -89,6 +90,43 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _json_obj(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _account_owned_metadata_from_payload(value: Any) -> Dict[str, Any]:
+    """Extract non-secret account metadata carried into platform I/O.
+
+    Session updates and account-operation-config refreshes share the legacy
+    credential JSON column. Keep the route state from the request context
+    available so a stale actor cannot erase it after platform I/O.
+    """
+    source = _json_obj(value)
+    credential = _json_obj(source.get("credential_payload"))
+    candidates = (
+        credential.get("operation_configs"),
+        source.get("operation_configs"),
+        source.get("operation_config_snapshot"),
+    )
+    for candidate in candidates:
+        state = operation_config_state(candidate)
+        if state.get("items") or state.get("selected_id"):
+            return {"operation_configs": state}
+    return {}
+
+
+def _merge_account_owned_metadata(
+    credential: Dict[str, Any],
+    incoming_payload: Any,
+) -> Dict[str, Any]:
+    """Merge route metadata without replacing newer persisted selections."""
+    merged = dict(credential)
+    incoming = _account_owned_metadata_from_payload(incoming_payload)
+    if not incoming:
+        return merged
+    current = operation_config_state(merged.get("operation_configs"))
+    incoming_state = operation_config_state(incoming.get("operation_configs"))
+    if not current.get("items") and incoming_state.get("items"):
+        merged["operation_configs"] = incoming_state
+    return merged
 
 
 def _snapshot_aad(account: QuotePlatformAccountProfile) -> str:
@@ -538,6 +576,7 @@ class QuotePlatformSessionStore:
         snapshot: AccountSessionSnapshot,
         *,
         expected_version: Optional[int] = None,
+        account_metadata: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         state = await self.get_state(db, account_id=int(account.id))
         if expected_version is not None and state is not None:
@@ -565,7 +604,10 @@ class QuotePlatformSessionStore:
         summary = snapshot.safe_summary()
         account.secret_payload_ciphertext = encrypt_json(snapshot.to_dict(), aad=_snapshot_aad(account))
         account.credential_payload = {
-            **_json_obj(account.credential_payload),
+            **_merge_account_owned_metadata(
+                _json_obj(account.credential_payload),
+                account_metadata,
+            ),
             "schema_version": 3,
             "secret_storage": "encrypted",
             "session_summary": summary,
@@ -884,7 +926,7 @@ class AccountSessionActor:
                         reason="上次登录未完成",
                     )
                     if restored is not None:
-                        ok = await self.store.save(db, account, restored, expected_version=previous.session_version)
+                        ok = await self.store.save(db, account, restored, expected_version=previous.session_version, account_metadata=ctx.payload)
                         if not ok:
                             return _session_conflict_result()
                         previous = restored
@@ -896,7 +938,7 @@ class AccountSessionActor:
                     status=SESSION_STATUS_LOGGING_IN,
                     fresh_generation=previous is None,
                 )
-                started = await self.store.save(db, account, running, expected_version=previous.session_version if previous else None)
+                started = await self.store.save(db, account, running, expected_version=previous.session_version if previous else None, account_metadata=ctx.payload)
                 if not started:
                     return PlatformRuntimeResult(status="conflict", message="账号会话已被其他请求更新，请重新操作")
 
@@ -940,7 +982,7 @@ class AccountSessionActor:
                         status=SESSION_STATUS_AUTHENTICATED,
                         fresh_generation=True,
                     )
-                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version)
+                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version, account_metadata=ctx.payload)
                     if not ok:
                         return PlatformRuntimeResult(status="conflict", message="账号会话已被更新，请重新操作")
                     return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -954,7 +996,7 @@ class AccountSessionActor:
                         fresh_generation=False,
                     )
                     _attach_previous_usable_session_to_challenge(challenge_snapshot=snapshot, previous=previous)
-                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version)
+                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -967,7 +1009,7 @@ class AccountSessionActor:
                         running=running,
                         result=result,
                     )
-                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version)
+                    ok = await self.store.save(db, account, snapshot, expected_version=running.session_version, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     message = snapshot.last_error_message or "新登录失败，已保留原有可用会话"
@@ -993,7 +1035,7 @@ class AccountSessionActor:
                     status=SESSION_STATUS_LOGIN_FAILED,
                     fresh_generation=False,
                 )
-                ok = await self.store.save(db, account, snapshot, expected_version=running.session_version)
+                ok = await self.store.save(db, account, snapshot, expected_version=running.session_version, account_metadata=ctx.payload)
                 if not ok:
                     return _session_conflict_result()
                 return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -1059,7 +1101,7 @@ class AccountSessionActor:
                         status=SESSION_STATUS_AUTHENTICATED,
                         fresh_generation=True,
                     )
-                    ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None)
+                    ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -1073,7 +1115,7 @@ class AccountSessionActor:
                         fresh_generation=False,
                     )
                     _attach_previous_usable_session_to_challenge(challenge_snapshot=snapshot, previous=previous)
-                    ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None)
+                    ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -1085,7 +1127,7 @@ class AccountSessionActor:
                     reason="验证码校验未完成",
                 )
                 if restored is not None:
-                    ok = await self.store.save(db, account, restored, expected_version=previous.session_version if previous else None)
+                    ok = await self.store.save(db, account, restored, expected_version=previous.session_version if previous else None, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     message = restored.last_error_message or "验证码校验未完成，已恢复原有可用会话"
@@ -1111,7 +1153,7 @@ class AccountSessionActor:
                     status=SESSION_STATUS_LOGIN_FAILED,
                     fresh_generation=False,
                 )
-                ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None)
+                ok = await self.store.save(db, account, snapshot, expected_version=previous.session_version if previous else None, account_metadata=ctx.payload)
                 if not ok:
                     return _session_conflict_result()
                 return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -1182,7 +1224,7 @@ class AccountSessionActor:
                         runtime_meta={"synthetic": True, "reason": "missing_snapshot_migration"},
                         last_authenticated_at=iso_now(),
                     )
-                    ok = await self.store.save(db, account, snapshot)
+                    ok = await self.store.save(db, account, snapshot, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
 
@@ -1200,7 +1242,7 @@ class AccountSessionActor:
                             reason="新登录未完成",
                         )
                         if restored is not None:
-                            ok = await self.store.save(db, account, restored, expected_version=snapshot.session_version)
+                            ok = await self.store.save(db, account, restored, expected_version=snapshot.session_version, account_metadata=ctx.payload)
                             if not ok:
                                 return _session_conflict_result()
                             snapshot = restored
@@ -1230,7 +1272,7 @@ class AccountSessionActor:
                         runtime_lock.assert_owned()
                     except TimeoutError as exc:
                         return _lock_lost_result(exc)
-                    ok = await self.store.save(db, account, snapshot, expected_version=snapshot.session_version)
+                    ok = await self.store.save(db, account, snapshot, expected_version=snapshot.session_version, account_metadata=ctx.payload)
                     if not ok:
                         return _session_conflict_result()
                     return replace(result, data=_safe_result_data(result, {"session": snapshot.safe_summary()}))
@@ -1334,7 +1376,7 @@ class AccountSessionActor:
                     next_snapshot.last_error_code = status.upper() if status else "BUSINESS_FAILED"
                     next_snapshot.last_error_message = result.message or "平台业务执行失败"
 
-                ok = await self.store.save(db, account, next_snapshot, expected_version=snapshot.session_version)
+                ok = await self.store.save(db, account, next_snapshot, expected_version=snapshot.session_version, account_metadata=ctx.payload)
                 if not ok:
                     return _session_conflict_result()
                 if expired:

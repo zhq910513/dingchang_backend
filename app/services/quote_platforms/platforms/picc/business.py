@@ -34,6 +34,7 @@ from app.services.quote_platforms.platforms.picc.operation_config import (
     DEFAULT_OPERATOR_PATH,
     OPERATE_CONFIG_LIST_PATH,
     SELECTED_OPERATOR_PATH,
+    operation_config_missing_quote_fields,
     operation_config_id_from_response,
     operation_config_items_from_responses,
     operation_config_quote_fields,
@@ -341,16 +342,7 @@ PICC_MOTOR_QUOTE_PROFILES: Dict[str, Dict[str, Any]] = {
 PICC_COMMON_PLATFORM_DEFAULTS: Dict[str, Any] = {
     "验车人工号": "24090664",
     "验车人姓名": "陈宛杰",
-    "送修码启用": "1",
-    "送修码": "3604731000027",
-    "送修码名称": "濂溪区金鑫汽车修理厂",
-    "专管代码": "3604731000027",
-    "专管名称": "濂溪区金鑫汽车修理厂",
-    "monopolyCode": "3604731000027",
-    "monopolyName": "濂溪区金鑫汽车修理厂",
     "查询区域代码": "360000",
-    "税务机关代码": "13604010000",
-    "税务机关名称": "国家税务总局九江市税务局第一税务分局",
     "是否代收车船税": "1",
     "行驶区域代码": "11",
     "条款类型": "F42",
@@ -418,6 +410,15 @@ def _picc_business_defaults(default_values: Any, ctx: Optional[PlatformAccountCo
     defaults.update(operation_config_quote_fields(selected_operation_config))
     defaults[PICC_DELETED_DEFAULT_FIELDS_KEY] = deleted
     return defaults
+
+
+def _picc_runtime_quote_overrides(normalized_data: Any) -> Dict[str, Any]:
+    """Keep user quote overrides while blocking account-owned route fields."""
+    overrides = _json_obj(_json_obj(normalized_data).get("quote_field_overrides"))
+    return strip_account_managed_default_fields(
+        overrides,
+        keep_runtime_quote_overrides=True,
+    )
 
 
 PICC_VEHICLE_CERT_FIELD_MAP: Dict[str, str] = {
@@ -590,8 +591,6 @@ USED_FUEL_QUOTE_EMPTY_FORM_FIELDS: tuple[str, ...] = (
     "lastIdentifyNo",
     "lastPolicyNo",
     "marketFeeRateChgBI",
-    "monopolyCode",
-    "monopolyName",
     "netTPPrpCyelInfo.yelFlag",
     "newCarFlag",
     "ocrIds",
@@ -2239,8 +2238,8 @@ def _repair_code_enabled(defaults: Mapping[str, Any]) -> bool:
     if _default_field_is_deleted(defaults, "送修码启用"):
         return False
     return _checked(
-        _field_value(defaults, "送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus", fallback="1"),
-        default=True,
+        _field_value(defaults, "送修码启用", "使用送修码", "启用送修码", "groupCodeValidStatus", fallback="0"),
+        default=False,
     )
 
 
@@ -5472,7 +5471,7 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                     "reason": "用户指定号牌种类",
                 }
         renewal_defaults = _json_obj(renewal_data.get("renewal_quote_field_defaults"))
-        user_overrides = _json_obj(normalized_data.get("quote_field_overrides"))
+        user_overrides = _picc_runtime_quote_overrides(normalized_data)
         configured_defaults = _json_obj(payload.get("default_config_json"))
         default_config = _picc_business_defaults(configured_defaults, ctx)
         merged_defaults = dict(default_config)
@@ -5869,12 +5868,18 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 },
             )
         selected_operation_config = selected_operation_config_from_context_payload(ctx.payload)
-        if not _to_str(selected_operation_config.get("id")).strip():
+        missing_operation_fields = operation_config_missing_quote_fields(selected_operation_config)
+        if missing_operation_fields:
+            missing_text = "、".join(missing_operation_fields)
             return PlatformRuntimeResult(
                 status="failed",
-                message="人保账号尚未选择有效操作配置，请在平台账号管理中重新登录、刷新并选择后再报价",
+                message=(
+                    "人保账号操作配置不完整，缺少："
+                    f"{missing_text}。请在平台账号管理中重新登录、刷新操作配置并选择完整配置后再报价。"
+                ),
                 data={
                     "error_code": "PICC_OPERATION_CONFIG_MISSING",
+                    "missing_operation_config_fields": missing_operation_fields,
                     "request_body": request_body_draft,
                     "request_body_draft": request_body_draft,
                     "offline_request_body": True,
@@ -6428,8 +6433,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
         resolved_account_type = _profile_text(profile, "account_type_name", USED_FUEL_ACCOUNT_TYPE)
         payload = _json_obj(quote_payload)
-        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
         normalized_data = _json_obj(payload.get("normalized_data"))
+        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
+        defaults.update(_picc_runtime_quote_overrides(normalized_data))
         explicit_loss_amount = _quote_loss_override_amount(payload, defaults)
         incoming_body = _json_obj(payload.get("request_body"))
         incoming_preflight = _json_obj(incoming_body.get("preflight"))
@@ -6567,8 +6573,9 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         profile = _motor_quote_profile(account_type_name) or _motor_quote_profile(USED_FUEL_ACCOUNT_TYPE)
         resolved_account_type = _profile_text(profile, "account_type_name", USED_FUEL_ACCOUNT_TYPE)
         payload = _json_obj(quote_payload)
-        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
         normalized_data = _json_obj(payload.get("normalized_data"))
+        defaults = _picc_business_defaults(payload.get("default_config_json"), ctx)
+        defaults.update(_picc_runtime_quote_overrides(normalized_data))
         explicit_loss_amount = _quote_loss_override_amount(payload, defaults)
         incoming_body = _json_obj(payload.get("request_body"))
         vehicle = self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile)
@@ -7069,15 +7076,22 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             medical_third_amount = _wan_or_amount_to_amount(third_party_amount, third_party_amount or "300")
         road_rescue_quantity = _safe_int_local(_default_value(defaults, PRODUCT_ROAD_RESCUE, ""), 0)
 
-        missing_config = []
+        missing_route_config = []
         if not main_com_code:
-            missing_config.append("归属机构代码")
+            missing_route_config.append("归属机构代码")
         if not opconf_com_code:
-            missing_config.append("操作机构代码")
+            missing_route_config.append("操作机构代码")
         if not selected_operate_config_id:
-            missing_config.append("操作配置ID")
+            missing_route_config.append("操作配置ID")
         if not business_nature:
-            missing_config.append("业务性质代码")
+            missing_route_config.append("业务性质代码")
+        if missing_route_config and strict_config:
+            raise PiccRequestError(
+                f"{_profile_text(prof, 'display_name', '人保报价')}账号操作配置不完整，缺少："
+                + "、".join(missing_route_config)
+                + "。请在平台账号管理中登录账号、刷新操作配置后再报价。"
+            )
+        missing_config = []
         if not carchecker_code:
             missing_config.append("验车人工号")
         if missing_config and strict_config:
@@ -7117,9 +7131,6 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "transfer": "0",
             "transferDate": _date_text(vehicle.get("transferDate")),
             "renewed": "0",
-            "groupCodeValidStatus": "1" if repair_code_enabled and repair_code else "0",
-            "monopolyCode": repair_code if repair_code_enabled else "",
-            "monopolyName": repair_name if repair_code_enabled else "",
             "HNfeProjectCode": "0",
             "isNetTransProposal": "0",
             "opVehicleTaxFlag": _to_str(_field_value(defaults, "是否代收车船税", "opVehicleTaxFlag", fallback="1")),
@@ -7236,6 +7247,14 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "quoteCacheFlagVal": "on",
             "opconf_makecomCode": opconf_com_code,
         }
+        if repair_code_enabled and repair_code:
+            form.update(
+                {
+                    "groupCodeValidStatus": "1",
+                    "monopolyCode": repair_code,
+                    "monopolyName": repair_name,
+                }
+            )
         if _profile_text(prof, "new_car_flag"):
             form["newCarFlag"] = _profile_text(prof, "new_car_flag")
         if not _profile_bool(prof, "include_pay_last_year", True):
