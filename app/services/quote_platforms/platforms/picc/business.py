@@ -2798,6 +2798,23 @@ def _vehicle_candidate_compatibility(row: Mapping[str, Any], vehicle: Mapping[st
     return True, ""
 
 
+def _effective_vehicle_seat_count(
+    vehicle: Mapping[str, Any], *platform_values: Any, fallback: Any = None
+) -> str:
+    """Apply explicit user corrections while preserving each legacy request's fallback."""
+    expected = _safe_int_local(vehicle.get("seatCount"), 0)
+    if bool(vehicle.get("seatCountManualOverride")) and expected > 0:
+        for value in platform_values:
+            platform_count = _safe_int_local(value, 0)
+            if platform_count > 0 and platform_count != expected:
+                raise PiccRequestError(
+                    f"人工确认的核定载客数为{expected}人，但平台车型配置为{platform_count}人，"
+                    "已停止报价；请核对座位数或选择一致的车型配置"
+                )
+        return str(expected)
+    return _first_text(fallback, vehicle.get("seatCount"), "5")
+
+
 def _vehicle_model_resolution_failure_message(
     vehicle: Mapping[str, Any],
     tried_terms: List[str],
@@ -4036,6 +4053,12 @@ def _accept_platform_returned_vehicle_body(request_body: Mapping[str, Any]) -> t
     precise_vehicle = _json_obj(preflight.get("preciseVehicle"))
     if not form or not precise_vehicle:
         return body, False
+
+    _effective_vehicle_seat_count(
+        vehicle,
+        _first_text(precise_vehicle.get("vehicleSeat"), precise_vehicle.get("seatCount"), precise_vehicle.get("seat")),
+        _first_text(selected.get("vehicleSeat"), selected.get("seatCount"), selected.get("seat")),
+    )
 
     changed = False
 
@@ -6440,10 +6463,16 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         incoming_body = _json_obj(payload.get("request_body"))
         incoming_preflight = _json_obj(incoming_body.get("preflight"))
 
+        base_vehicle = self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile)
         vehicle = _deep_merge(
-            self._base_used_fuel_vehicle(defaults, normalized_data, profile=profile),
+            base_vehicle,
             _json_obj(incoming_body.get("vehicleForm")),
         )
+        if base_vehicle.get("seatCountManualOverride"):
+            for key in ("seatCount", "seatCountConfirmed", "seatCountManualOverride"):
+                vehicle[key] = base_vehicle[key]
+        else:
+            vehicle.pop("seatCountManualOverride", None)
         vehicle = _clean_vehicle_cert_fields(vehicle)
         _apply_vehicle_model_seed_hints(
             vehicle,
@@ -6985,7 +7014,17 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
         strict_config: bool = True,
     ) -> Dict[str, Any]:
         prof = _json_obj(profile)
-        seats = max(1, _safe_int_local(vehicle.get("seatCount"), 5))
+        seats = max(
+            1,
+            _safe_int_local(
+                _effective_vehicle_seat_count(
+                    vehicle,
+                    _first_text(precise_vehicle.get("vehicleSeat"), precise_vehicle.get("seatCount"), precise_vehicle.get("seat")),
+                    _first_text(selected.get("vehicleSeat"), selected.get("seatCount"), selected.get("seat")),
+                ),
+                5,
+            ),
+        )
         passenger_quantity = max(seats - 1, 1)
         start_date_bi = _first_text(vehicle.get("startDateBI"), _next_day_text())
         start_date_ci = _first_text(vehicle.get("startDateCI"), _next_day_text())
@@ -7504,7 +7543,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             vehicle_name=vehicle_name_hint,
             vin=vin,
         )
-        confirmed_seat_count = _first_text(data.get("approved_passenger_count"), _field_value(defaults, "座位数"))
+        manual_seat_count = _first_text(_json_obj(data.get(QUOTE_DATA_OVERRIDES_KEY)).get("approved_passenger_count"))
+        confirmed_seat_count = _first_text(manual_seat_count, data.get("approved_passenger_count"), _field_value(defaults, "座位数"))
         vehicle = {
             "licenseNo": license_no,
             "licenseType": license_fields["license_type"],
@@ -7532,6 +7572,8 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "seatCount": _first_text(confirmed_seat_count, "5"),
             "seatCountConfirmed": bool(confirmed_seat_count),
         }
+        if manual_seat_count:
+            vehicle["seatCountManualOverride"] = True
         return _clean_vehicle_cert_fields(vehicle)
 
     def _query_vehicle_candidates(
@@ -7784,7 +7826,11 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
                 "车型配置ID",
                 "selectedOperateConfigId",
             ),
-            "seatCount": _first_text(selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
+            "seatCount": _effective_vehicle_seat_count(
+                vehicle,
+                _first_text(selected.get("vehicleSeat"), selected.get("seatCount"), selected.get("seat")),
+                fallback=_first_text(selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
+            ),
             "carLotEquQuality": _first_text(selected.get("vehicleWeight"), selected.get("carLotEquQuality"), "0"),
             "clauseFlag": _field_value(defaults, "条款标识", fallback="1"),
             "energyTypePlat": energy_fields["energy_type_plat"],
@@ -7798,6 +7844,15 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             headers={"Referer": f"{client.config.base_url}/khyxui/homePage"},
         )
         _ensure_platform_success(data, action="精确车型确认")
+        precise_rows = _vehicle_rows(data)
+        if (
+            vehicle.get("seatCountManualOverride")
+            and precise_rows
+            and not any(_vehicle_candidate_compatibility(row, vehicle)[0] for row in precise_rows)
+        ):
+            raise PiccRequestError(
+                f"精确车型配置与人工填写的车辆资料不一致（核定载客数{vehicle.get('seatCount')}人），请核对后重试"
+            )
         return data
 
     def _query_actual_value(
@@ -7818,7 +7873,12 @@ class PiccBusinessAdapter(QuotePlatformAdapter):
             "energyFlag": energy_fields["energy_flag"],
             "clauseType": _field_value(defaults, "条款类型", fallback="F42"),
             "carKindCode": vehicle.get("carKindCode") or "A01",
-            "seatCount": _first_text(precise_vehicle.get("vehicleSeat"), selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
+            "seatCount": _effective_vehicle_seat_count(
+                vehicle,
+                _first_text(precise_vehicle.get("vehicleSeat"), precise_vehicle.get("seatCount"), precise_vehicle.get("seat")),
+                _first_text(selected.get("vehicleSeat"), selected.get("seatCount"), selected.get("seat")),
+                fallback=_first_text(precise_vehicle.get("vehicleSeat"), selected.get("vehicleSeat"), vehicle.get("seatCount"), "5"),
+            ),
             "tonCount": _first_text(precise_vehicle.get("tonCount"), selected.get("tonCount"), selected.get("vehicleTonnage"), "0"),
             "enrollDate": vehicle.get("enrollDate") or "",
             "useNatureCode": vehicle.get("useNatureCode") or "211",

@@ -1133,6 +1133,7 @@ QUOTE_MANUAL_MATERIAL_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
     ("compulsory_start_date", "交强起保日期", "date"),
     ("vehicle_model", "车型名称", "text"),
     ("car_name", "销售车型", "text"),
+    ("approved_passenger_count", "核定载客数（含驾驶员）", "number"),
 )
 
 QUOTE_MANUAL_EXTRA_CONFIG_FIELD_ORDER: Tuple[Tuple[str, str, str], ...] = (
@@ -1387,6 +1388,11 @@ QUOTE_DATA_OVERRIDE_ALIASES: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("commercial_start_date", "商业起保日期", ("商业起保日期", "商业险起保日期", "商业起保", "商业险起期")),
     ("compulsory_start_date", "交强起保日期", ("交强起保日期", "交强险起保日期", "交强起保", "交强险起期")),
     ("license_type", "号牌种类", ("号牌种类", "号牌类型", "牌照类型", "车牌类型", "牌照种类", "licenseType")),
+    (
+        "approved_passenger_count",
+        "核定载客数（含驾驶员）",
+        ("核定载客数", "核定载客量", "核定载人数", "额定载客", "座位数", "座位", "几座"),
+    ),
 )
 
 QUOTE_DATA_OVERRIDE_LABELS: Dict[str, str] = {
@@ -3261,6 +3267,8 @@ def _quote_data_override_value_pattern(field_key: str) -> str:
         return r"(\d{4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2})"
     if field_key == "license_type":
         return r"(02|52|小型新能源汽车号牌|小型新能源汽车|小型汽车号牌|小型汽车|新能源车|新能源|燃油车|燃油|油车|绿牌|蓝牌|绿色|蓝色)"
+    if field_key == "approved_passenger_count":
+        return r"(\d{1,2}\s*(?:人|座)?)(?![\d.])"
     if field_key in {"owner_name", "id_name"}:
         return r"([\u4e00-\u9fffA-Za-z0-9（）()·\-]{2,40})"
     if field_key == "vehicle_model":
@@ -3316,6 +3324,45 @@ def _clean_quote_data_override_value(field_key: str, value: Any) -> Any:
     if value in (None, ""):
         return None
     return value
+
+
+def extract_quote_seat_count_adjustment(text: Any) -> Dict[str, str]:
+    """Extract the target of a bounded seat-count correction command."""
+    compact = re.sub(r"\s+", "", _norm_text(text))
+    if not compact:
+        return {}
+    aliases = (
+        "核定载客数（含驾驶员）",
+        "核定载客数(含驾驶员)",
+        "核定载客量（包括司机）",
+        "核定载客量(包括司机)",
+        "核定载客数",
+        "核定载客量",
+        "核定载人数",
+        "额定载客",
+        "座位数",
+        "座位",
+        "几座",
+    )
+    alias_pattern = "|".join(re.escape(item) for item in aliases)
+    connector = (
+        r"改成|改为|改到|调整成|调整为|调整到|调成|调到|调至|"
+        r"设置成|设置为|设成|设为|变成|变为|变到|修改成|修改为|修改到|"
+        r"更正成|更正为|更正到|修正成|修正为|修正到|纠正成|纠正为|纠正到|改|变"
+    )
+    patterns = (
+        rf"(?:{alias_pattern})(?:(\d{{1,2}})(?:人|座)?)?(?:{connector})(\d{{1,2}})(?:人|座)?(?![\d.])",
+        rf"(\d{{1,2}})座(?:{connector})(\d{{1,2}})(?:人|座)?(?![\d.])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if not match:
+            continue
+        target = _clean_quote_data_override_value("approved_passenger_count", match.group(2))
+        if not target:
+            return {}
+        return {"target": _to_str(target).strip()}
+    return {}
 
 
 def _merge_quote_data_overrides(*items: Any) -> Dict[str, Any]:
@@ -3450,6 +3497,9 @@ def extract_quote_data_overrides(text: Any) -> Dict[str, Any]:
         cleaned = _clean_quote_data_override_value("plate_no", compact_only)
         if cleaned:
             overrides["plate_no"] = cleaned
+    seat_adjustment = extract_quote_seat_count_adjustment(raw_text)
+    if seat_adjustment.get("target"):
+        overrides["approved_passenger_count"] = seat_adjustment["target"]
     return _merge_quote_data_overrides(overrides)
 
 
@@ -10588,6 +10638,10 @@ def _quote_material_form_field(
         field["placeholder"] = "请输入道路救援次数"
     elif key == QUOTE_EXTERNAL_GRID_LABEL:
         field["placeholder"] = "请输入外部电网故障损失险金额"
+    elif key == "approved_passenger_count":
+        field["placeholder"] = "请输入1-99的核定载客数（含驾驶员）"
+        field["min"] = 1
+        field["max"] = 99
     elif field_type == "date":
         field["placeholder"] = "请选择或输入日期"
     else:
@@ -10723,6 +10777,20 @@ def _quote_material_form_values_from_context(ctx: Mapping[str, Any]) -> Dict[str
         for key, value in values.items()
         if key in allowed
     }
+
+
+def _quote_material_form_validation_error(values: Mapping[str, Any]) -> str:
+    if "approved_passenger_count" not in _json_obj(values):
+        return ""
+    raw = _to_str(_json_obj(values).get("approved_passenger_count")).strip()
+    if not raw:
+        return ""
+    if not re.fullmatch(r"\d{1,2}", raw):
+        return "核定载客数只能填写1-99的正整数，不要填写“人”或“座”等单位。"
+    count = _safe_int(raw, 0)
+    if count < 1 or count > 99:
+        return "核定载客数只能填写1-99的正整数。"
+    return ""
 
 
 def _quote_material_form_submitted_field_keys_from_context(
@@ -17927,6 +17995,26 @@ async def handle_quote_text_material_message(
     )
     form_session_id = _to_str((ctx or {}).get("quote_material_form_session_id")).strip()
     form_case_id = _safe_int((ctx or {}).get("quote_material_form_case_id"), 0)
+    form_validation_error = _quote_material_form_validation_error(form_values)
+    if form_validation_error:
+        return (
+            form_validation_error,
+            {
+                "status": "success",
+                "intent": "quote_material_form",
+                "trace_id": _new_trace_id(),
+                "data": _mk_data(
+                    result_status=RESULT_NEED_MORE,
+                    message=form_validation_error,
+                    entities={"quote_case_id": form_case_id or None},
+                    payload={
+                        "material_saved": False,
+                        "quote_material_form_validation_error": True,
+                    },
+                ),
+                "actions": [],
+            },
+        )
     if form_values and form_session_id and session_id and form_session_id != session_id:
         return (
             "这份资料表单属于另一个会话，我没有写入当前会话。请在当前会话重新输入“手工”、“补资料”或“改资料”后再提交。",
